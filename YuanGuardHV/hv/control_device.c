@@ -2,10 +2,15 @@
 #include "control_ioctl.h"
 #include "control_device.h"
 #include "protect.h"
+#include "mem_pte.h"      /* Phase 1: page-table walk (Engine B foundation) */
 #include "debug.h"
 
 NTKERNELAPI PEPROCESS IoGetRequestorProcess(PIRP Irp);
 NTKERNELAPI HANDLE PsGetProcessId(PEPROCESS Process);
+/* Phase 1: the WDK km headers here do not declare this, so declare it
+ * explicitly (the project does the same for the others above). */
+NTKERNELAPI NTSTATUS PsLookupProcessByProcessId(HANDLE ProcessId,
+                                                PEPROCESS *Process);
 NTKERNELAPI NTSTATUS ZwFlushBuffersFile(HANDLE FileHandle,
                                         PIO_STATUS_BLOCK IoStatusBlock);
 
@@ -429,6 +434,71 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
             yghv_protect_sync_set_interval((int)in[1]);
             /* Master switch; per-page snapshots are taken inside the setter. */
             yghv_protect_sync_mode_set(in[0] ? 1 : 0);
+            status = STATUS_SUCCESS;
+            break;
+        }
+        status = STATUS_BUFFER_TOO_SMALL;
+        break;
+    }
+    case IOCTL_YGHV_PTE_PROBE: {
+        /* Phase 1 (2026-10-11): exercise the hand-rolled page-table walk.
+         * Read: {ULONG pid, ULONG pad, ULONG_PTR va} -> 16 qwords of result.
+         * Write: zero-length input -> reset the walk statistics.
+         * Nothing is read from the target process — this only translates.
+         *
+         * METHOD_BUFFERED shares ONE SystemBuffer between input and output,
+         * so the reply overwrites the request as it is written. Everything we
+         * still need (pid, va) must be read out BEFORE the first store. */
+        if (in_len == 0) {
+            yghv_pte_stats_reset();
+            status = STATUS_SUCCESS;
+            break;
+        }
+        if (in_len >= sizeof(yghv_ioctl_pte_probe_t) &&
+            out_len >= YGHV_PTE_PROBE_OUT_QWORDS * sizeof(UINT64)) {
+            yghv_ioctl_pte_probe_t *req = (yghv_ioctl_pte_probe_t *)buf;
+            UINT64 *out = (UINT64 *)buf;
+            PEPROCESS proc = NULL;
+            uint64_t cr3 = 0;
+            uint32_t req_pid = req->pid;          /* read BEFORE any store */
+            uint64_t req_va  = (uint64_t)req->va; /* ditto */
+            yghv_pte_info_t pi;
+            yghv_pte_stats_t st;
+            NTSTATUS lst;
+
+            lst = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)req_pid, &proc);
+            RtlZeroMemory(&pi, sizeof(pi));
+            if (NT_SUCCESS(lst) && proc) {
+                /* KPROCESS.DirectoryTableBase is at offset 0x028 on 19045 —
+                 * the same offset the protect path uses (protect.c set_target). */
+                cr3 = *(volatile uint64_t *)((uint8_t *)proc + 0x028);
+                yghv_pte_walk(cr3, req_va, &pi);
+            }
+
+            out[0] = pi.pa ? 1 : 0;
+            out[1] = cr3;
+            out[2] = req_va;
+            out[3] = pi.pa;
+            out[4] = pi.page_base;
+            out[5] = pi.page_size;
+            out[6] = (UINT64)pi.kind;
+            out[7] = (UINT64)pi.levels;
+            out[8] = ((UINT64)pi.present)
+                   | ((UINT64)pi.writable  << 1)
+                   | ((UINT64)pi.user      << 2)
+                   | ((UINT64)pi.accessed  << 3)
+                   | ((UINT64)pi.dirty     << 4)
+                   | ((UINT64)pi.nx        << 5)
+                   | ((UINT64)pi.global    << 6);
+            yghv_pte_stats_get(&st);
+            out[9]  = st.walks;       out[10] = st.hit_4k;
+            out[11] = st.hit_2m;      out[12] = st.hit_1g;
+            out[13] = st.not_present; out[14] = st.bad_cr3;
+            out[15] = st.table_reads;
+
+            if (NT_SUCCESS(lst) && proc)
+                ObDereferenceObject(proc);
+            info = YGHV_PTE_PROBE_OUT_QWORDS * sizeof(UINT64);
             status = STATUS_SUCCESS;
             break;
         }

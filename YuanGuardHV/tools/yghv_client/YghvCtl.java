@@ -36,6 +36,9 @@ public class YghvCtl {
     /* 9.299 (C line): sync guard — snapshot + poll, no NPT flip.
        PowerShell-only command (config-sync); declared for IOCTL parity. */
     private static final int FN_SET_SYNC = 0x814;
+    /* Phase 1 (2026-10-11): page-table walk probe (Engine B foundation).
+       PowerShell-only command (mem-pte); declared for IOCTL parity. */
+    private static final int FN_PTE_PROBE = 0x815;
 
     private static native long openHandle();
     private static native void closeHandle(long handle);

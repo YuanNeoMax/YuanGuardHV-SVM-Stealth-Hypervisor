@@ -64,6 +64,12 @@
 #define IOCTL_YGHV_SET_SYNC \
     YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x814, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
 
+/* Phase 1 (2026-10-11): page-table walk probe — Engine B foundation.
+   Read: 16-byte input {ULONG pid, ULONG pad, ULONG_PTR va} -> 16 qwords out.
+   Write: zero-length input -> reset walk stats. */
+#define IOCTL_YGHV_PTE_PROBE \
+    YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x815, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
+
 #define YGHV_DEVICE_NAME_STRING     L"\\Device\\YuanGuardHV"
 #define YGHV_DOS_DEVICE_NAME_STRING L"\\DosDevices\\YuanGuardHV"
 
@@ -92,5 +98,42 @@ typedef struct {
     ULONG pid;
     ULONG page_count;
 } yghv_ioctl_state_t;
+
+/*
+ * Phase 1 (2026-10-11): page-table walk probe.
+ *
+ * Read:  {ULONG pid, ULONG_PTR va} -> resolves VA through the target's CR3
+ *        by hand (CR3 -> PML4 -> PDPT -> PD -> PT) and reports what the walk
+ *        found. No memory is read from the target — this only exercises the
+ *        translation, which is the foundation of Engine B.
+ *
+ * Output layout (all UINT64 so it aligns):
+ *   [0] status      1 = resolved, 0 = not present / bad cr3
+ *   [1] cr3         the target's CR3 as used
+ *   [2] va          echoed
+ *   [3] pa          physical address (with page offset) or 0
+ *   [4] page_base   page-aligned physical base
+ *   [5] page_size   0x1000 / 0x200000 / 0x40000000
+ *   [6] kind        1 = 4K, 2 = 2M, 3 = 1G
+ *   [7] levels      2..4 (how deep the walk went)
+ *   [8] attrs       bit0 present, 1 writable, 2 user, 3 accessed,
+ *                   4 dirty, 5 nx, 6 global
+ *   [9] stats.walks
+ *  [10] stats.hit_4k
+ *  [11] stats.hit_2m
+ *  [12] stats.hit_1g
+ *  [13] stats.not_present
+ *  [14] stats.bad_cr3
+ *  [15] stats.table_reads
+ *
+ * Write: {} (zero-length input) -> resets the walk statistics.
+ */
+typedef struct {
+    ULONG     pid;
+    ULONG     _pad;
+    ULONG_PTR va;
+} yghv_ioctl_pte_probe_t;
+
+#define YGHV_PTE_PROBE_OUT_QWORDS 16
 
 #endif

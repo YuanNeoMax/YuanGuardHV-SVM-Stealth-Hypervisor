@@ -1016,6 +1016,78 @@ try {
             }
             Write-Host 'mmf-hold: done'
         }
+        'mem-pte' {
+            # Phase 1 (2026-10-11): page-table walk probe (Engine B foundation).
+            #
+            # Resolves a VA through the target's CR3 by hand —
+            # CR3 -> PML4 -> PDPT -> PD -> PT — reading only the table pages
+            # (system pages). It does NOT read the target's memory; it proves
+            # the translation works, which is what everything else builds on.
+            #
+            # usage:
+            #   mem-pte reset                    clear walk statistics
+            #   mem-pte <pid> <hex_va>           resolve one VA
+            #
+            # Reported: PA, page size (4K/2M/1G), depth, attribute bits, and
+            # cumulative walk stats (so large-page awareness is observable).
+            if ($null -eq $Arg1) {
+                throw 'mem-pte: usage: mem-pte reset | mem-pte <pid> <hex_va>'
+            }
+            if ($Arg1 -eq 'reset') {
+                Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x815)) -InBytes @() | Out-Null
+                Write-Host 'mem-pte: stats reset'
+                return
+            }
+            if ($null -eq $Arg2) {
+                throw 'mem-pte: usage: mem-pte reset | mem-pte <pid> <hex_va>'
+            }
+
+            $tpid = [uint32]::Parse($Arg1)
+            $tva  = [Convert]::ToUInt64(($Arg2 -replace '^0[xX]', ''), 16)
+
+            $req = New-Object byte[] 16
+            [BitConverter]::GetBytes($tpid).CopyTo($req, 0)
+            [BitConverter]::GetBytes([uint64]$tva).CopyTo($req, 8)
+
+            $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x815)) `
+                                    -InBytes $req -OutputLength 128
+            if ($out.Length -lt 128) { throw "mem-pte: short reply ($($out.Length) bytes)" }
+
+            $ok        = [BitConverter]::ToUInt64($out, 0)
+            $cr3       = [BitConverter]::ToUInt64($out, 8)
+            $vaEcho    = [BitConverter]::ToUInt64($out, 16)
+            $pa        = [BitConverter]::ToUInt64($out, 24)
+            $pageBase  = [BitConverter]::ToUInt64($out, 32)
+            $pageSize  = [BitConverter]::ToUInt64($out, 40)
+            $kind      = [BitConverter]::ToUInt64($out, 48)
+            $levels    = [BitConverter]::ToUInt64($out, 56)
+            $attrs     = [BitConverter]::ToUInt64($out, 64)
+            $walks     = [BitConverter]::ToUInt64($out, 72)
+            $h4k       = [BitConverter]::ToUInt64($out, 80)
+            $h2m       = [BitConverter]::ToUInt64($out, 88)
+            $h1g       = [BitConverter]::ToUInt64($out, 96)
+            $np        = [BitConverter]::ToUInt64($out, 104)
+            $badcr3    = [BitConverter]::ToUInt64($out, 112)
+            $treads    = [BitConverter]::ToUInt64($out, 120)
+
+            $kindName = switch ($kind) { 1 { '4K' } 2 { '2M' } 3 { '1G' } default { 'none' } }
+            $attrStr = @()
+            if ($attrs -band 0x01) { $attrStr += 'P' }
+            if ($attrs -band 0x02) { $attrStr += 'W' }
+            if ($attrs -band 0x04) { $attrStr += 'U' }
+            if ($attrs -band 0x08) { $attrStr += 'A' }
+            if ($attrs -band 0x10) { $attrStr += 'D' }
+            if ($attrs -band 0x20) { $attrStr += 'NX' }
+            if ($attrs -band 0x40) { $attrStr += 'G' }
+            if ($attrStr.Count -eq 0) { $attrStr = @('-') }
+
+            Write-Host ("mem-pte: pid={0} va=0x{1:X} -> {2}" -f $tpid, $vaEcho,
+                        $(if ($ok) { "PA=0x$('{0:X}' -f $pa)" } else { 'NOT MAPPED' }))
+            Write-Host ("         cr3=0x{0:X}  base=0x{1:X}  size={2}  kind={3}  depth={4}  attrs={5}" -f
+                        $cr3, $pageBase, $pageSize, $kindName, $levels, ($attrStr -join ''))
+            Write-Host ("         stats: walks={0} 4K={1} 2M={2} 1G={3} np={4} badcr3={5} reads={6}" -f
+                        $walks, $h4k, $h2m, $h1g, $np, $badcr3, $treads)
+        }
         'mmf-write' {
             # Attacker side: same section, foreign CR3. One store; while the
             # page is armed this must come back BLOCKED (DENY -> injected #PF

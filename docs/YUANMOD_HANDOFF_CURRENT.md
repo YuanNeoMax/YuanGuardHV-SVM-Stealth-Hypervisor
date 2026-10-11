@@ -6623,3 +6623,76 @@ PROCESS_NAME: MuMuNxMain.exe
 - MuMu 回滚：`D:\aaaaaavm\mumu_autostart_backup.txt`
 - 已清理 42 个可再生文件（302KB）
 - **新增文档**：`docs/KERNEL_API_CHECKLIST.md`（三次蓝屏的 API 契约教训清单）
+
+
+### 9.305 2026-10-11 **第一批 Phase 1：页表遍历库（Engine B 基础）** —— 6/6 PASS
+
+#### 9.305.1 目标与成果
+自主实现 CR3→PML4→PDPT→PD→PT 完整四级遍历，为无痕内存读写引擎（Engine B）打基础。
+**结果：6/6 全部通过，零蓝屏。**
+
+新增：
+- `hv/common/mem_pte.h`（137 行）—— 常量/结构/接口
+- `hv/mem_pte.c`（317 行）—— 遍历实现 + 统计 + 区间枚举
+
+修改：`control_ioctl.h`（+0x815）、`control_device.c`（+dispatch）、`build.bat`、
+`yghv_ctl.ps1`（+`mem-pte`）、`yghv_client/{README.md,YghvCtl.java}`（parity）
+
+镜像：`206d3_ptecopy`（md5 `33020FDE`，104832B）
+
+#### 9.305.2 ★ 关键技术发现：`MmGetVirtualForPhysical` **对用户页表页也不可靠**
+**这是 9.299 教训在遍历层本身的又一次体现。**
+
+第一版用 `MmGetVirtualForPhysical` 读页表项（沿用 `protect.c:yghv_pt_read` 的写法）。
+症状（决定性对比）：
+```
+explorer pid=2188, va=0x7FF6EB9B0000（模块基址）
+  Engine A (wpm-read)  → value=0x300905A4D   ✓ 读到了 PE 头
+  Engine B (mem-pte)   → NOT MAPPED          ✗
+  但同一 CR3 下 0x7FFE0000 (KUSER_SHARED_DATA) → PA=0x575E000 ✓
+```
+**同一进程、同一 CR3，一个地址成功一个失败** —— 说明不是 CR3 问题，而是
+**页表页本身的读取不可靠**：`MmGetVirtualForPhysical` 只映射系统已直接映射的物理页，
+而用户进程的页表页**不保证在其中**（有的返回指针，有的返回 NULL，返回指针时内容可能是错的）。
+
+**修复**：改用 `MmCopyMemory(MM_COPY_MEMORY_PHYSICAL)` 读表项 ——
+按物理地址直接拷贝，不需要映射，失败通过返回状态报告（没有野指针可解引用）。
+
+修复后：`0x7FF6EB9B0000 → PA=0x1AF355000`、`0x7FFDD2CB0000(kernel32) → PA=0x4037E8000`。
+
+> **教训（第六次）**：`MmGetVirtualForPhysical` 的适用范围比 9.299 记录的更窄 ——
+> **连页表页都不保证**。凡是"读任意物理页"，一律用 `MmCopyMemory`。
+
+#### 9.305.3 三个 bug（都不是崩溃，都是逻辑错误）
+| # | Bug | 症状 | 修复 |
+|---|---|---|---|
+| 1 | PS 参数名写错 `-InputBytes` | PowerShell **静默忽略**未知参数 → 输入恒为空 → 两个命令都走 reset 分支 | 改为 `-InBytes` |
+| 2 | **METHOD_BUFFERED 输入/输出共用 SystemBuffer** | 写 `out[1]=cr3` 时覆盖了 `req->va`（同在偏移 8）→ 回显 va 变成 cr3 的值 | 首次写入前先把 `req_pid`/`req_va` 读到局部变量 |
+| 3 | 第一版的 `MmGetVirtualForPhysical` | 见 9.305.2 | 改 `MmCopyMemory` |
+
+> Bug 1 值得记：**PowerShell 对未知参数不报错**（函数无 `[CmdletBinding()]`），
+> 静默忽略 —— 与 9.304 的 `$R`/`$r` 大小写问题同类，都是"PS 静默行为"陷阱。
+
+#### 9.305.4 验证（6/6 PASS）
+```
+Engine B walked  : 6/6  ALL WALKED OK
+Engine A cross   : 6/6   （wpm-read 交叉验证同一批地址）
+```
+**决定性**：同一进程、同一地址，**两个引擎都成功** → 手写遍历与内核路径等效。
+
+验证方法（重要）：
+- **必须在同一次 `powershell -File` 调用内完成 scan + walk** ——
+  每次调用都是新进程，PID 不同，跨调用传地址必然失效（这是前期大量假 FAIL 的原因）
+- 用 `wpm-read`（Engine A）做**交叉验证基准**，而非只看 B 自己的输出
+
+#### 9.305.5 附带产出
+- `mem-pte` 命令（读）+ `mem-pte reset`（清统计）
+- 遍历统计：walks / 4K / 2M / 1G / np / badcr3 / table_reads
+- `yghv_pte_enum_range()` —— 页表驱动的区间枚举（供后续扫描用，跳过未映射子树）
+- 大页感知（1GB/2MB/4KB 三分支，`kind` 字段）
+
+#### 9.305.6 状态
+- IOCTL：0x815 已占用（下一个空闲 0x816）
+- 命令数：35（PowerShell）
+- 静态检查：IOCTL parity C=22/PS=22/Java=22、Command parity PS=35/Java=18 全 PASS
+- **未推送**（本地领先 3 个提交 + 本次）
