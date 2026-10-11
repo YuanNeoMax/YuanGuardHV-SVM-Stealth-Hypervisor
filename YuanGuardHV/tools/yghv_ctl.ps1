@@ -1270,7 +1270,7 @@ try {
             $ok    = [BitConverter]::ToUInt64($out, 0)
             $eng   = [BitConverter]::ToUInt64($out, 8)
             $done  = [BitConverter]::ToUInt64($out, 16)
-            $engName = switch ($eng) { 1 { 'api' } 2 { 'pte' } default { '?' } }
+            $engName = switch ($eng) { 1 { 'api' } 2 { 'pte' } 3 { 'pte-selfmap' } default { '?' } }
 
             if (-not $ok) {
                 $st = [BitConverter]::ToUInt64($out, 48)
@@ -1316,7 +1316,7 @@ try {
             $ok   = [BitConverter]::ToUInt64($out, 0)
             $eng  = [BitConverter]::ToUInt64($out, 8)
             $done = [BitConverter]::ToUInt64($out, 16)
-            $engName = switch ($eng) { 1 { 'api' } 2 { 'pte' } default { '?' } }
+            $engName = switch ($eng) { 1 { 'api' } 2 { 'pte' } 3 { 'pte-selfmap' } default { '?' } }
             if ($ok) {
                 Write-Host ("mem-write: pid={0} va=0x{1:X} type={2} engine={3} bytes={4} OK" -f
                             $tpid, $tva, $tname, $engName, $done)
@@ -1333,7 +1333,7 @@ try {
             if ($null -eq $Arg1) {
                 $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x818)) -OutputLength 152
                 $sel = [BitConverter]::ToUInt64($out, 0)
-                $selName = switch ($sel) { 1 { 'api' } 2 { 'pte' } default { 'auto' } }
+                $selName = switch ($sel) { 1 { 'api' } 2 { 'pte' } 3 { 'selfmap' } default { 'auto' } }
                 Write-Host ("mem-engine: selection={0}" -f $selName)
                 Write-Host ("  api : reads={0} writes={1} fail={2}" -f `
                     [BitConverter]::ToUInt64($out,8), [BitConverter]::ToUInt64($out,16), [BitConverter]::ToUInt64($out,24))
@@ -1356,8 +1356,8 @@ try {
                 Write-Host 'mem-engine: stats reset'
                 return
             }
-            $sel = switch ($v) { 'auto' { 0 } 'api' { 1 } 'pte' { 2 } default { -1 } }
-            if ($sel -lt 0) { throw 'mem-engine: use auto|api|pte|reset' }
+            $sel = switch ($v) { 'auto' { 0 } 'api' { 1 } 'pte' { 2 } 'selfmap' { 3 } default { -1 } }
+            if ($sel -lt 0) { throw 'mem-engine: use auto|api|pte|selfmap|reset' }
             Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x818)) `
                              -InBytes ([BitConverter]::GetBytes([uint32]$sel)) | Out-Null
             Write-Host ("mem-engine: set to $v")
@@ -1419,6 +1419,39 @@ try {
                 $va = [BitConverter]::ToUInt64($out, 40 + $i*8)
                 Write-Host ("  hit[{0}] va=0x{1:X}" -f $i, $va)
             }
+        }
+        'mem-selfmap' {
+            # Phase 2b (2026-10-11): self-built physical mapping window.
+            #   mem-selfmap            read diagnostics
+            #   mem-selfmap init|stop|reset
+            #
+            # The window is one reserved VA whose leaf PTE is rewritten to
+            # alias a target frame, so a later access is a plain load/store —
+            # no MmCopyMemory, no per-page MDL. Requires PASSIVE_LEVEL, so it
+            # is set up from here rather than from the island.
+            if ($null -eq $Arg1) {
+                $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x81A)) -OutputLength 88
+                $up = [BitConverter]::ToUInt64($out, 0)
+                $va = [BitConverter]::ToUInt64($out, 8)
+                Write-Host ("mem-selfmap: ready={0} window_va=0x{1:X}" -f $up, $va)
+                Write-Host ("  inits={0} retargets={1} reads={2} writes={3} failures={4} tlb_flushes={5}" -f `
+                    [BitConverter]::ToUInt64($out,16), [BitConverter]::ToUInt64($out,24),
+                    [BitConverter]::ToUInt64($out,32), [BitConverter]::ToUInt64($out,40),
+                    [BitConverter]::ToUInt64($out,48), [BitConverter]::ToUInt64($out,56))
+                $eng = [BitConverter]::ToUInt64($out, 64)
+                $engName = switch ($eng) { 1 { 'api' } 2 { 'pte' } 3 { 'pte-selfmap' } default { 'auto' } }
+                Write-Host ("  engine={0}" -f $engName)
+                return
+            }
+            $op = switch ("$Arg1".ToLower()) {
+                'init'  { 1 }  'stop' { 0 }  'reset' { 2 }
+                default { -1 }
+            }
+            if ($op -lt 0) { throw 'mem-selfmap: use init|stop|reset' }
+            $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x81A)) `
+                                    -InBytes ([BitConverter]::GetBytes([uint32]$op)) `
+                                    -OutputLength 8
+            Write-Host ("mem-selfmap: {0} OK" -f "$Arg1")
         }
         'scan-pid' {
             # 206-C5 pilot helper: enumerate a foreign process's committed

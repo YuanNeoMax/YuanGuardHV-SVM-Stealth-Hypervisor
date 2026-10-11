@@ -68,6 +68,17 @@ typedef struct {
     uint64_t         page_size;   /* 4K / 2M / 1G */
     yghv_pte_kind_t  kind;
     uint64_t         entry;       /* the leaf entry that resolved it */
+    /*
+     * Physical address of the leaf entry itself, plus its index in the table.
+     *
+     * Phase 2b needs these to RETARGET a mapping: the self-map window is
+     * built by overwriting one leaf entry so it points at a different frame.
+     * Without the entry's own address there is no way to find it again after
+     * the walk has finished.
+     */
+    uint64_t         entry_pa;
+    uint32_t         entry_index;
+    uint32_t         _pad;
     uint32_t         levels;      /* how many tables we read (2/3/4) */
     /* Attributes assembled from the leaf entry */
     uint8_t          present;

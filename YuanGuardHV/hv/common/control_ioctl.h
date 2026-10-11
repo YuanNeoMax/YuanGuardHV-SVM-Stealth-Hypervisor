@@ -81,6 +81,12 @@
 /* Phase 4 (2026-10-11): page-table driven signature scan. */
 #define IOCTL_YGHV_MEM_SCAN \
     YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x819, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
+/* Phase 2b (2026-10-11): self-built physical mapping window.
+   Zero-length input = read diagnostics (11 qwords).
+   4-byte input {ULONG op}: 1 = init, 0 = stop, 2 = reset stats. */
+#define IOCTL_YGHV_SELFMAP \
+    YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x81A, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
+#define YGHV_SELFMAP_OUT_QWORDS 11
 
 #define YGHV_DEVICE_NAME_STRING     L"\\Device\\YuanGuardHV"
 #define YGHV_DOS_DEVICE_NAME_STRING L"\\DosDevices\\YuanGuardHV"

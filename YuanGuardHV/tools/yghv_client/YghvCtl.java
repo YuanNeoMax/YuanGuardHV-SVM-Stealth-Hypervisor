@@ -46,6 +46,9 @@ public class YghvCtl {
     private static final int FN_MEM_ENGINE = 0x818;
     /* Phase 4 (2026-10-11): page-table driven signature scan (mem-scan). */
     private static final int FN_MEM_SCAN = 0x819;
+    /* Phase 2b (2026-10-11): self-built physical mapping window
+       (mem-selfmap); declared for IOCTL parity. */
+    private static final int FN_SELFMAP = 0x81A;
 
     private static native long openHandle();
     private static native void closeHandle(long handle);

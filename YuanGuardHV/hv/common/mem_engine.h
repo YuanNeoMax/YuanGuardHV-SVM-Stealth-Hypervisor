@@ -20,6 +20,10 @@ typedef enum {
     YGHV_ENGINE_AUTO = 0,
     YGHV_ENGINE_API  = 1,   /* A: MmCopyVirtualMemory */
     YGHV_ENGINE_PTE  = 2,   /* B: page-table walk + physical frame */
+    /* B with the self-built mapping window (Phase 2b): same walk, but the
+     * transfer is a plain load/store through a PTE we own — no MmCopyMemory,
+     * no per-page MDL. Requires the window to be up (PASSIVE, once). */
+    YGHV_ENGINE_PTE_SELFMAP = 3,
 } yghv_engine_t;
 
 /* Typed access — the wire type ids are shared with the client. */

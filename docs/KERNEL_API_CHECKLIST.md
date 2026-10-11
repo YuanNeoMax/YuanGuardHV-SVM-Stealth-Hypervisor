@@ -217,3 +217,48 @@ kd -z C:\Windows\Minidump\<newest>.dmp -y srv*C:\symbols*https://msdl.microsoft.
 
 **本文件位置建议**：`D:\yuanguard\docs\KERNEL_API_CHECKLIST.md`
 （或在 `YUANMOD_NEXT_WINDOW_PROMPT.md` 里引用）
+
+---
+
+## 十三、API **配套关系**必须查文档（第七次教训：0x1A / PFN 数据库损坏）
+
+**事故**：`yghv_selfmap_init` 连续三次蓝屏 `0x1A` / `0x1240`（PFN 数据库损坏）。
+
+**错误的模式**：把两个"看起来相关"的 API 拼在一起，没核对各自的契约。
+
+```c
+// 我写的（错）
+va  = MmAllocateMappingAddress(size, tag);   // 保留地址：无物理页
+MmInitializeMdl(mdl, va, size);
+MmBuildMdlForNonPagedPool(mdl);              // ← 契约违反：要求非分页池地址
+locked = MmMapLockedPagesSpecifyCache(mdl, ...);  // 用垃圾 PFN 建 PTE
+// 然后还手工改 PTE 的 PFN 字段 ← 绕过引用计数
+```
+
+**三个 API 的真实契约**：
+
+| API | 契约 | 正确配套 |
+|---|---|---|
+| `MmAllocateMappingAddress` | 保留系统 VA 范围，**无物理页** | `MmProbeAndLockPages` + `MmMapLockedPagesWithReservedMapping` |
+| `MmBuildMdlForNonPagedPool` | 输入 VA 必须**在非分页池** | 用 `ExAllocatePoolWithTag(NonPagedPool...)` 分配的内存 |
+| `MmMapLockedPagesSpecifyCache` | 会**正确增减 PFN 引用计数**，但 `map`/`unmap` 必须**成对** | 每次用完立即 `MmUnmapLockedPages` |
+
+**为什么 `mem_pa.c` 同样"手工填 PFN"却安全**：
+```c
+MmInitializeMdl(假VA) → 手工填PFN → MmMapLockedPagesSpecifyCache
+  → 写 → **立即 MmUnmapLockedPages**      ← map/unmap 平衡
+```
+而 selfmap 是"**保持映射 + 手工改 PTE**" —— **两头都破坏契约**。
+
+**不可行性的结论**：
+```
+要"零 API 访问任意物理帧"  → 必须手工改 PTE
+要"不破坏 PFN 引用计数"    → 必须经过内存管理器的 map API
+两者不可兼得（除非完整实现 PFN 引用计数管理 = 内存管理器内部契约）
+```
+
+**规则**：
+1. **任何 `Mm*` API 组合前，先查两个 API 的文档**，确认"谁产出什么、谁消费什么"
+2. **MDL 的 `map` 与 `unmap` 必须成对**；需要长期映射时用 `MmMapLockedPagesWithReservedMapping`（不是 SpecifyCache）
+3. **永远不要手工改写 PTE** —— PFN 引用计数由内存管理器拥有
+4. 崩溃码 `0x1A` + `P1=0x1240` = **PFN 数据库损坏**（比访问违规更严重，有数据损坏风险）

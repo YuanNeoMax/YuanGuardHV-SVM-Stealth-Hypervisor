@@ -17,6 +17,7 @@
 
 #include "mem_engine.h"
 #include "mem_pa.h"
+#include "mem_selfmap.h"
 
 NTKERNELAPI NTSTATUS MmCopyVirtualMemory(
     PEPROCESS SourceProcess, PVOID SourceAddress,
@@ -113,6 +114,14 @@ static NTSTATUS pte_read(PEPROCESS proc, uint64_t va, void *buf, SIZE_T len,
             return STATUS_NOT_FOUND;      /* not present -> caller may fall back */
         }
 
+        /* Phase 2b: when the self-map window is up we can read the frame with
+         * a plain load instead of an MmCopyMemory call. Falls through to the
+         * API path when the window is unavailable, so behaviour is identical
+         * from the caller's point of view. */
+        if (yghv_selfmap_ready() && yghv_selfmap_read(pi.pa, dst + off, chunk)) {
+            off += chunk;
+            continue;
+        }
         if (!yghv_pa_read(pi.pa, dst + off, chunk)) {
             InterlockedIncrement64(&g_pte_fail);
             if (done)
@@ -178,6 +187,11 @@ static NTSTATUS pte_write(PEPROCESS proc, uint64_t va, const void *buf, SIZE_T l
             return STATUS_NOT_FOUND;
         }
 
+        /* Phase 2b: same for writes — the window makes it a plain store. */
+        if (yghv_selfmap_ready() && yghv_selfmap_write(pi.pa, src + off, chunk)) {
+            off += chunk;
+            continue;
+        }
         if (!yghv_pa_write(pi.pa, src + off, chunk)) {
             InterlockedIncrement64(&g_pte_wfail_pa);
             InterlockedIncrement64(&g_pte_fail);
@@ -225,6 +239,11 @@ yghv_engine_t yghv_mem_auto_pick(PEPROCESS proc, uint64_t va, SIZE_T len) {
 
     if (sel == YGHV_ENGINE_API || sel == YGHV_ENGINE_PTE)
         return sel;
+    /* Selfmap is Engine B with a different transfer primitive. If the window
+     * is not up, fall back to plain B so the request still succeeds and the
+     * caller's chosen semantic (walk + physical frame) is preserved. */
+    if (sel == YGHV_ENGINE_PTE_SELFMAP)
+        return yghv_selfmap_ready() ? YGHV_ENGINE_PTE_SELFMAP : YGHV_ENGINE_PTE;
 
     if (!proc)
         return YGHV_ENGINE_API;
@@ -260,10 +279,10 @@ NTSTATUS yghv_mem_read(PEPROCESS proc, uint64_t va, void *buf, SIZE_T len,
     yghv_engine_t e = yghv_mem_auto_pick(proc, va, len);
     NTSTATUS st;
 
-    if (e == YGHV_ENGINE_PTE) {
+    if (e == YGHV_ENGINE_PTE || e == YGHV_ENGINE_PTE_SELFMAP) {
         st = g_yghv_engine_pte.read(proc, va, buf, len, done);
         if (NT_SUCCESS(st)) {
-            if (used) *used = YGHV_ENGINE_PTE;
+            if (used) *used = e;
             return st;
         }
         /* B could not do it — A handles faults and COW. */
@@ -280,10 +299,10 @@ NTSTATUS yghv_mem_write(PEPROCESS proc, uint64_t va, const void *buf, SIZE_T len
     yghv_engine_t e = yghv_mem_auto_pick(proc, va, len);
     NTSTATUS st;
 
-    if (e == YGHV_ENGINE_PTE) {
+    if (e == YGHV_ENGINE_PTE || e == YGHV_ENGINE_PTE_SELFMAP) {
         st = g_yghv_engine_pte.write(proc, va, buf, len, done);
         if (NT_SUCCESS(st)) {
-            if (used) *used = YGHV_ENGINE_PTE;
+            if (used) *used = e;
             return st;
         }
         InterlockedIncrement64(&g_fallbacks);

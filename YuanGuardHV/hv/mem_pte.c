@@ -97,6 +97,8 @@ uint64_t yghv_pte_walk(uint64_t cr3, uint64_t va, yghv_pte_info_t *out) {
         o->kind      = YGHV_PTE_KIND_1G;
         o->entry     = pdpte;
         o->levels    = 3;
+        o->entry_pa    = pdpt_pa + YGHV_PTE_INDEX_PDPT(va) * 8;
+        o->entry_index = (uint32_t)YGHV_PTE_INDEX_PDPT(va);
         InterlockedIncrement64(&g_pte_1g);
         goto fill_attrs;
     }
@@ -115,6 +117,8 @@ uint64_t yghv_pte_walk(uint64_t cr3, uint64_t va, yghv_pte_info_t *out) {
         o->kind      = YGHV_PTE_KIND_2M;
         o->entry     = pde;
         o->levels    = 3;
+        o->entry_pa    = pd_pa + YGHV_PTE_INDEX_PD(va) * 8;
+        o->entry_index = (uint32_t)YGHV_PTE_INDEX_PD(va);
         InterlockedIncrement64(&g_pte_2m);
         goto fill_attrs;
     }
@@ -131,6 +135,8 @@ uint64_t yghv_pte_walk(uint64_t cr3, uint64_t va, yghv_pte_info_t *out) {
     o->kind      = YGHV_PTE_KIND_4K;
     o->entry     = pte;
     o->levels    = 4;
+    o->entry_pa    = pt_pa + YGHV_PTE_INDEX_PT(va) * 8;
+    o->entry_index = (uint32_t)YGHV_PTE_INDEX_PT(va);
     InterlockedIncrement64(&g_pte_4k);
 
 fill_attrs:

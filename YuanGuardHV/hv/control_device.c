@@ -5,6 +5,7 @@
 #include "mem_pte.h"      /* Phase 1: page-table walk (Engine B foundation) */
 #include "mem_engine.h"   /* Phase 3: dual-engine typed access */
 #include "mem_pa.h"       /* Phase 2: physical frame primitives */
+#include "mem_selfmap.h"  /* Phase 2b: self-built mapping window */
 #include "debug.h"
 
 NTKERNELAPI PEPROCESS IoGetRequestorProcess(PIRP Irp);
@@ -559,8 +560,8 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
             /* Engine 0 means "use the current selection" — do NOT overwrite
              * it with AUTO, or a mem-engine <sel> set earlier in the session
              * would be undone by the very next read/write. Only an explicit
-             * 1/2 in the request overrides for this call. */
-            if (req_engine == YGHV_ENGINE_API || req_engine == YGHV_ENGINE_PTE)
+             * 1/2/3 in the request overrides for this call. */
+            if (req_engine <= YGHV_ENGINE_PTE_SELFMAP)
                 yghv_mem_engine_set((yghv_engine_t)req_engine);
 
             if (is_read) {
@@ -646,7 +647,7 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
         }
         if (in_len >= sizeof(ULONG) && in_len < sizeof(yghv_ioctl_mem_req_t)) {
             ULONG sel = *(ULONG *)buf;
-            if (sel > YGHV_ENGINE_PTE)
+            if (sel > YGHV_ENGINE_PTE_SELFMAP)
                 sel = YGHV_ENGINE_AUTO;
             yghv_mem_engine_set((yghv_engine_t)sel);
             status = STATUS_SUCCESS;
@@ -738,6 +739,55 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
             break;
         }
         status = STATUS_BUFFER_TOO_SMALL;
+        break;
+    }
+    case IOCTL_YGHV_SELFMAP: {
+        /* Phase 2b (2026-10-11): self-built physical mapping window.
+         *   in_len == 0            -> read diagnostics (11 qwords)
+         *   in_len >= 4 {ULONG op} -> 0 stop, 1 init, 2 reset stats
+         *
+         * init/stop are PASSIVE_LEVEL operations (reserve VA, lock MDL,
+         * map) so they belong here rather than in the island. */
+        if (in_len == 0 && out_len >= YGHV_SELFMAP_OUT_QWORDS * sizeof(UINT64)) {
+            UINT64 *out = (UINT64 *)buf;
+            yghv_selfmap_stats_t ss;
+            yghv_selfmap_stats_get(&ss);
+            out[0]  = (UINT64)(yghv_selfmap_ready() ? 1 : 0);
+            out[1]  = yghv_selfmap_window_va();
+            out[2]  = ss.inits;
+            out[3]  = ss.retargets;
+            out[4]  = ss.reads;
+            out[5]  = ss.writes;
+            out[6]  = ss.failures;
+            out[7]  = ss.tlb_flushes;
+            out[8]  = (UINT64)yghv_mem_engine_get();
+            out[9]  = 0;
+            out[10] = 0;
+            info = YGHV_SELFMAP_OUT_QWORDS * sizeof(UINT64);
+            status = STATUS_SUCCESS;
+            break;
+        }
+        if (in_len >= sizeof(ULONG)) {
+            ULONG op = *(ULONG *)buf;
+            if (op == 1) {
+                status = yghv_selfmap_init() ? STATUS_SUCCESS
+                                             : STATUS_UNSUCCESSFUL;
+                break;
+            }
+            if (op == 0) {
+                yghv_selfmap_stop();
+                status = STATUS_SUCCESS;
+                break;
+            }
+            if (op == 2) {
+                yghv_selfmap_stats_reset();
+                status = STATUS_SUCCESS;
+                break;
+            }
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+        status = STATUS_INVALID_PARAMETER;
         break;
     }
     default:

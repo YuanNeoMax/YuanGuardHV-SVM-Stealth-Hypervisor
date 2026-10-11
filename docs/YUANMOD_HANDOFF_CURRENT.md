@@ -6776,3 +6776,119 @@ B 失败自动回退 A（fallbacks 计数）
 - 静态检查：IOCTL parity C=26/PS=26/Java=26、Command parity PS=39/Java=18 全 PASS
 - 镜像谱系：206d1..206d9（中间版）、**206e1_scanfix（当前可用）**
 - **未推送**（本地领先 5 个提交 + 本次）
+
+
+### 9.307 2026-10-11 **Phase 2b（自建物理映射）标注跳过** —— 第五次蓝屏（0x1A/0x1240）根因与不可行性论证
+
+#### 9.307.1 事故：第五次蓝屏，`0x1A` MEMORY_MANAGEMENT / `0x1240`
+
+```
+14:27:25  意外关闭  → 14:28:59 检测到
+14:30:59  意外关闭  → 14:32:38 检测到  (dump 101126-22906-01.dmp)
+14:35:38  意外关闭  → 14:37:14 检测到  (无 dump — 崩溃太快)
+14:32:42  0x1A (0x1240, 0xffffc507c8b4f430, 0xfffff5cf40322d60, 0)
+```
+
+**取证证据**：kd `!analyze -v` 输出含
+```
+*** WARNING: Unable to verify timestamp for yghv_g6.sys
+```
+崩溃时本驱动已加载。`P1 = 0x1240` = **PFN 数据库损坏**类子码。
+
+**风险等级高于前四次**：前四次是"访问非法地址"（进程级故障），
+本次是"**破坏内存管理子系统的数据结构**"（潜在数据损坏风险）。
+
+#### 9.307.2 根因：三个 API 错误叠加（静态审查确认）
+
+`yghv_selfmap_init` 的实现有**三处独立错误**：
+
+**错误 1：`MmBuildMdlForNonPagedPool` 用在了非非分页池地址上（致命）**
+```c
+g_window_va = MmAllocateMappingAddress(...);      // 保留地址：无物理页
+MmInitializeMdl(g_window_mdl, g_window_va, 0x1000);
+MmBuildMdlForNonPagedPool(g_window_mdl);          // ← 契约违反
+```
+该 API 假定 VA 在**非分页池**，用 `MmGetPhysicalAddress` 填 PFN。
+保留地址不在非分页池、无物理页 → 填入 **0 或垃圾 PFN**。
+
+**错误 2：用无效 PFN 建立映射**
+```c
+g_window_locked = MmMapLockedPagesSpecifyCache(g_window_mdl, ...);
+```
+垃圾 PFN 被写进 PTE → PTE 指向不存在的 PFN → PFN 数据库不一致。
+
+**错误 3：手工改写 PTE 绕过引用计数**
+`yghv_selfmap_retarget` 直接改 leaf entry 的 PFN 字段：
+```c
+new_entry = (entry & ~YGHV_PTE_ADDR_MASK) | (frame & YGHV_PTE_ADDR_MASK);
+```
+即使前两步正确，这也会**绕过内存管理器的 PFN 引用计数** ——
+系统发现"某 PFN 被 PTE 引用但引用计数为 0" → 同样触发 `0x1240`。
+
+#### 9.307.3 不可行性论证（查阅权威文档后的结论）
+
+**目标**：一个能指向任意物理帧、且访问路径上**没有 API 调用**的窗口。
+
+逐一查证所有可能路径：
+
+| 方案 | 权威依据 | 零 API | 结论 |
+|---|---|---|---|
+| 手工改 PTE | 本项目实测 | ✅ | ❌ **破坏 PFN 引用计数**（本次蓝屏） |
+| `MmAllocateMappingAddress` + `MmMapLockedPagesWithReservedMapping` | [MS Learn](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/nf-wdm-mmmaplockedpageswithreservedmapping) | ❌ | 可行但**不满足零 API** |
+| `MmAllocateMappingAddressEx` | [MS Learn](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/nf-wdm-mmallocatemappingaddressex)：*"allocates a system PTE mapping... can be used later to map arbitrary addresses"* | ❌ | 仍需 map API |
+| `MmProbeAndLockPages` | [MS Learn](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/nf-wdm-mmprobeandlockpages) | — | ❌ **只接受 VA，不能锁物理地址** |
+| 直接映射（`MmGetVirtualForPhysical`） | 本项目 9.299 实测 | ✅ | ❌ **只对系统页有效**，用户页不可靠（第三次蓝屏根因） |
+
+**OSR 论坛的佐证**：`MmAllocateMappingAddress` 的正确配套是
+`MmProbeAndLockPages`（[OSR 讨论](https://community.osr.com/t/mmallocatemappingaddress-and-mmprobeandlockpages/40248)），
+而它**只接受虚拟地址** —— 无法用于"已知 PA，求 VA"的方向。
+
+**核心矛盾（不可调和）**：
+```
+要"零 API 访问任意物理帧"  → 必须手工改 PTE
+要"不破坏 PFN 引用计数"    → 必须经过内存管理器的 map API
+两者不可兼得 —— 除非完整实现 PFN 引用计数管理
+（那是内存管理器的内部契约，不属于驱动职责范围）
+```
+
+#### 9.307.4 对照：为什么 `mem_pa.c` 的手工填 PFN 是安全的
+
+同样"手工填 PFN"，`mem_pa.c`（Phase 2，**10/10 验证通过**）却没问题：
+
+```
+mem_pa.c      : MmInitializeMdl(假VA) → 手工填PFN → MmMapLockedPagesSpecifyCache
+                → 写 → **立即 MmUnmapLockedPages**
+mem_selfmap.c : MmAllocateMappingAddress → MmBuildMdlForNonPagedPool
+                → **保持映射** → **手工改 PTE**
+```
+
+**关键差异**：`MmMapLockedPagesSpecifyCache` 自己会**正确地增减 PFN 引用计数**，
+且 `map`/`unmap` **成对平衡**。而"保持映射 + 手工改 PTE"两头都破坏了契约。
+
+**这解释了为什么 Phase 2 可用而 Phase 2b 崩溃。**
+
+#### 9.307.5 决定：**标注跳过，保留代码但不启用**
+
+- `hv/mem_selfmap.c` / `hv/common/mem_selfmap.h` **保留在仓库**（作为研究记录）
+- **IOCTL 0x81A 保留但 `init` 永远返回失败**（安全阀：默认不可用）
+- 引擎值 `YGHV_ENGINE_PTE_SELFMAP` 保留，`auto_pick` 检测到窗口不可用时
+  **自动降级到 `YGHV_ENGINE_PTE`**（已有逻辑，无需改动）
+- **文档标注**：Phase 2b **已验证不可行**（原因见 9.307.3）
+
+**替代方案（务实）**：
+- **访问路径已由 Phase 1-5 达成**：Engine B（页表遍历 + 物理帧）**不使用任何
+  进程语义 API**（无 `MmCopyVirtualMemory`、无 CR3 切换）—— 这是"无痕"的主要收益，
+  **已经实现且 10/10 验证通过**
+- 唯一残留的 API 是 `MmCopyMemory`（读）与 `MmMapLockedPagesSpecifyCache`（写），
+  二者**都不携带进程语义**，监视"跨进程内存操作"的工具看不到它们
+
+#### 9.307.6 教训（第七次）
+
+**API 配套关系必须查文档，不能凭直觉组合。**
+
+本次错误的模式：**把两个"看起来相关"的 API 拼在一起**，没有核对各自的契约：
+- `MmAllocateMappingAddress` 的配套是 `MmProbeAndLockPages` + `MmMapLockedPagesWithReservedMapping`
+- `MmBuildMdlForNonPagedPool` 的输入必须是**非分页池地址**
+- 我拼成了 `MmAllocateMappingAddress` + `MmBuildMdlForNonPagedPool` —— 两边都不对
+
+**已加入 `KERNEL_API_CHECKLIST.md`**（见下条）。
