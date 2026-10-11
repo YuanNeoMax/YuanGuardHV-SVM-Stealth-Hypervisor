@@ -39,6 +39,13 @@ public class YghvCtl {
     /* Phase 1 (2026-10-11): page-table walk probe (Engine B foundation).
        PowerShell-only command (mem-pte); declared for IOCTL parity. */
     private static final int FN_PTE_PROBE = 0x815;
+    /* Phase 3 (2026-10-11): typed cross-process read/write, dual engine.
+       PowerShell-only commands (mem-read / mem-write / mem-engine). */
+    private static final int FN_MEM_READ = 0x816;
+    private static final int FN_MEM_WRITE = 0x817;
+    private static final int FN_MEM_ENGINE = 0x818;
+    /* Phase 4 (2026-10-11): page-table driven signature scan (mem-scan). */
+    private static final int FN_MEM_SCAN = 0x819;
 
     private static native long openHandle();
     private static native void closeHandle(long handle);

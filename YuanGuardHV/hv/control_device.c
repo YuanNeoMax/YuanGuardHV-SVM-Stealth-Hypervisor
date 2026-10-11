@@ -3,6 +3,8 @@
 #include "control_device.h"
 #include "protect.h"
 #include "mem_pte.h"      /* Phase 1: page-table walk (Engine B foundation) */
+#include "mem_engine.h"   /* Phase 3: dual-engine typed access */
+#include "mem_pa.h"       /* Phase 2: physical frame primitives */
 #include "debug.h"
 
 NTKERNELAPI PEPROCESS IoGetRequestorProcess(PIRP Irp);
@@ -499,6 +501,239 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
             if (NT_SUCCESS(lst) && proc)
                 ObDereferenceObject(proc);
             info = YGHV_PTE_PROBE_OUT_QWORDS * sizeof(UINT64);
+            status = STATUS_SUCCESS;
+            break;
+        }
+        status = STATUS_BUFFER_TOO_SMALL;
+        break;
+    }
+    case IOCTL_YGHV_MEM_READ:
+    case IOCTL_YGHV_MEM_WRITE: {
+        /* Phase 3 (2026-10-11): typed cross-process access via either engine.
+         *
+         * METHOD_BUFFERED shares ONE SystemBuffer, so the header is saved to
+         * a local BEFORE any store — writing the reply would otherwise
+         * clobber the request fields we still need (the bug hit in Phase 1).
+         *
+         * MEM_READ reply: 8-qword header, then the payload.
+         * MEM_WRITE reply: 8-qword header only. */
+        if (in_len >= sizeof(yghv_ioctl_mem_req_t) &&
+            out_len >= YGHV_MEM_HDR_BYTES) {
+            yghv_ioctl_mem_req_t *req = (yghv_ioctl_mem_req_t *)buf;
+            UINT64 *out = (UINT64 *)buf;
+            ULONG  req_pid    = req->pid;
+            ULONG  req_type   = req->type;
+            ULONG  req_count  = req->count;
+            ULONG  req_engine = req->engine;
+            ULONG_PTR req_va  = req->va;
+            PEPROCESS proc = NULL;
+            NTSTATUS lst;
+            SIZE_T want, done = 0;
+            yghv_engine_t used = YGHV_ENGINE_AUTO;
+            BOOLEAN is_read = (code == IOCTL_YGHV_MEM_READ);
+
+            /* Payload size: fixed types derive it; strings/bytes take count. */
+            if (req_type == YGHV_T_STR_ASCII || req_type == YGHV_T_STR_UTF8 ||
+                req_type == YGHV_T_BYTES) {
+                want = req_count;
+            } else if (req_type == YGHV_T_STR_UTF16) {
+                want = (SIZE_T)req_count * 2;
+            } else {
+                want = (SIZE_T)yghv_mem_type_size(req_type) * req_count;
+            }
+            if (want == 0 || want > YGHV_MEM_MAX_PAYLOAD) {
+                status = STATUS_INVALID_PARAMETER;
+                break;
+            }
+
+            lst = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)req_pid, &proc);
+            if (!NT_SUCCESS(lst) || !proc) {
+                out[0] = 0; out[1] = 0; out[2] = 0;
+                out[3] = req_type; out[4] = req_count; out[5] = YGHV_MEM_HDR_BYTES;
+                out[6] = 0; out[7] = 0;
+                info = YGHV_MEM_HDR_BYTES;
+                status = STATUS_SUCCESS;
+                break;
+            }
+
+            /* Engine 0 means "use the current selection" — do NOT overwrite
+             * it with AUTO, or a mem-engine <sel> set earlier in the session
+             * would be undone by the very next read/write. Only an explicit
+             * 1/2 in the request overrides for this call. */
+            if (req_engine == YGHV_ENGINE_API || req_engine == YGHV_ENGINE_PTE)
+                yghv_mem_engine_set((yghv_engine_t)req_engine);
+
+            if (is_read) {
+                /* Read the payload into a stack staging area first: the reply
+                 * header is written into the same buffer. */
+                UCHAR stage[YGHV_MEM_MAX_PAYLOAD];
+                if (want > sizeof(stage)) {
+                    ObDereferenceObject(proc);
+                    status = STATUS_INVALID_PARAMETER;
+                    break;
+                }
+                lst = yghv_mem_read(proc, (uint64_t)req_va, stage, want, &done, &used);
+                out[0] = NT_SUCCESS(lst) ? 1 : 0;
+                out[1] = (UINT64)used;
+                out[2] = (UINT64)done;
+                out[3] = req_type;
+                out[4] = req_count;
+                out[5] = YGHV_MEM_HDR_BYTES;
+                out[6] = NT_SUCCESS(lst) ? 0 : (UINT64)lst;
+                out[7] = 0;
+                if (NT_SUCCESS(lst) && done) {
+                    if (out_len >= YGHV_MEM_HDR_BYTES + done)
+                        RtlCopyMemory((UCHAR *)buf + YGHV_MEM_HDR_BYTES, stage, done);
+                    else
+                        done = 0;
+                }
+                info = (ULONG)(YGHV_MEM_HDR_BYTES + done);
+            } else {
+                UCHAR stage[YGHV_MEM_MAX_PAYLOAD];
+                if (want > sizeof(stage) || in_len < YGHV_MEM_HDR_BYTES + want) {
+                    ObDereferenceObject(proc);
+                    status = STATUS_BUFFER_TOO_SMALL;
+                    break;
+                }
+                RtlCopyMemory(stage, (UCHAR *)buf + YGHV_MEM_HDR_BYTES, want);
+                lst = yghv_mem_write(proc, (uint64_t)req_va, stage, want, &done, &used);
+                out[0] = NT_SUCCESS(lst) ? 1 : 0;
+                out[1] = (UINT64)used;
+                out[2] = (UINT64)done;
+                out[3] = req_type;
+                out[4] = req_count;
+                out[5] = YGHV_MEM_HDR_BYTES;
+                out[6] = NT_SUCCESS(lst) ? 0 : (UINT64)lst;
+                out[7] = 0;
+                info = YGHV_MEM_HDR_BYTES;
+            }
+
+            ObDereferenceObject(proc);
+            status = STATUS_SUCCESS;
+            break;
+        }
+        status = STATUS_BUFFER_TOO_SMALL;
+        break;
+    }
+    case IOCTL_YGHV_MEM_ENGINE: {
+        /* Phase 3: engine selection + diagnostics.
+         * Zero-length input = reset stats; 4-byte input = set selection. */
+        if (in_len == 0 && out_len >= YGHV_MEM_ENGINE_OUT_QWORDS * sizeof(UINT64)) {
+            UINT64 *out = (UINT64 *)buf;
+            yghv_mem_stats_t ms;
+            yghv_pa_stats_t ps;
+
+            yghv_mem_stats_get(&ms);
+            yghv_pa_stats_get(&ps);
+            out[0]  = (UINT64)yghv_mem_engine_get();
+            out[1]  = ms.api_reads;       out[2]  = ms.api_writes;
+            out[3]  = ms.api_fail;
+            out[4]  = ms.pte_reads;       out[5]  = ms.pte_writes;
+            out[6]  = ms.pte_fail;
+            out[7]  = ms.fallbacks;
+            out[8]  = ms.auto_choices_api; out[9] = ms.auto_choices_pte;
+            out[10] = ps.reads;           out[11] = ps.reads_failed;
+            out[12] = ps.writes;          out[13] = ps.writes_failed;
+            out[14] = ps.bytes_read;      out[15] = ps.map_failures;
+            /* Engine B write-failure breakdown (added after a wrong mapping
+             * API made every B write fall back silently). */
+            out[16] = ms.pte_wfail_irql;
+            out[17] = ms.pte_wfail_walk;
+            out[18] = ms.pte_wfail_pa;
+            info = YGHV_MEM_ENGINE_OUT_QWORDS * sizeof(UINT64);
+            status = STATUS_SUCCESS;
+            break;
+        }
+        if (in_len >= sizeof(ULONG) && in_len < sizeof(yghv_ioctl_mem_req_t)) {
+            ULONG sel = *(ULONG *)buf;
+            if (sel > YGHV_ENGINE_PTE)
+                sel = YGHV_ENGINE_AUTO;
+            yghv_mem_engine_set((yghv_engine_t)sel);
+            status = STATUS_SUCCESS;
+            break;
+        }
+        if (in_len == 0) {
+            yghv_mem_stats_reset();
+            yghv_pa_stats_reset();
+            status = STATUS_SUCCESS;
+            break;
+        }
+        status = STATUS_INVALID_PARAMETER;
+        break;
+    }
+    case IOCTL_YGHV_MEM_SCAN: {
+        /* Phase 4 (2026-10-11): page-table driven signature scan. */
+        if (in_len >= sizeof(yghv_ioctl_scan_req_t) &&
+            out_len >= YGHV_SCAN_OUT_HDR_QWORDS * sizeof(UINT64)) {
+            yghv_ioctl_scan_req_t *req = (yghv_ioctl_scan_req_t *)buf;
+            UINT64 *out = (UINT64 *)buf;
+            ULONG req_pid = req->pid;
+            ULONG req_pat = req->pat_len;
+            ULONG req_max = req->max_results;
+            ULONG req_flags = req->flags;
+            ULONG_PTR req_start = req->range_start;
+            ULONG_PTR req_end   = req->range_end;
+            ULONG64 req_align   = req->align;
+            UCHAR pat[64], msk[64];
+            PEPROCESS proc = NULL;
+            NTSTATUS lst;
+            uint32_t max_va, found;
+            uint64_t *hits = NULL;
+            uint64_t pr = 0, psk = 0, bs = 0;
+
+            if (req_pat == 0 || req_pat > 64) {
+                status = STATUS_INVALID_PARAMETER;
+                break;
+            }
+            RtlCopyMemory(pat, req->pattern, 64);
+            RtlCopyMemory(msk, req->mask, 64);
+
+            /* How many VAs fit after the header? */
+            max_va = (ULONG)((out_len - YGHV_SCAN_OUT_HDR_QWORDS * sizeof(UINT64)) /
+                             sizeof(UINT64));
+            if (req_max && req_max < max_va)
+                max_va = req_max;
+            if (max_va == 0) {
+                status = STATUS_BUFFER_TOO_SMALL;
+                break;
+            }
+
+            if (!req_start)
+                req_start = (ULONG_PTR)YGHV_USER_VA_MIN;
+            if (!req_end)
+                req_end = (ULONG_PTR)YGHV_USER_VA_MAX;
+
+            lst = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)req_pid, &proc);
+            if (!NT_SUCCESS(lst) || !proc) {
+                out[0] = 0; out[1] = 0; out[2] = 0; out[3] = 0; out[4] = 0;
+                info = YGHV_SCAN_OUT_HDR_QWORDS * sizeof(UINT64);
+                status = STATUS_SUCCESS;
+                break;
+            }
+
+            hits = (uint64_t *)ExAllocatePoolWithTag(
+                NonPagedPoolNx, (SIZE_T)max_va * sizeof(uint64_t), 'TSHS');
+            if (hits) {
+                found = yghv_mem_scan(proc, (uint64_t)req_start, (uint64_t)req_end,
+                                      pat, msk, req_pat, (uint64_t)req_align,
+                                      req_flags, hits, max_va, &pr, &psk, &bs);
+                out[0] = 1;
+                out[1] = (UINT64)found;
+                out[2] = pr;
+                out[3] = psk;
+                out[4] = bs;
+                if (found) {
+                    RtlCopyMemory(out + YGHV_SCAN_OUT_HDR_QWORDS, hits,
+                                  (SIZE_T)found * sizeof(uint64_t));
+                }
+                info = (ULONG)(YGHV_SCAN_OUT_HDR_QWORDS * sizeof(UINT64) +
+                               (SIZE_T)found * sizeof(uint64_t));
+                ExFreePoolWithTag(hits, 'TSHS');
+            } else {
+                out[0] = 0; out[1] = 0; out[2] = 0; out[3] = 0; out[4] = 0;
+                info = YGHV_SCAN_OUT_HDR_QWORDS * sizeof(UINT64);
+            }
+            ObDereferenceObject(proc);
             status = STATUS_SUCCESS;
             break;
         }

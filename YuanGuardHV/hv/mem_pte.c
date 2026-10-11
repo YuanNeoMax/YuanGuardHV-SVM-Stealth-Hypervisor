@@ -191,6 +191,7 @@ uint64_t yghv_pte_enum_range(uint64_t cr3, uint64_t start_va, uint64_t end_va,
                              yghv_pte_enum_cb_t cb, void *cookie) {
     uint64_t pml4_pa, pdpt_pa, pd_pa, pt_pa;
     uint64_t i4, i3, i2, i1;
+    uint64_t i4_end, i3_start, i3_end, i2_start, i2_end;
     uint64_t visited = 0;
     uint64_t va;
 
@@ -201,8 +202,16 @@ uint64_t yghv_pte_enum_range(uint64_t cr3, uint64_t start_va, uint64_t end_va,
     if (!pml4_pa)
         return 0;
 
-    /* Iterate the four levels by index, so we can skip absent subtrees. */
-    for (i4 = YGHV_PTE_INDEX_PML4(start_va); i4 < 512; i4++) {
+    /* Iterate the four levels by index, so we can skip absent subtrees.
+     *
+     * Every level must be bounded at BOTH ends by the requested range, not
+     * just started at the range's index. Starting each inner loop at 0 and
+     * running to 512 makes the cost depend on the range's *position* rather
+     * than its size: a 16-page scan starting at 0x1ED498B0000 walked
+     * 388 * 512 * 512 entries (~100M table reads) and wedged the driver in
+     * STOP_PENDING. Each loop now stops at the index its end_va lands on. */
+    i4_end = YGHV_PTE_INDEX_PML4(end_va - 1);
+    for (i4 = YGHV_PTE_INDEX_PML4(start_va); i4 <= i4_end; i4++) {
         uint64_t pml4e = yghv_pte_read_entry(pml4_pa, i4);
         if (!(pml4e & YGHV_PTE_PRESENT))
             continue;
@@ -210,8 +219,10 @@ uint64_t yghv_pte_enum_range(uint64_t cr3, uint64_t start_va, uint64_t end_va,
         if (!pdpt_pa)
             continue;
 
-        for (i3 = (i4 == YGHV_PTE_INDEX_PML4(start_va)) ? YGHV_PTE_INDEX_PDPT(start_va) : 0;
-             i3 < 512; i3++) {
+        i3_start = (i4 == YGHV_PTE_INDEX_PML4(start_va))
+                       ? YGHV_PTE_INDEX_PDPT(start_va) : 0;
+        i3_end   = (i4 == i4_end) ? YGHV_PTE_INDEX_PDPT(end_va - 1) : 511;
+        for (i3 = i3_start; i3 <= i3_end; i3++) {
             uint64_t pdpte = yghv_pte_read_entry(pdpt_pa, i3);
             if (!(pdpte & YGHV_PTE_PRESENT))
                 continue;
@@ -244,9 +255,12 @@ uint64_t yghv_pte_enum_range(uint64_t cr3, uint64_t start_va, uint64_t end_va,
             if (!pd_pa)
                 continue;
 
-            for (i2 = (i3 == YGHV_PTE_INDEX_PDPT(start_va) && i4 == YGHV_PTE_INDEX_PML4(start_va))
-                          ? YGHV_PTE_INDEX_PD(start_va) : 0;
-                 i2 < 512; i2++) {
+            i2_start = (i4 == YGHV_PTE_INDEX_PML4(start_va) &&
+                        i3 == YGHV_PTE_INDEX_PDPT(start_va))
+                           ? YGHV_PTE_INDEX_PD(start_va) : 0;
+            i2_end   = (i4 == i4_end && i3 == i3_end)
+                           ? YGHV_PTE_INDEX_PD(end_va - 1) : 511;
+            for (i2 = i2_start; i2 <= i2_end; i2++) {
                 uint64_t pde = yghv_pte_read_entry(pd_pa, i2);
                 if (!(pde & YGHV_PTE_PRESENT))
                     continue;
@@ -279,7 +293,7 @@ uint64_t yghv_pte_enum_range(uint64_t cr3, uint64_t start_va, uint64_t end_va,
                 if (!pt_pa)
                     continue;
 
-                for (i1 = 0; i1 < 512; i1++) {
+                for (i1 = 0; i1 <= 511; i1++) {
                     uint64_t pte = yghv_pte_read_entry(pt_pa, i1);
                     if (!(pte & YGHV_PTE_PRESENT))
                         continue;

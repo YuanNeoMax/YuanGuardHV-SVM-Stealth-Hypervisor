@@ -67,6 +67,10 @@ yghv_ctl.ps1 config-fake <0|1>
 yghv_ctl.ps1 config-fake-tlb [0|1|2|3|4]
 yghv_ctl.ps1 config-sync [0|1] [interval_ms]
 yghv_ctl.ps1 mem-pte reset | mem-pte <pid> <hex_va>
+yghv_ctl.ps1 mem-read <pid> <hex_va> <type> [count]
+yghv_ctl.ps1 mem-write <pid> <hex_va> <type> <value>
+yghv_ctl.ps1 mem-engine [auto|api|pte|reset]
+yghv_ctl.ps1 mem-scan <pid> <hex_pattern> [max] [writable] [exec]
 ```
 
 `protect` sets the target, enumerates committed pages of the real Java process,

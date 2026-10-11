@@ -6696,3 +6696,83 @@ Engine A cross   : 6/6   （wpm-read 交叉验证同一批地址）
 - 命令数：35（PowerShell）
 - 静态检查：IOCTL parity C=22/PS=22/Java=22、Command parity PS=35/Java=18 全 PASS
 - **未推送**（本地领先 3 个提交 + 本次）
+
+
+### 9.306 2026-10-11 **第一批 Phase 2-5 完成**（物理帧原语 + 双引擎 + 类型化读写 + 特征码扫描）—— 10/10 PASS
+
+#### 9.306.1 成果总览
+新增 4 个模块：
+- `hv/common/mem_pa.h` + `hv/mem_pa.c` —— 物理帧读/写原语（Phase 2）
+- `hv/common/mem_engine.h` + `hv/mem_engine.c` —— 双引擎抽象 + 类型化读写（Phase 3）
+- `hv/mem_scan.c` —— 页表驱动特征码扫描（Phase 4）
+
+新增 IOCTL：`0x816` MEM_READ、`0x817` MEM_WRITE、`0x818` MEM_ENGINE、`0x819` MEM_SCAN
+新增命令：`mem-read` / `mem-write` / `mem-engine` / `mem-scan`（PowerShell 命令数 35 → 39）
+
+镜像：`206e1_scanfix`（md5 `23DAF7EB`）
+
+#### 9.306.2 ★ 四个关键 bug（全部自主定位修复）
+
+**Bug 1：`KeAreApcsDisabled()` 在 IOCTL dispatch 里恒为 TRUE**
+症状：`pte writes=0`、`fallbacks=N`、`B-wfail irql=1` —— **每次 Engine B 写入都静默回退到 API 路径**。
+根因：IOCTL dispatch 例程**本来就禁用 APC**，但 IRQL 仍是 PASSIVE，映射完全合法。
+**修复**：改用 `KeAreAllApcsDisabled()`（只有 IRQL 真正 ≥ APC_LEVEL 才为 TRUE）。
+> 这是本轮最隐蔽的 bug：**写入"成功"了（走了 fallback），所以功能测试通过，只有计数器暴露了真相**。
+> 教训：**引擎选择必须可观测**（新增 B-wfail 三项计数器才有诊断力）。
+
+**Bug 2：`MmMapIoSpace` 不能写普通 RAM 页**
+症状：Engine B 写入失败，`mapfail` 计数增长。
+根因：`MmMapIoSpace` 是给**设备 MMIO** 用的，对普通 RAM 页失败。
+**修复**：改用 **MDL**（`MmInitializeMdl` + 手工填 PFN + `MmMapLockedPagesSpecifyCache`）。
+
+**Bug 3：`yghv_pte_enum_range` 各层循环未按范围截断**
+症状：`mem-scan` **挂起 90 秒**，驱动进入 `STOP_PENDING`。
+根因：每层循环只**起始**于范围的索引，却跑到 512。16 页的扫描从 `0x1ED498B0000` 开始 →
+遍历 388 × 512 × 512 ≈ **1 亿次表读取**。代价取决于范围的**位置**而非**大小**。
+**修复**：每层都加 `i_end`（由 `end_va - 1` 的索引决定）。
+修复后：同一扫描 **1.9 秒**完成。
+
+**Bug 4：`mem-engine <sel>` 被每次请求重置为 AUTO**
+症状：`mem-engine pte` 后立刻被下一次读/写覆盖。
+根因：dispatch 里 `else yghv_mem_engine_set(YGHV_ENGINE_AUTO)` 把请求里的 `engine=0` 当成"重置为 auto"。
+**修复**：`engine=0` 改为"沿用当前选择"（不覆盖）。
+
+#### 9.306.3 测试脚本 bug（3 个，非驱动）
+1. `[uint64]::Parse('0x...')` 抛异常 —— 需去 `0x` 前缀 + `NumberStyles::HexNumber`
+2. u8/i8 的 `return ,([byte]...)` 返回**标量**而非数组 → `.CopyTo` 不存在。改 `[byte[]]@(...)`
+3. `powershell -File` 把 `-` 当**参数名** → 改用 `x` 作跳过标记；且 `param()` 需声明到 `$Arg7`
+
+#### 9.306.4 验证（W1-W8 全 PASS，10/10）
+| 项 | 内容 | 结果 |
+|---|---|---|
+| W1 | 引擎诊断可读（含 B-wfail 细分） | PASS |
+| W2 | 类型化读 u8/u32/u64/f32/f64/bytes | **6/6 PASS** |
+| W3 | **双引擎一致性**（api vs pte 读同一地址） | PASS（值相同） |
+| W4 | 类型化写 + 读回 u64/u32/u8/f64/f32 | **5/5 PASS** |
+| W4b | 字符串写 + 读回 | PASS |
+| W5 | 引擎切换可观测（pte/api/auto） | PASS |
+| W6 | 特征码扫描命中 | PASS |
+| W6b | 通配符扫描命中 | PASS |
+| W7 | 扫描统计（pages_read=1） | PASS |
+| W8 | 干净卸载 | PASS |
+
+**关键数据**：
+- Engine B 读/写：`pte reads=1 writes=1 fail=0 fallbacks=0`
+- 扫描：`hits=1 pages_read=1 bytes=4096` —— **只读 1 页**（页表驱动，非逐地址）
+- 扫描耗时：**1.9 秒**（修复前挂起 >90 秒）
+
+#### 9.306.5 双引擎行为
+```
+selection=auto  → 按 7 条启发式选择（大页/跨页/缺页/系统空间…）
+selection=api   → 强制 MmCopyVirtualMemory
+selection=pte   → 强制页表遍历 + 物理帧
+B 失败自动回退 A（fallbacks 计数）
+```
+实测：**Engine B 独立完成读写，零回退**。
+
+#### 9.306.6 状态
+- IOCTL：0x815-0x819 已占用（下一个空闲 0x81A）
+- 命令数：39（PowerShell）
+- 静态检查：IOCTL parity C=26/PS=26/Java=26、Command parity PS=39/Java=18 全 PASS
+- 镜像谱系：206d1..206d9（中间版）、**206e1_scanfix（当前可用）**
+- **未推送**（本地领先 5 个提交 + 本次）

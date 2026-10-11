@@ -70,6 +70,18 @@
 #define IOCTL_YGHV_PTE_PROBE \
     YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x815, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
 
+/* Phase 3 (2026-10-11): typed cross-process read/write (dual engine). */
+#define IOCTL_YGHV_MEM_READ \
+    YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x816, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
+#define IOCTL_YGHV_MEM_WRITE \
+    YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x817, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
+/* Engine selection + diagnostics. */
+#define IOCTL_YGHV_MEM_ENGINE \
+    YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x818, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
+/* Phase 4 (2026-10-11): page-table driven signature scan. */
+#define IOCTL_YGHV_MEM_SCAN \
+    YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x819, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
+
 #define YGHV_DEVICE_NAME_STRING     L"\\Device\\YuanGuardHV"
 #define YGHV_DOS_DEVICE_NAME_STRING L"\\DosDevices\\YuanGuardHV"
 
@@ -135,5 +147,88 @@ typedef struct {
 } yghv_ioctl_pte_probe_t;
 
 #define YGHV_PTE_PROBE_OUT_QWORDS 16
+
+/*
+ * Phase 3 (2026-10-11): typed cross-process read/write + engine selection.
+ *
+ * MEM_READ / MEM_WRITE share this request header. `count` is the number of
+ * elements for fixed-size types; for STR_* and BYTES it is the byte count.
+ * `engine` is 0 auto / 1 api / 2 pte.
+ *
+ * METHOD_BUFFERED shares one SystemBuffer between input and output, so the
+ * reply overwrites the request as it is written — the driver must copy
+ * everything it still needs out of the buffer before the first store.
+ *
+ * Read reply layout (QWORDs):
+ *   [0] status      1 = ok
+ *   [1] engine used 1 = api, 2 = pte
+ *   [2] bytes transferred
+ *   [3] type echoed
+ *   [4] count echoed
+ *   [5] data offset (bytes, from start of the buffer)
+ *   ... payload bytes follow at that offset
+ *
+ * Write reply: same header, no payload.
+ */
+typedef struct {
+    ULONG     pid;
+    ULONG     type;
+    ULONG_PTR va;
+    ULONG     count;
+    ULONG     engine;
+    ULONG     flags;
+    ULONG     _pad[2];
+} yghv_ioctl_mem_req_t;
+
+#define YGHV_MEM_HDR_QWORDS   8
+#define YGHV_MEM_HDR_BYTES    (YGHV_MEM_HDR_QWORDS * 8)
+#define YGHV_MEM_MAX_PAYLOAD  4096
+
+/*
+ * Engine control / diagnostics.
+ *   Read: 16 qwords out.
+ *     [0] current selection (0 auto, 1 api, 2 pte)
+ *     [1] api_reads     [2] api_writes   [3] api_fail
+ *     [4] pte_reads     [5] pte_writes   [6] pte_fail
+ *     [7] fallbacks
+ *     [8] auto_choices_api  [9] auto_choices_pte
+ *     [10] pa reads     [11] pa reads_failed
+ *     [12] pa writes    [13] pa writes_failed
+ *     [14] pa bytes_read [15] pa map_failures
+ *   Write: 4 bytes {ULONG sel} -> set engine; zero-length -> reset stats.
+ */
+/* 16 base + 3 Engine B write-failure counters (see control_device.c) */
+#define YGHV_MEM_ENGINE_OUT_QWORDS 19
+
+/*
+ * Phase 4: signature scan.
+ *
+ * Input:
+ *   {ULONG pid, ULONG pat_len, ULONG max_results, ULONG flags,
+ *    ULONG_PTR range_start, ULONG_PTR range_end, ULONG64 align,
+ *    UCHAR pattern[64], UCHAR mask[64]}
+ *   flags: bit0 = writable only, bit1 = executable only
+ *
+ * Output (QWORDs):
+ *   [0] status 1 = ok
+ *   [1] hit count
+ *   [2] pages read
+ *   [3] pages skipped
+ *   [4] bytes scanned
+ *   [5..] hit VAs
+ */
+typedef struct {
+    ULONG     pid;
+    ULONG     pat_len;
+    ULONG     max_results;
+    ULONG     flags;
+    ULONG_PTR range_start;
+    ULONG_PTR range_end;
+    ULONG64   align;
+    UCHAR     pattern[64];
+    UCHAR     mask[64];
+} yghv_ioctl_scan_req_t;
+
+#define YGHV_SCAN_OUT_HDR_QWORDS 5
 
 #endif

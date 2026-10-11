@@ -38,7 +38,14 @@ param(
     [Parameter(Position = 2)]$Arg2 = $null,
     [Parameter(Position = 3)]$Arg3 = $null,
     # 9.305: Arg4 added for mmf-hold's optional mapping size (multi-page tests).
-    [Parameter(Position = 4)]$Arg4 = $null
+    [Parameter(Position = 4)]$Arg4 = $null,
+    # Phase 4: Arg5..Arg7 carry mem-scan's writable/exec flags and range.
+    # Without these declarations PowerShell rejects the extra positional
+    # arguments outright ("cannot find a positional parameter"), which is why
+    # mem-scan failed before its handler ever ran.
+    [Parameter(Position = 5)]$Arg5 = $null,
+    [Parameter(Position = 6)]$Arg6 = $null,
+    [Parameter(Position = 7)]$Arg7 = $null
 )
 
 $ErrorActionPreference = 'Stop'
@@ -414,6 +421,117 @@ if ($handle -eq [IntPtr]::Zero) {
 if ($handle -eq [IntPtr](-1)) {
     throw ("CreateFile {0} failed, Win32 error 0x{1:X8}" -f $devicePath,
         [Runtime.InteropServices.Marshal]::GetLastWin32Error())
+}
+
+# ===== Phase 3-5 helpers (2026-10-11) =====
+
+# sizeof(yghv_ioctl_scan_req_t) = 4*4 + 8*3 + 64 + 64 = 168
+$sizeofYghvScanReq = 168
+
+function Get-YghvMemTypeId {
+    param([string]$Name)
+    switch ($Name.ToLower()) {
+        'u8'    { 0 }  'byte'  { 0 }
+        'u16'   { 1 }  'i16'   { 5 }
+        'u32'   { 2 }  'int32' { 6 }  'i32' { 6 }
+        'u64'   { 3 }  'int64' { 7 }  'i64' { 7 }
+        'i8'    { 4 }
+        'f32'   { 8 }  'float' { 8 }
+        'f64'   { 9 }  'double'{ 9 }
+        'str'   { 10 } 'ascii' { 10 }
+        'wstr'  { 11 } 'utf16' { 11 }
+        'utf8'  { 12 }
+        'bytes' { 13 } 'hex'   { 13 }
+        'vec3'  { 14 }
+        'mat4'  { 15 }
+        default { -1 }
+    }
+}
+
+function Get-YghvMemTypeSize {
+    param([int]$Type)
+    switch ($Type) {
+        0 { 1 } 1 { 2 } 2 { 4 } 3 { 8 }
+        4 { 1 } 5 { 2 } 6 { 4 } 7 { 8 }
+        8 { 4 } 9 { 8 }
+        14 { 12 } 15 { 64 }
+        default { 0 }   # strings / bytes are variable
+    }
+}
+
+function Format-YghvMemValue {
+    param([int]$Type, [byte[]]$Bytes, [int]$Count)
+    if ($Bytes.Length -eq 0) { return '(no data)' }
+    switch ($Type) {
+        0  { return ("0x{0:X2} ({0})" -f $Bytes[0]) }
+        1  { return ("0x{0:X4} ({0})" -f [BitConverter]::ToUInt16($Bytes,0)) }
+        2  { return ("0x{0:X8} ({0})" -f [BitConverter]::ToUInt32($Bytes,0)) }
+        3  { return ("0x{0:X16} ({0})" -f [BitConverter]::ToUInt64($Bytes,0)) }
+        4  { return ("{0}" -f [sbyte]$Bytes[0]) }
+        5  { return ("{0}" -f [BitConverter]::ToInt16($Bytes,0)) }
+        6  { return ("{0}" -f [BitConverter]::ToInt32($Bytes,0)) }
+        7  { return ("{0}" -f [BitConverter]::ToInt64($Bytes,0)) }
+        8  { return ("{0:G9}" -f [BitConverter]::ToSingle($Bytes,0)) }
+        9  { return ("{0:G17}" -f [BitConverter]::ToDouble($Bytes,0)) }
+        10 { return ('"' + [Text.Encoding]::ASCII.GetString($Bytes).TrimEnd([char]0) + '"') }
+        11 { return ('"' + [Text.Encoding]::Unicode.GetString($Bytes).TrimEnd([char]0) + '"') }
+        12 { return ('"' + [Text.Encoding]::UTF8.GetString($Bytes).TrimEnd([char]0) + '"') }
+        13 { return (($Bytes | ForEach-Object { '{0:X2}' -f $_ }) -join ' ') }
+        14 {
+            $f = @(); for($i=0;$i -lt 3;$i++){ $f += ('{0:G6}' -f [BitConverter]::ToSingle($Bytes,$i*4)) }
+            return ('vec3(' + ($f -join ', ') + ')')
+        }
+        15 {
+            $f = @(); for($i=0;$i -lt 16;$i++){ $f += ('{0:G6}' -f [BitConverter]::ToSingle($Bytes,$i*4)) }
+            return ('mat4[' + ($f -join ' ') + ']')
+        }
+        default { return (($Bytes | ForEach-Object { '{0:X2}' -f $_ }) -join ' ') }
+    }
+}
+
+function ConvertTo-YghvMemBytes {
+    param([int]$Type, [string]$Value)
+    $v = $Value.Trim()
+    # Integer parses must not see a 0x prefix: [uint64]::Parse('0x..') throws
+    # and NumberStyles::HexNumber does not accept the prefix either.
+    $vi = $v -replace '^0[xX]',''
+    switch ($Type) {
+        0  { return ,([byte[]]@([byte]([uint32]::Parse($vi, [Globalization.NumberStyles]::HexNumber)))) }
+        1  { return ,([BitConverter]::GetBytes([uint16]::Parse($vi, [Globalization.NumberStyles]::HexNumber))) }
+        2  { return ,([BitConverter]::GetBytes([uint32]::Parse($vi, [Globalization.NumberStyles]::HexNumber))) }
+        3  { return ,([BitConverter]::GetBytes([uint64]::Parse($vi, [Globalization.NumberStyles]::HexNumber))) }
+        4  { return ,([byte[]]@([byte]([int32]::Parse($vi, [Globalization.NumberStyles]::HexNumber) -band 0xFF))) }
+        5  { return ,([BitConverter]::GetBytes([int16]::Parse($vi, [Globalization.NumberStyles]::HexNumber))) }
+        6  { return ,([BitConverter]::GetBytes([int32]::Parse($vi, [Globalization.NumberStyles]::HexNumber))) }
+        7  { return ,([BitConverter]::GetBytes([int64]::Parse($vi, [Globalization.NumberStyles]::HexNumber))) }
+        8  { return ,([BitConverter]::GetBytes([single]::Parse($v, [Globalization.CultureInfo]::InvariantCulture))) }
+        9  { return ,([BitConverter]::GetBytes([double]::Parse($v, [Globalization.CultureInfo]::InvariantCulture))) }
+        10 { return ,([Text.Encoding]::ASCII.GetBytes($v)) }
+        11 { return ,([Text.Encoding]::Unicode.GetBytes($v)) }
+        12 { return ,([Text.Encoding]::UTF8.GetBytes($v)) }
+        13 {
+            $hx = ($v -replace '[\s,]','')
+            if ($hx.Length % 2) { throw 'hex payload needs an even digit count' }
+            $b = New-Object byte[] ($hx.Length/2)
+            for ($i=0; $i -lt $b.Length; $i++) { $b[$i] = [Convert]::ToByte($hx.Substring($i*2,2),16) }
+            return ,$b
+        }
+        14 {
+            $p = ($v -split '[\s,]+') | Where-Object { $_ -ne '' }
+            if ($p.Count -ne 3) { throw 'vec3 needs 3 floats' }
+            $b = New-Object byte[] 12
+            for($i=0;$i -lt 3;$i++){ [BitConverter]::GetBytes([single]::Parse($p[$i],[Globalization.CultureInfo]::InvariantCulture)).CopyTo($b,$i*4) }
+            return ,$b
+        }
+        15 {
+            $p = ($v -split '[\s,]+') | Where-Object { $_ -ne '' }
+            if ($p.Count -ne 16) { throw 'mat4 needs 16 floats' }
+            $b = New-Object byte[] 64
+            for($i=0;$i -lt 16;$i++){ [BitConverter]::GetBytes([single]::Parse($p[$i],[Globalization.CultureInfo]::InvariantCulture)).CopyTo($b,$i*4) }
+            return ,$b
+        }
+        default { throw "unsupported type $Type" }
+    }
 }
 
 function Invoke-YghvIoctl {
@@ -1119,6 +1237,187 @@ try {
                 }
             } finally {
                 [YghvMmf]::UnmapFile($map)
+            }
+        }
+        'mem-read' {
+            # Phase 3 (2026-10-11): typed cross-process read, dual engine.
+            # usage: mem-read <pid> <hex_va> <type> [count]
+            if ($null -eq $Arg1 -or $null -eq $Arg2 -or $null -eq $Arg3) {
+                throw 'mem-read: usage: mem-read <pid> <hex_va> <type> [count]'
+            }
+            $tpid = [uint32]::Parse($Arg1)
+            $tva  = [Convert]::ToUInt64(($Arg2 -replace '^0[xX]',''), 16)
+            $tname = "$Arg3"
+            $type = Get-YghvMemTypeId $tname
+            if ($type -lt 0) { throw "mem-read: unknown type '$tname'" }
+
+            $count = 1
+            if ($null -ne $Arg4) { $count = [uint32]::Parse($Arg4) }
+            $fixed = Get-YghvMemTypeSize $type
+            $want = if ($fixed -gt 0) { $fixed * $count } else { $count }
+            if ($want -le 0) { $want = 1 }
+
+            $req = New-Object byte[] (64 + $want)
+            [BitConverter]::GetBytes($tpid).CopyTo($req, 0)
+            [BitConverter]::GetBytes([uint32]$type).CopyTo($req, 4)
+            [BitConverter]::GetBytes([uint64]$tva).CopyTo($req, 8)
+            [BitConverter]::GetBytes([uint32]$count).CopyTo($req, 16)
+            [BitConverter]::GetBytes([uint32]0).CopyTo($req, 20)   # engine auto
+            [BitConverter]::GetBytes([uint32]0).CopyTo($req, 24)   # flags
+
+            $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x816)) `
+                                    -InBytes $req -OutputLength (64 + $want)
+            $ok    = [BitConverter]::ToUInt64($out, 0)
+            $eng   = [BitConverter]::ToUInt64($out, 8)
+            $done  = [BitConverter]::ToUInt64($out, 16)
+            $engName = switch ($eng) { 1 { 'api' } 2 { 'pte' } default { '?' } }
+
+            if (-not $ok) {
+                $st = [BitConverter]::ToUInt64($out, 48)
+                Write-Host ("mem-read: FAILED status=0x{0:X8}" -f $st)
+                return
+            }
+            $payload = New-Object byte[] $done
+            [Array]::Copy($out, 64, $payload, 0, $done)
+            Write-Host ("mem-read: pid={0} va=0x{1:X} type={2} engine={3} bytes={4}" -f
+                        $tpid, $tva, $tname, $engName, $done)
+            Write-Host ("  value: " + (Format-YghvMemValue -Type $type -Bytes $payload -Count $count))
+        }
+        'mem-write' {
+            # Phase 3: typed cross-process write, dual engine.
+            # usage: mem-write <pid> <hex_va> <type> <value>
+            if ($null -eq $Arg1 -or $null -eq $Arg2 -or $null -eq $Arg3 -or $null -eq $Arg4) {
+                throw 'mem-write: usage: mem-write <pid> <hex_va> <type> <value>'
+            }
+            $tpid = [uint32]::Parse($Arg1)
+            $tva  = [Convert]::ToUInt64(($Arg2 -replace '^0[xX]',''), 16)
+            $tname = "$Arg3"
+            $type = Get-YghvMemTypeId $tname
+            if ($type -lt 0) { throw "mem-write: unknown type '$tname'" }
+
+            $payload = ConvertTo-YghvMemBytes -Type $type -Value "$Arg4"
+            if ($payload.Length -eq 0) { throw 'mem-write: empty payload' }
+
+            $count = if ((Get-YghvMemTypeSize $type) -gt 0) {
+                        [int]($payload.Length / (Get-YghvMemTypeSize $type))
+                     } else { $payload.Length }
+
+            $req = New-Object byte[] (64 + $payload.Length)
+            [BitConverter]::GetBytes($tpid).CopyTo($req, 0)
+            [BitConverter]::GetBytes([uint32]$type).CopyTo($req, 4)
+            [BitConverter]::GetBytes([uint64]$tva).CopyTo($req, 8)
+            [BitConverter]::GetBytes([uint32]$count).CopyTo($req, 16)
+            [BitConverter]::GetBytes([uint32]0).CopyTo($req, 20)
+            [BitConverter]::GetBytes([uint32]0).CopyTo($req, 24)
+            $payload.CopyTo($req, 64)
+
+            $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x817)) `
+                                    -InBytes $req -OutputLength 64
+            $ok   = [BitConverter]::ToUInt64($out, 0)
+            $eng  = [BitConverter]::ToUInt64($out, 8)
+            $done = [BitConverter]::ToUInt64($out, 16)
+            $engName = switch ($eng) { 1 { 'api' } 2 { 'pte' } default { '?' } }
+            if ($ok) {
+                Write-Host ("mem-write: pid={0} va=0x{1:X} type={2} engine={3} bytes={4} OK" -f
+                            $tpid, $tva, $tname, $engName, $done)
+            } else {
+                $st = [BitConverter]::ToUInt64($out, 48)
+                Write-Host ("mem-write: FAILED status=0x{0:X8}" -f $st)
+            }
+        }
+        'mem-engine' {
+            # Phase 3: engine selection + diagnostics.
+            # usage: mem-engine            (read)
+            #        mem-engine auto|api|pte (set)
+            #        mem-engine reset        (clear stats)
+            if ($null -eq $Arg1) {
+                $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x818)) -OutputLength 152
+                $sel = [BitConverter]::ToUInt64($out, 0)
+                $selName = switch ($sel) { 1 { 'api' } 2 { 'pte' } default { 'auto' } }
+                Write-Host ("mem-engine: selection={0}" -f $selName)
+                Write-Host ("  api : reads={0} writes={1} fail={2}" -f `
+                    [BitConverter]::ToUInt64($out,8), [BitConverter]::ToUInt64($out,16), [BitConverter]::ToUInt64($out,24))
+                Write-Host ("  pte : reads={0} writes={1} fail={2}" -f `
+                    [BitConverter]::ToUInt64($out,32), [BitConverter]::ToUInt64($out,40), [BitConverter]::ToUInt64($out,48))
+                Write-Host ("  fallbacks={0}  auto: api={1} pte={2}" -f `
+                    [BitConverter]::ToUInt64($out,56), [BitConverter]::ToUInt64($out,64), [BitConverter]::ToUInt64($out,72))
+                Write-Host ("  pa  : reads={0} rfail={1} writes={2} wfail={3} bytes_r={4} mapfail={5}" -f `
+                    [BitConverter]::ToUInt64($out,80), [BitConverter]::ToUInt64($out,88),
+                    [BitConverter]::ToUInt64($out,96), [BitConverter]::ToUInt64($out,104),
+                    [BitConverter]::ToUInt64($out,112), [BitConverter]::ToUInt64($out,120))
+                Write-Host ("  B-wfail: irql={0} walk={1} pa={2}" -f `
+                    [BitConverter]::ToUInt64($out,128), [BitConverter]::ToUInt64($out,136),
+                    [BitConverter]::ToUInt64($out,144))
+                return
+            }
+            $v = "$Arg1".ToLower()
+            if ($v -eq 'reset') {
+                Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x818)) -InBytes @() | Out-Null
+                Write-Host 'mem-engine: stats reset'
+                return
+            }
+            $sel = switch ($v) { 'auto' { 0 } 'api' { 1 } 'pte' { 2 } default { -1 } }
+            if ($sel -lt 0) { throw 'mem-engine: use auto|api|pte|reset' }
+            Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x818)) `
+                             -InBytes ([BitConverter]::GetBytes([uint32]$sel)) | Out-Null
+            Write-Host ("mem-engine: set to $v")
+        }
+        'mem-scan' {
+            # Phase 4 (2026-10-11): page-table driven signature scan.
+            # usage: mem-scan <pid> <hex_pattern> [max_results] [writable] [exec]
+            #   pattern: hex bytes, '??' = wildcard, e.g. "48 8B 05 ?? ?? ?? ??"
+            if ($null -eq $Arg1 -or $null -eq $Arg2) {
+                throw 'mem-scan: usage: mem-scan <pid> <hex_pattern> [max] [writable] [exec]'
+            }
+            $tpid = [uint32]::Parse($Arg1)
+            $toks = ("$Arg2" -split '[\s,]+') | Where-Object { $_ -ne '' }
+            $patLen = $toks.Count
+            if ($patLen -lt 1 -or $patLen -gt 64) { throw 'mem-scan: pattern must be 1..64 bytes' }
+
+            $pat = New-Object byte[] 64
+            $msk = New-Object byte[] 64
+            for ($i = 0; $i -lt $patLen; $i++) {
+                $t = $toks[$i]
+                if ($t -eq '??' -or $t -eq '?') { $pat[$i] = 0; $msk[$i] = 0 }
+                else { $pat[$i] = [Convert]::ToByte(($t -replace '^0[xX]',''), 16); $msk[$i] = 0xFF }
+            }
+
+            $maxR = 32
+            if ($null -ne $Arg3) { $maxR = [uint32]::Parse($Arg3) }
+            $flags = 0
+            if ($null -ne $Arg4 -and "$Arg4" -ne '' -and "$Arg4" -ne 'x') { $flags = $flags -bor 1 }
+            if ($null -ne $Arg5 -and "$Arg5" -ne '' -and "$Arg5" -ne 'x') { $flags = $flags -bor 2 }
+
+            # Optional explicit range: mem-scan <pid> <pat> <max> <fl> <ex> <start> <end>
+            $rStart = [uint64]0
+            $rEnd   = [uint64]0
+            if ($null -ne $Arg6 -and "$Arg6" -ne '' -and "$Arg6" -ne 'x') { $rStart = [Convert]::ToUInt64(("$Arg6" -replace '^0[xX]',''),16) }
+            if ($null -ne $Arg7 -and "$Arg7" -ne '' -and "$Arg7" -ne 'x') { $rEnd   = [Convert]::ToUInt64(("$Arg7" -replace '^0[xX]',''),16) }
+
+            $req = New-Object byte[] $sizeofYghvScanReq
+            [BitConverter]::GetBytes($tpid).CopyTo($req, 0)
+            [BitConverter]::GetBytes([uint32]$patLen).CopyTo($req, 4)
+            [BitConverter]::GetBytes([uint32]$maxR).CopyTo($req, 8)
+            [BitConverter]::GetBytes([uint32]$flags).CopyTo($req, 12)
+            [BitConverter]::GetBytes($rStart).CopyTo($req, 16)   # range_start
+            [BitConverter]::GetBytes($rEnd).CopyTo($req, 24)     # range_end
+            [BitConverter]::GetBytes([uint64]0).CopyTo($req, 32) # align
+            [Array]::Copy($pat, 0, $req, 40, 64)
+            [Array]::Copy($msk, 0, $req, 104, 64)
+
+            $outLen = 40 + $maxR * 8
+            $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x819)) `
+                                    -InBytes $req -OutputLength $outLen
+            $ok    = [BitConverter]::ToUInt64($out, 0)
+            $hits  = [BitConverter]::ToUInt64($out, 8)
+            $pr    = [BitConverter]::ToUInt64($out, 16)
+            $psk   = [BitConverter]::ToUInt64($out, 24)
+            $bs    = [BitConverter]::ToUInt64($out, 32)
+            if (-not $ok) { Write-Host 'mem-scan: FAILED'; return }
+            Write-Host ("mem-scan: hits={0} pages_read={1} pages_skipped={2} bytes={3}" -f $hits,$pr,$psk,$bs)
+            for ($i = 0; $i -lt $hits; $i++) {
+                $va = [BitConverter]::ToUInt64($out, 40 + $i*8)
+                Write-Host ("  hit[{0}] va=0x{1:X}" -f $i, $va)
             }
         }
         'scan-pid' {
