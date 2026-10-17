@@ -179,7 +179,10 @@ int  yghv_protect_sync_is_guarded(uint64_t gpa);   /* Phase 7: guard query */
    module to program VMCB ControlArea.NCr3. */
 UINT64 yghv_protect_fake_main_pa(void);
 /* Tier 4.6: change one page's NPT permission (PASSIVE only). */
+int yghv_protect_npt_split_4k(uint64_t gpa);
 int yghv_protect_npt_set_perm(uint64_t gpa, uint64_t perm);
+/* Tier 4.4: re-arm an instruction-level breakpoint page (PASSIVE). */
+int yghv_bp_rearm_bare(uint64_t gpa);
 UINT64 yghv_protect_fake_alt_pa(void);
 
 int  yghv_protect_npt_remap(uint64_t gpa, uint64_t spa, int use_alt,

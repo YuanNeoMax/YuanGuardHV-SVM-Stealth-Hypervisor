@@ -63,6 +63,10 @@ public class YghvCtl {
     private static final int FN_WATCH = 0x820;
     /* Tier 4.2 (2026-10-17): O(1) snapshot/rollback. */
     private static final int FN_TIME = 0x821;
+    /* Tier 4.7 (2026-10-17): cache behaviour control. */
+    private static final int FN_CACHE = 0x822;
+    /* Tier 4.4 (2026-10-17): instruction-level breakpoints. */
+    private static final int FN_BP = 0x823;
 
     private static native long openHandle();
     private static native void closeHandle(long handle);

@@ -8,6 +8,7 @@
     @copyright  Copyright (c) 2017-2020, Satoshi Tanda. All rights reserved.
  */
 #define POOL_NX_OPTIN   1
+#include "common/npt.h"   /* NPT_PERM_* / NPT_4K_PAGE_FLAGS */
 #include "svm_simplevm206.hpp"
 
 #include <intrin.h>
@@ -56,10 +57,16 @@ extern UINT64 yghv_view_pick_ncr3(UINT64 guest_cr3);
 /* Tier 4.6: NPF watchpoints (island-safe). */
 extern int  yghv_watch_match(UINT64 gpa, UINT32 kind);
 extern void yghv_watch_record(UINT64 cr3, UINT64 rip, UINT64 gpa, UINT32 kind, UINT32 cpl);
-UINT64 yghv_protect_fake_main_pa(void);
-void yghv_protect_reopen_page_bare(UINT64 gpa);
-UINT64 yghv_protect_guest_va_to_pa(UINT64 cr3, UINT64 va);
-UINT64 yghv_protect_control_walk_gpa(void);
+/* Tier 4.4: instruction-level breakpoints (returns 1 = take the ALLOW path). */
+extern int yghv_bp_on_npf(UINT64 gpa, UINT64 rip, UINT32 kind, UINT32 cpl, UINT64 cr3);
+/* Tier 4.4: re-arm an instruction-level breakpoint page (PASSIVE). */
+extern int yghv_bp_rearm_bare(UINT64 gpa);
+/* Tier 4.4: change one page's NPT permission (PASSIVE). */
+extern int yghv_protect_npt_set_perm(UINT64 gpa, UINT64 perm);
+extern UINT64 yghv_protect_fake_main_pa(void);
+extern void yghv_protect_reopen_page_bare(UINT64 gpa);
+extern UINT64 yghv_protect_guest_va_to_pa(UINT64 cr3, UINT64 va);
+extern UINT64 yghv_protect_control_walk_gpa(void);
 /* 9.297 (A'): runtime TLB-flush strategy for the fake path (see protect.c).
  * plan() returns the TlbControl value; *use_invlpga says whether to INVLPGA. */
 int yghv_protect_fake_tlb_plan(int *use_invlpga);
@@ -1332,7 +1339,67 @@ SvHandleVmExit (
 
             if (writeFault)
             {
-                int vr = yghv_protect_on_npf_write_bare(
+                int vr;
+
+                /*
+                 * Tier 4.4 (2026-10-17): instruction-level breakpoints.
+                 *
+                 * A breakpoint page has its write permission revoked, so a
+                 * guest write raises #NPF exactly like an armed page. The
+                 * breakpoint is distinguished by (gpa, rip) rather than by
+                 * membership in g_protect — which is why this check must come
+                 * BEFORE yghv_protect_on_npf_write_bare(): that function only
+                 * knows armed pages and would return YGHV_NPF_NONE, sending
+                 * us down the inject-#PF path that froze the box in 9.313.
+                 *
+                 * On a match we take the ALLOW path ourselves, complete with
+                 * the permission restore and single-step that 4.6 was missing:
+                 *
+                 *   1. record the hit (island-safe)
+                 *   2. RESTORE the write permission, so the retried store lands
+                 *   3. set TF, so #DB fires after the store
+                 *   4. the #DB path re-arms (revokes again)
+                 *
+                 * Without step 2 the guest can never write the page and the
+                 * machine spins in #NPF. That is the whole lesson of 9.313.
+                 */
+                UINT64 bpRip = VpData->GuestVmcb.ControlArea.NRip;
+                if (yghv_bp_on_npf(gpa, bpRip, 0x2,
+                                   (UINT32)VpData->GuestVmcb.StateSaveArea.Cpl,
+                                   curCr3)) {
+                    if (!yghv_protect_npt_set_perm(
+                            gpa & ~(UINT64)0xFFFULL,
+                            NPT_PERM_PRESENT | NPT_PERM_WRITABLE)) {
+                        /* Could not reopen: refuse rather than spin. */
+                                                 /*
+                          * Could not reopen the page. Refusing to spin matters
+                          * more than the breakpoint: deliver an access
+                          * violation at the null page (ec P=0,W=1,U=1), the
+                          * same deterministic shape the DENY path uses, so the
+                          * guest catches it instead of retrying forever.
+                          */
+                         VpData->GuestVmcb.StateSaveArea.Cr2 = 0;
+                         VpData->GuestVmcb.ControlArea.EventInj =
+                             (1ULL << 31) | (3ULL << 8) | (1ULL << 11) |
+                             0x0EULL | (0x6ULL << 32);
+                        break;
+                    }
+                    rearmGpa = gpa;
+                     /*
+                      * 9.317 FIX: the #DB handler reads its re-arm target from
+                      * GuestPaOfGhcb, NOT from the local rearmGpa. Without this
+                      * the slot is 0 (or stale), the re-arm path is handed a null
+                      * gpa, and the box bugchecks 0x3B walking a zero page.
+                      * Measured: 0x3B / 0xC0000005 at 21:59:21.
+                      */
+                     VpData->GuestVmcb.ControlArea.GuestPaOfGhcb = gpa;
+                    flip = 1;
+                    VpData->GuestVmcb.StateSaveArea.Rflags |=
+                        0x100ULL; /* TF — the #DB re-arms */
+                    break;
+                }
+
+                vr = yghv_protect_on_npf_write_bare(
                     curCr3,
                     VpData->GuestVmcb.StateSaveArea.Cpl,
                     gpa, &rearmGpa, &flip);
@@ -1675,6 +1742,14 @@ SvHandleVmExit (
                     yghv_protect_fake_restore(slot & ~1ULL);
                 } else {
                     yghv_protect_arm_page_bare(slot);
+                    /*
+                     * Tier 4.4: if the page is not in g_protect it may be an
+                     * instruction-level breakpoint - those live in mem_bp's own
+                     * table and need their own re-arm, or the page stays
+                     * writable after the first hit.
+                     */
+                    if (yghv_protect_find_page_bare(slot & ~1ULL) == NULL)
+                        yghv_bp_rearm_bare(slot & ~1ULL);
                 }
                 VpData->GuestVmcb.ControlArea.GuestPaOfGhcb = 0;
             }

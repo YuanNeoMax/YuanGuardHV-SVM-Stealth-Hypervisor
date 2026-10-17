@@ -79,6 +79,8 @@ yghv_ctl.ps1 npt-remap <hex_gpa> <hex_spa> [alt]
 yghv_ctl.ps1 mem-view [init|stop|split <gpa> <real> <decoy>|unsplit <gpa>|observer <cr3>|unobserver <cr3>|pick <cr3>]
 yghv_ctl.ps1 mem-watch [add <gpa> <r|w|rw>|del <gpa>|drain [max]|reset]
 yghv_ctl.ps1 mem-time [track|untrack|snapshot|goto|current] <gpa> [ver]
+yghv_ctl.ps1 mem-cache [set|setalt|reset] <gpa> [mode]
+yghv_ctl.ps1 mem-bp [add|del|drain] <gpa> <rip|0> [kinds]
 ```
 
 `protect` sets the target, enumerates committed pages of the real Java process,

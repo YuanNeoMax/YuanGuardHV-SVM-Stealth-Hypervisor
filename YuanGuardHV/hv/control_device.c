@@ -11,6 +11,8 @@
 #include "mem_view.h"     /* Tier 4.1/4.3: split view + aliasing */
 #include "mem_watch.h"    /* Tier 4.6: NPF watchpoints */
 #include "mem_time.h"     /* Tier 4.2: O(1) snapshot/rollback */
+#include "mem_cache.h"    /* Tier 4.7: cache behaviour control */
+#include "mem_bp.h"       /* Tier 4.4: instruction-level access control */
 #include "debug.h"
 
 NTKERNELAPI PEPROCESS IoGetRequestorProcess(PIRP Irp);
@@ -795,7 +797,128 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
         status = STATUS_INVALID_PARAMETER;
         break;
     }
+    case IOCTL_YGHV_CACHE: {
+        /* Tier 4.7: cache behaviour control.
+         * Zero-length input = diagnostics.
+         * 32-byte input {ULONG op, pad, ULONG_PTR a, b, c}:
+         *   op 0 = set(gpa, mode)    op 1 = set_alt(gpa, mode)
+         *   op 2 = reset(gpa) */
+        if (in_len == 0 && out_len >= 6 * sizeof(UINT64)) {
+            UINT64 *out = (UINT64 *)buf;
+            yghv_cache_stats_t cs;
+            yghv_cache_stats_get(&cs);
+            out[0] = 1;
+            out[1] = 0;
+            out[2] = cs.tracked;
+            out[3] = cs.sets;
+            out[4] = cs.resets;
+            out[5] = cs.failures;
+            info = 6 * sizeof(UINT64);
+            status = STATUS_SUCCESS;
+            break;
+        }
+        if (in_len >= 32) {
+            UINT64 *in = (UINT64 *)buf;
+            UINT64 *out = (UINT64 *)buf;
+            ULONG op = (ULONG)in[0];
+            ULONG_PTR a = (ULONG_PTR)in[1];
+            ULONG_PTR b = (ULONG_PTR)in[2];
+            int ok = 0;
+
+            switch (op) {
+            case 0: ok = yghv_cache_set((uint64_t)a, (uint32_t)b); break;
+            case 1: ok = yghv_cache_set_alt((uint64_t)a, (uint32_t)b); break;
+            case 2: ok = yghv_cache_reset((uint64_t)a); break;
+            default: ok = 0; break;
+            }
+            out[0] = (UINT64)(ok ? 1 : 0);
+            info = 8;
+            status = STATUS_SUCCESS;
+            break;
+        }
+        status = STATUS_INVALID_PARAMETER;
+        break;
+    }
+    case IOCTL_YGHV_BP: {
+        /* Tier 4.4: instruction-level access control.
+         * Zero-length input = diagnostics.
+         * 32-byte input {ULONG op, pad, ULONG_PTR a(gpa), b(rip), c(kinds)}:
+         *   op 0 = add   op 1 = remove   op 2 = drain(a = max qwords) */
+        if (in_len == 0 && out_len >= 6 * sizeof(UINT64)) {
+            UINT64 *out = (UINT64 *)buf;
+            yghv_bp_stats_t bs;
+            yghv_bp_stats_get(&bs);
+            out[0] = 1;
+            out[1] = 0;
+            out[2] = bs.count;
+            out[3] = bs.hits;
+            out[4] = bs.recorded;
+            out[5] = bs.refusals;
+            info = 6 * sizeof(UINT64);
+            status = STATUS_SUCCESS;
+            break;
+        }
+        if (in_len >= 32) {
+            UINT64 *in = (UINT64 *)buf;
+            UINT64 *out = (UINT64 *)buf;
+            ULONG op = (ULONG)in[0];
+            ULONG_PTR a = (ULONG_PTR)in[1];
+            ULONG_PTR b = (ULONG_PTR)in[2];
+            ULONG_PTR c = (ULONG_PTR)in[3];
+            int ok = 0;
+
+            switch (op) {
+            case 0:
+                ok = yghv_bp_add((uint64_t)a, (uint64_t)b, (uint32_t)c);
+                out[0] = (UINT64)(ok ? 1 : 0);
+                info = 8;
+                break;
+            case 1:
+                ok = yghv_bp_remove((uint64_t)a, (uint64_t)b);
+                out[0] = (UINT64)(ok ? 1 : 0);
+                info = 8;
+                break;
+            case 2: {
+                uint32_t maxq, got;
+                uint64_t *tmp;
+                if (out_len < 8) {
+                    ok = 0;
+                    break;
+                }
+                maxq = (uint32_t)((out_len - 8) / sizeof(UINT64));
+                if (a && a < maxq)
+                    maxq = (uint32_t)a;
+                if (maxq == 0)
+                    maxq = 1;
+                tmp = (uint64_t *)ExAllocatePoolWithTag(
+                    NonPagedPoolNx, (SIZE_T)maxq * sizeof(uint64_t), 'BPDR');
+                if (tmp) {
+                    got = yghv_bp_drain(tmp, maxq);
+                    out[0] = (UINT64)got;
+                    if (got)
+                        RtlCopyMemory(out + 1, tmp, (SIZE_T)got * sizeof(UINT64));
+                    info = (ULONG)(8 + (SIZE_T)got * sizeof(UINT64));
+                    ExFreePoolWithTag(tmp, 'BPDR');
+                } else {
+                    out[0] = 0;
+                    info = 8;
+                }
+                ok = 1;
+                break;
+            }
+            default:
+                out[0] = 0;
+                info = 8;
+                break;
+            }
+            status = STATUS_SUCCESS;
+            break;
+        }
+        status = STATUS_INVALID_PARAMETER;
+        break;
+    }
     case IOCTL_YGHV_WATCH: {
+
         /* Tier 4.6: NPF watchpoints. op 2 drains the event ring into the
          * output buffer (header: [0]=count, [1]=dropped). */
         if (in_len == 0 && out_len >= 6 * sizeof(UINT64)) {

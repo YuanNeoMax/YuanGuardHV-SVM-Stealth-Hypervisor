@@ -1460,7 +1460,115 @@ try {
                                     -OutputLength 8
             Write-Host ("mem-selfmap: {0} OK" -f "$Arg1")
         }
-                                'mem-watch' {
+                                        'mem-cache' {
+            # Tier 4.7 (2026-10-17): cache behaviour control (NPT PWT/PCD).
+            #
+            # PWT/PCD live in the NPT entry, so they are set per GPA and the
+            # guest sees them on every access through that entry. Modes:
+            #   0 writeback (default)  1 write-through  2 uncached  3 uncacheable-strong
+            #
+            # HONEST: this changes the GUEST's behaviour too — uncached memory
+            # is dramatically slower for the guest, and a target that measures
+            # its own throughput can detect it. This is not a stealth feature.
+            # "Per-observer" needs the split-view mechanism: set the mode in
+            # the ALT table and register an observer (mem-view).
+            # usage: mem-cache [set <gpa> <mode> | setalt <gpa> <mode> | reset <gpa>]
+            if ($null -eq $Arg1) {
+                $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x822)) -OutputLength 48
+                Write-Host ("mem-cache: tracked={0} sets={1} resets={2} failures={3}" -f `
+                    [BitConverter]::ToUInt64($out,16), [BitConverter]::ToUInt64($out,24),
+                    [BitConverter]::ToUInt64($out,32), [BitConverter]::ToUInt64($out,40))
+                return
+            }
+            $v = "$Arg1".ToLower()
+            $op = -1; $a=[uint64]0; $b=[uint64]0
+            switch ($v) {
+                'set'     { $op = 0 }
+                'setalt'  { $op = 1 }
+                'reset'   { $op = 2 }
+                default   { throw 'mem-cache: use set|setalt|reset' }
+            }
+            if ($null -eq $Arg2) { throw 'mem-cache: needs a hex_gpa' }
+            $a = [Convert]::ToUInt64(("$Arg2" -replace '^0[xX]',''),16)
+            if ($op -eq 0 -or $op -eq 1) {
+                if ($null -eq $Arg3) { throw 'mem-cache set: needs a mode (0-3)' }
+                $b = [uint64]::Parse($Arg3)
+            }
+            $req = New-Object byte[] 32
+            [BitConverter]::GetBytes([uint32]$op).CopyTo($req, 0)
+            [BitConverter]::GetBytes([uint64]$a).CopyTo($req, 8)
+            [BitConverter]::GetBytes([uint64]$b).CopyTo($req, 16)
+            $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x822)) -InBytes $req -OutputLength 8
+            Write-Host ("mem-cache: {0} {1}" -f $v, $(if([BitConverter]::ToUInt64($out,0)){'OK'}else{'FAILED'}))
+        }
+        'mem-bp' {
+            # Tier 4.4 (2026-10-17): instruction-level access control.
+            #
+            # A watchpoint that fires on ONE instruction, not on a page: the
+            # page's permission is revoked, and the #NPF handler compares the
+            # faulting RIP against the registered instruction's RIP. Match ->
+            # record, restore permission, single-step (TF), let it land, and
+            # re-arm on #DB. That ALLOW loop is the part 4.6 was missing.
+            #
+            # rip = 0 means "any instruction on this page" (degrades to 4.6).
+            # usage:
+            #   mem-bp                              diagnostics
+            #   mem-bp add <gpa> <rip|0> <r|w|rw>
+            #   mem-bp del <gpa> <rip|0>
+            #   mem-bp drain [max]
+            if ($null -eq $Arg1) {
+                $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x823)) -OutputLength 48
+                Write-Host ("mem-bp: count={0} hits={1} recorded={2} refusals={3}" -f `
+                    [BitConverter]::ToUInt64($out,16), [BitConverter]::ToUInt64($out,24),
+                    [BitConverter]::ToUInt64($out,32), [BitConverter]::ToUInt64($out,40))
+                return
+            }
+            $v = "$Arg1".ToLower()
+            $op = -1; $a=[uint64]0; $b=[uint64]0; $k=[uint64]3
+            switch ($v) {
+                'add'    { $op = 0 }
+                'del'    { $op = 1 }
+                'drain'  { $op = 2 }
+                default  { throw 'mem-bp: use add|del|drain' }
+            }
+            if ($op -eq 0 -or $op -eq 1) {
+                if ($null -eq $Arg2) { throw "mem-bp ${v}: usage: mem-bp ${v} <gpa> <rip|0> [kinds]" }
+                $a = [Convert]::ToUInt64(("$Arg2" -replace '^0[xX]',''),16)
+                if ($null -ne $Arg3) { $b = [Convert]::ToUInt64(("$Arg3" -replace '^0[xX]',''),16) }
+                if ($null -ne $Arg4) {
+                    $ks = "$Arg4".ToLower(); $k = 0
+                    if ($ks -match 'r') { $k = $k -bor 1 }
+                    if ($ks -match 'w') { $k = $k -bor 2 }
+                    if ($k -eq 0) { $k = 2 }
+                }
+            } elseif ($op -eq 2) {
+                $a = 32
+                if ($null -ne $Arg2) { $a = [uint64]::Parse($Arg2) }
+            }
+            $req = New-Object byte[] 32
+            [BitConverter]::GetBytes([uint32]$op).CopyTo($req, 0)
+            [BitConverter]::GetBytes([uint64]$a).CopyTo($req, 8)
+            [BitConverter]::GetBytes([uint64]$b).CopyTo($req, 16)
+            [BitConverter]::GetBytes([uint64]$k).CopyTo($req, 24)
+            if ($op -eq 2) {
+                $outLen = 8 + [int]$a * 8
+                $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x823)) -InBytes $req -OutputLength $outLen
+                $got = [BitConverter]::ToUInt64($out, 0)
+                Write-Host ("mem-bp drain: {0} qword(s)" -f $got)
+                for ($i = 0; $i -lt $got; $i += 4) {
+                    $rip  = [BitConverter]::ToUInt64($out, 8 + $i*8)
+                    $gpa  = [BitConverter]::ToUInt64($out, 8 + ($i+1)*8)
+                    $kd   = [BitConverter]::ToUInt64($out, 8 + ($i+2)*8)
+                    $cr3  = [BitConverter]::ToUInt64($out, 8 + ($i+3)*8)
+                    Write-Host ("  hit rip=0x{0:X} gpa=0x{1:X} kind={2} cpl={3} cr3=0x{4:X}" -f `
+                        $rip, $gpa, ($kd -band 0xFF), (($kd -shr 8) -band 0xFF), $cr3)
+                }
+                return
+            }
+            $out2 = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x823)) -InBytes $req -OutputLength 8
+            Write-Host ("mem-bp: {0} {1}" -f $v, $(if([BitConverter]::ToUInt64($out2,0)){'OK'}else{'FAILED'}))
+        }
+        'mem-watch' {
             # Tier 4.6 (2026-10-17): NPF watchpoints — the debug-register superset.
             #
             # x86 gives a debugger FOUR hardware breakpoints (DR0-DR3), and

@@ -285,3 +285,34 @@ pt[p0].all = (spa & ~0xFFF) | (flags & 0xFFF) | (flags & (1ULL<<63));
    → 加 `KeAreAllApcsDisabled()` 检查
 3. **`0x0A` 的 P2 直接就是 IRQL**，不需要 kd 分析
 4. **kd 在本机不可用**（两次事故：管道损坏、挂起）→ 只用 dump 参数 + 代码审查
+---
+
+## 十五、★ kd 用**本地符号**完全可用（第十次教训：误判导致 2 次无谓崩溃）
+
+**误判**：以为 kd 在这台机器上不可用（两次挂起后放弃）。
+**真相**：挂起的是**符号服务器联网**，不是 kd。
+
+```bash
+# 可用（本地 38 个内核符号，90 秒内稳定返回）
+kd -z <dmp> -y C:\symbols -c "k; q"        # 栈回溯
+kd -z <dmp> -y C:\symbols -c "r; q"        # 寄存器
+kd -z <dmp> -y C:\symbols;C:\ -c "u yghv_g16+0x19d17; q"   # 反汇编
+kd -z <dmp> -y C:\symbols -c "dt nt!_CONTEXT 0xffffab8c...; q"   # 异常上下文
+
+# 会挂起（符号服务器超时）
+kd -z <dmp> -y "srv*C:\symbols*https://msdl.microsoft.com/download/symbols" -c "!analyze -v; q"
+```
+
+**关键技巧**：
+1. **`-y C:\symbols`**（本地）而不是 `srv*...`
+2. **短命令**：`k` / `r` / `u` / `dt`，不要 `!analyze -v`
+3. **超时保护**：`Start-Job` + `Wait-Job -Timeout 90`
+4. **反汇编自己的驱动**：把镜像放回 `C:\<svcname>.sys`，
+   然后 `-y C:\symbols;C:\` + `u <drvname>+0x<RVA>`
+5. **拿异常时的寄存器**：0x3B 的 P3 是 CONTEXT 地址，
+   `dt nt!_CONTEXT <P3>` 能看到故障现场的 Rcx/Rdx/R11 等
+
+**代价**：这个误判让我白崩了 2 次（9.311 之后纯靠猜）。
+
+**规则**：崩溃后**第一件事**是用本地符号 kd 取证，
+不要猜，也不要因为一次工具失败就放弃工具。

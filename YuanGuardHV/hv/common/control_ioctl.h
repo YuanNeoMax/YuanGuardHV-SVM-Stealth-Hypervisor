@@ -142,6 +142,18 @@ typedef struct {
 #define IOCTL_YGHV_TIME \
     YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x821, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
 #define YGHV_TIME_OUT_QWORDS 6
+/* Tier 4.7 (2026-10-17): cache behaviour control (NPT PWT/PCD).
+   Zero-length input = 6 qwords diagnostics.
+   32-byte input {ULONG op, pad, ULONG_PTR a, b, c}: op 0 set(gpa,mode),
+   1 set_alt(gpa,mode), 2 reset(gpa). */
+#define IOCTL_YGHV_CACHE \
+    YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x822, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
+/* Tier 4.4 (2026-10-17): instruction-level access control.
+   Zero-length input = 6 qwords diagnostics.
+   32-byte input {ULONG op, pad, ULONG_PTR gpa, rip, kinds}: op 0 add,
+   1 remove, 2 drain(a = max qwords). */
+#define IOCTL_YGHV_BP \
+    YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x823, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
 /* Tier 4 prerequisite (2026-10-11): NPT remap experiment.
    Rewrites one GPA's NPT entry to point at a different SPA, then reports
    whether the guest actually observes the change.

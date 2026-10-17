@@ -2710,6 +2710,23 @@ int yghv_protect_npt_remap(uint64_t gpa, uint64_t spa, int use_alt,
  * which 9.299 measured returning a bogus pointer for user-owned pages. Same
  * rule as yghv_protect_npt_remap (9.311).
  */
+/*
+ * Tier 4.4/4.6 (2026-10-17): split a 2MB large page into 4K entries before
+ * touching one page's permission.
+ *
+ * npt_set_page_perm() targets `&pd[p1]` when the containing entry is a large
+ * page, so a permission change there applies to the whole 2MB region. Callers
+ * that want ONE page protected must split first — the same order
+ * yghv_protect_arm_page_bare() has always used.
+ *
+ * PASSIVE only (npt_split_2mb_to_4kb allocates a page table).
+ */
+int yghv_protect_npt_split_4k(uint64_t gpa) {
+    if (KeAreAllApcsDisabled())
+        return 0;
+    return NT_SUCCESS(npt_split_2mb_to_4kb(&g_npt, gpa)) ? 1 : 0;
+}
+
 int yghv_protect_npt_set_perm(uint64_t gpa, uint64_t perm) {
     int st;
 
@@ -2736,4 +2753,25 @@ int yghv_protect_npt_set_perm(uint64_t gpa, uint64_t perm) {
         st = npt_set_page_perm(&g_npt, gpa, perm | attrs);
     }
     return NT_SUCCESS(st) ? 1 : 0;
+}
+/*
+ * Tier 4.4 (2026-10-17): re-arm an instruction-level breakpoint page.
+ *
+ * The #DB handler calls yghv_protect_arm_page_bare(), which only knows pages
+ * registered in g_protect. A breakpoint page is not there, so that call
+ * silently does nothing and the page stays writable forever after the first
+ * hit — the breakpoint would fire once and then never again.
+ *
+ * This is the matching re-arm. The NPF handler sets rearm_gpa for a bp page,
+ * the #DB handler sees the g_protect lookup fail, and calls this instead.
+ */
+int yghv_bp_rearm_bare(uint64_t gpa) {
+    uint64_t page = gpa & ~(uint64_t)0xFFFULL;
+
+    if (!page)
+        return 0;
+    if (KeAreAllApcsDisabled())
+        return 0;                       /* PASSIVE-only */
+
+    return yghv_protect_npt_set_perm(page, NPT_PERM_PRESENT);
 }
