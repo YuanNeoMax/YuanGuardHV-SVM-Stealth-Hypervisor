@@ -166,6 +166,8 @@ void SvInvlpgaByVa(UINT64 gva, UINT32 asid);   /* 9.289: asm, 206-only */
  * (above it) needs to register pages with it. */
 int  yghv_protect_sync_arm(uint64_t gpa);
 void yghv_protect_sync_disarm(uint64_t gpa);
+int  yghv_protect_sync_resnapshot(uint64_t gpa);   /* Phase 7 */
+int  yghv_protect_sync_is_guarded(uint64_t gpa);   /* Phase 7 */
 static int yghv_protect_sync_arm_locked(uint64_t gpa);   /* caller holds lock */
 
 /* 9.297 (A'): runtime TLB-flush strategy for the fake-write path.
@@ -266,6 +268,7 @@ static volatile LONG g_sync_mode;             /* 0 = off, 1 = on */
 static volatile LONG g_sync_polls;
 static volatile LONG g_sync_hits;
 static volatile LONG g_sync_refused;   /* 9.302: arm refused (slot table full) */
+static volatile LONG64 g_sync_resnaps; /* Phase 7: cooperative re-snapshots */
 static volatile LONG64 g_sync_cpu_100ns; /* 9.304: cumulative poll CPU time */
 static volatile LONG g_sync_ms = YGHV_SYNC_DEFAULT_MS;
 static HANDLE g_sync_thread;
@@ -512,6 +515,66 @@ void yghv_protect_sync_disarm(uint64_t gpa) {
             
         }
     }
+}
+
+/*
+ * Phase 7 (2026-10-11): cooperative write support.
+ *
+ * The guard restores a page whenever its content drifts from the snapshot.
+ * A write from Engine B lands on the PHYSICAL FRAME, so the poll sees drift
+ * and undoes it — meaning an ordinary write to a guarded page does not
+ * stick. That is the intended behaviour against a host-side writer, but it
+ * also blocks US.
+ *
+ * This entry point lets our own writer say "this change is deliberate": the
+ * snapshot is retaken (making the new content the baseline) so the poll has
+ * nothing to restore. Protection stays armed.
+ *
+ * Returns 1 if the gpa is guarded and the snapshot was refreshed, 0 if the
+ * page is not guarded (the caller should just write normally).
+ *
+ * Call it BEFORE the write: retaking afterwards would read the page twice
+ * and could race the poll.
+ */
+int yghv_protect_sync_resnapshot(uint64_t gpa) {
+    int i;
+    int hit = 0;
+    gpa &= ~(uint64_t)0xFFFULL;
+
+    /* FastMutex is NOT recursive (9.299), and this runs from the IOCTL path
+     * where nothing else is held — the same discipline public sync_arm uses. */
+    ExAcquireFastMutex(&g_protect_lock);
+    for (i = 0; i < YGHV_SYNC_MAX; i++) {
+        if (InterlockedCompareExchange(&g_sync[i].active, 0, 0) &&
+            g_sync[i].gpa == gpa) {
+            yghv_sync_snapshot_locked(&g_sync[i]);
+            InterlockedIncrement64(&g_sync_resnaps);
+            hit = 1;
+            break;
+        }
+    }
+    ExReleaseFastMutex(&g_protect_lock);
+    return hit;
+}
+
+/*
+ * Query only: is this gpa currently guarded?
+ *
+ * Deliberately does NOT take g_protect_lock — it is called from the write
+ * path, and taking the mutex there would serialize every write behind the
+ * guard. The slot table is a plain array of volatile fields, so a racy read
+ * is safe: a false positive only means we re-snapshot a page that was about
+ * to be disarmed anyway.
+ */
+int yghv_protect_sync_is_guarded(uint64_t gpa) {
+    int i;
+    gpa &= ~(uint64_t)0xFFFULL;
+    for (i = 0; i < YGHV_SYNC_MAX; i++) {
+        if (InterlockedCompareExchange(&g_sync[i].active, 0, 0) &&
+            g_sync[i].gpa == gpa)
+            return 1;
+    }
+    return 0;
 }
 
 /* Poll body: for each tracked page, read it through MmCopyMemory, compare

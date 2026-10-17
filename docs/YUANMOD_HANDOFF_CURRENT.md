@@ -6892,3 +6892,90 @@ mem_selfmap.c : MmAllocateMappingAddress → MmBuildMdlForNonPagedPool
 - 我拼成了 `MmAllocateMappingAddress` + `MmBuildMdlForNonPagedPool` —— 两边都不对
 
 **已加入 `KERNEL_API_CHECKLIST.md`**（见下条）。
+
+
+### 9.308 2026-10-11 **第三批 Phase 7（保护协同）完成** —— 7/7 PASS，零蓝屏
+
+#### 9.308.1 成果
+新增：
+- `hv/common/mem_coop.h` + `hv/mem_coop.c` —— 协作写（超越点 2.3）
+- `protect.c` 新增 `yghv_protect_sync_resnapshot()` / `yghv_protect_sync_is_guarded()`
+- IOCTL `0x81B` MEM_COOP（诊断）
+- 命令 `mem-coop [reset]`（PowerShell 命令数 40 → 41）
+
+镜像：`206g2_coop`（md5 `BCE1709C`）
+
+#### 9.308.2 ★ 核心能力：同一个受保护页，我们的写入持久，外部写入被回滚
+
+这是 Phase 7 的全部意义。实测证据（同一次运行）：
+```
+C3  我们的写入 AAAABBBBCCCCDDDD → 等 2s（守卫 poll 40 次）→ 读回 AAAABBBBCCCCDDDD  ✓ 持久
+    coop: guarded=1 rollbacks_avoided=1
+C4  外部进程 mmf-write DEADBEEF00000001 → LANDED → 等 2s → 读回 AAAABBBBCCCCDDDD  ✓ 被回滚
+```
+
+**机制**：守卫的 poll 比较"当前内容 vs 快照"，不同就恢复。我们的写入
+先落盘、再刷新快照，使新内容成为基线 → poll 找不到漂移 → 不恢复。
+外部写入没有这个通知 → 被恢复。
+
+**为什么只有我们能做到**：守卫是我们的。宿主侧的写入者无法告知守卫，
+所以它的写入必然被撤销 —— 这个页面对除我们以外的所有人**都是只读的**。
+
+#### 9.308.3 ★ 关键 bug：快照顺序反了（第一次实现错误）
+
+**第一版**：先 `resnapshot` 再 `write`。
+```c
+(void)yghv_coop_notify_write(cur);      // 刷新快照
+if (!yghv_pa_write(...))                // 然后才写
+```
+**结果**：快照记录的是**旧内容**，写入后 poll 看到漂移 → 回滚。
+实测：写入 `AAAABBBBCCCCDDDD`，读回 `1111222233334444`（上一次的值），
+而 `coop` 计数显示 `guarded=1`（通知**成功了**，是顺序错了）。
+
+**第二版（正确）**：先 `write` 再 `resnapshot`。
+```c
+guarded = yghv_protect_sync_is_guarded(cur);   // 先查
+if (!yghv_pa_write(...)) return 0;             // 先写
+if (guarded) yghv_protect_sync_resnapshot(cur); // 后刷新
+```
+新内容成为基线 → poll 无漂移 → 写入持久。
+
+**暴露窗口**：写入与刷新之间若 poll 恰好运行，会恢复一次。可接受
+（调用方在 VA 层重试），远好于"永不持久"。
+
+> **教训（第八次）**：**"通知"类 API 的时序决定语义**。
+> 同一对函数，先通知后操作 = 通知的是旧状态；先操作后通知 = 通知新状态。
+> 必须问："我通知的是**将要发生**还是**已经发生**？"
+
+#### 9.308.4 三个测试脚本 bug（非驱动）
+
+| # | 问题 | 真相 |
+|---|---|---|
+| 1 | `protect-page` 返回 `0x490` (NOT_FOUND) | 需先 `set-target <pid>`（该命令注释已写明） |
+| 2 | `pages=0`，守卫没武装 | 需 `start`（0x803）。`protect-page` 只**加入表**（`armed=0`），真正 arm 在 `start_protect` |
+| 3 | **`config-sync` 必须在 `protect-page` 之前** | `arm_page_locked` 只在 sync 模式**已开**时才注册到守卫（protect.c:1104）；顺序反了就走 NPT 分支，守卫永远收不到页 |
+| 4 | C4 用 `mem-write` 当"外部写入" | `mem-write` 走 `yghv_coop_write`（Engine B 的 pte_write 内部调用），**不是外部**。必须用 `mmf-write`（另一进程、自己的 CR3、一次裸 store） |
+| 5 | C5 断言 `notifies>0` | 重构后 `notifies` 不再递增（改用 `is_guarded`+`resnapshot`）。正确断言是 `rollbacks_avoided>0` |
+
+**顺序总结（写进文档，避免再犯）**：
+```
+config-sync 1  →  set-target <pid>  →  protect-page <pid> <va>  →  start
+```
+
+#### 9.308.5 验证（C1-C6，7/7 PASS）
+| 项 | 内容 | 结果 |
+|---|---|---|
+| C1 | mem-coop 诊断可读 | PASS |
+| C2 | 未保护页的普通写入 | PASS |
+| **C3** | **受保护页的写入持久生效** | **PASS**（核心） |
+| C3 armed | 守卫真的武装了（pages=1） | PASS |
+| **C4** | **外部写入被守卫回滚** | **PASS**（证明保护没失效） |
+| C5 | coop 计数（rollbacks_avoided>0） | PASS |
+| C6 | 干净卸载 | PASS |
+
+#### 9.308.6 状态
+- IOCTL：0x815-0x81B 已占用（下一个空闲 0x81C）
+- 命令数：41（PowerShell）
+- 静态检查：IOCTL parity C=28/PS=28/Java=28、Command parity PS=41/Java=18 全 PASS
+- 镜像：`206g2_coop`（当前可用）
+- **未推送**（本地领先 7 个提交 + 本次）

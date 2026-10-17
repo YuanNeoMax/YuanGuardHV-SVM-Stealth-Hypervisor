@@ -172,6 +172,8 @@ void yghv_protect_config_save(void);
 void yghv_protect_config_load(void);
 int  yghv_protect_sync_arm(uint64_t gpa);
 void yghv_protect_sync_disarm(uint64_t gpa);
+int  yghv_protect_sync_resnapshot(uint64_t gpa);   /* Phase 7: cooperative write */
+int  yghv_protect_sync_is_guarded(uint64_t gpa);   /* Phase 7: guard query */
 void yghv_protect_sync_init(void);
 void yghv_protect_sync_stop(void);
 uint64_t yghv_protect_control_walk_gpa(void);

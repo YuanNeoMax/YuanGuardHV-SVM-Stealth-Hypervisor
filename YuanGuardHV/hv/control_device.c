@@ -6,6 +6,7 @@
 #include "mem_engine.h"   /* Phase 3: dual-engine typed access */
 #include "mem_pa.h"       /* Phase 2: physical frame primitives */
 #include "mem_selfmap.h"  /* Phase 2b: self-built mapping window */
+#include "mem_coop.h"     /* Phase 7: guard cooperation */
 #include "debug.h"
 
 NTKERNELAPI PEPROCESS IoGetRequestorProcess(PIRP Irp);
@@ -781,6 +782,36 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
             }
             if (op == 2) {
                 yghv_selfmap_stats_reset();
+                status = STATUS_SUCCESS;
+                break;
+            }
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+        status = STATUS_INVALID_PARAMETER;
+        break;
+    }
+    case IOCTL_YGHV_MEM_COOP: {
+        /* Phase 7 (2026-10-11): guard cooperation diagnostics.
+         *   in_len == 0            -> read 5 qwords
+         *   in_len >= 4 {ULONG op} -> 2 = reset stats */
+        if (in_len == 0 && out_len >= YGHV_COOP_OUT_QWORDS * sizeof(UINT64)) {
+            UINT64 *out = (UINT64 *)buf;
+            yghv_coop_stats_t cs;
+            yghv_coop_stats_get(&cs);
+            out[0] = cs.notifies;
+            out[1] = cs.guarded_hits;
+            out[2] = cs.unguarded;
+            out[3] = cs.rollbacks_avoided;
+            out[4] = 0;
+            info = YGHV_COOP_OUT_QWORDS * sizeof(UINT64);
+            status = STATUS_SUCCESS;
+            break;
+        }
+        if (in_len >= sizeof(ULONG)) {
+            ULONG op = *(ULONG *)buf;
+            if (op == 2) {
+                yghv_coop_stats_reset();
                 status = STATUS_SUCCESS;
                 break;
             }

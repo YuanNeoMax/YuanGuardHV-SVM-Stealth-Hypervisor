@@ -18,6 +18,7 @@
 #include "mem_engine.h"
 #include "mem_pa.h"
 #include "mem_selfmap.h"
+#include "mem_coop.h"
 
 NTKERNELAPI NTSTATUS MmCopyVirtualMemory(
     PEPROCESS SourceProcess, PVOID SourceAddress,
@@ -192,7 +193,12 @@ static NTSTATUS pte_write(PEPROCESS proc, uint64_t va, const void *buf, SIZE_T l
             off += chunk;
             continue;
         }
-        if (!yghv_pa_write(pi.pa, src + off, chunk)) {
+        /* Phase 7 (2.3): go through the cooperative path. If this frame is
+         * under the sync guard, the guard is told the change is deliberate
+         * and refreshes its baseline — otherwise its next poll would see
+         * drift and roll our write back. For an unguarded frame this is just
+         * a plain physical write. */
+        if (!yghv_coop_write(pi.pa, src + off, chunk)) {
             InterlockedIncrement64(&g_pte_wfail_pa);
             InterlockedIncrement64(&g_pte_fail);
             if (done)

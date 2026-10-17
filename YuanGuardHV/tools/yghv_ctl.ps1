@@ -1453,6 +1453,29 @@ try {
                                     -OutputLength 8
             Write-Host ("mem-selfmap: {0} OK" -f "$Arg1")
         }
+        'mem-coop' {
+            # Phase 7 (2026-10-11): guard cooperation diagnostics.
+            # A write to a page the sync guard protects is normally undone by
+            # its next poll (the poll compares against a snapshot and restores
+            # on any difference). The coop path tells the guard the change is
+            # deliberate and refreshes its baseline first, so our write
+            # persists while protection stays armed. This reports how often
+            # that happened.
+            if ($null -eq $Arg1) {
+                $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x81B)) -OutputLength 40
+                Write-Host ("mem-coop: notifies={0} guarded={1} unguarded={2} rollbacks_avoided={3}" -f `
+                    [BitConverter]::ToUInt64($out,0), [BitConverter]::ToUInt64($out,8),
+                    [BitConverter]::ToUInt64($out,16), [BitConverter]::ToUInt64($out,24))
+                return
+            }
+            if ("$Arg1" -eq 'reset') {
+                Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x81B)) `
+                                 -InBytes ([BitConverter]::GetBytes([uint32]2)) | Out-Null
+                Write-Host 'mem-coop: stats reset'
+                return
+            }
+            throw 'mem-coop: usage: mem-coop [reset]'
+        }
         'scan-pid' {
             # 206-C5 pilot helper: enumerate a foreign process's committed
             # PRIVATE read-write pages (VirtualQueryEx; kernel-mediated read,

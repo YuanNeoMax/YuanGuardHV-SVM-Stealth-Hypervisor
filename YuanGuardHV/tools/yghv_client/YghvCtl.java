@@ -49,6 +49,8 @@ public class YghvCtl {
     /* Phase 2b (2026-10-11): self-built physical mapping window
        (mem-selfmap); declared for IOCTL parity. */
     private static final int FN_SELFMAP = 0x81A;
+    /* Phase 7 (2026-10-11): guard cooperation (mem-coop). */
+    private static final int FN_MEM_COOP = 0x81B;
 
     private static native long openHandle();
     private static native void closeHandle(long handle);
