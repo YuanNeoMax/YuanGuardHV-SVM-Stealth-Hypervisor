@@ -17,6 +17,7 @@
 
 #include "mem_engine.h"
 #include "mem_pa.h"
+#include "mem_bp.h"
 #include "mem_selfmap.h"
 #include "mem_coop.h"
 
@@ -32,6 +33,7 @@ static volatile LONG64 g_api_reads, g_api_writes, g_api_fail;
 static volatile LONG64 g_pte_reads, g_pte_writes, g_pte_fail;
 static volatile LONG64 g_fallbacks, g_auto_api, g_auto_pte;
 static volatile LONG64 g_pte_wfail_irql;
+static volatile LONG64 g_pte_wfail_bp;   /* Tier 4.4: refused, page is bp-armed */
 static volatile LONG64 g_pte_wfail_walk;
 static volatile LONG64 g_pte_wfail_pa;
 
@@ -186,6 +188,30 @@ static NTSTATUS pte_write(PEPROCESS proc, uint64_t va, const void *buf, SIZE_T l
             if (done)
                 *done = off;
             return STATUS_NOT_FOUND;
+        }
+
+        /*
+         * Tier 4.4 (2026-10-17): refuse to write a breakpoint-guarded frame.
+         *
+         * A breakpoint revokes the page's NPT write permission. Measurement
+         * (five crashes: 0x3B x4, 0x50 x1) showed that OUR OWN engine writing
+         * that frame then fails hard, on both storage strategies we have —
+         * MDL mapping and the kernel direct map. The faulting store is inside
+         * yghv_pa_write, with the destination being the mapping itself.
+         *
+         * Declining is correct here. A breakpoint exists to OBSERVE the guest;
+         * writing through it was never part of the feature — it was a mistake
+         * in the first test script, and it is what took the machine down.
+         *
+         * Returning STATUS_ACCESS_DENIED gives the caller a clear answer
+         * instead of a bugcheck.
+         */
+        if (yghv_bp_is_armed(pi.pa)) {
+            InterlockedIncrement64(&g_pte_wfail_bp);
+            InterlockedIncrement64(&g_pte_fail);
+            if (done)
+                *done = off;
+            return STATUS_ACCESS_DENIED;
         }
 
         /* Phase 2b: same for writes — the window makes it a plain store. */

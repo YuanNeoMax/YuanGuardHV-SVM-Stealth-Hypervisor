@@ -363,3 +363,52 @@ kd 证据（2026-10-17 22:59, 0x50 PAGE_FAULT_IN_NONPAGED_AREA）
 
 **结论**：在建立这个模型之前，**不要重新启用 Tier 4.4**。
 试错的代价是每次一个重启。
+---
+
+## 十八、★ 分阶段返回码：一次运行定位失败原因（第十二次教训）
+
+**问题**：`bp_add` 返回 0，但不知道是哪个守卫拒绝。只能靠猜 → 每次猜错崩一次。
+
+**做法**：让失败路径返回**不同的负值**，每个值对应一个守卫：
+
+```c
+if (KeAreAllApcsDisabled())              return -1;  /* IRQL */
+if (yghv_mem_engine_get() != PTE)        return -2;  /* engine */
+if (!yghv_protect_npt_split_4k(page))    return -3;  /* split */
+if (!yghv_protect_npt_set_perm(page,..)) return -4;  /* perm */
+/* table full */                          return -5;
+```
+
+IOCTL 层用 `out[0] = (UINT64)(INT64)ok;` 原样传出，PS 层写成 switch 打印。
+
+**效果**：第一次运行就打印出
+`mem-bp: add FAILED (stage -2: engine is not PTE)`，
+直接指向 bug，而不是靠又崩一次来缩小范围。
+
+**规则**：**任何有多重前置检查的操作，失败时必须报告"哪一步"**，
+不要只返回 bool。诊断成本 >> 代码成本。
+
+---
+
+## 十九、★ 引擎选择被每次读写重置（9.326，潜伏极久的 bug）
+
+```c
+/* control_device.c，注释写得很清楚： */
+/* "Engine 0 means use the current selection — do NOT overwrite it with AUTO,
+ *  or a mem-engine <sel> set earlier would be undone by the very next
+ *  read/write." */
+if (req_engine <= YGHV_ENGINE_PTE_SELFMAP)        /* ← 0 也满足！ */
+    yghv_mem_engine_set((yghv_engine_t)req_engine);
+```
+
+`req_engine` 默认 0，`0 <= 3` 恒真 → **每次 mem-read/write 都 set(AUTO)**，
+把先前 `mem-engine pte` 的选择清掉。
+
+**潜伏原因**：所有旧测试都在**每次 write 前重新设一次引擎**，
+所以从未暴露。只有"设一次 → 中间夹一次读 → 再检查选择"的路径才会踩到。
+
+**修复**：`if (req_engine != YGHV_ENGINE_AUTO && req_engine <= SELFMAP)`
+
+**教训**：**注释和代码不一致时，信注释的意图，检查代码的条件**。
+这个 bug 的注释完全正确，代码却与它相反，而注释被写在那里恰恰说明
+作者知道这个陷阱 —— 只是条件写错了。

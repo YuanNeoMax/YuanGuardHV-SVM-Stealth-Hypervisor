@@ -22,6 +22,14 @@ static volatile LONG64 g_bp_recorded;
 static volatile LONG64 g_bp_missed;
 static volatile LONG64 g_bp_refusals;
 
+/* 9.325: one counter per guard, so a single run names the failing stage
+ * instead of requiring another crash to narrow it down. */
+static volatile LONG64 g_bp_fail_irql;
+static volatile LONG64 g_bp_fail_engine;
+static volatile LONG64 g_bp_fail_split;
+static volatile LONG64 g_bp_fail_perm;
+static volatile LONG64 g_bp_fail_table;
+
 static int yghv_bp_find(uint64_t gpa, uint64_t rip) {
     int i;
     uint64_t page = gpa & ~(uint64_t)0xFFFULL;
@@ -37,44 +45,69 @@ static int yghv_bp_find(uint64_t gpa, uint64_t rip) {
 }
 
 int yghv_bp_add(uint64_t gpa, uint64_t rip, uint32_t kinds) {
+    uint64_t page = gpa & ~(uint64_t)0xFFFULL;
+    int i;
+
     /*
-     * ===== 9.324 DISABLED (final) — five crashes, three wrong theories =====
+     * 9.325: RE-ENABLED, with stage-coded returns for diagnosis.
      *
-     * 2026-10-17, 21:59 -> 22:59:
+     * The five crashes (21:59-22:59) were not in this function: they came
+     * from the TEST calling mem-write on the very page the breakpoint had
+     * just armed. A breakpoint OBSERVES the guest; writing through it was
+     * never part of the feature. pte_write now declines such writes with
+     * STATUS_ACCESS_DENIED, which removes the crash path.
      *
-     *   21:59  0x3B C0000005   pa_write+0xDC  (MDL path)
-     *   22:05  0x3B C0000005   same
-     *   22:20  0x3B C0000005   same
-     *   22:38  0x3B C0000005   same
-     *   22:59  0x50             pa_write+0x6A  (direct-map path)
-     *
-     * Theories tested and DISPROVEN, each costing one crash:
-     *   1. GuestPaOfGhcb not set on the bp path        -> set it, still crashed
-     *   2. Engine A stores through the guest NPT       -> refused non-PTE, still crashed
-     *   3. npt_set_page_perm hits the 2MB PDE          -> split first, still crashed
-     *   4. fake-VA MDL is not writable (9.321)         -> direct map, crashed differently
-     *
-     * What the kd evidence actually shows (local symbols, which DO work):
-     * every crash is inside yghv_pa_write's copy, faulting on the destination
-     * address. Both storage strategies faulted, and the failing PA was in the
-     * 13-15 GB range both times. That points at the FRAME ITSELF not being
-     * ordinarily writable from the host in this state — not at the bp logic
-     * and not at the mapping technique.
-     *
-     * The unresolved question, stated plainly: a target frame that is a
-     * normal private page when the process runs is, after the bp revokes its
-     * NPT write permission, apparently no longer writable through the paths we
-     * have (MDL mapping or direct map). Until that is understood, this feature
-     * cannot be made safe, and trial-and-error costs a reboot per attempt.
-     *
-     * The breakpoint TABLE, the NPF hook and the re-arm path are all still
-     * present and are believed correct — it is the write path under a revoked
-     * permission that is not modelled. Re-enable only with a full model of
-     * that interaction.
+     * Return codes (all negatives are failures, mapped to a stage):
+     *   1  success
+     *  -1  wrong IRQL (must be PASSIVE)
+     *  -2  engine is not PTE (Engine A would fault on the revoked page)
+     *  -3  could not split the 2MB page to 4K
+     *  -4  could not set the NPT permission
+     *  -5  breakpoint table full
      */
-    (void)gpa; (void)rip; (void)kinds;
-    InterlockedIncrement64(&g_bp_refusals);
-    return 0;
+    if (!page || !kinds)
+        return 0;
+    if (KeAreAllApcsDisabled()) {
+        InterlockedIncrement64(&g_bp_fail_irql);
+        return -1;
+    }
+
+    if (yghv_bp_find(page, rip) >= 0)
+        return 1;                       /* already armed: idempotent */
+
+    if (yghv_mem_engine_get() != YGHV_ENGINE_PTE) {
+        InterlockedIncrement64(&g_bp_fail_engine);
+        InterlockedIncrement64(&g_bp_refusals);
+        return -2;
+    }
+
+    if (!yghv_protect_npt_split_4k(page)) {
+        InterlockedIncrement64(&g_bp_fail_split);
+        return -3;
+    }
+    if (!yghv_protect_npt_set_perm(page, NPT_PERM_PRESENT)) {
+        InterlockedIncrement64(&g_bp_fail_perm);
+        return -4;
+    }
+
+    for (i = 0; i < YGHV_BP_MAX; i++) {
+        if (!InterlockedCompareExchange(&g_bp[i].active, 0, 0)) {
+            g_bp[i].gpa   = page;
+            g_bp[i].rip   = rip;
+            g_bp[i].kinds = kinds;
+            g_bp[i].hits  = 0;
+            InterlockedExchange(&g_bp[i].active, 1);
+            InterlockedIncrement(&g_bp_count);
+            return 1;
+        }
+    }
+
+    /* Table full: give the page its access back so it is not left faulting
+     * with nobody listening. */
+    InterlockedIncrement64(&g_bp_fail_table);
+    (void)yghv_protect_npt_set_perm(page,
+                                    NPT_PERM_PRESENT | NPT_PERM_WRITABLE);
+    return -5;
 }
 
 static int yghv_bp_add_unsafe_do_not_call(uint64_t gpa, uint64_t rip, uint32_t kinds) {
@@ -275,4 +308,21 @@ void yghv_bp_stats_reset(void) {
     InterlockedExchange64(&g_bp_refusals, 0);
     InterlockedExchange(&g_head, 0);
     InterlockedExchange(&g_tail, 0);
+}
+
+/*
+ * Tier 4.4 (2026-10-17): is this GPA guarded by an active breakpoint?
+ *
+ * Called by the write engine before touching a frame. Returns 1 when the page
+ * is armed, and the caller must then refuse the write with a clear status
+ * instead of attempting it.
+ *
+ * Why this exists: five crashes (0x3B x4, 0x50 x1) all came from our own
+ * engine writing a frame whose NPT write permission a breakpoint had just
+ * revoked. Every storage strategy we tried (MDL mapping, kernel direct map)
+ * faulted on the destination. A breakpoint is an OBSERVER; writing through it
+ * is not part of the feature, so the write is declined.
+ */
+int yghv_bp_is_armed(uint64_t gpa) {
+    return yghv_bp_find(gpa, 0) >= 0 ? 1 : 0;
 }

@@ -568,7 +568,15 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
              * it with AUTO, or a mem-engine <sel> set earlier in the session
              * would be undone by the very next read/write. Only an explicit
              * 1/2/3 in the request overrides for this call. */
-            if (req_engine <= YGHV_ENGINE_PTE_SELFMAP)
+            /* 9.326 FIX: the condition used to be `req_engine <= SELFMAP`,
+             * which is true for 0 as well — so every read and write carrying
+             * the default (0) called set(AUTO) and silently undid an earlier
+             * `mem-engine pte`. That is why bp_add saw a non-PTE engine right
+             * after the user selected one: a single baseline read reset it.
+             * AUTO must mean "keep what is selected", exactly as the comment
+             * above says. */
+            if (req_engine != YGHV_ENGINE_AUTO &&
+                req_engine <= YGHV_ENGINE_PTE_SELFMAP)
                 yghv_mem_engine_set((yghv_engine_t)req_engine);
 
             if (is_read) {
@@ -869,8 +877,10 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
 
             switch (op) {
             case 0:
+                /* 9.325: pass the stage code through (a negative value names
+                 * the guard that refused). PowerShell prints it. */
                 ok = yghv_bp_add((uint64_t)a, (uint64_t)b, (uint32_t)c);
-                out[0] = (UINT64)(ok ? 1 : 0);
+                out[0] = (UINT64)(INT64)ok;
                 info = 8;
                 break;
             case 1:

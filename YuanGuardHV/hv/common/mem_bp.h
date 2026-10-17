@@ -61,6 +61,20 @@ typedef struct {
  */
 int yghv_bp_add(uint64_t gpa, uint64_t rip, uint32_t kinds);
 
+/*
+ * Tier 4.4 (2026-10-17): is this page currently guarded by a breakpoint?
+ *
+ * The write engine MUST ask this before writing. A bp page has its NPT write
+ * permission revoked, and measurement showed that our own engine's write to
+ * such a frame fails hard (0x3B / 0x50 across five crashes). A breakpoint is
+ * a MONITOR — it exists to observe the guest, not to let us write through it.
+ * Refusing the write is the correct behaviour; attempting it is what crashed
+ * the machine.
+ *
+ * Lock-free, callable at any IRQL.
+ */
+int yghv_bp_is_armed(uint64_t gpa);
+
 /* Remove by (gpa, rip). */
 int yghv_bp_remove(uint64_t gpa, uint64_t rip);
 

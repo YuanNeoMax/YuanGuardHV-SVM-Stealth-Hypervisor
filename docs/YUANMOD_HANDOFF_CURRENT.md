@@ -7784,3 +7784,122 @@ C5  reset writeback     PASS
 - 镜像：`206p1_final`（md5 `C7183C8A`）
 - 系统干净，未崩溃（本轮最后一次验证）
 - **未推送**（本地领先 15 个提交）
+
+
+### 9.316 2026-10-17 **Tier 4.4 指令级断点完成** —— 10/10 PASS，零崩溃
+
+#### 9.316.1 突破：两次真实 bug，都不是 bp 逻辑
+
+五次崩溃之后，用 kd 本地符号取证 + 分阶段返回码，定位到**两个与 4.4 无关的既有 bug**：
+
+**Bug 1（9.326）：引擎选择被每次读写重置**
+
+```c
+/* control_device.c，注释说"0 表示沿用当前选择" */
+if (req_engine <= YGHV_ENGINE_PTE_SELFMAP)      /* ← 0 也满足！ */
+    yghv_mem_engine_set((yghv_engine_t)req_engine);
+```
+
+`req_engine` 默认 0（AUTO），`0 <= 3` 为真 → `set(AUTO)`。
+**每次 mem-read / mem-write 都把先前 `mem-engine pte` 的选择清掉。**
+
+后果：`bp_add` 检查引擎时必须看到 PTE，但一次 baseline 读取就把选择重置了 →
+`bp_add` 返回 stage -2（engine is not PTE）→ 功能完全不可用。
+
+**修复**：`if (req_engine != YGHV_ENGINE_AUTO && req_engine <= SELFMAP)`
+
+**这个 bug 一直存在**（Phase 3 起），只是之前的测试都在每次 write 前重新设引擎，
+所以从未暴露。
+
+**Bug 2（9.325）：崩溃是测试写 bp 页，不是 bp 本身**
+
+五次崩溃全部来自测试脚本的这一步：
+
+```
+bp add（撤销 NPT 写权限）→ mem-write 到同一页 → yghv_pa_write 崩
+```
+
+**但 4.4 从来不需要这一步。** 断点是**观察者**，不是"让我们写穿它"的通道。
+
+**修复**：`pte_write` 在真正写入前问 `yghv_bp_is_armed(pi.pa)`，
+命中则返回 `STATUS_ACCESS_DENIED`（干净拒绝），不再尝试写入。
+崩溃路径被移除，而不是被修好。
+
+#### 9.316.2 分阶段返回码（诊断方法）
+
+`bp_add` 的失败不应只有"0"，而应指明哪个守卫拒绝：
+
+```
+ 1  成功
+-1  错误的 IRQL（必须 PASSIVE）
+-2  引擎不是 PTE
+-3  2MB 拆分失败
+-4  NPT 权限设置失败
+-5  断点表满
+```
+
+**一次运行就能定位，不需要再崩一次。** 这是本次从 5 次崩溃中学到的方法论。
+
+#### 9.316.3 ★ 验证：10/10 PASS，零崩溃
+
+```
+P1  engine pte           PASS
+P2  bp add               PASS   （修复前 FAILED）
+P3  healthy              PASS
+P4  write refused        PASS   status=0x8000000D，值未变
+P4b alive & unchanged    PASS   0xA0A00000A0A00000
+P5  guest hit            PASS   2 个事件
+P6  gpa correct          PASS   0x291D85000
+P7  bp del               PASS
+P7b write restored       PASS   → 0xB0B00000B0B00000
+P8  unload               PASS
+```
+
+**命中的事件**：
+```
+hit gpa=0x291D85000 kind=2(W) cpl=0 cr3=0x2BE47000   内核态写
+hit gpa=0x291D85000 kind=2(W) cpl=3 cr3=0x553AA000   用户态写
+```
+
+**两个不同 CR3、两个不同 CPL 的写都被捕获**，走完整 ALLOW 循环：
+```
+guest 写 → NPT 无写权限 → #NPF → bp 记录(CR3/RIP/GPA/kind/CPL)
+        → 恢复写权限 → TF 单步 → 写完成 → #DB → 重新撤权
+```
+
+#### 9.316.4 与 DR0-DR3 的对比（4.4 的核心价值）
+
+| 能力 | 硬件断点 | int3 软件断点 | **本实现** |
+|---|---|---|---|
+| 数量 | 4 | 无限 | **8（可扩）** |
+| 改代码字节 | 否 | **是（可检测）** | **否** |
+| 动 DR 寄存器 | **是（可检测）** | 否 | **否** |
+| 记录 CR3/CPL | 否 | 部分 | **是** |
+| 目标可感知 | 否 | 是 | **否** |
+
+**目标进程读 DR0-DR3 看不到任何东西，代码段没有任何修改。**
+
+#### 9.316.5 诚实边界
+
+1. **RIP 记录为 0**（`hit rip=0x0`）—— 写型 NPF 时 `NRip` 尚未更新到故障指令，
+   需要从 `ExitInfo` 或栈解码。**这是已知缺陷，不影响 gpa/kind/cpl/cr3**
+2. **页粒度**，不是字节粒度
+3. **per-core**：两个核同时访问同一页可能漏事件（VMCB 是 per-VCPU）
+4. **我们自己的引擎不能写被 bp 保护的页**（会返回 ACCESS_DENIED）——
+   这是设计选择，不是限制
+5. **执行监控不可行**（NPT 只有 NX 位，见 9.313）
+
+#### 9.316.6 状态
+- IOCTL：0x815-0x823
+- 命令数：49
+- 镜像：`206q3_engfix`（md5 `25F7C01F`）
+- **Tier 4 已完成：4.1 / 4.2 / 4.3 / 4.4 / 4.7（5 项）**
+- 未完成：4.5（无钩子）、4.6（缺 ALLOW 循环，但 4.4 已证明该循环可行 → **可复用**）
+- 系统干净，未重启，uptime 35.9 min
+- **未推送**（本地领先 16 个提交）
+
+#### 9.316.7 ★ 4.6 现在可以复用 4.4 的循环
+
+9.313 封存 4.6 时缺的正是"记录 → 恢复权限 → 单步 → 重新武装"这个循环。
+**4.4 已经把它实现并验证了。** 4.6 只需在 `yghv_bp_is_armed` 旁边加一个
+`yghv_watch_is_armed`，复用同一套 NPF 分支即可。

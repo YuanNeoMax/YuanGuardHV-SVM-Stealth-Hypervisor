@@ -1566,7 +1566,19 @@ try {
                 return
             }
             $out2 = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x823)) -InBytes $req -OutputLength 8
-            Write-Host ("mem-bp: {0} {1}" -f $v, $(if([BitConverter]::ToUInt64($out2,0)){'OK'}else{'FAILED'}))
+                        $rc = [BitConverter]::ToInt64($out2, 0)
+            $stage = switch ($rc) {
+                1  { 'OK' }
+                -1 { 'FAILED (stage -1: wrong IRQL, must be PASSIVE)' }
+                -2 { 'FAILED (stage -2: engine is not PTE - run mem-engine pte first)' }
+                -3 { 'FAILED (stage -3: could not split 2MB page to 4K)' }
+                -4 { 'FAILED (stage -4: could not set NPT permission)' }
+                -5 { 'FAILED (stage -5: breakpoint table full)' }
+                0  { 'FAILED (stage 0: bad arguments)' }
+                default { "FAILED (rc=$rc)" }
+            }
+            if ($v -eq 'add') { Write-Host ("mem-bp: {0} {1}" -f $v, $stage) }
+            else { Write-Host ("mem-bp: {0} {1}" -f $v, $(if($rc -gt 0){'OK'}else{'FAILED'})) }
         }
         'mem-watch' {
             # Tier 4.6 (2026-10-17): NPF watchpoints — the debug-register superset.
