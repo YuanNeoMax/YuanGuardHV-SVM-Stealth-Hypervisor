@@ -71,6 +71,10 @@ public class YghvCtl {
     private static final int FN_FRAME = 0x824;
     /* Tier 7.2/7.7 (2026-10-18): graceful degradation counters. */
     private static final int FN_FAIL = 0x825;
+    /* Tier 7.1/7.3 (2026-10-18): self-hiding + integrity self-check. */
+    private static final int FN_GUARD = 0x826;
+    /* 9.338: direct physical-frame access. */
+    private static final int FN_PA = 0x827;
 
     private static native long openHandle();
     private static native void closeHandle(long handle);

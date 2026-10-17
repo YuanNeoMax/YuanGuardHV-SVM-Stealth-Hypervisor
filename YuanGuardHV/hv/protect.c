@@ -2837,3 +2837,21 @@ int yghv_protect_npt_remap_flags(uint64_t gpa, uint64_t spa, int use_alt,
         return NT_SUCCESS(npt_map_page(m, gpa, spa, flags | base)) ? 1 : 0;
     }
 }
+/*
+ * 9.336 (Tier 7.1): remove one page from the guest's identity map.
+ *
+ * Distinct from yghv_protect_npt_set_perm(page, 0): that clears PRESENT through
+ * npt_set_page_perm, which is the same entry shape a breakpoint uses. Hiding
+ * wants the leaf entry GONE, so the guest's walk finds nothing at all rather
+ * than a non-present entry it might treat as a demand-fault candidate.
+ *
+ * npt_exclude_pa() already does exactly this (split first, then clear), and is
+ * what main.c's own exclude pass uses — so this wrapper only owns the PASSIVE
+ * check and the main-table selection.
+ */
+int yghv_protect_npt_unmap_page(uint64_t gpa) {
+    if (KeAreAllApcsDisabled())
+        return 0;
+    return NT_SUCCESS(npt_exclude_pa(&g_npt, gpa & ~(uint64_t)0xFFFULL))
+           ? 1 : 0;
+}

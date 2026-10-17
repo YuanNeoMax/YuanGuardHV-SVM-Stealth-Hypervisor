@@ -1515,6 +1515,150 @@ try {
             $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x822)) -InBytes $req -OutputLength 8
             Write-Host ("mem-cache: {0} {1}" -f $v, $(if([BitConverter]::ToUInt64($out,0)){'OK'}else{'FAILED'}))
         }
+        'pa-io' {
+            # 9.338 (2026-10-18): direct physical-frame access.
+            #
+            # WHY THIS EXISTS: mem-write takes a VIRTUAL address and walks the
+            # page tables. A test that wanted to touch a physical frame had no
+            # entry point and handed a PHYSICAL address to mem-write instead —
+            # which crashed the machine twice:
+            #     0x3B  Engine A faults, the "VA" is not mapped
+            #     0x1A  the memory manager then tries to make it resident
+            # Rather than keep abusing an interface, this one says what it does.
+            #
+            # usage:
+            #   pa-io read <hex_pa> [len] [off]
+            #   pa-io write <hex_pa> <u64 value>
+            if ($null -eq $Arg1 -or $null -eq $Arg2) { throw 'pa-io: usage: pa-io read <hex_pa> [len] [off] | pa-io write <hex_pa> <value>' }
+            $v = "$Arg1".ToLower()
+            $pa = [Convert]::ToUInt64(("$Arg2" -replace '^0[xX]',''),16)
+            $req = New-Object byte[] 32
+            [BitConverter]::GetBytes([uint64]$pa).CopyTo($req, 8)
+            if ($v -eq 'read') {
+                $len = 64; $off = 0
+                if ($null -ne $Arg3) { $len = [int]::Parse($Arg3) }
+                if ($null -ne $Arg4) { $off = [int]::Parse($Arg4) }
+                [BitConverter]::GetBytes([uint64]$len).CopyTo($req, 16)
+                [BitConverter]::GetBytes([uint64]$off).CopyTo($req, 24)
+                $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x827)) -InBytes $req -OutputLength 264
+                $got = [BitConverter]::ToUInt64($out, 0)
+                Write-Host ("pa-io read: 0x{0:X} -> {1} byte(s)" -f $pa, $got)
+                if ($got -gt 0) {
+                    $n = [Math]::Min(32, [int]$got)
+                    Write-Host ("  " + (($out[8..(8+$n-1)] | ForEach-Object { $_.ToString('X2') }) -join ' '))
+                }
+                return
+            }
+            if ($v -eq 'write') {
+                if ($null -eq $Arg3) { throw 'pa-io write: usage: pa-io write <hex_pa> <value>' }
+                $val = [Convert]::ToUInt64(("$Arg3" -replace '^0[xX]',''),16)
+                [BitConverter]::GetBytes([uint64]1).CopyTo($req, 0)
+                [BitConverter]::GetBytes([uint64]$val).CopyTo($req, 16)
+                $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x827)) -InBytes $req -OutputLength 8
+                Write-Host ("pa-io: write 0x{0:X} <- 0x{1:X} : {2}" -f $pa, $val, $(if([BitConverter]::ToUInt64($out,0)){'OK'}else{'FAILED'}))
+                return
+            }
+            throw 'pa-io: use read|write'
+        }
+        'sys-guard' {
+            # Tier 7.1/7.3 (2026-10-18): self-hiding + integrity self-check.
+            #
+            # THE EXPOSURE this answers: our tables are ordinary physical pages
+            # below 4GB (MmAllocateContiguousMemory). The NPT identity-maps
+            # physical memory for the guest, so a guest walking its own address
+            # space can read AND WRITE them — an NPT entry, a breakpoint slot, a
+            # frame reservation. Nothing detected it and nothing stopped it.
+            #
+            # Two answers, and they are complementary:
+            #
+            #   hide  (7.1)  remove the page's leaf entry from the guest's
+            #                identity map. The guest's access raises #NPF and we
+            #                deliver an access violation, so the range simply is
+            #                not there. Our own code never uses the guest
+            #                mapping (tables use the recorded direct VA, 9.280),
+            #                so this costs us nothing.
+            #                HONEST LIMIT: the address space is now
+            #                discontinuous. A guest that compares its memory
+            #                descriptors against what it can touch sees holes.
+            #
+            #   hash  (7.3)  FNV-1a over the page at arm time, re-checked on
+            #                demand. Hiding is not perfect, so assume someone
+            #                gets through: a changed hash names the page.
+            #
+            # usage:
+            #   sys-guard                     diagnostics
+            #   sys-guard arm                 guard the Tier-4 tables (bp/frame/view)
+            #   sys-guard add <hex_pa> [hide] [hash] [tag]
+            #   sys-guard del <hex_pa>
+            #   sys-guard verify              re-hash everything; count changes
+            #   sys-guard list
+            if ($null -eq $Arg1) {
+                $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x826)) -OutputLength 64
+                Write-Host ("sys-guard: guarded={0} hidden={1} verified={2} changed={3}" -f `
+                    [BitConverter]::ToUInt64($out,0), [BitConverter]::ToUInt64($out,8),
+                    [BitConverter]::ToUInt64($out,16), [BitConverter]::ToUInt64($out,24))
+                Write-Host ("  probes={0}  hide_fail={1}  hash_fail={2}" -f `
+                    [BitConverter]::ToUInt64($out,32), [BitConverter]::ToUInt64($out,40),
+                    [BitConverter]::ToUInt64($out,48))
+                if ([BitConverter]::ToUInt64($out,24) -gt 0) {
+                    Write-Host '  WARNING: a guarded page changed since it was armed'
+                }
+                return
+            }
+            $v = "$Arg1".ToLower()
+            $op = -1; $a=[uint64]0; $b=[uint64]1; $c=[uint64]1
+            $tag = 'user'
+            switch ($v) {
+                'add'    { $op = 0 }
+                'del'    { $op = 1; $b=[uint64]0; $c=[uint64]0 }
+                'verify' { $op = 2 }
+                'list'   { $op = 3 }
+                'arm'    { $op = 4 }
+                default  { throw 'sys-guard: use arm|add|del|verify|list' }
+            }
+            if ($op -eq 0) {
+                if ($null -eq $Arg2) { throw 'sys-guard add: usage: sys-guard add <hex_pa> [hide] [hash] [tag]' }
+                $a = [Convert]::ToUInt64(("$Arg2" -replace '^0[xX]',''),16)
+                if ($null -ne $Arg3) { $b = [uint64]::Parse($Arg3) }
+                if ($null -ne $Arg4) { $c = [uint64]::Parse($Arg4) }
+                if ($null -ne $Arg5) { $tag = "$Arg5" }
+            } elseif ($op -eq 1) {
+                if ($null -eq $Arg2) { throw 'sys-guard del: usage: sys-guard del <hex_pa>' }
+                $a = [Convert]::ToUInt64(("$Arg2" -replace '^0[xX]',''),16)
+            }
+            $req = New-Object byte[] 64
+            [BitConverter]::GetBytes([uint32]$op).CopyTo($req, 0)
+            [BitConverter]::GetBytes([uint64]$a).CopyTo($req, 8)
+            [BitConverter]::GetBytes([uint64]$b).CopyTo($req, 16)
+            [BitConverter]::GetBytes([uint64]$c).CopyTo($req, 24)
+            if ($op -eq 0) {
+                $tb = [Text.Encoding]::ASCII.GetBytes($tag)
+                $n = [Math]::Min($tb.Length, 15)
+                [Array]::Copy($tb, 0, $req, 32, $n)
+            }
+            if ($op -eq 3) {
+                $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x826)) -InBytes $req -OutputLength 256
+                $n = [BitConverter]::ToUInt64($out, 0)
+                Write-Host ("sys-guard list: {0} page(s)" -f $n)
+                for ($i = 0; $i -lt $n; $i++) {
+                    $o = 8 + $i*48
+                    $tg = -join (5..12 | ForEach-Object { if($out[$o+40+($_-5)] -ne 0){[char]$out[$o+40+($_-5)]}else{''} })
+                    Write-Host ("  [{0}] pa=0x{1:X} hidden={2} checks={3} changes={4} tag={5}" -f `
+                        $i, [BitConverter]::ToUInt64($out,$o), [BitConverter]::ToUInt64($out,$o+32),
+                        [BitConverter]::ToUInt64($out,$o+16), [BitConverter]::ToUInt64($out,$o+24), $tg)
+                }
+                return
+            }
+            $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x826)) -InBytes $req -OutputLength 8
+            $rc = [BitConverter]::ToInt64($out, 0)
+            switch ($op) {
+                0 { if ($rc -ge 0) { Write-Host ("sys-guard: add OK slot={0}" -f $rc) }
+                    else { Write-Host ("sys-guard: add FAILED rc={0}" -f $rc) } }
+                1 { Write-Host ("sys-guard: del {0}" -f $(if($rc -gt 0){'OK'}else{'FAILED'})) }
+                2 { Write-Host ("sys-guard: verify -> {0} page(s) changed" -f $rc) }
+                4 { Write-Host ("sys-guard: armed {0} page(s)" -f $rc) }
+            }
+        }
         'sys-health' {
             # Tier 7.2/7.7 (2026-10-18): failure isolation / graceful degradation.
             #

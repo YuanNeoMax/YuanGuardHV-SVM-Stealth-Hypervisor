@@ -412,3 +412,65 @@ if (req_engine <= YGHV_ENGINE_PTE_SELFMAP)        /* ← 0 也满足！ */
 **教训**：**注释和代码不一致时，信注释的意图，检查代码的条件**。
 这个 bug 的注释完全正确，代码却与它相反，而注释被写在那里恰恰说明
 作者知道这个陷阱 —— 只是条件写错了。
+---
+
+## 二十、★★ OS-as-guest 决定了"什么能隐藏"（第十三次崩溃的教训）
+
+**这是本项目最重要的一条结构约束，它决定了一整类设计的可行性。**
+
+```asm
+; 第 13 次崩溃（0x3B）
+yghv_guard_find+0x15:  cmp qword ptr [g_guard...], rcx   ; 读自己的数组 -> 崩
+```
+
+`arm_core` 隐藏了 frame-table 所页，而 `.bss` 把两者放同一页：
+```
+g_frame  RVA 0x34A40  page 0x34000
+g_guard  RVA 0x34FE0  page 0x34000
+```
+
+**机制**：
+> 本 build 是 OS-as-guest。只有 VMRUN 循环内和 VMEXIT 处理器里跑 **HOST 模式**
+> （不查 NPT）。普通驱动线程（IOCTL、系统 worker）跑 **GUEST 模式**，
+> 指针解引用走 guest VA → 页表 → GPA → NPT → SPA。
+>
+> **隐藏一个页 = 从 NPT 摘掉它 => 隐藏驱动自己在 guest 模式要读的页 = 把驱动自己摘掉。**
+
+**可隐藏 vs 不可隐藏**：
+
+| 对象 | 谁能访问 | 能否隐藏 |
+|---|---|---|
+| VMCB / host stack / MSRPM / IOPM | 只 host 模式的 VMEXIT | ✅ 能（main.c 已在做） |
+| NPT 表自身 | host 模式（用记录的直接 VA） | ✅ 能 |
+| **bp / frame / view 表** | **IOCTL 用普通 C 读写** | ❌ **不能** |
+| 断点目标帧、外来进程页 | guest | ✅ 能 |
+
+**规则**：**隐藏前先问"这个页是谁在读"。如果读它的是 guest 模式的驱动代码，
+隐藏它就是隐藏自己。这类对象只能做检测（哈希），不能做隐藏。**
+
+---
+
+## 二十一、★ 地址类型与边界：五个崩溃同一类根因
+
+第 13/14 次崩溃 + 三次哈希误报，**全部是 VA/PA 或边界没想清楚**：
+
+| 错误 | 后果 |
+|---|---|
+| 把物理地址传给要 VA 的 `mem-write` | `0x1A`（MM 试图让 bogus VA 常驻） |
+| 把 VA 传给要 PA 的 `hash_region` | hash 一个随机帧 → 未篡改却报 changed |
+| 从页中偏移起 hash `0x1000` 字节 | 越过页边界，hash 到相邻无关全局 |
+| hash 整页 | 把 `g_guard` 自己算进去，它边跑边变 |
+
+**根治方法是消掉整类自由度，而不是逐个打补丁：**
+
+```c
+/* 对我们已持有地址的对象 —— 直接在 VA 上读精确字节 */
+int yghv_guard_add_va(const void *va, uint32_t len, const char *tag, int hide);
+```
+
+读 VA 上的 `len` 字节：不需要 VA→PA、不需要页内偏移推理、不会读到相邻对象。
+
+**`yghv_pa_read` 保留给没有 VA 的帧**（断点目标、外来进程的页）。
+
+**规则**：**每个接收地址的函数都要在签名/注释里写清楚它要的是 VA 还是 PA。**
+本项目的 `mem-write` 要 VA，`pa-io` 要 PA —— 用错一个是蓝屏。

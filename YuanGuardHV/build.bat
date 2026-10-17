@@ -87,7 +87,7 @@ echo   WDK Version: %WDK_VER%
 echo   Compiling...
 
 rem 2026-10-11 Phase 1: mem_pte added (page-table walk, Engine B foundation).
-for %%f in (main svm_core npt_core vmexit vmmcall multi_core protect control_device loader_stealth svm_simplevm_port mem_pte mem_pa mem_engine mem_scan mem_selfmap mem_coop mem_island mem_view mem_watch mem_time mem_cache mem_bp mem_frame yghv_fail) do call :compile %%f || goto :error
+for %%f in (main svm_core npt_core vmexit vmmcall multi_core protect control_device loader_stealth svm_simplevm_port mem_pte mem_pa mem_engine mem_scan mem_selfmap mem_coop mem_island mem_view mem_watch mem_time mem_cache mem_bp mem_frame yghv_fail yghv_guard) do call :compile %%f || goto :error
 
 echo   svm_trampoline.S
 "%CLANG_CL%" %CFLAGS% %INCLUDES% /c /Fo"%BIN_DIR%\svm_trampoline.obj" "%HV_DIR%\svm_trampoline.S"
@@ -143,6 +143,7 @@ set "LIB=%SS_LIB%"
     "%BIN_DIR%\mem_bp.obj" ^
     "%BIN_DIR%\mem_frame.obj" ^
     "%BIN_DIR%\yghv_fail.obj" ^
+    "%BIN_DIR%\yghv_guard.obj" ^
     "%BIN_DIR%\svm_simplevm_port.obj" ^
     "%BIN_DIR%\svm_simplevm_port_asm.obj" ^
     "%BIN_DIR%\svm_trampoline.obj" ^

@@ -163,6 +163,33 @@ typedef struct {
      total, degraded, fatal, last_reason, last_a, last_b, last_c, reserved
    A rising `fatal` means the machine needed a bugcheck; `total - fatal` is how
    many abnormal conditions the guest survived. */
+/* Tier 7.1/7.3 (2026-10-18): self-hiding + integrity self-check.
+   Zero-length input = 8 qwords: guarded, hidden, verified, changed, probes,
+                                hide_fail, hash_fail, reserved
+   32-byte input {ULONG op, pad, a, b, c}:
+     op 0 add(a=gpa, b=hide, c=hash, tag in in[4..7])
+     op 1 remove(a=gpa)
+     op 2 verify all      -> out[0] = changed count
+     op 3 list            -> out[0] = count, then 6 qwords per entry
+     op 4 arm core        -> out[0] = pages guarded */
+/* 9.338 (2026-10-18): direct physical-frame access.
+   Tier 1/2 have always had this internally (yghv_pa_read / yghv_pa_write) but
+   it was never exposed, so a test wanting to touch a frame had to misuse
+   mem-write by handing it a PHYSICAL address as if it were a VA. That mistake
+   is what crashed the machine twice:
+     0x3B  Engine A faults because the "VA" is not mapped (13th)
+     0x1A  the memory manager tries to make that bogus VA resident (14th)
+   A dedicated entry point removes the need to abuse another one.
+
+   32-byte input {ULONG op, pad, ULONG_PTR a(pa), b(value|len), c(off)}:
+     op 0 = read  (a=pa, b=len, c=off)  -> out[0]=got, then the bytes
+     op 1 = write (a=pa, b=u64 value)   -> out[0]=ok
+     op 2 = write bytes from in[4..]   -> in[1]=pa, in[2]=len */
+#define IOCTL_YGHV_PA \
+    YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x827, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
+#define IOCTL_YGHV_GUARD \
+    YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x826, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
+#define YGHV_GUARD_OUT_QWORDS 8
 #define IOCTL_YGHV_FAIL \
     YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x825, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
 #define YGHV_FAIL_OUT_QWORDS 8

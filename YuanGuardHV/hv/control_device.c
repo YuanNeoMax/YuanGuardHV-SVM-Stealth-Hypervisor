@@ -15,6 +15,7 @@
 #include "mem_bp.h"       /* Tier 4.4: instruction-level access control */
 #include "mem_frame.h"    /* Tier 4.5: frame ownership takeover */
 #include "yghv_fail.h"     /* Tier 7.2/7.7: graceful degradation */
+#include "yghv_guard.h"    /* Tier 7.1/7.3: self-hiding + integrity */
 #include "debug.h"
 
 NTKERNELAPI PEPROCESS IoGetRequestorProcess(PIRP Irp);
@@ -859,6 +860,147 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
             if (op != 3) {
                 out[0] = (UINT64)(ok ? 1 : 0);
                 info = 8;
+            }
+            status = STATUS_SUCCESS;
+            break;
+        }
+        status = STATUS_INVALID_PARAMETER;
+        break;
+    }
+    case IOCTL_YGHV_PA: {
+        /* 9.338: physical frame read/write. PASSIVE (pa_write uses an MDL). */
+        if (in_len >= 32) {
+            UINT64 *in = (UINT64 *)buf;
+            UINT64 *out = (UINT64 *)buf;
+            ULONG op = (ULONG)in[0];
+            uint64_t pa = (uint64_t)in[1];
+
+            if (op == 0) {
+                uint32_t len = (uint32_t)in[2];
+                uint32_t off = (uint32_t)in[3];
+                uint32_t want;
+                if (len == 0 || len > 256)
+                    len = 256;
+                want = len;
+                if ((SIZE_T)(8 + want) > out_len)
+                    want = (uint32_t)(out_len - 8);
+                if (yghv_pa_read(pa + off, (void *)(out + 1), want)) {
+                    out[0] = (UINT64)want;
+                    info = (ULONG)(8 + want);
+                    status = STATUS_SUCCESS;
+                } else {
+                    out[0] = 0;
+                    info = 8;
+                    status = STATUS_UNSUCCESSFUL;
+                }
+                break;
+            }
+            if (op == 1) {
+                uint64_t v = (uint64_t)in[2];
+                out[0] = (UINT64)(yghv_pa_write(pa, &v, sizeof(v)) ? 1 : 0);
+                info = 8;
+                status = STATUS_SUCCESS;
+                break;
+            }
+            if (op == 2) {
+                uint32_t len = (uint32_t)in[2];
+                if (len > 0 && len <= 4096 && in_len >= (ULONG)(24 + len)) {
+                    out[0] = (UINT64)(yghv_pa_write(pa, (uint8_t *)&in[3], len) ? 1 : 0);
+                } else {
+                    out[0] = 0;
+                }
+                info = 8;
+                status = STATUS_SUCCESS;
+                break;
+            }
+            out[0] = 0;
+            info = 8;
+            status = STATUS_SUCCESS;
+            break;
+        }
+        status = STATUS_INVALID_PARAMETER;
+        break;
+    }
+    case IOCTL_YGHV_GUARD: {
+        /* Tier 7.1/7.3: which pages are hidden from the guest, and whether
+         * any of them changed since they were armed. */
+        if (in_len == 0 && out_len >= 8 * sizeof(UINT64)) {
+            UINT64 *out = (UINT64 *)buf;
+            yghv_guard_stats_t gs;
+            yghv_guard_stats_get(&gs);
+            out[0] = gs.guarded;
+            out[1] = gs.hidden;
+            out[2] = gs.verified;
+            out[3] = gs.changed;
+            out[4] = gs.probes;
+            out[5] = gs.hide_fail;
+            out[6] = gs.hash_fail;
+            out[7] = 0;
+            info = 8 * sizeof(UINT64);
+            status = STATUS_SUCCESS;
+            break;
+        }
+        if (in_len >= 32) {
+            UINT64 *in = (UINT64 *)buf;
+            UINT64 *out = (UINT64 *)buf;
+            ULONG op = (ULONG)in[0];
+            ULONG_PTR a = (ULONG_PTR)in[1];
+            ULONG_PTR b = (ULONG_PTR)in[2];
+            ULONG_PTR c = (ULONG_PTR)in[3];
+
+            switch (op) {
+            case 0: {
+                char tag[YGHV_GUARD_TAG_LEN];
+                int i;
+                for (i = 0; i < YGHV_GUARD_TAG_LEN - 1; i++) {
+                    char ch = (char)((in_len >= 64 && (ULONG)(4 + i/8) < (in_len/8))
+                                     ? ((char *)&in[4 + i/8])[i % 8] : 0);
+                    tag[i] = ch;
+                    if (!ch) break;
+                }
+                tag[YGHV_GUARD_TAG_LEN - 1] = 0;
+                out[0] = (UINT64)(INT64)yghv_guard_add((uint64_t)a, tag,
+                                                       (int)b, (int)c);
+                info = 8;
+                break;
+            }
+            case 1:
+                out[0] = (UINT64)(yghv_guard_remove((uint64_t)a) ? 1 : 0);
+                info = 8;
+                break;
+            case 2:
+                out[0] = (UINT64)yghv_guard_verify_all();
+                info = 8;
+                break;
+            case 3: {
+                yghv_guard_info_t gi[8];
+                uint32_t n, i;
+                n = yghv_guard_list(gi, 8);
+                out[0] = (UINT64)n;
+                for (i = 0; i < n && (2 + i * 6) * sizeof(UINT64) <= out_len; i++) {
+                    UINT64 *e = &out[1 + i * 6];
+                    e[0] = gi[i].gpa;
+                    e[1] = gi[i].hash;
+                    e[2] = gi[i].checks;
+                    e[3] = gi[i].changes;
+                    e[4] = gi[i].hidden;
+                    /* 9.339: pack the object range into the tag slot so a
+                     * test can see WHERE the hash was taken. */
+                    e[5] = ((UINT64)gi[i].hash_off << 32) | (UINT64)gi[i].hash_len;
+                    /* tag packed as 8 bytes */
+                    RtlCopyMemory(&e[5], gi[i].tag, 8);
+                }
+                info = (ULONG)(8 + (SIZE_T)n * 6 * sizeof(UINT64));
+                break;
+            }
+            case 4:
+                out[0] = (UINT64)yghv_guard_arm_core();
+                info = 8;
+                break;
+            default:
+                out[0] = 0;
+                info = 8;
+                break;
             }
             status = STATUS_SUCCESS;
             break;

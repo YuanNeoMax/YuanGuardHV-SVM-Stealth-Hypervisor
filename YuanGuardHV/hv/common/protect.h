@@ -184,6 +184,8 @@ int yghv_protect_npt_split_4k(uint64_t gpa);
 int yghv_protect_npt_get_entry(uint64_t gpa, uint64_t *entry);
 /* 9.330: remap with caller-supplied NPT flags (cache attributes). */
 int yghv_protect_npt_remap_flags(uint64_t gpa, uint64_t spa, int use_alt, uint64_t flags);
+/* 9.336 (Tier 7.1): remove one page from the guest identity map. */
+int yghv_protect_npt_unmap_page(uint64_t gpa);
 int yghv_protect_npt_set_perm(uint64_t gpa, uint64_t perm);
 /* Tier 4.4: re-arm an instruction-level breakpoint page (PASSIVE). */
 int yghv_bp_rearm_bare(uint64_t gpa);

@@ -599,3 +599,15 @@ void yghv_bp_stats_reset(void) {
     InterlockedExchange(&g_head, 0);
     InterlockedExchange(&g_tail, 0);
 }
+
+
+/*
+ * 9.336 (Tier 7.1): expose the table's address and size so the guard can hide
+ * and hash it. This table is ordinary pool memory, guest-reachable, and every
+ * newer feature depends on it — main.c's exclude pass predates its existence.
+ */
+uint64_t *yghv_bp_table_va(uint32_t *bytes) {
+    if (bytes)
+        *bytes = (uint32_t)sizeof(g_bp);
+    return (uint64_t *)(void *)g_bp;
+}

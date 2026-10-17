@@ -8216,3 +8216,119 @@ H8 干净卸载                PASS
 但 7.7 会把它变成"功能返回 ACCESS_DENIED"而不是"页权限撤了但没恢复"。
 
 **下一步 Tier 7 剩余项**：7.3 完整性自检 / 7.1 自我隐藏 / 7.5 逃逸检测。
+
+
+### 9.320 2026-10-18 **第三阶段：Tier 7.1 自隐藏 + 7.3 完整性自检** —— 9/9 PASS
+
+#### 9.320.1 ★ 最重要的一条认识：OS-as-guest 决定了什么能隐藏
+
+**第 13 次崩溃（0x3B）把这条规则用最直接的方式教给了我：**
+
+```
+yghv_guard_find+0x15:  cmp qword ptr [g_guard...], rcx   ← 读自己的数组，崩
+```
+
+`arm_core` 隐藏了 frame-table 所在的页，而 `.bss` 把两者放在**同一页**：
+
+```
+g_frame   RVA 0x34A40   page 0x34000
+g_guard   RVA 0x34FE0   page 0x34000   ← 同一页
+```
+
+**机制如下（这条决定了整个设计的边界）：**
+
+> 本 build 是 OS-as-guest。只有 VMRUN 循环内和 VMEXIT 处理器里的代码运行在
+> **HOST 模式**，那里不查 NPT。普通驱动线程（IOCTL、系统 worker）运行在
+> **GUEST 模式**，它的指针解引用走 guest VA → guest 页表 → GPA → NPT → SPA。
+
+**隐藏一个页 = 从 NPT 里摘掉它。所以隐藏驱动自己在 guest 模式要读的页，等于把驱动自己摘掉。**
+
+`main.c` 原有的 exclude 之所以安全：它隐藏的 VMCB / host stack / MSRPM / IOPM
+只被 **host 模式**的 VMEXIT 路径访问。
+`npt_core` 自己的表之所以安全：它用记录下来的 **direct VA**（host 模式）。
+
+**而 `g_bp` / `g_frame` / `g_view` 是 IOCTL 用普通 C 读写的 `.bss` 全局 —— 不能隐藏。**
+
+**结论（诚实）：这三张表无法对 guest 隐藏，因为它们就是 guest 自己驱动代码要用的同一个对象。**
+**能给它们的是检测（7.3）—— 这才是能扛住这个模型的那一半。**
+
+#### 9.320.2 五次崩溃，五个 VA/PA 或边界错误（全部是我的实现/测试错误）
+
+| # | 现象 | 真因 |
+|---|---|---|
+| 13 | `0x3B` 读 `g_guard` 崩 | 隐藏了自己要读的页（见上） |
+| 14 | `0x1A` | 测试把**物理地址**传给 `mem-write`（它要 **VA**）→ Engine A 让 bogus VA 常驻 → `MiInPagePageTable` |
+| — | verify 未篡改却报 2 changed | `arm_core` 把 **VA** 传给要 PA 的 `add_range` → hash 了一个随机帧 |
+| — | 同上 | hash `0x1000` 字节但起点在页中 → **越过页边界**，hash 到相邻无关全局 |
+| — | 同上 | hash **整页** → 把 `g_guard` 自己也算进去，而它边跑边变 |
+
+**五个错误全是同一类：地址类型/边界没想清楚。** 修法是把整类可能性消掉，而不是逐个打补丁：
+
+**`yghv_guard_add_va(va, len, tag, hide)` —— 对我们已持有地址的对象，直接在 VA 上读它的精确字节。**
+
+```
+读 VA 上的 len 字节没有任何自由度：
+  - 不需要 VA→PA 转换
+  - 不需要页内偏移推理
+  - 不会读到相邻对象
+```
+
+`yghv_pa_read` 保留给**没有 VA 的帧**（断点目标、外来进程的页）。
+
+#### 9.320.3 新增能力
+
+**7.1 隐藏（自隐藏）**
+- `yghv_protect_npt_unmap_page(gpa)` —— 从 guest identity map 摘除一个页
+- `yghv_guard_owns_page(page)` —— **拒绝隐藏驱动自己要读的页**（显式拒绝，把边界教给调用方）
+- NPF 处理器优先判断 `yghv_guard_is_hidden()`：命中则**投递访问违例而不是恢复页**
+
+**7.3 完整性**
+- `yghv_guard_hash_va(va, len)` —— FNV-1a，按对象精确字节
+- `yghv_guard_verify / verify_all` —— 重新计算并计数变化
+- `yghv_guard_add_range / add_va` —— **ensure 语义**（先登记哈希、后要求隐藏时补做隐藏）
+
+**新命令**：`sys-guard`（arm/add/del/verify/list）、`pa-io`（物理帧读写，9.338）
+
+#### 9.320.4 验证（9/9 PASS，零崩溃）
+
+```
+H1  sys-guard 可读           PASS
+H2  arm 3 张表               PASS
+H2b 不隐藏自己（9.337）      PASS   guarded=3 hidden=0
+H3  未篡改 verify 干净       PASS   0 pages changed
+H4  pa-io 篡改 → 检测        PASS   changed=1
+H5  恢复后回到干净           PASS
+H6  隐藏外来页 → probe       PASS   probes 0→3，guest 返回 AVE
+H7  del 恢复可见             PASS   LANDED
+H8  干净卸载                 PASS
+```
+
+**H6/H7 是 7.1 的完整证明**：
+```
+add（隐藏） → guest 写 → AVE（不是 OK），probes 0→3
+del（恢复） → guest 写 → OK，LANDED
+```
+
+**H3/H4/H5 是 7.3 的完整证明**：
+```
+未篡改 verify → 0 changed      （不误报）
+pa-io 篡改    → 1 changed      （真检测到）
+恢复内容      → 又回到 0       （不是永久告警）
+```
+
+#### 9.320.5 诚实边界
+
+1. **我们自己的 3 张表只做哈希，不隐藏** —— 见 9.320.1
+2. **隐藏后地址空间不连续** —— guest 若把自己的内存描述符（`MmGetPhysicalMemoryRanges`、
+   注册表里的固件内存图）和实际能碰的范围对照，会看到空洞。**从遍历里藏起来，
+   不等于从清单里藏起来。**
+3. **只监视已登记的页** —— 未登记页被改不会报告（H4 之前就因此假阴性）
+4. **哈希是 FNV-1a 不是密码学哈希** —— 防意外/防简单篡改，不防精心构造的碰撞
+
+#### 9.320.6 状态
+- IOCTL：0x815-0x827（40）
+- 命令：53（新增 `sys-guard`、`pa-io`）
+- 镜像：`206v9_ensure2`（md5 `B809D106`）
+- 静态检查：IOCTL 40/40/40，Command 53/18 全 PASS
+- 系统干净，uptime 29.9 min
+- **未推送**（本地领先 23 个提交）

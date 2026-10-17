@@ -59,6 +59,8 @@ extern int  yghv_watch_match(UINT64 gpa, UINT32 kind);
 extern void yghv_watch_record(UINT64 cr3, UINT64 rip, UINT64 gpa, UINT32 kind, UINT32 cpl);
 /* Tier 4.4: instruction-level breakpoints (returns 1 = take the ALLOW path). */
 extern int yghv_bp_on_npf(UINT64 gpa, UINT64 rip, UINT32 kind, UINT32 cpl, UINT64 cr3);
+/* Tier 7.1 (9.336): a page we hid from the guest - never restore it. */
+extern int yghv_guard_is_hidden(UINT64 gpa);
 /* Tier 4.4: re-arm an instruction-level breakpoint page (PASSIVE). */
 extern int yghv_bp_rearm_bare(UINT64 gpa);
 /* Tier 4.4: change one page's NPT permission (PASSIVE). */
@@ -1341,6 +1343,30 @@ SvHandleVmExit (
                 }
                 VpData->GuestVmcb.ControlArea.GuestPaOfGhcb = gpa | 1ULL;
                 VpData->GuestVmcb.StateSaveArea.Rflags |= 0x100ULL; /* TF */
+                break;
+            }
+
+            /*
+             * 9.336 (Tier 7.1): a guest access to a page we HID must not be
+             * restored.
+             *
+             * Hiding works by removing the leaf entry from the guest identity
+             * map (npt_exclude_pa). The page then raises #NPF on any access —
+             * which is exactly the breakpoint shape, so the ALLOW loop below
+             * would happily restore it and let the guest read our tables. That
+             * was the hole: 7.1's hiding depended on the fault handler agreeing
+             * to keep it hidden.
+             *
+             * So this check runs FIRST and answers with an access violation at
+             * the null page (deterministic, unresolvable — the same shape the
+             * DENY path uses). The guest sees a hole in physical memory, which
+             * from its side is what a reserved range looks like anyway.
+             */
+            if (yghv_guard_is_hidden(gpa)) {
+                VpData->GuestVmcb.StateSaveArea.Cr2 = 0;
+                VpData->GuestVmcb.ControlArea.EventInj =
+                    (1ULL << 31) | (3ULL << 8) | (1ULL << 11) |
+                    0x0EULL | (0x6ULL << 32);   /* P=0,W=1,U=1 */
                 break;
             }
 

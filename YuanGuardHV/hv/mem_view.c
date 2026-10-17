@@ -251,3 +251,15 @@ void yghv_view_stats_reset(void) {
     InterlockedExchange64(&g_view_installs, 0);
     InterlockedExchange64(&g_view_fail, 0);
 }
+
+
+/*
+ * 9.336 (Tier 7.1): expose the table's address and size so the guard can hide
+ * and hash it. This table is ordinary pool memory, guest-reachable, and every
+ * newer feature depends on it — main.c's exclude pass predates its existence.
+ */
+uint64_t *yghv_view_table_va(uint32_t *bytes) {
+    if (bytes)
+        *bytes = (uint32_t)sizeof(g_view_pages);
+    return (uint64_t *)(void *)g_view_pages;
+}
