@@ -7380,3 +7380,131 @@ NPF 里逐次判断，那是 4.4（指令级访问控制）的范畴，本次未
 - 镜像：`206k1_view`（当前可用）
 - 系统干净，未重启，uptime 22.9 min
 - **未推送**（本地领先 11 个提交 + 本次）
+
+
+### 9.313 2026-10-17 **Tier 4.2 时间维度完成 + 4.6 标注缺陷** —— 8/8 PASS，零冻结
+
+#### 9.313.1 事故：第七次崩溃（硬冻结，非蓝屏）
+
+```
+21:06:56  意外关闭 —— 无 dump、无 BSOD、无 bugcheck 事件
+21:08:52  重启
+```
+
+**触发点**：`mem-watch add` 之后。
+**性质**：硬冻结。CPU 在 #NPF 里无限循环，从未跑够时间写 dump。
+
+#### 9.313.2 根因：watch 只实现了"撤销权限"，没有"恢复权限"
+
+```c
+// mem_watch.c 做的（一半）
+yghv_protect_npt_set_perm(page, NPT_PERM_PRESENT);   // 撤写权限
+
+// NPF handler 里没有对应分支：
+//   watch 页不在 g_protect 表
+//   → on_npf_write_bare 返回 YGHV_NPF_NONE
+//   → cpp 侧注入 #PF
+//   → 目标写失败、重试、再 NPF → 无限循环
+```
+
+**这是第三次同类失误**：
+
+| # | 场景 | 实现的一半 | 漏掉的一半 |
+|---|---|---|---|
+| 9.307 | 自建映射 | 改 PTE 指向新帧 | PFN 引用计数 |
+| 9.311 | NPT remap | 改表项地址 | 完整属性位 |
+| **本次** | **watch** | **撤销权限** | **恢复权限 + 单步重试** |
+
+**共同模式：把"状态改变"当成"功能完成"，但每个都需要一个配对的反向操作。**
+
+#### 9.313.3 设计文档：`docs/TIER4_WATCH_DESIGN.md`
+
+完整写出了正确的裁决循环（复用现有 armed 页的 ALLOW 路径）：
+
+```
+① watch_add:  撤写权限
+② guest 写 → #NPF
+③ handler:    记录事件 → **恢复权限** → rearm_gpa = gpa → ALLOW
+④ cpp:        TF 单步 → 写入重试成功
+⑤ #DB:        重新撤权
+⑥ 回到 ②
+```
+
+**核心洞察：watch 不需要新机制，只需复用 ALLOW 的完整路径，在恢复权限前多记录一次事件。**
+
+**文档还明确了一项不可行**：
+- **执行监控（EXEC）不可行** —— NPT 只有 NX 位，`NX=0` 不产生 NPF（无法记录），
+  `NX=1` 整个页不可执行（目标无法运行）。需要 Intel PT / AMD IBS，不是 NPF 能做的。
+
+#### 9.313.4 安全阀：`watch_add` 改为永远返回失败
+
+```c
+int yghv_watch_add(uint64_t gpa, uint32_t kinds) {
+    /* 9.314 DISABLED — this path froze the machine on 2026-10-17 */
+    InterlockedIncrement64(&g_watch_dropped);
+    return 0;
+}
+static int yghv_watch_add_unsafe_do_not_call(...) { /* 原实现，不被调用 */ }
+```
+
+**实测生效**：
+```
+S1:  mem-watch add FAILED
+S1b: liveness: target read = 0x00C4C40000000000  → 系统健康，无冻结
+```
+
+#### 9.313.5 ★ Tier 4.2 时间维度：完成并验证（8/8 PASS）
+
+**实测序列**：
+```
+track      : v0 = 缓冲区A（AAAA），NPT 指向 v0
+snapshot   : v1 = 复制当前内容（AAAA）
+write BBBB : 写进 v0 → A 变 BBBB
+goto v1    : 读到 AAAA  ✓ 切到旧版本
+goto v0    : 读到 BBBB  ✓ 切回新版本
+```
+
+**O(1) 语义成立**：`goto` 是一次 NPT store，零数据拷贝。
+
+#### 9.313.6 三个实现 bug（本次修的）
+
+| # | 问题 | 真相 |
+|---|---|---|
+| 1 | `track` 用 `yghv_pte_walk(readcr3(), gpa)` | **GPA 已经是物理地址**，无需翻译。而且用的是调用者 CR3，不是目标地址空间 |
+| 2 | `track` 只分配缓冲区，**没有 npt_remap** | 写入落在原始帧，缓冲区从未被写 → 版本语义完全无效 |
+| 3 | `mem-time` 诊断返回 `0x57` | 驱动缺 `in_len == 0` 分支 |
+
+**bug 2 最有教育意义**：`track` 看起来成功了（返回 1，pages=1），
+但功能完全无效 —— **"操作返回成功"不等于"功能生效"**。
+
+#### 9.313.7 版本语义（写进文档，避免再误解）
+
+```
+track    -> v0 = 活副本，NPT 指向 v0
+snapshot -> vN = 复制**当时**的活内容（不是"未来槽位"）
+write    -> 落在当前 live 版本上
+goto N   -> 切到 vN
+```
+
+**snapshot 捕获的是"此刻"，不是"之后"。** 我第一版测试假设反了，
+导致"看起来 S5/S6 交替失败"—— 实际是测试期望错，实现是对的。
+
+#### 9.313.8 验证（8/8 PASS）
+| 项 | 内容 | 结果 |
+|---|---|---|
+| S1 | watch add 被安全阀拒绝 | PASS |
+| S1b | 拒绝后系统健康（无冻结） | PASS |
+| S2 | mem-time 诊断（零长度输入） | PASS |
+| S3 | track 建立 v0 | PASS |
+| S4 | snapshot 捕获基线 | PASS |
+| **S5** | **goto v1 → AAAA（O(1) 切旧版本）** | **PASS** |
+| **S6** | **goto v0 → BBBB（切回新版本）** | **PASS** |
+| S7 | 干净卸载 | PASS |
+
+#### 9.313.9 状态
+- IOCTL：0x815-0x821 已占用（下一个空闲 0x822）
+- 命令数：47（PowerShell）
+- 镜像：`206l6_trackfix`（md5 `57B9CCA2`）
+- **Tier 4.2 完成；4.6 标注缺陷，代码保留但安全阀禁用**
+- 系统干净，uptime 11.6 min
+- **未推送**（本地领先 12 个提交 + 本次）

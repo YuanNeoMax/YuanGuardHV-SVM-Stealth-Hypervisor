@@ -53,6 +53,9 @@ void SvInvlpgaByVa(UINT64 gva, UINT32 asid);         // asm helper
 UINT64 yghv_protect_fake_alt_pa(void);
 /* Tier 4.1: split-view NPT selection (island-safe, no calls). */
 extern UINT64 yghv_view_pick_ncr3(UINT64 guest_cr3);
+/* Tier 4.6: NPF watchpoints (island-safe). */
+extern int  yghv_watch_match(UINT64 gpa, UINT32 kind);
+extern void yghv_watch_record(UINT64 cr3, UINT64 rip, UINT64 gpa, UINT32 kind, UINT32 cpl);
 UINT64 yghv_protect_fake_main_pa(void);
 void yghv_protect_reopen_page_bare(UINT64 gpa);
 UINT64 yghv_protect_guest_va_to_pa(UINT64 cr3, UINT64 va);
@@ -1266,6 +1269,30 @@ SvHandleVmExit (
                 g_S206NpfLog[g_S206NpfIdx * 3 + 2] =
                     VpData->GuestVmcb.StateSaveArea.Cpl;
                 g_S206NpfIdx++;
+            }
+
+            //
+            // Tier 4.6 (2026-10-17): watchpoint telemetry.
+            //
+            // A watched page raises #NPF exactly like an armed one, so the
+            // same exit serves both. Record (CR3, RIP, GPA, kind, CPL) into a
+            // preallocated ring — island-safe: stores only, no calls, no
+            // allocation, no locks. The ring is drained later from PASSIVE by
+            // the IOCTL that reads it.
+            //
+            // This is the debug-register superset: unlimited watchpoints, no
+            // code bytes modified (so no int3 to detect), and DR0-DR3 stay
+            // untouched (a target reading them sees nothing).
+            //
+            {
+                UINT32 watchKind = writeFault ? 0x2u : 0x1u;
+                if (yghv_watch_match(gpa, watchKind)) {
+                    yghv_watch_record(curCr3,
+                                      VpData->GuestVmcb.ControlArea.NRip,
+                                      gpa,
+                                      watchKind,
+                                      (UINT32)VpData->GuestVmcb.StateSaveArea.Cpl);
+                }
             }
 
             /* 9.282 (C6 v3): cpl=0 NPFs on ARMED pages must NEVER inject #PF

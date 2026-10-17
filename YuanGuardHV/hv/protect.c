@@ -2695,3 +2695,45 @@ int yghv_protect_npt_remap(uint64_t gpa, uint64_t spa, int use_alt,
 
     return NT_SUCCESS(st) ? 1 : 0;
 }
+/*
+ * Tier 4.6 (2026-10-17): change one page's NPT permission in the MAIN table.
+ *
+ * This is the mechanism behind watchpoints. Registering a watch in a table
+ * alone does nothing — the page keeps its normal permission, no #NPF is ever
+ * raised, and the handler never runs. The watch only exists once the NPT
+ * entry stops permitting the access.
+ *
+ * `perm` is a NPT_PERM_* set. Passing 0 removes PRESENT entirely (any access
+ * faults); passing NPT_PERM_PRESENT keeps reads working and faults writes.
+ *
+ * PASSIVE only: npt_set_page_perm reaches npt_get_pt -> MmGetVirtualForPhysical,
+ * which 9.299 measured returning a bogus pointer for user-owned pages. Same
+ * rule as yghv_protect_npt_remap (9.311).
+ */
+int yghv_protect_npt_set_perm(uint64_t gpa, uint64_t perm) {
+    int st;
+
+    if (KeAreAllApcsDisabled())
+        return 0;
+
+    /*
+     * 9.313 FIX: do NOT OR the whole attribute set into `perm`.
+     *
+     * NPT_4K_PAGE_FLAGS is present|writable|user|accessed (0x27), so
+     * `perm | NPT_4K_PAGE_FLAGS` always re-adds WRITABLE — which silently
+     * cancelled the very permission removal a watchpoint depends on. The
+     * first run of the 4.6 test captured zero events for exactly this
+     * reason: the watch was registered, the NPT write bit was never dropped,
+     * and no #NPF was ever raised.
+     *
+     * What must be carried is only the ATTRIBUTE bits that are not
+     * permissions — user (2) and accessed (5) — while the caller keeps full
+     * control of present (0) and writable (1).
+     */
+    {
+        uint64_t attrs = NPT_4K_PAGE_FLAGS &
+                         ~((uint64_t)NPT_PERM_PRESENT | (uint64_t)NPT_PERM_WRITABLE);
+        st = npt_set_page_perm(&g_npt, gpa, perm | attrs);
+    }
+    return NT_SUCCESS(st) ? 1 : 0;
+}

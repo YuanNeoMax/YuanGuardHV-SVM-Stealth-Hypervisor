@@ -59,6 +59,10 @@ public class YghvCtl {
     private static final int FN_NPT_REMAP = 0x81E;
     /* Tier 4.1/4.3 (2026-10-11): split view + aliasing. */
     private static final int FN_VIEW = 0x81F;
+    /* Tier 4.6 (2026-10-17): NPF watchpoints. */
+    private static final int FN_WATCH = 0x820;
+    /* Tier 4.2 (2026-10-17): O(1) snapshot/rollback. */
+    private static final int FN_TIME = 0x821;
 
     private static native long openHandle();
     private static native void closeHandle(long handle);

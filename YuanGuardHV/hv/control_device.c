@@ -9,6 +9,8 @@
 #include "mem_coop.h"     /* Phase 7: guard cooperation */
 #include "mem_island.h"   /* Phase 6: island (direct-map) access */
 #include "mem_view.h"     /* Tier 4.1/4.3: split view + aliasing */
+#include "mem_watch.h"    /* Tier 4.6: NPF watchpoints */
+#include "mem_time.h"     /* Tier 4.2: O(1) snapshot/rollback */
 #include "debug.h"
 
 NTKERNELAPI PEPROCESS IoGetRequestorProcess(PIRP Irp);
@@ -793,7 +795,139 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
         status = STATUS_INVALID_PARAMETER;
         break;
     }
+    case IOCTL_YGHV_WATCH: {
+        /* Tier 4.6: NPF watchpoints. op 2 drains the event ring into the
+         * output buffer (header: [0]=count, [1]=dropped). */
+        if (in_len == 0 && out_len >= 6 * sizeof(UINT64)) {
+            UINT64 *out = (UINT64 *)buf;
+            yghv_watch_stats_t ws;
+            yghv_watch_stats_get(&ws);
+            out[0] = ws.pages;
+            out[1] = ws.total_hits;
+            out[2] = ws.recorded;
+            out[3] = ws.dropped;
+            out[4] = ws.seq;
+            out[5] = 0;
+            info = 6 * sizeof(UINT64);
+            status = STATUS_SUCCESS;
+            break;
+        }
+        if (in_len >= 32) {
+            UINT64 *in = (UINT64 *)buf;
+            UINT64 *out = (UINT64 *)buf;
+            ULONG op = (ULONG)in[0];
+            ULONG_PTR a = (ULONG_PTR)in[1];
+            ULONG_PTR b = (ULONG_PTR)in[2];
+            int ok = 0;
+
+            switch (op) {
+            case 0: ok = yghv_watch_add((uint64_t)a, (uint32_t)b); break;
+            case 1: ok = yghv_watch_remove((uint64_t)a); break;
+            case 2: {
+                uint32_t maxev, got;
+                yghv_watch_event_t *ev;
+                if (out_len <= YGHV_WATCH_OUT_HDR_QWORDS * sizeof(UINT64)) {
+                    ok = 0;
+                    break;
+                }
+                maxev = (uint32_t)((out_len - YGHV_WATCH_OUT_HDR_QWORDS * sizeof(UINT64)) /
+                                   (4 * sizeof(UINT64)));
+                if (a && a < maxev)
+                    maxev = (uint32_t)a;
+                ev = (yghv_watch_event_t *)ExAllocatePoolWithTag(
+                    NonPagedPoolNx, (SIZE_T)maxev * sizeof(*ev), 'WCHG');
+                if (ev) {
+                    got = yghv_watch_drain(ev, maxev);
+                    out[0] = (UINT64)got;
+                    out[1] = 0;
+                    if (got) {
+                        UINT64 *dst = out + YGHV_WATCH_OUT_HDR_QWORDS;
+                        uint32_t i;
+                        for (i = 0; i < got; i++) {
+                            dst[i*4+0] = ev[i].cr3;
+                            dst[i*4+1] = ev[i].rip;
+                            dst[i*4+2] = ev[i].gpa;
+                            dst[i*4+3] = (UINT64)ev[i].kind |
+                                         ((UINT64)ev[i].cpl << 8);
+                        }
+                        info = (ULONG)(YGHV_WATCH_OUT_HDR_QWORDS * sizeof(UINT64) +
+                                       (SIZE_T)got * 4 * sizeof(UINT64));
+                    } else {
+                        info = YGHV_WATCH_OUT_HDR_QWORDS * sizeof(UINT64);
+                    }
+                    ExFreePoolWithTag(ev, 'WCHG');
+                    status = STATUS_SUCCESS;
+                    break;
+                }
+                ok = 0;
+                break;
+            }
+            case 3: yghv_watch_stats_reset(); ok = 1; break;
+            default: ok = 0; break;
+            }
+            if (op != 2) {
+                out[0] = (UINT64)(ok ? 1 : 0);
+                info = 8;
+            }
+            status = STATUS_SUCCESS;
+            break;
+        }
+        status = STATUS_INVALID_PARAMETER;
+        break;
+    }
+    case IOCTL_YGHV_TIME: {
+        /* Tier 4.2: O(1) snapshot / rollback.
+         * Zero-length input = diagnostics (same convention as the others). */
+        if (in_len == 0 && out_len >= YGHV_TIME_OUT_QWORDS * sizeof(UINT64)) {
+            UINT64 *out = (UINT64 *)buf;
+            yghv_time_stats_t ts;
+            yghv_time_stats_get(&ts);
+            out[0] = 1;
+            out[1] = 0;
+            out[2] = ts.pages;
+            out[3] = ts.snapshots;
+            out[4] = ts.switches;
+            out[5] = ts.failures;
+            info = YGHV_TIME_OUT_QWORDS * sizeof(UINT64);
+            status = STATUS_SUCCESS;
+            break;
+        }
+        if (in_len >= 32) {
+            UINT64 *in = (UINT64 *)buf;
+            UINT64 *out = (UINT64 *)buf;
+            ULONG op = (ULONG)in[0];
+            ULONG_PTR a = (ULONG_PTR)in[1];
+            ULONG_PTR b = (ULONG_PTR)in[2];
+            int ok = 0;
+            int cur = -1;
+
+            switch (op) {
+            case 0: ok = yghv_time_track((uint64_t)a); break;
+            case 1: ok = yghv_time_untrack((uint64_t)a); break;
+            case 2: cur = yghv_time_snapshot((uint64_t)a); ok = (cur >= 0); break;
+            case 3: ok = yghv_time_goto((uint64_t)a, (uint32_t)b); break;
+            case 4: cur = yghv_time_current((uint64_t)a); ok = (cur >= 0); break;
+            default: ok = 0; break;
+            }
+            {
+                yghv_time_stats_t ts;
+                yghv_time_stats_get(&ts);
+                out[0] = (UINT64)(ok ? 1 : 0);
+                out[1] = (UINT64)cur;
+                out[2] = ts.pages;
+                out[3] = ts.snapshots;
+                out[4] = ts.switches;
+                out[5] = ts.failures;
+            }
+            info = YGHV_TIME_OUT_QWORDS * sizeof(UINT64);
+            status = STATUS_SUCCESS;
+            break;
+        }
+        status = STATUS_INVALID_PARAMETER;
+        break;
+    }
     case IOCTL_YGHV_VIEW: {
+
         /* Tier 4.1/4.3: split-view + cross-process aliasing.
          * Every op is PASSIVE (they call npt remap, which needs it). */
         if (in_len == 0 && out_len >= YGHV_VIEW_OUT_QWORDS * sizeof(UINT64)) {

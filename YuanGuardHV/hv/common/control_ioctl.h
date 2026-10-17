@@ -128,6 +128,20 @@ typedef struct {
     ULONG_PTR b;
     ULONG_PTR c;
 } yghv_ioctl_view_t;
+/* Tier 4.6 (2026-10-17): NPF watchpoints (debug-register superset).
+   Zero-length input = 6 qwords diagnostics.
+   32-byte input {ULONG op, pad, ULONG_PTR a, b, c}:
+     op 0 add(gpa,kinds) / 1 remove(gpa) / 2 drain(a=max) / 3 reset */
+#define IOCTL_YGHV_WATCH \
+    YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x820, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
+#define YGHV_WATCH_OUT_HDR_QWORDS 2
+/* Tier 4.2 (2026-10-17): time-dimension control (O(1) snapshot/rollback).
+   32-byte input {ULONG op, pad, ULONG_PTR a, b, c}:
+     op 0 track(gpa) / 1 untrack(gpa) / 2 snapshot(gpa)
+     op 3 goto(gpa, version) / 4 current(gpa) */
+#define IOCTL_YGHV_TIME \
+    YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x821, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
+#define YGHV_TIME_OUT_QWORDS 6
 /* Tier 4 prerequisite (2026-10-11): NPT remap experiment.
    Rewrites one GPA's NPT entry to point at a different SPA, then reports
    whether the guest actually observes the change.

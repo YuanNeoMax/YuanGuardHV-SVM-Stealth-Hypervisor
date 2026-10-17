@@ -1460,7 +1460,144 @@ try {
                                     -OutputLength 8
             Write-Host ("mem-selfmap: {0} OK" -f "$Arg1")
         }
-                        'mem-view' {
+                                'mem-watch' {
+            # Tier 4.6 (2026-10-17): NPF watchpoints — the debug-register superset.
+            #
+            # x86 gives a debugger FOUR hardware breakpoints (DR0-DR3), and
+            # software breakpoints need int3 (a code byte the target can see).
+            # This takes the page's NPT permission away instead: any access
+            # raises #NPF, the island handler records (CR3, RIP, GPA, kind,
+            # CPL) into a ring, and the ring is drained here. Unlimited
+            # watchpoints, no code modified, DR registers untouched.
+            #
+            # Granularity is per-PAGE, not per-byte: a watch reports any
+            # access to the page. (x86 NPT has no finer execute fault.)
+            # usage:
+            #   mem-watch                      diagnostics
+            #   mem-watch add <hex_gpa> <r|w|rw>
+            #   mem-watch del <hex_gpa>
+            #   mem-watch drain [max]
+            #   mem-watch reset
+            if ($null -eq $Arg1) {
+                $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x820)) -OutputLength 48
+                Write-Host ("mem-watch: pages={0} hits={1} recorded={2} dropped={3} seq={4}" -f `
+                    [BitConverter]::ToUInt64($out,0), [BitConverter]::ToUInt64($out,8),
+                    [BitConverter]::ToUInt64($out,16), [BitConverter]::ToUInt64($out,24),
+                    [BitConverter]::ToUInt64($out,32))
+                return
+            }
+            $v = "$Arg1".ToLower()
+            $op = -1; $a=[uint64]0; $b=[uint64]0
+            switch ($v) {
+                'add'   { $op = 0 }
+                'del'   { $op = 1 }
+                'drain' { $op = 2 }
+                'reset' { $op = 3 }
+                default { throw 'mem-watch: use add|del|drain|reset' }
+            }
+            if ($op -eq 0) {
+                if ($null -eq $Arg2 -or $null -eq $Arg3) { throw 'mem-watch add: usage: mem-watch add <hex_gpa> <r|w|rw>' }
+                $a = [Convert]::ToUInt64(("$Arg2" -replace '^0[xX]',''),16)
+                $k = "$Arg3".ToLower()
+                $b = 0
+                if ($k -match 'r') { $b = $b -bor 1 }
+                if ($k -match 'w') { $b = $b -bor 2 }
+                if ($k -match 'x') { $b = $b -bor 4 }
+                if ($b -eq 0) { $b = 3 }
+            } elseif ($op -eq 1) {
+                if ($null -eq $Arg2) { throw 'mem-watch del: usage: mem-watch del <hex_gpa>' }
+                $a = [Convert]::ToUInt64(("$Arg2" -replace '^0[xX]',''),16)
+            } elseif ($op -eq 2) {
+                $a = 32
+                if ($null -ne $Arg2) { $a = [uint64]::Parse($Arg2) }
+            }
+
+            $req = New-Object byte[] 32
+            [BitConverter]::GetBytes([uint32]$op).CopyTo($req, 0)
+            [BitConverter]::GetBytes([uint64]$a).CopyTo($req, 8)
+            [BitConverter]::GetBytes([uint64]$b).CopyTo($req, 16)
+
+            if ($op -eq 2) {
+                $outLen = 16 + [int]$a * 32
+                $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x820)) -InBytes $req -OutputLength $outLen
+                $got = [BitConverter]::ToUInt64($out, 0)
+                Write-Host ("mem-watch drain: {0} event(s)" -f $got)
+                for ($i = 0; $i -lt $got; $i++) {
+                    $o = 16 + $i*32
+                    $cr3  = [BitConverter]::ToUInt64($out, $o)
+                    $rip  = [BitConverter]::ToUInt64($out, $o+8)
+                    $gpa  = [BitConverter]::ToUInt64($out, $o+16)
+                    $kd   = [BitConverter]::ToUInt64($out, $o+24)
+                    $kind = $kd -band 0xFF
+                    $cpl  = ($kd -shr 8) -band 0xFF
+                    $ks = @()
+                    if ($kind -band 1) { $ks += 'R' }
+                    if ($kind -band 2) { $ks += 'W' }
+                    if ($kind -band 4) { $ks += 'X' }
+                    Write-Host ("  [{0}] {1} cr3=0x{2:X} rip=0x{3:X} gpa=0x{4:X} cpl={5}" -f `
+                        $i, ($ks -join ''), $cr3, $rip, $gpa, $cpl)
+                }
+                return
+            }
+            $out2 = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x820)) -InBytes $req -OutputLength 8
+            Write-Host ("mem-watch: {0} {1}" -f $v, $(if([BitConverter]::ToUInt64($out2,0)){'OK'}else{'FAILED'}))
+        }
+        'mem-time' {
+            # Tier 4.2 (2026-10-17): time-dimension control — O(1) snapshot/rollback.
+            #
+            # Keep several physical copies of one page and switch between them
+            # by rewriting ONE NPT entry. Rollback costs a store, not a 4KB
+            # copy, so a page can be reverted instantly and repeatedly.
+            #
+            # The host cannot express this: in the host one VA has exactly one
+            # content, so "version 0 and version 1 both exist for this
+            # address" is not representable. Only the translation layer can.
+            # usage:
+            #   mem-time                       diagnostics
+            #   mem-time track <hex_gpa>
+            #   mem-time untrack <hex_gpa>
+            #   mem-time snapshot <hex_gpa>    capture current content as new version
+            #   mem-time goto <hex_gpa> <ver>  O(1) switch to that version
+            #   mem-time current <hex_gpa>
+            if ($null -eq $Arg1) {
+                # Zero-length input: the driver treats that as "read diagnostics".
+                # (Note: the parameter is -InBytes; an unknown name is silently
+                # ignored by PowerShell and the call goes out with no input.)
+                $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x821)) -OutputLength 48
+                Write-Host ("mem-time: pages={0} snapshots={1} switches={2} failures={3}" -f `
+                    [BitConverter]::ToUInt64($out,16), [BitConverter]::ToUInt64($out,24),
+                    [BitConverter]::ToUInt64($out,32), [BitConverter]::ToUInt64($out,40))
+                return
+            }
+            $v = "$Arg1".ToLower()
+            $op = -1; $a=[uint64]0; $b=[uint64]0
+            switch ($v) {
+                'track'    { $op = 0 }
+                'untrack'  { $op = 1 }
+                'snapshot' { $op = 2 }
+                'goto'     { $op = 3 }
+                'current'  { $op = 4 }
+                default    { throw 'mem-time: use track|untrack|snapshot|goto|current' }
+            }
+            if ($null -eq $Arg2) { throw 'mem-time: needs a hex_gpa' }
+            $a = [Convert]::ToUInt64(("$Arg2" -replace '^0[xX]',''),16)
+            if ($op -eq 3) {
+                if ($null -eq $Arg3) { throw 'mem-time goto: usage: mem-time goto <hex_gpa> <ver>' }
+                $b = [uint64]::Parse($Arg3)
+            }
+            $req = New-Object byte[] 32
+            [BitConverter]::GetBytes([uint32]$op).CopyTo($req, 0)
+            [BitConverter]::GetBytes([uint64]$a).CopyTo($req, 8)
+            [BitConverter]::GetBytes([uint64]$b).CopyTo($req, 16)
+            $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x821)) -InBytes $req -OutputLength 48
+            $ok  = [BitConverter]::ToUInt64($out, 0)
+            $cur = [BitConverter]::ToInt64($out, 8)
+            Write-Host ("mem-time: {0} {1}  current={2} pages={3} snapshots={4} switches={5}" -f `
+                $v, $(if($ok){'OK'}else{'FAILED'}), $cur,
+                [BitConverter]::ToUInt64($out,16), [BitConverter]::ToUInt64($out,24),
+                [BitConverter]::ToUInt64($out,32))
+        }
+        'mem-view' {
             # Tier 4.1/4.3 (2026-10-11): split-view memory + cross-process aliasing.
             #
             # 4.1: the SAME guest-physical page shows different content

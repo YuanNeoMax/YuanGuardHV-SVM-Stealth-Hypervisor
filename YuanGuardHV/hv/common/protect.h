@@ -178,6 +178,8 @@ int  yghv_protect_sync_is_guarded(uint64_t gpa);   /* Phase 7: guard query */
 /* NPT table bases (0 when the table is not built). Used by the split-view
    module to program VMCB ControlArea.NCr3. */
 UINT64 yghv_protect_fake_main_pa(void);
+/* Tier 4.6: change one page's NPT permission (PASSIVE only). */
+int yghv_protect_npt_set_perm(uint64_t gpa, uint64_t perm);
 UINT64 yghv_protect_fake_alt_pa(void);
 
 int  yghv_protect_npt_remap(uint64_t gpa, uint64_t spa, int use_alt,
