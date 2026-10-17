@@ -55,6 +55,8 @@ public class YghvCtl {
     private static final int FN_MEM_SCAN_REV = 0x81C;
     /* Phase 6 (2026-10-11): island direct-map access (mem-island). */
     private static final int FN_ISLAND = 0x81D;
+    /* Tier 4 prerequisite (2026-10-11): NPT remap experiment. */
+    private static final int FN_NPT_REMAP = 0x81E;
 
     private static native long openHandle();
     private static native void closeHandle(long handle);

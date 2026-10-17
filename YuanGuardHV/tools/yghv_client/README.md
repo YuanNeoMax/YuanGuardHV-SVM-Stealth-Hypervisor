@@ -75,6 +75,7 @@ yghv_ctl.ps1 mem-selfmap [init|stop|reset]
 yghv_ctl.ps1 mem-coop [reset]
 yghv_ctl.ps1 mem-scan-rev <pid> <hex_pa> [max] [start] [end]
 yghv_ctl.ps1 mem-island [init <va_a> <pa_a> <va_b> <pa_b> | read <hex_pa> [len]]
+yghv_ctl.ps1 npt-remap <hex_gpa> <hex_spa> [alt]
 ```
 
 `protect` sets the target, enumerates committed pages of the real Java process,

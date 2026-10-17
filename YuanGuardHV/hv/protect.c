@@ -2632,3 +2632,66 @@ uint64_t yghv_protect_get_hook_stub_va(uint8_t hook_id) {
         return 0;
     return (uint64_t)g_hook_stub_pages[hook_id];
 }
+
+/*
+ * Tier 4 prerequisite (2026-10-11): remap one GPA to a different SPA and
+ * report the previous mapping.
+ *
+ * This exists to ANSWER A QUESTION, not to ship a feature: 9.297/9.298
+ * proved that NPT *permission* flips do not take effect on this CPU, and a
+ * remap changes the same GPA->SPA translation the CPU may have cached. Until
+ * we know whether a remap is observed, split-view (4.1), cross-process
+ * aliasing (4.3) and frame takeover (4.5) all rest on an unverified premise.
+ *
+ * Safe to call ONLY at PASSIVE: npt_map_page reaches npt_get_pt, which calls
+ * MmGetVirtualForPhysical — and 9.299 measured that returning a bogus pointer
+ * for user-owned pages. Dereferencing it at DISPATCH is exactly the 0x0A we
+ * took on 10-17 (P1 = page-aligned user address, P2 = IRQL 2). The IRQL check
+ * below makes that path unreachable rather than relying on the caller.
+ */
+int yghv_protect_npt_remap(uint64_t gpa, uint64_t spa, int use_alt,
+                           uint64_t *prev_spa) {
+    npt_mgr_t *m = use_alt ? &g_npt_alt : &g_npt;
+    int st;
+
+    /*
+     * 9.311: refuse above PASSIVE. npt_alloc_table uses
+     * MmAllocateContiguousMemory (DISPATCH-capped at best) and npt_get_pt
+     * uses MmGetVirtualForPhysical (returns garbage for user pages), so this
+     * whole path is PASSIVE-only in practice. KeAreAllApcsDisabled() is TRUE
+     * only when the IRQL is actually raised to APC or above — the same probe
+     * mem_engine.c uses (KeGetCurrentIrql lowers to __readcr8, which these
+     * WDK libs do not export).
+     */
+    if (KeAreAllApcsDisabled())
+        return 0;
+
+    /*
+     * ===== 9.311 FIX: the flags argument must carry the FULL attribute set =====
+     *
+     * The first version passed NPT_PERM_PRESENT | NPT_PERM_WRITABLE (0x3).
+     * npt_map_page() writes:
+     *
+     *     pt[p0].all = (spa & ~0xFFF) | (flags & 0xFFF) | (flags & (1<<63));
+     *
+     * so anything not in `flags` is DROPPED — including the user bit (2) and
+     * the accessed bit (5) that NPT_4K_PAGE_FLAGS carries. The remapped entry
+     * therefore lost its original attributes, and the machine bugchecked
+     * 0x0A (IRQL_NOT_LESS_OR_EQUAL, P1 = a page-aligned USER address,
+     * P2 = IRQL 2) on the next guest access through it.
+     *
+     * npt_split_2mb_to_4kb() avoids this by carrying a `common` mask of the
+     * original bits; calling npt_map_page() directly bypasses that. Use the
+     * same full set here. (We cannot read the OLD entry's exact bits without
+     * widening npt_core's static helpers, and NPT_4K_PAGE_FLAGS is what a
+     * normal 4K NPT entry carries, so this is the correct baseline.)
+     *
+     * A remap also must NOT drop NX: a page that was non-executable becoming
+     * executable is a silent security change, and the reverse can fault.
+     */
+    st = npt_map_page(m, gpa, spa, NPT_4K_PAGE_FLAGS);
+    if (NT_SUCCESS(st) && prev_spa)
+        *prev_spa = 0;                  /* caller reads the "before" itself */
+
+    return NT_SUCCESS(st) ? 1 : 0;
+}

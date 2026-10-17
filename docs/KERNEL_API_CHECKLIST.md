@@ -262,3 +262,26 @@ MmInitializeMdl(假VA) → 手工填PFN → MmMapLockedPagesSpecifyCache
 2. **MDL 的 `map` 与 `unmap` 必须成对**；需要长期映射时用 `MmMapLockedPagesWithReservedMapping`（不是 SpecifyCache）
 3. **永远不要手工改写 PTE** —— PFN 引用计数由内存管理器拥有
 4. 崩溃码 `0x1A` + `P1=0x1240` = **PFN 数据库损坏**（比访问违规更严重，有数据损坏风险）
+---
+
+## 十四、NPT 表项的 flags 必须完整（第九次教训：0x0A / IRQL_NOT_LESS_OR_EQUAL）
+
+**事故**：`npt-remap` 实验导致 `0x0A`（P1=页对齐用户地址，P2=IRQL 2）。
+
+**根因**：`npt_map_page(m, g, spa, flags)` 内部：
+```c
+pt[p0].all = (spa & ~0xFFF) | (flags & 0xFFF) | (flags & (1ULL<<63));
+```
+**不在 `flags` 里的位全部被丢弃。** 传 `NPT_PERM_PRESENT | NPT_PERM_WRITABLE`
+（0x3）会丢掉 bit2(user) 和 bit5(accessed) → NPT 层触发 #NPF →
+岛内 handler 用 `MmGetVirtualForPhysical`（对用户页返回野指针）→ 0x0A。
+
+**正确**：用 `NPT_4K_PAGE_FLAGS`（0x27 = present|writable|user|accessed），
+与 `npt_split_2mb_to_4kb` 内部的 `common` 掩码同理。
+
+**规则**：
+1. 调用任何 `npt_map_page` 前，确认 flags 含完整属性集，**不要只传权限位**
+2. `npt_get_pt` / `npt_get_pd` 用 `MmGetVirtualForPhysical`，实质 **PASSIVE-only**
+   → 加 `KeAreAllApcsDisabled()` 检查
+3. **`0x0A` 的 P2 直接就是 IRQL**，不需要 kd 分析
+4. **kd 在本机不可用**（两次事故：管道损坏、挂起）→ 只用 dump 参数 + 代码审查

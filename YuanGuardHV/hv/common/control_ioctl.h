@@ -113,6 +113,19 @@ typedef struct {
 #define IOCTL_YGHV_ISLAND \
     YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x81D, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
 #define YGHV_ISLAND_OUT_QWORDS 8
+/* Tier 4 prerequisite (2026-10-11): NPT remap experiment.
+   Rewrites one GPA's NPT entry to point at a different SPA, then reports
+   whether the guest actually observes the change.
+   Input:  {ULONG gpa, ULONG spa, ULONG mode}   (mode 0 = main NPT, 1 = alt)
+   Output: [0] status 1=ok, [1] previous spa, [2] new spa */
+#define IOCTL_YGHV_NPT_REMAP \
+    YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x81E, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
+typedef struct {
+    ULONG_PTR gpa;
+    ULONG_PTR spa;
+    ULONG     mode;
+    ULONG     _pad;
+} yghv_ioctl_npt_remap_t;
 
 #define YGHV_DEVICE_NAME_STRING     L"\\Device\\YuanGuardHV"
 #define YGHV_DOS_DEVICE_NAME_STRING L"\\DosDevices\\YuanGuardHV"

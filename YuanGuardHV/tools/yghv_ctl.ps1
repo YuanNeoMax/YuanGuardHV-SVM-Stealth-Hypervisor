@@ -1460,6 +1460,39 @@ try {
                                     -OutputLength 8
             Write-Host ("mem-selfmap: {0} OK" -f "$Arg1")
         }
+                'npt-remap' {
+            # Tier 4 prerequisite (2026-10-11): rewrite one NPT entry so a GPA
+            # points at a different frame, then let the caller observe whether
+            # the guest actually sees the change.
+            #
+            # This answers a question rather than shipping a feature. 9.297/
+            # 9.298 proved NPT *permission* flips are not observed on this CPU;
+            # a remap changes the same GPA->SPA translation the CPU may have
+            # cached, so split-view (4.1), cross-process aliasing (4.3) and
+            # frame takeover (4.5) all rest on whether this works.
+            #
+            # usage: npt-remap <hex_gpa> <hex_spa> [alt]
+            if ($null -eq $Arg1 -or $null -eq $Arg2) {
+                throw 'npt-remap: usage: npt-remap <hex_gpa> <hex_spa> [alt]'
+            }
+            $gpa = [Convert]::ToUInt64(("$Arg1" -replace '^0[xX]',''), 16)
+            $spa = [Convert]::ToUInt64(("$Arg2" -replace '^0[xX]',''), 16)
+            $mode = 0
+            if ($null -ne $Arg3 -and "$Arg3" -eq 'alt') { $mode = 1 }
+
+            $req = New-Object byte[] 24
+            [BitConverter]::GetBytes([uint64]$gpa).CopyTo($req, 0)
+            [BitConverter]::GetBytes([uint64]$spa).CopyTo($req, 8)
+            [BitConverter]::GetBytes([uint32]$mode).CopyTo($req, 16)
+
+            $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x81E)) `
+                                    -InBytes $req -OutputLength 24
+            $ok   = [BitConverter]::ToUInt64($out, 0)
+            $prev = [BitConverter]::ToUInt64($out, 8)
+            $new  = [BitConverter]::ToUInt64($out, 16)
+            Write-Host ("npt-remap: gpa=0x{0:X} prev=0x{1:X} -> spa=0x{2:X} ok={3} mode={4}" -f
+                        $gpa, $prev, $new, $ok, $(if($mode){'alt'}else{'main'}))
+        }
         'mem-island' {
             # Phase 6 (2026-10-11): island (direct-map) access.
             #

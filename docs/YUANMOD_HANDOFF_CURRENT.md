@@ -7153,3 +7153,135 @@ E5: mem-island read 0x1000 → REFUSED   （init 之前）
 - 静态检查：IOCTL parity C=30/PS=30/Java=30、Command parity PS=43/Java=18 全 PASS
 - 镜像：`206i1_island`（当前可用）
 - **未推送**（本地领先 9 个提交 + 本次）
+
+
+### 9.311 2026-10-17 **第六次蓝屏（0x0A）根因 + ★ NPT 重映射实测生效** —— Tier 4 解锁
+
+#### 9.311.1 事故：第六次蓝屏 `0x0A` IRQL_NOT_LESS_OR_EQUAL
+
+```
+20:09:20  0x0A (0x1FA707F1000, 0x2, 0x0, 0xFFFFF80754813D4F)
+20:19:22  第二次"意外关闭"（无 dump、无 bugcheck）—— 跑 kd 分析时挂起
+```
+
+**第二次是 kd 造成的**：kd 在这台机器上**两次**出问题（第一次管道损坏截断输出，
+第二次直接挂起）。**结论：不再使用 kd。**
+
+#### 9.311.2 根因：`npt_map_page` 的 flags 参数丢属性位（我的错误）
+
+**从 dump 参数直接读出，不需要 kd**：
+```
+P1 = 0x1FA707F1000  页对齐的用户态地址
+P2 = 0x2            IRQL = DISPATCH_LEVEL
+P3 = 0x0            读
+```
+
+**P2=2 证明崩溃在岛内（NPF handler）**，不是我的 IOCTL 上下文。
+
+**代码追查**：
+```c
+// npt_map_page 内部
+pt[p0].all = (spa & ~0xFFF) | (flags & 0xFFF) | (flags & (1ULL<<63));
+//                                ^^^^^^^^^^^^^^ 不在 flags 里的位被丢弃
+
+// 我传的（错）
+NPT_PERM_PRESENT | NPT_PERM_WRITABLE = 0x3
+// 缺 bit2 (user) + bit5 (accessed)
+
+// 正确值
+NPT_4K_PAGE_FLAGS = 0x27 = present|writable|user|accessed
+```
+
+**`npt_split_2mb_to_4kb` 内部保留了 `common` 属性掩码，我直接调 `npt_map_page` 绕过了这层保护。**
+
+属性缺失 → NPT 层触发 #NPF → 岛内 handler 用 `MmGetVirtualForPhysical`
+（9.299 证明对用户页返回野指针）解引用 → `0x0A`。
+
+**两处修复**：
+1. `flags` 改用 `NPT_4K_PAGE_FLAGS`（完整属性集）
+2. 加 `KeAreAllApcsDisabled()` 检查（IRQL >= APC 一律拒绝，因为
+   `npt_alloc_table` 用 `MmAllocateContiguousMemory`、`npt_get_pt` 用
+   `MmGetVirtualForPhysical`，整条路径实质 PASSIVE-only）
+
+镜像：`206j2_remapfix`（md5 `84DEA7F5`）
+
+#### 9.311.3 ★★★ 决定性发现：**NPT 重映射生效**（推翻我之前的判断）
+
+修复后重跑（`g12_remap_safe.ps1`，三重安全措施）：
+
+```
+P1 baseline  : A=0xAAAAAAAAAAAAAAAA  B=0xBBBBBBBBBBBBBBBB   (engine=api 最保守)
+P2 remap     : gpa=0x1D59CD000 -> spa=0xB1B00000  ok=1
+P3 liveness  : B 连读 3 次 = 0xBBBB...  => 系统健康
+P4 关键      : A after remap = 0xBBBBBBBBBBBBBBBB
+               => A 读到了 B 的内容
+```
+
+**没有崩溃。零蓝屏。**
+
+**我在 9.310 之后写过"Tier 4 在当前实现下不可达"—— 那个判断是错的。**
+`0x0A` 不是"NPT remap 不可行"，而是**我的 flags 参数写错了**。
+
+#### 9.311.4 ★ 需要重新审视 9.297/9.298 的结论
+
+| 操作 | 结果 | 证据 |
+|---|---|---|
+| NPT **权限翻转**（present → present-only） | ❌ 不生效 | 9.297/9.298（attempts == consulted == 29,697,622） |
+| NPT **地址重映射**（GPA → 不同 SPA） | ✅ **生效** | **本次实测** |
+
+**两者都改 NPT 表项，但行为不同。**
+
+可能的解释（待验证）：
+- 权限位可能在每次访问时被重新评估，而地址字段只在 TLB miss 时读取
+- 或 Zen3 对 PTE 权限位与地址字段采用不同的缓存策略
+- 或 9.297/9.298 的实验设计有未被发现的因素（那次用 TlbControl/nCR3/INVLPG，
+  与本次直接改表项不同）
+
+**无论原因如何，事实是：重映射生效。**
+
+#### 9.311.5 这解锁了什么
+
+| Tier 4 项 | 依赖 | 状态 |
+|---|---|---|
+| 4.1 视图分裂（split-view） | NPT 重映射 | **✅ 可行** |
+| 4.3 跨进程物理别名 | NPT 重映射 | **✅ 可行** |
+| 4.5 物理帧所有权接管 | NPT 重映射 | **✅ 可行** |
+| 4.2 时间维度（O(1) 回滚） | 快照 + 重映射 | ✅ 可行 |
+| 4.4 指令级访问控制（按 RIP） | NPF + 判定 | 需 NPF 决策，未验证 |
+| 4.6 调试寄存器超集 | VMCB DR 拦截 | 已有拦截位，未实现 |
+| 4.7 缓存行为控制 | NPT cache 属性 | 需验证属性位生效 |
+
+**Tier 4 从"不可达"变成"可做"，但只验证了 4.1/4.3/4.5 的共同前提（重映射），
+具体每项仍需各自验证。**
+
+#### 9.311.6 安全措施（本次实验与崩溃版 g11 的区别）
+
+| g11（崩了） | g12（安全） |
+|---|---|
+| remap 后立刻读**被 remap 的页** | 先读**未被动过的页 B** 确认存活（3 次） |
+| 基线用 Engine B（走 NPF） | 基线用 Engine A（`MmCopyVirtualMemory`） |
+| 无存活检查 | 存活失败立即中止，不碰 A |
+| 连续观测 5 个时间点 | **只读一次 A** |
+
+#### 9.311.7 教训（第九次）
+
+**1. `npt_map_page` 的 flags 必须是完整属性集。**
+`NPT_PERM_PRESENT | NPT_PERM_WRITABLE` 会丢弃 user/accessed 位。
+正确用 `NPT_4K_PAGE_FLAGS`。这与 `npt_split_2mb_to_4kb` 里的 `common` 掩码同理。
+
+**2. `0x0A` 的 P2 参数直接给出 IRQL，不需要 kd。**
+`P2 = 2` 就是 DISPATCH，一眼看出崩溃在岛内而非 IOCTL。
+
+**3. kd 在这台机器上不可用（两次事故）。**
+不再使用。
+
+**4. "不可行"的判断必须基于正确的实现。**
+我在 9.310 断言 Tier 4 不可达，实际是我的 bug。**教训：断言"不可行"之前，
+先确认实现本身没有明显错误。**
+
+#### 9.311.8 状态
+- IOCTL：0x815-0x81E 已占用（下一个空闲 0x81F）
+- 命令数：44（PowerShell）
+- 镜像：`206j2_remapfix`（md5 `84DEA7F5`）
+- 系统干净（无服务/驱动/文件残留），未重启
+- **未推送**（本地领先 10 个提交 + 本次）

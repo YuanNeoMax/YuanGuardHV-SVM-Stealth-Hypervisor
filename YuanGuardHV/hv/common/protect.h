@@ -174,6 +174,9 @@ int  yghv_protect_sync_arm(uint64_t gpa);
 void yghv_protect_sync_disarm(uint64_t gpa);
 int  yghv_protect_sync_resnapshot(uint64_t gpa);   /* Phase 7: cooperative write */
 int  yghv_protect_sync_is_guarded(uint64_t gpa);   /* Phase 7: guard query */
+/* Tier 4 prerequisite: remap one GPA to a different SPA (returns 1 on ok). */
+int  yghv_protect_npt_remap(uint64_t gpa, uint64_t spa, int use_alt,
+                            uint64_t *prev_spa);
 void yghv_protect_sync_init(void);
 void yghv_protect_sync_stop(void);
 uint64_t yghv_protect_control_walk_gpa(void);

@@ -792,6 +792,37 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
         status = STATUS_INVALID_PARAMETER;
         break;
     }
+    case IOCTL_YGHV_NPT_REMAP: {
+        /* Tier 4 prerequisite: rewrite one NPT entry to a different frame.
+         *
+         * Safe by construction: an NPT entry is hardware metadata owned by
+         * this driver (the tables come from npt_alloc_table), not a guest
+         * PTE — so this does NOT touch the PFN reference counts that 9.307
+         * corrupted. The open question is only whether the CPU observes the
+         * change, which is the TLB problem 9.297/9.298 measured for
+         * permission flips. */
+        if (in_len >= sizeof(yghv_ioctl_npt_remap_t) &&
+            out_len >= 3 * sizeof(UINT64)) {
+            yghv_ioctl_npt_remap_t *req = (yghv_ioctl_npt_remap_t *)buf;
+            UINT64 *out = (UINT64 *)buf;
+            ULONG_PTR gpa = req->gpa;
+            ULONG_PTR spa = req->spa;
+            ULONG mode = req->mode;
+            uint64_t prev = 0;
+            int ok;
+
+            ok = yghv_protect_npt_remap((uint64_t)gpa, (uint64_t)spa,
+                                        (mode == 1) ? 1 : 0, &prev);
+            out[0] = (UINT64)(ok ? 1 : 0);
+            out[1] = prev;
+            out[2] = (UINT64)spa;
+            info = 3 * sizeof(UINT64);
+            status = STATUS_SUCCESS;
+            break;
+        }
+        status = STATUS_BUFFER_TOO_SMALL;
+        break;
+    }
     case IOCTL_YGHV_ISLAND: {
         /* Phase 6 (2026-10-11): island-context access via the direct map.
          *   in_len == 0                        -> 8 qwords of diagnostics
