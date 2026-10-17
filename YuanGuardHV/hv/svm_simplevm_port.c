@@ -205,8 +205,22 @@ static VOID yghv_svp_watchdog(PVOID ctx) {
             last = g_svp_hb;
             stall = 0;
         } else if (++stall >= 10) {
-            KeBugCheckEx(0xE2, 0x53565052 /* 'SVPR' */,
-                         (ULONG_PTR)g_svp_hb, (ULONG_PTR)last, 0);
+        } else if (++stall >= 10) {
+            /*
+             * 9.334 (Tier 7.2/7.7): a stalled heartbeat is a real problem but
+             * not necessarily a dead machine. Report it through the failure
+             * framework and keep polling; only bugcheck if it says there is
+             * nothing safe left.
+             */
+            extern int yghv_fail_degrade(int reason, uint64_t a,
+                                         uint64_t b, uint64_t c);
+            if (!yghv_fail_degrade(2 /* WATCHDOG */,
+                                   (uint64_t)g_svp_hb,
+                                   (uint64_t)last, 0)) {
+                KeBugCheckEx(0xE2, 0x53565052 /* 'SVPR' */,
+                             (ULONG_PTR)g_svp_hb, (ULONG_PTR)last, 0);
+            }
+            stall = 0;
         }
     }
 }

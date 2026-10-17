@@ -1515,6 +1515,46 @@ try {
             $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x822)) -InBytes $req -OutputLength 8
             Write-Host ("mem-cache: {0} {1}" -f $v, $(if([BitConverter]::ToUInt64($out,0)){'OK'}else{'FAILED'}))
         }
+        'sys-health' {
+            # Tier 7.2/7.7 (2026-10-18): failure isolation / graceful degradation.
+            #
+            # Before this existed, every abnormal condition ended in
+            # KeBugCheckEx — a feature hitting an unexpected state and the
+            # machine being broken looked identical, and the price was a reboot
+            # each time (12 of them in one day).
+            #
+            # Now an unexpected condition is DEGRADED first: unknown VMEXIT is
+            # recorded and skipped, an unexpected CR write is dropped, a stalled
+            # watchdog is reported. A bugcheck happens only when the framework
+            # says nothing safe is left.
+            #
+            # total    = abnormal conditions seen
+            # fatal    = of those, how many could not be survived
+            # degraded = 1 once anything was degraded
+            if ($null -ne $Arg1 -and "$Arg1" -eq 'reset') {
+                $req = New-Object byte[] 32
+                Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x825)) -OutputLength 64 | Out-Null
+                Write-Host 'sys-health: counters are per-boot; nothing to reset yet'
+                return
+            }
+            $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x825)) -OutputLength 64
+            $tot  = [BitConverter]::ToUInt64($out, 0)
+            $deg  = [BitConverter]::ToUInt64($out, 8)
+            $fat  = [BitConverter]::ToUInt64($out, 16)
+            $lr   = [BitConverter]::ToUInt64($out, 24)
+            $la   = [BitConverter]::ToUInt64($out, 32)
+            $lb   = [BitConverter]::ToUInt64($out, 40)
+            $lc   = [BitConverter]::ToUInt64($out, 48)
+            $names = @('unknown-vmexit','unexpected-cr','watchdog-stall','npf-unresolved','table-full')
+            $nm = if ($lr -lt 5) { $names[[int]$lr] } else { "reason=$lr" }
+            Write-Host ("sys-health: degraded={0} total={1} fatal={2}" -f $deg, $tot, $fat)
+            if ($tot -gt 0) {
+                Write-Host ("  last: {0}  a=0x{1:X} b=0x{2:X} c=0x{3:X}" -f $nm, $la, $lb, $lc)
+                Write-Host ("  survived={0}  died={1}" -f ($tot - $fat), $fat)
+            } else {
+                Write-Host '  no abnormal conditions recorded'
+            }
+        }
         'mem-frame' {
             # Tier 4.5 (2026-10-17): frame ownership takeover.
             #

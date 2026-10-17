@@ -14,6 +14,7 @@
 #include "mem_cache.h"    /* Tier 4.7: cache behaviour control */
 #include "mem_bp.h"       /* Tier 4.4: instruction-level access control */
 #include "mem_frame.h"    /* Tier 4.5: frame ownership takeover */
+#include "yghv_fail.h"     /* Tier 7.2/7.7: graceful degradation */
 #include "debug.h"
 
 NTKERNELAPI PEPROCESS IoGetRequestorProcess(PIRP Irp);
@@ -863,6 +864,27 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
             break;
         }
         status = STATUS_INVALID_PARAMETER;
+        break;
+    }
+    case IOCTL_YGHV_FAIL: {
+        /* Tier 7.2/7.7: how many abnormal conditions we survived vs. died on. */
+        if (out_len >= 8 * sizeof(UINT64)) {
+            UINT64 *out = (UINT64 *)buf;
+            yghv_fail_stats_t fs;
+            yghv_fail_stats_get(&fs);
+            out[0] = fs.total;
+            out[1] = fs.degraded;
+            out[2] = fs.fatal;
+            out[3] = fs.last_reason;
+            out[4] = fs.last_a;
+            out[5] = fs.last_b;
+            out[6] = fs.last_c;
+            out[7] = 0;
+            info = 8 * sizeof(UINT64);
+            status = STATUS_SUCCESS;
+        } else {
+            status = STATUS_BUFFER_TOO_SMALL;
+        }
         break;
     }
     case IOCTL_YGHV_FRAME: {

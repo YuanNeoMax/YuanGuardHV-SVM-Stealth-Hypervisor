@@ -1742,9 +1742,17 @@ SvHandleVmExit (
                 /* unexpected CR index (we only intercept 3 and 4) */
                 S206RecordFatal(VpData->GuestVmcb.ControlArea.ExitCode,
                                 rip, newCr);
-                KeBugCheckEx(0xE2, 0x20602,
-                             VpData->GuestVmcb.ControlArea.ExitCode,
-                             rip, newCr);
+                extern int yghv_fail_degrade(int reason, uint64_t a,
+                                             uint64_t b, uint64_t c);
+                if (!yghv_fail_degrade(1 /* BAD_CR */,
+                                       VpData->GuestVmcb.ControlArea.ExitCode,
+                                       rip, newCr)) {
+                    S206RecordFatal(VpData->GuestVmcb.ControlArea.ExitCode,
+                                    rip, newCr);
+                    KeBugCheckEx(0xE2, 0x20602,
+                                 VpData->GuestVmcb.ControlArea.ExitCode,
+                                 rip, newCr);
+                }
             }
             VpData->GuestVmcb.ControlArea.TlbControl = 1;
             VpData->GuestVmcb.StateSaveArea.Rip =
@@ -1874,9 +1882,11 @@ SvHandleVmExit (
         S206RecordFatal(VMEXIT_SHUTDOWN,
                         VpData->GuestVmcb.StateSaveArea.Rip,
                         VpData->HostStackLayout.Padding1);
-        KeBugCheckEx(0xE2, 0x20601, VMEXIT_SHUTDOWN,
-                     VpData->GuestVmcb.StateSaveArea.Rip,
-                     VpData->HostStackLayout.Padding1);
+        extern int yghv_fail_degrade(int reason, uint64_t a,
+                                     uint64_t b, uint64_t c);
+        (void)yghv_fail_degrade(0 /* informational */, VMEXIT_SHUTDOWN,
+                                VpData->GuestVmcb.StateSaveArea.Rip,
+                                VpData->HostStackLayout.Padding1);
         break;
     default:
         // 9.250c: an unhandled exit code must be OBSERVABLE (bugcheck with the
@@ -1886,10 +1896,17 @@ SvHandleVmExit (
         S206RecordFatal(VpData->GuestVmcb.ControlArea.ExitCode,
                         VpData->GuestVmcb.StateSaveArea.Rip,
                         VpData->GuestVmcb.ControlArea.ExitInfo1);
-        KeBugCheckEx(0xE2, 0x20600,
-                     VpData->GuestVmcb.ControlArea.ExitCode,
-                     VpData->GuestVmcb.StateSaveArea.Rip,
-                     VpData->GuestVmcb.ControlArea.ExitInfo1);
+            extern int yghv_fail_degrade(int reason, uint64_t a,
+                                         uint64_t b, uint64_t c);
+            if (!yghv_fail_degrade(0 /* UNKNOWN_EXIT */,
+                                   VpData->GuestVmcb.ControlArea.ExitCode,
+                                   VpData->GuestVmcb.StateSaveArea.Rip,
+                                   VpData->GuestVmcb.ControlArea.ExitInfo1)) {
+                KeBugCheckEx(0xE2, 0x20600,
+                             VpData->GuestVmcb.ControlArea.ExitCode,
+                             VpData->GuestVmcb.StateSaveArea.Rip,
+                             VpData->GuestVmcb.ControlArea.ExitInfo1);
+            }
     }
 
     //

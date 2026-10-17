@@ -82,6 +82,7 @@ yghv_ctl.ps1 mem-time [track|untrack|snapshot|goto|current] <gpa> [ver]
 yghv_ctl.ps1 mem-cache [set|setalt|reset] <gpa> [mode]
 yghv_ctl.ps1 mem-bp [add|int3|dr|del|clear|drain] ...
 yghv_ctl.ps1 mem-frame [reserve <gpa> [len]|read <slot> [off] [len]|list|release <slot>]
+yghv_ctl.ps1 sys-health                                # Tier 7.2/7.7 降级计数器
 ```
 
 `protect` sets the target, enumerates committed pages of the real Java process,

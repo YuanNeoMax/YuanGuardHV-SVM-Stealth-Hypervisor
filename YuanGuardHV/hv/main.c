@@ -1451,9 +1451,26 @@ static VOID yghv_resident_watchdog_thread(PVOID ctx) {
             continue;
         if (g_os_resident_exits == last) {
             if (++stall >= 3) {
-                KeBugCheckEx(0xE2, 0x59475644,
-                             (ULONG_PTR)g_os_resident_exits,
-                             (ULONG_PTR)stall, 0);
+                /*
+                 * 9.334 (Tier 7.2/7.7): degrade before dying.
+                 *
+                 * Three polls with no VMEXIT progress used to be an immediate
+                 * bugcheck. It is a real stall, but the machine is often still
+                 * serviceable — the guest is running, we simply stopped seeing
+                 * exits, which usually means an intercept was dropped or the
+                 * watchdog is racing a paused core. Report it, and only die if
+                 * the framework says nothing safe is left.
+                 */
+                extern int yghv_fail_degrade(int reason, uint64_t a,
+                                             uint64_t b, uint64_t c);
+                if (!yghv_fail_degrade(2 /* WATCHDOG */,
+                                       (uint64_t)g_os_resident_exits,
+                                       (uint64_t)stall, 0)) {
+                    KeBugCheckEx(0xE2, 0x59475644,
+                                 (ULONG_PTR)g_os_resident_exits,
+                                 (ULONG_PTR)stall, 0);
+                }
+                stall = 0;
             }
         } else {
             last = g_os_resident_exits;

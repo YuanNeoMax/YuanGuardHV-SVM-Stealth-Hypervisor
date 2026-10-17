@@ -69,6 +69,8 @@ public class YghvCtl {
     private static final int FN_BP = 0x823;
     /* Tier 4.5 (2026-10-17): frame ownership takeover. */
     private static final int FN_FRAME = 0x824;
+    /* Tier 7.2/7.7 (2026-10-18): graceful degradation counters. */
+    private static final int FN_FAIL = 0x825;
 
     private static native long openHandle();
     private static native void closeHandle(long handle);

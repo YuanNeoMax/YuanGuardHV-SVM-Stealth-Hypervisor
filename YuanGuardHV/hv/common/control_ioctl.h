@@ -158,6 +158,14 @@ typedef struct {
      op 0 reserve(gpa, len)   op 1 release(slot)
      op 2 read(slot, off)     -> out[0..] = bytes
      op 3 list                -> out[0] = count, then per item 5 qwords */
+/* Tier 7.2/7.7 (2026-10-18): failure isolation / graceful degradation.
+   Zero-length input = 8 qwords:
+     total, degraded, fatal, last_reason, last_a, last_b, last_c, reserved
+   A rising `fatal` means the machine needed a bugcheck; `total - fatal` is how
+   many abnormal conditions the guest survived. */
+#define IOCTL_YGHV_FAIL \
+    YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x825, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
+#define YGHV_FAIL_OUT_QWORDS 8
 #define IOCTL_YGHV_FRAME \
     YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x824, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
 #define YGHV_FRAME_OUT_QWORDS 8
