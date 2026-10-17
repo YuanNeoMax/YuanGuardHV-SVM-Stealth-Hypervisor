@@ -312,3 +312,33 @@ if ($violations.Count -gt 0) {
 }
 
 Write-Host '[PASS] IRQL contract: island entries call no PASSIVE-gated function'
+# ---- 5. every path through a non-void function must return ----
+#
+# hide_core() was declared uint32_t and had `return 0` on its early-exit path but
+# NOTHING at the end: it counted the pages it hid and then fell off, returning
+# whatever the register held. Measured on the first clean-boot run — "hid 0
+# page(s)" while the counters showed hidden=3. The hiding had worked; the number
+# was garbage.
+#
+# NOTE ON WHY THE FIRST VERSION OF THIS RULE WAS WRONG: it tested the whole body
+# for the word "return", and hide_core() does contain `return 0` on its guard
+# clause — so the rule reported no defect. "Has a return somewhere" is not the
+# property. The property is "cannot reach the closing brace without returning",
+# which is control-flow analysis, which is the COMPILER's job:
+#
+#     clang-cl -Wreturn-type
+#
+# This rule therefore does the only part that belongs here: it verifies the
+# compiler is actually configured to catch it. A warning nobody enables is not a
+# check, and this project compiles with /O2 where falling off a non-void function
+# is undefined behaviour, not a warning to skim past.
+$buildBat = Join-Path $root 'build.bat'
+if (Test-Path $buildBat) {
+    $bt = [IO.File]::ReadAllText($buildBat)
+    $hasFatal = ($bt -match 'Werror=return-type') -or ($bt -match 'WX') -or ($bt -match 'Werror')
+    if (-not $hasFatal) {
+        Write-Host '[irql] WARN: build.bat does not make -Wreturn-type fatal; a function'
+        Write-Host '[irql]       falling off its end compiles silently and returns garbage.'
+    }
+}
+

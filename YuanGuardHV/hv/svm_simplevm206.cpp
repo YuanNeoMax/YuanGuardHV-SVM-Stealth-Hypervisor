@@ -68,6 +68,8 @@ extern void yghv_sentry_exit_begin(UINT64 tsc);
 extern void yghv_sentry_exit_end(UINT64 tsc);
 extern int yghv_guard_remap_bare(UINT64 gpa);
 extern int yghv_guard_reopen_bare(UINT64 gpa);
+/* 9.350: re-hide using the entry's recorded mechanism. */
+extern int yghv_guard_rehide_bare(UINT64 gpa);
 extern int yghv_guard_decoy_bare(UINT64 gpa);
 extern int yghv_guard_hiding_armed(void);
 extern int yghv_guard_decoy_ready(void);
@@ -1924,13 +1926,24 @@ SvHandleVmExit (
                     yghv_protect_fake_restore(slot & ~1ULL);
                 } else if (slot & 4ULL) {
                     /*
-                     * 9.343: re-hide a guarded page after our own access was
-                     * allowed through. Same shape as the breakpoint re-arm.
+                    /*
+                     * 9.350 FIX: re-hide with the SAME mechanism that hid it.
+                     *
+                     * 9.348 used yghv_guard_decoy_bare() unconditionally. But
+                     * hidecore hides with UNMAP, so re-hiding with DECOY left
+                     * the page present-but-zeroed: every read of g_bp saw an
+                     * empty table, mem-bp add() wrote into a discarded decoy and
+                     * reported OK, no breakpoint ever matched, and the guest
+                     * store spun forever inside this handler. mmf-write never
+                     * returned while the driver kept answering — a guest-side
+                     * spin, not a deadlock.
+                     *
+                     * yghv_guard_rehide_bare() reads the entry's recorded
+                     * hide_mode and applies the matching mechanism.
                      */
-                    if (yghv_guard_decoy_ready()) {
-                        (void)yghv_guard_decoy_bare(slot & ~7ULL);
+                    if (yghv_guard_hiding_armed()) {
+                        (void)yghv_guard_rehide_bare(slot & ~7ULL);
                     }
-                    VpData->GuestVmcb.ControlArea.TlbControl = 1;
                 } else if (slot & 2ULL) {
                     /*
                      * 9.327 (INT3 mode): the #BP handler restored the real

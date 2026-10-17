@@ -2778,7 +2778,7 @@ int yghv_bp_rearm_bare(uint64_t gpa) {
      * It was called "_bare" and called from the island (#DB re-arm after an
      * ALLOWed write), but it began with
      *
-     *     if (KeAreAllApcsDisabled()) return 0;   /* PASSIVE-only */
+     *     if (KeAreAllApcsDisabled()) return 0;        (PASSIVE-only)
      *
      * and a #DB VMEXIT handler runs at DISPATCH with GIF=0, which IS "all APCs
      * disabled". So the re-arm returned 0 every time it was reached from the
@@ -2798,7 +2798,30 @@ int yghv_bp_rearm_bare(uint64_t gpa) {
     if (st)
         return st;
 
-    return npt_set_page_perm(&g_npt, page, NPT_PERM_PRESENT);
+    /*
+     * 9.349 FIX: carry the ATTRIBUTE bits, exactly as yghv_protect_npt_set_perm()
+     * has done since 9.313.
+     *
+     * This called npt_set_page_perm(&g_npt, page, NPT_PERM_PRESENT) — PRESENT
+     * only, with the USER and ACCESSED bits dropped. NPT checks the USER bit for
+     * every guest access at CPL > 0: without it, the CPU raises #NPF on EVERY
+     * access to that page, not just writes. The handler re-arms the page, the
+     * access faults again, and the machine loops forever.
+     *
+     * Measured: the first run with 9.348's island-safe version hung in the
+     * breakpoint step (mmf-write did not return within 30s) while the machine
+     * itself stayed alive — 35 minutes of uptime, no bugcheck. A hang, not a
+     * crash, and caused by one missing bit.
+     *
+     * 9.313 removed exactly this class of attribute loss from the PASSIVE path;
+     * the island-safe path I added had reintroduced it.
+     */
+    {
+        uint64_t attrs = NPT_4K_PAGE_FLAGS &
+                         ~((uint64_t)NPT_PERM_PRESENT | (uint64_t)NPT_PERM_WRITABLE);
+        return NT_SUCCESS(npt_set_page_perm(&g_npt, page,
+                                            NPT_PERM_PRESENT | attrs)) ? 1 : 0;
+    }
 }
 /*
  * 9.329: read one NPT leaf entry (the MAIN table).

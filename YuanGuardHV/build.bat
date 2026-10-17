@@ -54,6 +54,20 @@ set "INCLUDES=%INCLUDES% /I"%HV_DIR%\pool""
 
 set "CFLAGS=/nologo /O2 /kernel /GR- /EHs-c- /Zl /GS-"
 set "CFLAGS=%CFLAGS% -Wno-microsoft -Wno-unknown-pragmas -Wno-ignored-attributes -Wno-visibility -Wno-pragma-pack"
+rem 9.349: make ONLY the silently-wrong-behaviour warnings fatal.
+rem
+rem hide_core() was declared uint32_t, counted the pages it hid, then fell off its
+rem end with no return, so it returned whatever the register held. Measured on the
+rem first clean-boot run: "hid 0 page(s)" while the counters showed hidden=3.
+rem
+rem The compiler DID warn (-Wreturn-type), but this build emits 208 warnings from
+rem cl.exe's kernel-intrinsic set and the real one was invisible among them.
+rem Making every warning fatal is not possible (those 208 are not defects).
+rem Making the ones that mean "this code has no defined behaviour" fatal is:
+rem such a value cannot be a warning to skim past, because the caller receives
+rem something arbitrary that looks plausible.
+set "CFLAGS=%CFLAGS% -Werror=return-type"
+set "CFLAGS=%CFLAGS% -Werror=implicit-function-declaration"
 set "CFLAGS=%CFLAGS% /D_KERNEL_MODE /D_AMD64_ /DNTDDI_VERSION=0x0A000005 /DYGHV_DEBUG_LOG"
 if "%YGHV_BAREMETAL_NO_RESIDENT%"=="1" set "CFLAGS=%CFLAGS% /DYGHV_BAREMETAL_NO_RESIDENT=1"
 if not "%YGHV_BAREMETAL_STEP%"=="" set "CFLAGS=%CFLAGS% /DYGHV_BAREMETAL_STEP=%YGHV_BAREMETAL_STEP%"

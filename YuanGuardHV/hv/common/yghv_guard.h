@@ -103,6 +103,15 @@ int yghv_guard_reopen_bare(uint64_t gpa);
 int yghv_guard_decoy_bare(uint64_t gpa);
 int yghv_guard_hiding_armed(void);
 
+/*
+ * 9.350: re-hide a page with the SAME mechanism that hid it. Re-hiding with the
+ * other one leaves the page present-but-zeroed, which silently empties whatever
+ * table lived there — measured as mem-bp add() reporting OK while writing into
+ * a discarded decoy, followed by a guest-side spin.
+ */
+int yghv_guard_rehide_bare(uint64_t gpa);
+int yghv_guard_hide_mode(uint64_t gpa);
+
 int yghv_guard_remove(uint64_t gpa);
 
 /*

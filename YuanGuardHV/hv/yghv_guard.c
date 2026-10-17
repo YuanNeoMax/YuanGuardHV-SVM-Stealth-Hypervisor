@@ -12,6 +12,9 @@
 /* 9.344: the main NPT manager, needed by the island-safe remap helpers. */
 extern npt_mgr_t g_npt;
 
+#define YGHV_HIDE_UNMAP 0   /* remove PRESENT: our fault is served by the ALLOW loop */
+#define YGHV_HIDE_DECOY 1   /* point at the decoy: page stays present, reads return 0 */
+
 typedef struct {
     uint64_t gpa;
     uint8_t  digest[YGHV_SHA256_DIGEST];   /* 9.342: cryptographic */
@@ -27,6 +30,21 @@ typedef struct {
     uint64_t checks;
     uint64_t changes;
     uint32_t hidden;
+    /* 9.350: WHICH mechanism hid this page — re-hiding with the wrong one
+     * is what hung the machine (mmf-write never returned, driver still
+     * answering: a guest-side spin, not a deadlock).
+     *
+     *   UNMAP — our own next access faults and the ALLOW loop serves the
+     *           REAL frame. Correct for our own tables, which we read.
+     *   DECOY — the page stays present so the guest map looks continuous
+     *           and reads return zeros. Correct for foreign pages.
+     *
+     * Measured: hidecore hid g_bp with UNMAP, the #DB re-hide used the
+     * DECOY, so the page came back pointing at zeros — every read of the
+     * breakpoint table saw an empty table, mem-bp add() wrote into a
+     * discarded decoy, no breakpoint ever matched, and the guest store
+     * spun forever inside the NPF handler. */
+    uint32_t hide_mode;
     uint32_t armed;
     char     tag[YGHV_GUARD_TAG_LEN];
     volatile LONG active;
@@ -170,6 +188,7 @@ int yghv_guard_add_va(const void *va, uint32_t len, const char *tag, int hide) {
             if (hide && !g_guard[_s].hidden) {
                 if (yghv_protect_npt_unmap_page(page)) {
                     g_guard[_s].hidden = 1;
+                    g_guard[_s].hide_mode = YGHV_HIDE_UNMAP;
                     InterlockedIncrement64(&g_g_hidden);
                 } else {
                     InterlockedIncrement64(&g_g_hidefail);
@@ -202,6 +221,7 @@ int yghv_guard_add_va(const void *va, uint32_t len, const char *tag, int hide) {
 
     if (hide && yghv_protect_npt_unmap_page(page)) {
         g_guard[slot].hidden = 1;
+                    g_guard[slot].hide_mode = YGHV_HIDE_UNMAP;
         InterlockedIncrement64(&g_g_hidden);
     }
 
@@ -416,6 +436,7 @@ int yghv_guard_add_range(uint64_t gpa, uint32_t off, uint32_t len,
             if (hide && !g_guard[_s].hidden) {
                 if (yghv_protect_npt_unmap_page(page)) {
                     g_guard[_s].hidden = 1;
+                    g_guard[_s].hide_mode = YGHV_HIDE_UNMAP;
                     InterlockedIncrement64(&g_g_hidden);
                 } else {
                     InterlockedIncrement64(&g_g_hidefail);
@@ -452,6 +473,7 @@ int yghv_guard_add_range(uint64_t gpa, uint32_t off, uint32_t len,
                 return -4;
         } else {
             g_guard[slot].hidden = 1;
+                    g_guard[slot].hide_mode = YGHV_HIDE_UNMAP;
             InterlockedIncrement64(&g_g_hidden);
         }
     }
@@ -793,6 +815,7 @@ uint32_t yghv_guard_hide_core(void) {
                         continue;
                     if (yghv_protect_npt_unmap_page(gpa + off)) {
                         g_guard[s].hidden = 1;
+                    g_guard[s].hide_mode = YGHV_HIDE_UNMAP;
                         InterlockedIncrement64(&g_g_hidden);
                         hid++;
                     }
@@ -800,6 +823,7 @@ uint32_t yghv_guard_hide_core(void) {
             }
         }
     }
+    return hid;
 }
 
 /* ============================================================================
@@ -846,7 +870,26 @@ int yghv_guard_remap_bare(uint64_t gpa) {
     if (npt_split_2mb_to_4kb(&g_npt, page))
         return 0;
 
-    st = npt_set_page_perm(&g_npt, page, NPT_PERM_PRESENT | NPT_PERM_WRITABLE);
+    /*
+     * 9.349 FIX: include the ATTRIBUTE bits, not just present+writable.
+     *
+     * yghv_protect_npt_set_perm() merges USER|ACCESSED in deliberately (9.313);
+     * these island-safe twins called npt_set_page_perm directly and dropped them.
+     * NPT checks the USER bit for EVERY guest access at CPL > 0, so without it
+     * the CPU raises #NPF on every touch, the handler reopens, and the access
+     * faults again — an infinite loop.
+     *
+     * Measured as a 30-second hang in the breakpoint step (mmf-write never
+     * returned) while the machine stayed alive: 35 minutes of uptime, no
+     * bugcheck. A hang caused by one missing bit, and 9.313 had already removed
+     * this exact class of loss from the PASSIVE path.
+     */
+    {
+        uint64_t attrs = NPT_4K_PAGE_FLAGS &
+                         ~((uint64_t)NPT_PERM_PRESENT | (uint64_t)NPT_PERM_WRITABLE);
+        st = npt_set_page_perm(&g_npt, page,
+                               NPT_PERM_PRESENT | NPT_PERM_WRITABLE | attrs);
+    }
     return st ? 0 : 1;
 }
 
@@ -908,6 +951,67 @@ int yghv_guard_reopen_bare(uint64_t gpa) {
         return 0;
     if (npt_split_2mb_to_4kb(&g_npt, page))
         return 0;
-    st = npt_set_page_perm(&g_npt, page, NPT_PERM_PRESENT | NPT_PERM_WRITABLE);
+    /*
+     * 9.349 FIX: include the ATTRIBUTE bits, not just present+writable.
+     *
+     * yghv_protect_npt_set_perm() merges USER|ACCESSED in deliberately (9.313);
+     * these island-safe twins called npt_set_page_perm directly and dropped them.
+     * NPT checks the USER bit for EVERY guest access at CPL > 0, so without it
+     * the CPU raises #NPF on every touch, the handler reopens, and the access
+     * faults again — an infinite loop.
+     *
+     * Measured as a 30-second hang in the breakpoint step (mmf-write never
+     * returned) while the machine stayed alive: 35 minutes of uptime, no
+     * bugcheck. A hang caused by one missing bit, and 9.313 had already removed
+     * this exact class of loss from the PASSIVE path.
+     */
+    {
+        uint64_t attrs = NPT_4K_PAGE_FLAGS &
+                         ~((uint64_t)NPT_PERM_PRESENT | (uint64_t)NPT_PERM_WRITABLE);
+        st = npt_set_page_perm(&g_npt, page,
+                               NPT_PERM_PRESENT | NPT_PERM_WRITABLE | attrs);
+    }
     return st ? 0 : 1;
+}
+
+/*
+ * 9.350: re-hide a page the way it was hidden.
+ *
+ * The NPF handler serves our own access to a hidden page (RIP whitelist), sets
+ * TF, and lets #DB put the page back. Putting it back with the WRONG mechanism
+ * is what hung the machine:
+ *
+ *   hidecore hid g_bp with UNMAP. The #DB path re-hid it with the DECOY. So the
+ *   page came back present-but-zeroed: every read of the breakpoint table saw an
+ *   empty table, mem-bp add() reported OK while writing into a discarded decoy,
+ *   no breakpoint ever matched, and the guest store retried forever inside the
+ *   NPF handler. mmf-write never returned, yet the driver kept answering — a
+ *   guest-side spin, not a deadlock.
+ *
+ * ISLAND-SAFE: reads one array field, then the same bare NPT primitives.
+ */
+int yghv_guard_rehide_bare(uint64_t gpa) {
+    int s = yghv_guard_find(gpa);
+
+    if (s < 0)
+        return 0;
+
+    if (g_guard[s].hide_mode == YGHV_HIDE_DECOY) {
+        if (!yghv_guard_decoy_bare(gpa))
+            return 0;
+    } else {
+        if (!yghv_protect_npt_unmap_page(gpa))
+            return 0;
+    }
+    g_guard[s].hidden = 1;
+    return 1;
+}
+
+/* ISLAND-SAFE: which mechanism hid this page (-1 = not guarded). */
+int yghv_guard_hide_mode(uint64_t gpa) {
+    int s = yghv_guard_find(gpa);
+
+    if (s < 0)
+        return -1;
+    return (int)g_guard[s].hide_mode;
 }
