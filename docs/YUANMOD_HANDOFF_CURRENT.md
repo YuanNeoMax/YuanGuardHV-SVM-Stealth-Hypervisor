@@ -6979,3 +6979,86 @@ config-sync 1  →  set-target <pid>  →  protect-page <pid> <va>  →  start
 - 静态检查：IOCTL parity C=28/PS=28/Java=28、Command parity PS=41/Java=18 全 PASS
 - 镜像：`206g2_coop`（当前可用）
 - **未推送**（本地领先 7 个提交 + 本次）
+
+
+### 9.309 2026-10-11 **第四批 Phase 4b（页表级扫描优化）完成** —— 6/6 PASS，零蓝屏
+
+#### 9.309.1 成果
+三层优化全部实现（超越点 3.3）：
+- **① 页表级预筛**：新增 `flags bit2 = dirty-only`，只扫 PTE 标记为已写的帧
+- **② 共享页去重**：开放寻址表按帧地址去重，同一物理页只扫一次
+- **③ 反向扫描**：`yghv_mem_scan_reverse()` —— 已知 PA，反查所有映射它的 VA
+
+新增：IOCTL `0x81C` MEM_SCAN_REV、命令 `mem-scan-rev`
+`mem-scan` 的 flags 改为字母集（`w`/`x`/`d` 及组合）
+
+镜像：`206h1_scan4b`（md5 `3A6BCE72`）
+
+#### 9.309.2 ★ 反向扫描：Engine A 结构上做不到的能力
+
+```
+mem-scan-rev: pa=0x228F50000 hits=1 pages_visited=24408
+  va=0x1FAEB390000
+```
+
+`pages_visited=24408` 说明真的遍历了页表，不是猜的。
+
+**为什么 Engine A 做不到**：`MmCopyVirtualMemory` 只有 `(process, VA)` 接口，
+没有"给定物理地址"的入口 —— **没有可搜索的东西**。这不是性能差异，是
+**能力的有无**。
+
+#### 9.309.3 ★ 共享页去重的诚实验证
+
+**普通映射不会产生"同一帧两个 VA"** —— 单进程内每个 VA 都有独立帧。
+第一版测试扫整个用户空间，`pages_read=8192`（撞预算上限），`skipped=0`，
+**证明不了去重**。
+
+**唯一诚实的验证**：让目标进程把**同一个文件映射两次**。
+新建 `g8b_dupmap.ps1` 做这件事：
+```
+dupmap: pid=12240 va1=0x17AF11C0000 va2=0x17AF1300000 share=True
+va1 -> PA=0xAB0FE000   va2 -> PA=0xAB0FE000   same_frame=True
+reverse: pa=0xAB0FE000 hits=2  →  va=0x17AF11C0000, va=0x17AF1300000
+```
+
+**一个帧，两个 VA，反向扫描精确找到两个** —— 这同时验证了去重的前提和
+反向扫描的正确性。
+
+#### 9.309.4 dirty-only 预筛（实测有效）
+
+```
+no filter : pages_read=8192 pages_skipped=3    hits=6
+dirty-only: pages_read=8192 pages_skipped=120  hits=2
+```
+**dirty 过滤多跳过 117 页**。命中数从 6 降到 2，说明过滤掉的确实是
+"PTE 说没写过"的页 —— 它们的旧内容里也有 `MZ` 头，但已不是当前状态。
+
+> 注意 `pages_read` 两者都是 8192（撞预算），说明**全用户空间扫描需要
+> 分批**。这是已知限制（Phase 4 的 page budget），不是本次的缺陷。
+
+#### 9.309.5 三个测试脚本问题（非驱动）
+
+| # | 问题 | 真相 |
+|---|---|---|
+| 1 | 去重测试用普通映射 | 单进程内不会有两个 VA 共享一帧。必须**同一文件映射两次** |
+| 2 | 全空间扫描撞预算（8192） | 目标进程用户空间远超预算，共享 DLL 页在预算耗尽后才出现 |
+| 3 | `$sc` 变量被 D3 覆盖 | D3 把 `$sc` 改成了反向扫描结果，D4 比较时读到错的值 |
+| 4 | `g8b_dupmap.ps1` 提取 Add-Type 失败 | `yghv_ctl.ps1` 有**三个** Add-Type 块，`YghvMmf` 在第二个。需按"含 class YghvMmf"定位，不能取第一个 |
+| 5 | `[YghvCtlNative]` 在另一个块里 | 用 `$PID` 代替 `GetCurrentProcessId()` |
+
+#### 9.309.6 验证（D1-D6，6/6 PASS）
+| 项 | 内容 | 结果 |
+|---|---|---|
+| D1 | 反向扫描找到 VA | PASS（pages_visited=24408） |
+| D2 | 找到的 VA 就是目标 | PASS |
+| **D3** | **一帧两 VA（去重前提成立）** | **PASS**（hits=2） |
+| **D4** | **dirty 预筛多跳过 117 页** | **PASS** |
+| D5 | 前向扫描回归 | PASS |
+| D6 | 干净卸载 | PASS |
+
+#### 9.309.7 状态
+- IOCTL：0x815-0x81C 已占用（下一个空闲 0x81D）
+- 命令数：42（PowerShell）
+- 静态检查：IOCTL parity C=29/PS=29/Java=29、Command parity PS=42/Java=18 全 PASS
+- 镜像：`206h1_scan4b`（当前可用）
+- **未推送**（本地领先 8 个提交 + 本次）

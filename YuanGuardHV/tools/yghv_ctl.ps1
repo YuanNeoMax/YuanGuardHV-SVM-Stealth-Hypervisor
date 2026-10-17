@@ -1384,9 +1384,16 @@ try {
 
             $maxR = 32
             if ($null -ne $Arg3) { $maxR = [uint32]::Parse($Arg3) }
+            # Flags: bit0 writable, bit1 executable, bit2 dirty-only.
+            # Arg4/Arg5 take a letter set: 'w', 'x', 'd', or a combination
+            # ('wx', 'd', ...). 'x' alone keeps meaning "executable only", so
+            # the letters are matched explicitly instead of "anything not x".
             $flags = 0
-            if ($null -ne $Arg4 -and "$Arg4" -ne '' -and "$Arg4" -ne 'x') { $flags = $flags -bor 1 }
-            if ($null -ne $Arg5 -and "$Arg5" -ne '' -and "$Arg5" -ne 'x') { $flags = $flags -bor 2 }
+            $f4 = if ($null -ne $Arg4) { "$Arg4".ToLower() } else { '' }
+            $f5 = if ($null -ne $Arg5) { "$Arg5".ToLower() } else { '' }
+            if ($f4 -match 'w') { $flags = $flags -bor 1 }
+            if ($f4 -match 'x' -or $f5 -match 'x') { $flags = $flags -bor 2 }
+            if ($f4 -match 'd' -or $f5 -match 'd') { $flags = $flags -bor 4 }
 
             # Optional explicit range: mem-scan <pid> <pat> <max> <fl> <ex> <start> <end>
             $rStart = [uint64]0
@@ -1452,6 +1459,43 @@ try {
                                     -InBytes ([BitConverter]::GetBytes([uint32]$op)) `
                                     -OutputLength 8
             Write-Host ("mem-selfmap: {0} OK" -f "$Arg1")
+        }
+                'mem-scan-rev' {
+            # Phase 4b (2026-10-11): reverse scan — find the VAs mapping a frame.
+            # Forward scan asks "what is at this VA"; this asks "who points at
+            # this frame". Engine A cannot express the second question: it has
+            # no physical-address interface to search with.
+            # usage: mem-scan-rev <pid> <hex_pa> [max] [start] [end]
+            if ($null -eq $Arg1 -or $null -eq $Arg2) {
+                throw 'mem-scan-rev: usage: mem-scan-rev <pid> <hex_pa> [max] [start] [end]'
+            }
+            $tpid = [uint32]::Parse($Arg1)
+            $tpa  = [Convert]::ToUInt64(($Arg2 -replace '^0[xX]',''), 16)
+            $maxR = 32
+            if ($null -ne $Arg3) { $maxR = [uint32]::Parse($Arg3) }
+            $rs = [uint64]0
+            $re = [uint64]0
+            if ($null -ne $Arg4 -and "$Arg4" -ne '') { $rs = [Convert]::ToUInt64(("$Arg4" -replace '^0[xX]',''),16) }
+            if ($null -ne $Arg5 -and "$Arg5" -ne '') { $re = [Convert]::ToUInt64(("$Arg5" -replace '^0[xX]',''),16) }
+
+            $req = New-Object byte[] 32
+            [BitConverter]::GetBytes($tpid).CopyTo($req, 0)
+            [BitConverter]::GetBytes([uint32]$maxR).CopyTo($req, 4)
+            [BitConverter]::GetBytes([uint64]$tpa).CopyTo($req, 8)
+            [BitConverter]::GetBytes([uint64]$rs).CopyTo($req, 16)
+            [BitConverter]::GetBytes([uint64]$re).CopyTo($req, 24)
+
+            $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x81C)) `
+                                    -InBytes $req -OutputLength (24 + $maxR * 8)
+            $ok   = [BitConverter]::ToUInt64($out, 0)
+            $hits = [BitConverter]::ToUInt64($out, 8)
+            $vis  = [BitConverter]::ToUInt64($out, 16)
+            if (-not $ok) { Write-Host 'mem-scan-rev: FAILED'; return }
+            Write-Host ("mem-scan-rev: pa=0x{0:X} hits={1} pages_visited={2}" -f $tpa, $hits, $vis)
+            for ($i = 0; $i -lt $hits; $i++) {
+                $va = [BitConverter]::ToUInt64($out, 24 + $i*8)
+                Write-Host ("  va=0x{0:X}" -f $va)
+            }
         }
         'mem-coop' {
             # Phase 7 (2026-10-11): guard cooperation diagnostics.

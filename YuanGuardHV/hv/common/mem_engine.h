@@ -95,4 +95,13 @@ uint32_t yghv_mem_scan(PEPROCESS proc, uint64_t start_va, uint64_t end_va,
                        uint64_t *pages_read, uint64_t *pages_skipped,
                        uint64_t *bytes_scanned);
 
+/* --- Phase 4b: reverse scan (PA -> VA list) ------------------------------
+ * Every VA in [start_va, end_va) that maps `target_pa`'s frame. Engine A has
+ * no physical-address interface, so it cannot express this query at all.
+ * Pass start_va >= end_va to search the whole user range. */
+uint32_t yghv_mem_scan_reverse(PEPROCESS proc, uint64_t target_pa,
+                               uint64_t start_va, uint64_t end_va,
+                               uint64_t *out, uint32_t out_max,
+                               uint64_t *pages_visited);
+
 #endif /* YGHV_MEM_ENGINE_H */

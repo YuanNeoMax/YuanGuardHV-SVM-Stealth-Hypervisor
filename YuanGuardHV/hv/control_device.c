@@ -791,6 +791,66 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
         status = STATUS_INVALID_PARAMETER;
         break;
     }
+    case IOCTL_YGHV_MEM_SCAN_REV: {
+        /* Phase 4b (2026-10-11): reverse scan — every VA mapping a frame. */
+        if (in_len >= sizeof(yghv_ioctl_scan_rev_t) &&
+            out_len >= YGHV_SCAN_REV_OUT_HDR_QWORDS * sizeof(UINT64)) {
+            yghv_ioctl_scan_rev_t *req = (yghv_ioctl_scan_rev_t *)buf;
+            UINT64 *out = (UINT64 *)buf;
+            ULONG  req_pid = req->pid;
+            ULONG  req_max = req->max_results;
+            ULONG_PTR req_pa = req->target_pa;
+            ULONG_PTR req_s = req->range_start;
+            ULONG_PTR req_e = req->range_end;
+            PEPROCESS proc = NULL;
+            NTSTATUS lst;
+            uint32_t max_va, found;
+            uint64_t *hits;
+            uint64_t visited = 0;
+
+            max_va = (ULONG)((out_len - YGHV_SCAN_REV_OUT_HDR_QWORDS * sizeof(UINT64)) /
+                             sizeof(UINT64));
+            if (req_max && req_max < max_va)
+                max_va = req_max;
+            if (max_va == 0) {
+                status = STATUS_BUFFER_TOO_SMALL;
+                break;
+            }
+
+            lst = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)req_pid, &proc);
+            if (!NT_SUCCESS(lst) || !proc) {
+                out[0] = 0; out[1] = 0; out[2] = 0;
+                info = YGHV_SCAN_REV_OUT_HDR_QWORDS * sizeof(UINT64);
+                status = STATUS_SUCCESS;
+                break;
+            }
+
+            hits = (uint64_t *)ExAllocatePoolWithTag(
+                NonPagedPoolNx, (SIZE_T)max_va * sizeof(uint64_t), 'TSRV');
+            if (hits) {
+                found = yghv_mem_scan_reverse(proc, (uint64_t)req_pa,
+                                              (uint64_t)req_s, (uint64_t)req_e,
+                                              hits, max_va, &visited);
+                out[0] = 1;
+                out[1] = (UINT64)found;
+                out[2] = visited;
+                if (found)
+                    RtlCopyMemory(out + YGHV_SCAN_REV_OUT_HDR_QWORDS, hits,
+                                  (SIZE_T)found * sizeof(uint64_t));
+                info = (ULONG)(YGHV_SCAN_REV_OUT_HDR_QWORDS * sizeof(UINT64) +
+                               (SIZE_T)found * sizeof(uint64_t));
+                ExFreePoolWithTag(hits, 'TSRV');
+            } else {
+                out[0] = 0; out[1] = 0; out[2] = 0;
+                info = YGHV_SCAN_REV_OUT_HDR_QWORDS * sizeof(UINT64);
+            }
+            ObDereferenceObject(proc);
+            status = STATUS_SUCCESS;
+            break;
+        }
+        status = STATUS_BUFFER_TOO_SMALL;
+        break;
+    }
     case IOCTL_YGHV_MEM_COOP: {
         /* Phase 7 (2026-10-11): guard cooperation diagnostics.
          *   in_len == 0            -> read 5 qwords

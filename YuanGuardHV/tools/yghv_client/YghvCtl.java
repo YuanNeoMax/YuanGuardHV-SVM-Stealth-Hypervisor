@@ -51,6 +51,8 @@ public class YghvCtl {
     private static final int FN_SELFMAP = 0x81A;
     /* Phase 7 (2026-10-11): guard cooperation (mem-coop). */
     private static final int FN_MEM_COOP = 0x81B;
+    /* Phase 4b (2026-10-11): reverse scan (mem-scan-rev). */
+    private static final int FN_MEM_SCAN_REV = 0x81C;
 
     private static native long openHandle();
     private static native void closeHandle(long handle);

@@ -73,6 +73,7 @@ yghv_ctl.ps1 mem-engine [auto|api|pte|reset]
 yghv_ctl.ps1 mem-scan <pid> <hex_pattern> [max] [writable] [exec]
 yghv_ctl.ps1 mem-selfmap [init|stop|reset]
 yghv_ctl.ps1 mem-coop [reset]
+yghv_ctl.ps1 mem-scan-rev <pid> <hex_pa> [max] [start] [end]
 ```
 
 `protect` sets the target, enumerates committed pages of the real Java process,

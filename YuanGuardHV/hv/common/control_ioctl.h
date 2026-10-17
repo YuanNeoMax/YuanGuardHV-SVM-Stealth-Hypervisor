@@ -92,6 +92,20 @@
 #define IOCTL_YGHV_MEM_COOP \
     YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x81B, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
 #define YGHV_COOP_OUT_QWORDS 5
+/* Phase 4b (2026-10-11): reverse scan — find VAs that map a physical frame.
+   Input:  {ULONG pid, ULONG max_results, ULONG_PTR target_pa,
+            ULONG_PTR range_start, ULONG_PTR range_end}
+   Output: [0] status, [1] count, [2] pages_visited, [3..] VAs */
+#define IOCTL_YGHV_MEM_SCAN_REV \
+    YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x81C, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
+typedef struct {
+    ULONG     pid;
+    ULONG     max_results;
+    ULONG_PTR target_pa;
+    ULONG_PTR range_start;
+    ULONG_PTR range_end;
+} yghv_ioctl_scan_rev_t;
+#define YGHV_SCAN_REV_OUT_HDR_QWORDS 3
 
 #define YGHV_DEVICE_NAME_STRING     L"\\Device\\YuanGuardHV"
 #define YGHV_DOS_DEVICE_NAME_STRING L"\\DosDevices\\YuanGuardHV"
