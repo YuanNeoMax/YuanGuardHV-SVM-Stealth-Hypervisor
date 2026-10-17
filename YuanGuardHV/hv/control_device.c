@@ -838,10 +838,27 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
             case 0: ok = yghv_cache_set((uint64_t)a, (uint32_t)b); break;
             case 1: ok = yghv_cache_set_alt((uint64_t)a, (uint32_t)b); break;
             case 2: ok = yghv_cache_reset((uint64_t)a); break;
+            case 3: {
+                /* 9.329: read the NPT entry back and report the real bits.
+                 * "The call returned success" is not evidence that PWT/PCD
+                 * landed in the table — that was the only proof Tier 4.7 had. */
+                int pwt = 0, pcd = 0;
+                uint64_t raw = 0;
+                ok = yghv_cache_verify((uint64_t)a, &pwt, &pcd, &raw);
+                out[0] = (UINT64)(ok ? 1 : 0);
+                out[1] = (UINT64)pwt;
+                out[2] = (UINT64)pcd;
+                out[3] = raw;
+                info = 32;
+                status = STATUS_SUCCESS;
+                break;
+            }
             default: ok = 0; break;
             }
-            out[0] = (UINT64)(ok ? 1 : 0);
-            info = 8;
+            if (op != 3) {
+                out[0] = (UINT64)(ok ? 1 : 0);
+                info = 8;
+            }
             status = STATUS_SUCCESS;
             break;
         }
@@ -907,7 +924,7 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
                     out[1 + i*4 + 0] = fi[i].gpa;
                     out[1 + i*4 + 1] = fi[i].seq;
                     out[1 + i*4 + 2] = fi[i].len;
-                    out[1 + i*4 + 3] = fi[i].alive;
+                    out[1 + i*4 + 3] = fi[i].captured;
                 }
                 info = (ULONG)(8 + (SIZE_T)n * 4 * sizeof(UINT64));
                 break;

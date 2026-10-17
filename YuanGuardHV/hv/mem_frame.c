@@ -153,7 +153,7 @@ uint32_t yghv_frame_list(yghv_frame_info_t *out, uint32_t max) {
         out[n].gpa = g_frame[i].gpa;
         out[n].seq = g_frame[i].seq;
         out[n].len = g_frame[i].len;
-        out[n].alive = g_frame[i].alive;
+        out[n].captured = g_frame[i].alive;
         out[n].active = 1;
         n++;
     }

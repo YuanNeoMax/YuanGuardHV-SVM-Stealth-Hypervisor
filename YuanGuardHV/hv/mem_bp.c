@@ -456,11 +456,21 @@ int yghv_bp_on_npf(uint64_t gpa, uint64_t rip, uint32_t kind, uint32_t cpl,
         InterlockedIncrement64(&g_bp_refusals);
         return 0;
     }
-    if (!(g_bp[slot].kinds & kind)) {
-        InterlockedIncrement64(&g_bp_refusals);
-        return 0;
-    }
-
+    /*
+     * 9.330 FIX: do not filter by kind once the page matches.
+     *
+     * A read-watch removes PRESENT entirely (the NPT has no read-disable bit),
+     * so EVERY access to the page faults — writes included. The old code then
+     * required (kinds & kind), a read-watch failed the check for a write fault,
+     * returned 0, and the caller fell through to "reflect as #PF". The guest
+     * retried forever: measured as a 30-second hang on the very first mmf-write
+     * after `mem-watch add ... r`.
+     *
+     * Once a page is guarded, any fault on it is ours to handle and release.
+     * The recorded kind is the ACTUAL access, so a read-watch on a page that
+     * is also written reports both — which is the honest semantic: the NPT
+     * cannot express "read only", so a read-watch is a full-access watch.
+     */
     InterlockedIncrement((volatile LONG *)&g_bp[slot].hits);
     InterlockedIncrement64(&g_bp_hits);
     yghv_bp_record(rip, page, 0, kind, cpl, YGHV_BP_MODE_NPF, cr3);

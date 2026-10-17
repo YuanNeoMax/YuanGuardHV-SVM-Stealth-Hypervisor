@@ -69,22 +69,27 @@ static int yghv_cache_apply(uint64_t gpa, uint32_t mode, int use_alt) {
             | (uint64_t)NPT_PERM_PRESENT
             | (uint64_t)NPT_PERM_WRITABLE;
 
+    /* 9.330: every case needs its own break. Without them the WRITEBACK case
+     * fell through and set PWT|PCD, so "reset to writeback" left the page
+     * uncached. */
     switch (mode) {
-    case YGHV_CACHE_WRITEBACK:     break;                       /* 00 */
-    case YGHV_CACHE_WRITETHROUGH:  attrs |= YGHV_CACHE_PCD;      /* 01 */
-    case YGHV_CACHE_UNCACHED:      attrs |= YGHV_CACHE_PWT;      /* 10 */
-    case YGHV_CACHE_UNCACHEABLE_STRONG:
-                                   attrs |= YGHV_CACHE_PWT | YGHV_CACHE_PCD;
-                                   break;
-    default:                       break;
+    case YGHV_CACHE_WRITEBACK:            break;                  /* 00 */
+    case YGHV_CACHE_WRITETHROUGH:         attrs |= YGHV_CACHE_PCD; break; /* 01 */
+    case YGHV_CACHE_UNCACHED:             attrs |= YGHV_CACHE_PWT; break; /* 10 */
+    case YGHV_CACHE_UNCACHEABLE_STRONG:   attrs |= YGHV_CACHE_PWT | YGHV_CACHE_PCD;
+                                          break;
+    default:                              break;
     }
 
     /*
-     * npt_map_page takes (m, gpa, spa, flags) and writes
-     *   (spa & ~0xFFF) | (flags & 0xFFF) | (flags & bit63)
-     * so the cache bits must be inside `flags`, which they are.
+     * 9.330 FIX: use the flags-taking entry point.
+     *
+     * The cache bits are computed above and MUST reach npt_map_page, which
+     * writes (spa & ~0xFFF) | (flags & 0xFFF). The plain remap used to hardcode
+     * its own flag set (9.311), so every "cache set OK" changed nothing —
+     * measured by the 9.329 readback: PWT=0 PCD=0 after a successful set.
      */
-    if (!yghv_protect_npt_remap(page, spa, use_alt, NULL)) {
+    if (!yghv_protect_npt_remap_flags(page, spa, use_alt, attrs)) {
         InterlockedIncrement64(&g_cache_fail);
         return 0;
     }
@@ -176,4 +181,29 @@ void yghv_cache_stats_reset(void) {
     InterlockedExchange64(&g_cache_sets, 0);
     InterlockedExchange64(&g_cache_resets, 0);
     InterlockedExchange64(&g_cache_fail, 0);
+}
+
+/*
+ * 9.329: verify that the requested cache mode is actually present in the NPT
+ * entry.
+ *
+ * Tier 4.7 was originally "verified" by the call returning success — which
+ * proves nothing about the bits. This reads the entry back and reports the
+ * PWT/PCD pair, so a test can assert on the table itself rather than on the
+ * API's optimism.
+ *
+ * Returns 1 when the entry was read; pwt/pcd receive the bits.
+ */
+int yghv_cache_verify(uint64_t gpa, int *pwt, int *pcd, uint64_t *raw) {
+    uint64_t entry = 0;
+    uint64_t page = gpa & ~(uint64_t)0xFFFULL;
+
+    if (!page || KeAreAllApcsDisabled())
+        return 0;
+    if (!yghv_protect_npt_get_entry(page, &entry))
+        return 0;
+    if (pwt) *pwt = (entry & (1ULL << 3)) ? 1 : 0;
+    if (pcd) *pcd = (entry & (1ULL << 4)) ? 1 : 0;
+    if (raw) *raw = entry;
+    return 1;
 }

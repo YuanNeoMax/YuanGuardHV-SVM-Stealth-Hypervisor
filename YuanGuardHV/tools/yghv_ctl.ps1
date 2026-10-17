@@ -1486,7 +1486,8 @@ try {
                 'set'     { $op = 0 }
                 'setalt'  { $op = 1 }
                 'reset'   { $op = 2 }
-                default   { throw 'mem-cache: use set|setalt|reset' }
+                'verify'  { $op = 3 }
+                default   { throw 'mem-cache: use set|setalt|reset|verify' }
             }
             if ($null -eq $Arg2) { throw 'mem-cache: needs a hex_gpa' }
             $a = [Convert]::ToUInt64(("$Arg2" -replace '^0[xX]',''),16)
@@ -1498,6 +1499,19 @@ try {
             [BitConverter]::GetBytes([uint32]$op).CopyTo($req, 0)
             [BitConverter]::GetBytes([uint64]$a).CopyTo($req, 8)
             [BitConverter]::GetBytes([uint64]$b).CopyTo($req, 16)
+            if ($op -eq 3) {
+                # 9.329: read the NPT entry back. "The call returned success"
+                # is not evidence that PWT/PCD landed in the table.
+                $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x822)) -InBytes $req -OutputLength 32
+                if ([BitConverter]::ToUInt64($out,0)) {
+                    Write-Host ("mem-cache verify: gpa=0x{0:X}  PWT={1}  PCD={2}  entry=0x{3:X}" -f `
+                        $a, [BitConverter]::ToUInt64($out,8), [BitConverter]::ToUInt64($out,16),
+                        [BitConverter]::ToUInt64($out,24))
+                } else {
+                    Write-Host 'mem-cache verify: entry not found'
+                }
+                return
+            }
             $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x822)) -InBytes $req -OutputLength 8
             Write-Host ("mem-cache: {0} {1}" -f $v, $(if([BitConverter]::ToUInt64($out,0)){'OK'}else{'FAILED'}))
         }

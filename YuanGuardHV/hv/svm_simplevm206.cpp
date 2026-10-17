@@ -1302,7 +1302,7 @@ SvHandleVmExit (
                 UINT32 watchKind = writeFault ? 0x2u : 0x1u;
                 if (yghv_watch_match(gpa, watchKind)) {
                     yghv_watch_record(curCr3,
-                                      VpData->GuestVmcb.ControlArea.NRip,
+                                      VpData->GuestVmcb.StateSaveArea.Rip,
                                       gpa,
                                       watchKind,
                                       (UINT32)VpData->GuestVmcb.StateSaveArea.Cpl);
@@ -1344,6 +1344,44 @@ SvHandleVmExit (
                 break;
             }
 
+            /*
+             * 9.330: breakpoint/watch check for BOTH fault kinds.
+             *
+             * This used to live inside `if (writeFault)`. A read-watch removes
+             * PRESENT, so writes fault too — and because the check was skipped
+             * for non-write faults, those went to the "reflect as #PF" path and
+             * the guest retried forever (measured: 30-second hang on the first
+             * mmf-write after `mem-watch add ... r`).
+             *
+             * Handled here for read and write alike: record, restore the page
+             * so the access can proceed, single-step via TF, and let the #DB
+             * path re-arm.
+             */
+            {
+                UINT32 bpKind = writeFault ? 0x2u : 0x1u;
+                UINT64 bpRipAny = VpData->GuestVmcb.StateSaveArea.Rip;
+
+                if (yghv_bp_on_npf(gpa, bpRipAny, bpKind,
+                                   (UINT32)VpData->GuestVmcb.StateSaveArea.Cpl,
+                                   curCr3)) {
+                    if (yghv_protect_npt_set_perm(
+                            gpa & ~(UINT64)0xFFFULL,
+                            NPT_PERM_PRESENT | NPT_PERM_WRITABLE)) {
+                        VpData->GuestVmcb.ControlArea.GuestPaOfGhcb = gpa;
+                        VpData->GuestVmcb.StateSaveArea.Rflags |= 0x100ULL; /* TF */
+                        VpData->GuestVmcb.ControlArea.TlbControl = 1;
+                        break;      /* out of the NPF case */
+                    }
+                    /* Could not reopen: deliver an access violation rather
+                     * than spin. */
+                    VpData->GuestVmcb.StateSaveArea.Cr2 = 0;
+                    VpData->GuestVmcb.ControlArea.EventInj =
+                        (1ULL << 31) | (3ULL << 8) | (1ULL << 11) |
+                        0x0EULL | (0x6ULL << 32);
+                    break;
+                }
+            }
+
             if (writeFault)
             {
                 int vr;
@@ -1370,7 +1408,10 @@ SvHandleVmExit (
                  * Without step 2 the guest can never write the page and the
                  * machine spins in #NPF. That is the whole lesson of 9.313.
                  */
-                UINT64 bpRip = VpData->GuestVmcb.ControlArea.NRip;
+                /* 9.329: same reason as the watch path — NRIP is RIP+1 for an
+                 * exception VMEXIT, so it can never be the instruction address
+                 * a breakpoint was armed on. */
+                UINT64 bpRip = VpData->GuestVmcb.StateSaveArea.Rip;
                 if (yghv_bp_on_npf(gpa, bpRip, 0x2,
                                    (UINT32)VpData->GuestVmcb.StateSaveArea.Cpl,
                                    curCr3)) {

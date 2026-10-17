@@ -40,6 +40,7 @@ uint64_t npt_read_entry(npt_mgr_t*m,uint64_t g);
 int npt_write_entry(npt_mgr_t*m,uint64_t g,uint64_t v);
 int npt_split_2mb_to_4kb(npt_mgr_t*m,uint64_t g);
 int npt_map_page(npt_mgr_t*m,uint64_t g,uint64_t spa,uint64_t flags);
+int npt_get_entry(npt_mgr_t*m,uint64_t g,uint64_t*out);   /* 9.329: read a leaf entry back */
 int npt_exclude_pa(npt_mgr_t*m,uint64_t g);
 int npt_exclude_range(npt_mgr_t*m,uint64_t g,uint64_t s);
 int npt_exclude_self(npt_mgr_t*m);

@@ -2775,3 +2775,65 @@ int yghv_bp_rearm_bare(uint64_t gpa) {
 
     return yghv_protect_npt_set_perm(page, NPT_PERM_PRESENT);
 }
+/*
+ * 9.329: read one NPT leaf entry (the MAIN table).
+ *
+ * Tier 4.7 set PWT/PCD and was "verified" only by the call returning success —
+ * which says nothing about the bits. This is the readback that lets a test
+ * assert on the table itself.
+ */
+int yghv_protect_npt_get_entry(uint64_t gpa, uint64_t *entry) {
+    if (!entry || KeAreAllApcsDisabled())
+        return 0;
+    return NT_SUCCESS(npt_get_entry(&g_npt, gpa & ~(uint64_t)0xFFFULL, entry))
+           ? 1 : 0;
+}
+/*
+ * 9.330: same remap, but the caller supplies the flags.
+ *
+ * 9.311 hardcoded NPT_4K_PAGE_FLAGS inside yghv_protect_npt_remap() to fix an
+ * attribute-loss crash — correct at the time, but it made the flags parameter
+ * unreachable. Tier 4.7 then computed a PWT/PCD attribute set and handed it to
+ * a function that ignored it: the set call reported OK, the table never
+ * changed, and only the readback added in 9.329 exposed it
+ * (verify: PWT=0 PCD=0 after "set OK").
+ *
+ * Callers that want cache attributes use this entry point. Callers that just
+ * want an identity/real remap keep using the simple form, which supplies the
+ * full default attribute set exactly as before.
+ */
+int yghv_protect_npt_remap_flags(uint64_t gpa, uint64_t spa, int use_alt,
+                                 uint64_t flags) {
+    npt_mgr_t *m = use_alt ? &g_npt_alt : &g_npt;
+
+    if (KeAreAllApcsDisabled())
+        return 0;
+    if (use_alt && !g_npt_alt_ready)
+        return 0;
+
+    /*
+     * 9.331: carry the CURRENT entry's status bits over.
+     *
+     * Building the flag set from a constant alone loses whatever the hardware
+     * put there. Measured: a page whose entry read 0x...067 (present|write|
+     * user|accessed|DIRTY) came back as 0x...027 after a cache-attribute set
+     * and reset — the dirty bit was gone. Dirty is hardware-maintained, but
+     * discarding it silently makes the entry describe a state that never
+     * happened, and the next thing that reads it may act on that.
+     *
+     * Only status bits travel (dirty, accessed, user); present/write/cache/NX
+     * stay under the caller's control.
+     */
+    {
+        uint64_t old = 0;
+        uint64_t keep = NPT_4K_PAGE_FLAGS &
+                        ~((uint64_t)NPT_PERM_PRESENT | (uint64_t)NPT_PERM_WRITABLE);
+        uint64_t base;
+
+        if (NT_SUCCESS(npt_get_entry(m, gpa, &old)))
+            keep |= old & ((1ULL << 6) | (1ULL << 5));   /* dirty | accessed */
+
+        base = keep & ~((uint64_t)NPT_PERM_PRESENT | (uint64_t)NPT_PERM_WRITABLE);
+        return NT_SUCCESS(npt_map_page(m, gpa, spa, flags | base)) ? 1 : 0;
+    }
+}

@@ -64,6 +64,8 @@ int yghv_cache_set_alt(uint64_t gpa, uint32_t mode);
 
 /* Back to writeback, both tables. */
 int yghv_cache_reset(uint64_t gpa);
+/* 9.329: read the entry back — proves the PWT/PCD bits actually landed. */
+int yghv_cache_verify(uint64_t gpa, int *pwt, int *pcd, uint64_t *raw);
 
 typedef struct {
     uint64_t sets;      /* successful mode changes */

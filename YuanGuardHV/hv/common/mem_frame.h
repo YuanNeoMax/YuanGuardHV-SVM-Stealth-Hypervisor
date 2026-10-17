@@ -41,7 +41,14 @@ typedef struct {
     uint64_t gpa;       /* source physical address */
     uint64_t seq;       /* reservation order */
     uint32_t len;       /* bytes retained */
-    uint32_t alive;     /* 1 while the source frame is still mapped to its owner */
+    uint32_t captured;  /* 1 = the snapshot read succeeded at reserve time.
+                         * 9.329: previously named `alive` and documented as
+                         * "the source frame is still mapped to its owner" — a
+                         * claim nothing ever computed, and there is no
+                         * documented API that can: no Windows interface answers
+                         * "does this PFN still belong to that process". This
+                         * now reports only what is actually known, that the
+                         * read worked. */
     volatile LONG active;
 } yghv_frame_info_t;
 

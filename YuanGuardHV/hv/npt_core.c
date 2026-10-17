@@ -301,3 +301,30 @@ int npt_cleanup(npt_mgr_t*m){
     RtlZeroMemory(m,sizeof(*m));
     return STATUS_SUCCESS;
 }
+
+/*
+ * 9.329: read one leaf entry back.
+ *
+ * npt_set_page_perm() changes bits and returns only a status, so nothing
+ * verified that a permission or cache-attribute change actually landed in the
+ * table. Tier 4.7 (PWT/PCD) was written exactly that way and never observed —
+ * "the call returned success" was the whole evidence. This exposes the entry so
+ * a test can assert on the bits themselves.
+ *
+ * For a 2MB large page the PDE is returned (large_page set), which is the entry
+ * a permission change would have hit.
+ */
+int npt_get_entry(npt_mgr_t*m,uint64_t g,uint64_t*out){
+    npt_entry_t *pd, *pt;
+    uint32_t p4=(uint32_t)NPT_PML4_INDEX(g),p2=(uint32_t)NPT_PDPT_INDEX(g),p1=(uint32_t)NPT_PD_INDEX(g),p0=(uint32_t)NPT_PT_INDEX(g);
+
+    if(!m||!m->pml4_va||!out)return STATUS_INVALID_PARAMETER;
+    pd=npt_get_pd(m,p4,p2);
+    if(!pd)return STATUS_NOT_FOUND;
+    if(pd[p1].large_page){ *out=pd[p1].all; return STATUS_SUCCESS; }
+    if(!pd[p1].present)return STATUS_NOT_FOUND;
+    pt=npt_get_pt(m,p4,p2,p1);
+    if(!pt)return STATUS_NOT_FOUND;
+    *out=pt[p0].all;
+    return STATUS_SUCCESS;
+}
