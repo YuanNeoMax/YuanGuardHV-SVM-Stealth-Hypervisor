@@ -8029,3 +8029,90 @@ mem-frame read: 4096 byte(s)
 - 静态检查：IOCTL C=37/PS=37/Java=37，Command PS=50/Java=18 全 PASS
 - 系统干净，**uptime 61 min 未重启**
 - **未推送**（本地领先 18 个提交）
+
+
+### 9.318 2026-10-18 **第一阶段：五个缺陷修复 + 长跑稳定** —— STABLE
+
+#### 9.318.1 五个缺陷，全部有实测证据
+
+| # | 缺陷 | 真因 | 证据（修复后） |
+|---|---|---|---|
+| 1 | SIG 记录恒为 0 | `NRip` 对异常 VMEXIT 是 `RIP+1`（APM），应使用 `StateSaveArea.Rip` | `rip=0x7FF92EC6DB62` |
+| 2 | PWT/PCD 从未生效 | `yghv_protect_npt_remap` 在 9.311 硬编码 flags，mem_cache 算的 attrs **根本传不进去** | `0x...67 → 0x...6F` |
+| 3 | 读监控挂起 30s | 撤 PRESENT 后写也故障，bp 检查只在 `if (writeFault)` 内 → 注入 #PF → guest 无限重试 | 不再挂起 |
+| 4 | dirty 位丢失 | 重建 flag 集时只用常量，丢掉硬件写的 bit6 | `0x67 → 0x6F → 0x67` |
+| 5 | `alive` 字段是假的 | 文档声称"源帧仍映射给所有者"，但没有任何代码计算过，也没有 API 能算 | 改名 `captured` |
+
+**缺陷 2 最值得记**：9.311 为了修属性丢失而硬编码 flags，正确；
+但副作用是 flags 参数不可达，4.7 的整个机制从来没生效过。
+**"set 报 OK" 是唯一的证据** —— 直到 9.329 加了 readback 才暴露。
+
+#### 9.318.2 三处关键修复
+
+**a) `yghv_protect_npt_remap_flags(gpa, spa, use_alt, flags)`**
+让调用方控制 flags。同时保留原表项的 dirty/accessed（bit6/bit5）：
+
+```c
+if (NT_SUCCESS(npt_get_entry(m, gpa, &old)))
+    keep |= old & ((1ULL << 6) | (1ULL << 5));   /* dirty | accessed */
+```
+
+**b) bp 检查提到 `if (writeFault)` 之外**
+读和写都处理。同时 `yghv_bp_on_npf` 不再按 kind 过滤 —— 页被禁后
+任何访问都是我们的，按实际 kind 记录。
+
+**诚实语义**：NPT **没有读禁用位**，所以"读监控"实际是**全访问监控**。
+代码注释和命令帮助都写明了这一点。
+
+**c) `npt_get_entry(m, g, *out)`**
+`npt_set_page_perm` 只返回状态，没有任何方式验证改动是否落地。
+这个读回接口让测试能对**表项本身**断言，而不是对 API 的乐观断言。
+
+#### 9.318.3 ★ 长跑：10.2 分钟 STABLE
+
+```
+镜像    206t3_statusfix (md5 2B2F8812)
+目标    64 页 mmf（每轮压 16 页）
+循环    8 轮 = 128 写 + 128 读 = 256 次 IOCTL
+```
+
+**结果**：
+```
+失败       : 0
+目标 WS    : 104.7 -> 104.0 MB     无增长
+目标句柄   : 641 -> 610            无泄漏
+驱动       : drv=up 全程
+卸载       : removed
+OVERALL    : STABLE
+```
+
+**同时覆盖的路径**：
+- 每轮 16 页写+读（Engine B / 物理帧）
+- 每 10 轮 cache set → verify → reset（含 readback 断言）
+- 每 5 轮 bp add → guest 写 → drain → del（完整 ALLOW 循环）
+
+**静态泄漏分析**（跑之前做的）：
+```
+mem_bp     : alloc=0 free=0     ← NPF 热路径零分配
+mem_cache  : alloc=0 free=0
+protect    : alloc=5 free=5     ← 平衡
+on_npf     : 无分配、无锁       ← 岛内纪律成立
+```
+
+#### 9.318.4 今天第一次 100 分钟不重启
+
+```
+uptime 100.8 min，全程未重启
+本会话崩溃总数：12（全部集中在 Tier 4.4 探索期）
+修复后：0
+```
+
+**这不是"调好了"的证明，是第一份"没有累积性问题"的证据。**
+
+#### 9.318.5 状态
+- IOCTL：0x815-0x824（37）
+- 命令：50
+- 镜像：`206t3_statusfix`（md5 `2B2F8812`）
+- 提交：`6adaf78`
+- **未推送**（本地领先 20 个提交）
+- 下一步：Tier 7（自保），7 项全未做
