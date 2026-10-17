@@ -5,6 +5,7 @@
 
 #include "mem_watch.h"
 #include "protect.h"
+#include "mem_bp.h"
 #include "npt.h"
 
 static yghv_watch_page_t  g_watch[YGHV_WATCH_MAX_PAGES];
@@ -37,31 +38,50 @@ static int yghv_watch_find(uint64_t gpa) {
 
 int yghv_watch_add(uint64_t gpa, uint32_t kinds) {
     uint64_t page = gpa & ~(uint64_t)0xFFFULL;
-    int slot;
-    int i;
+    int rc;
 
     /*
-     * ===== 9.314 DISABLED — this path froze the machine on 2026-10-17 =====
+     * ===== 9.328: RE-ENABLED, delegating to the breakpoint engine =====
      *
-     * Taking the page's NPT write permission away does raise #NPF, but the
-     * handler has no branch for a watched page: yghv_protect_on_npf_write_bare
-     * only knows pages registered in g_protect, so it returns YGHV_NPF_NONE,
-     * the cpp injects #PF, the target's write fails, the target retries, and
-     * the machine spins in #NPF forever. Measured: hard freeze at 21:06:56
-     * with no dump and no bugcheck (nothing ever ran long enough to write one).
+     * 9.313 disabled this path because it revoked the page's NPT write
+     * permission and nothing ever put it back: the NPF handler had no branch
+     * for a watch page, injected #PF, and the guest spun until the box froze.
      *
-     * The missing half is the ALLOW loop: on a watch hit the handler must
-     * RECORD, RESTORE the write permission, set TF, and let the retried store
-     * land — the same cycle armed pages already use (protect.c 1484-1557).
-     * See docs/TIER4_WATCH_DESIGN.md for the complete design.
+     * Tier 4.4 (9.316) then implemented the missing half — the ALLOW loop:
+     * record, RESTORE the permission, single-step, re-arm on #DB — and 9.327
+     * generalised the table to 64 entries with a mode per entry.
      *
-     * Until that loop exists, add() refuses. Bookkeeping alone (registering
-     * the page in g_watch without touching the NPT) would be harmless but
-     * useless, and silently doing nothing is worse than saying no.
+     * A page-level watch IS a breakpoint with no instruction filter, i.e.
+     * rip = 0. So this module is now a thin alias over yghv_bp_add(): the
+     * mechanism, the loop, the ring and the stats are the verified ones, and
+     * there is only one implementation to keep correct.
      */
-    (void)page; (void)slot; (void)i;
-    InterlockedIncrement64(&g_watch_dropped);
-    return 0;
+    if (!page || !kinds) {
+        InterlockedIncrement64(&g_watch_dropped);
+        return 0;
+    }
+
+    rc = yghv_bp_add(page, 0 /* any instruction */, kinds);
+    if (rc != 1) {
+        InterlockedIncrement64(&g_watch_dropped);
+        return 0;
+    }
+
+    /* Mirror the registration so watch-side stats stay meaningful. */
+    if (yghv_watch_find(page) < 0) {
+        int i;
+        for (i = 0; i < YGHV_WATCH_MAX_PAGES; i++) {
+            if (!InterlockedCompareExchange(&g_watch[i].active, 0, 0)) {
+                g_watch[i].gpa = page;
+                g_watch[i].kinds = kinds;
+                g_watch[i].hits = 0;
+                InterlockedExchange(&g_watch[i].active, 1);
+                InterlockedIncrement(&g_watch_count);
+                break;
+            }
+        }
+    }
+    return 1;
 }
 
 static int yghv_watch_add_unsafe_do_not_call(uint64_t gpa, uint32_t kinds) {
@@ -117,15 +137,11 @@ static int yghv_watch_add_unsafe_do_not_call(uint64_t gpa, uint32_t kinds) {
 int yghv_watch_remove(uint64_t gpa) {
     int slot = yghv_watch_find(gpa);
 
+    /* 9.328: the real arming lives in the breakpoint table now. */
+    (void)yghv_bp_remove(gpa & ~(uint64_t)0xFFFULL, 0);
+
     if (slot < 0)
         return 0;
-    if (KeAreAllApcsDisabled())
-        return 0;
-
-    /* Give the page its normal access back BEFORE dropping the slot, so the
-     * target is never left with a permanently faulting page. */
-    (void)yghv_protect_npt_set_perm(g_watch[slot].gpa,
-                                    NPT_PERM_PRESENT | NPT_PERM_WRITABLE);
     InterlockedExchange(&g_watch[slot].active, 0);
     InterlockedDecrement(&g_watch_count);
     return 1;

@@ -63,6 +63,13 @@ extern int yghv_bp_on_npf(UINT64 gpa, UINT64 rip, UINT32 kind, UINT32 cpl, UINT6
 extern int yghv_bp_rearm_bare(UINT64 gpa);
 /* Tier 4.4: change one page's NPT permission (PASSIVE). */
 extern int yghv_protect_npt_set_perm(UINT64 gpa, UINT64 perm);
+/* Tier 4.4 (9.327, INT3 mode): #BP handling + the byte we displaced. */
+extern int yghv_bp_on_int3(UINT64 va, UINT32 cpl, UINT64 cr3);
+extern int yghv_bp_int3_orig(UINT64 va, UINT8 *out);
+/* Tier 4.4 (9.327, DR mode): which breakpoint fired, per DR6. */
+extern int yghv_bp_on_dr(UINT64 dr6, UINT64 rip, UINT32 cpl, UINT64 cr3);
+/* Physical write, used to restore/patch the instruction byte. */
+extern int yghv_pa_write(UINT64 pa, const void *src, size_t len);
 extern UINT64 yghv_protect_fake_main_pa(void);
 extern void yghv_protect_reopen_page_bare(UINT64 gpa);
 extern UINT64 yghv_protect_guest_va_to_pa(UINT64 cr3, UINT64 va);
@@ -1703,6 +1710,45 @@ SvHandleVmExit (
                 VpData->GuestVmcb.ControlArea.NRip;
         }
         break;
+    case VMEXIT_EXCEPTION_BP:
+        //
+        // 9.327 (Tier 4.4, INT3 mode): the guest executed a 0xCC we placed.
+        //
+        // The saved RIP points AT the 0xCC (a fault, not a trap), so the
+        // original instruction is the one about to run. The loop mirrors the
+        // NPF ALLOW path:
+        //   1. record (CR3, RIP, VA, CPL) - island-safe
+        //   2. restore the original byte we displaced
+        //   3. set TF so #DB fires after the real instruction executes
+        //   4. remember the VA in GuestPaOfGhcb with bit1 set, so the #DB
+        //      handler re-patches instead of re-arming an NPT page
+        // bit0 of that slot already means "fake-write shadow" (9.275), so
+        // INT3 uses bit1 and the two cannot collide.
+        //
+        {
+            UINT64 bpVa = VpData->GuestVmcb.StateSaveArea.Rip;
+            UINT8 origByte = 0;
+
+            if (yghv_bp_on_int3(bpVa,
+                                (UINT32)VpData->GuestVmcb.StateSaveArea.Cpl,
+                                VpData->HostStackLayout.Padding1) &&
+                yghv_bp_int3_orig(bpVa, &origByte)) {
+                UINT64 bpGpa = yghv_protect_guest_va_to_pa(
+                                   VpData->HostStackLayout.Padding1, bpVa);
+                if (bpGpa)
+                    (void)yghv_pa_write(bpGpa, &origByte, 1);
+                VpData->GuestVmcb.StateSaveArea.Rflags |= 0x100ULL; /* TF */
+                VpData->GuestVmcb.ControlArea.GuestPaOfGhcb = bpVa | 2ULL;
+                VpData->GuestVmcb.ControlArea.TlbControl = 1;
+                break;
+            }
+
+            /* No INT3 breakpoint here: this #BP is the guest's own.
+             * Reflect it as a real #BP so Windows raises the usual exception. */
+            VpData->GuestVmcb.ControlArea.EventInj =
+                (1ULL << 31) | (3ULL << 8) | (1ULL << 11) | 0x03ULL;
+        }
+        break;
     case VMEXIT_EXCEPTION_DB:
         //
         // 9.249: after an ALLOWed protected write, we set TF; the #DB fires on
@@ -1740,6 +1786,23 @@ SvHandleVmExit (
                     VpData->GuestVmcb.ControlArea.VmcbClean = 0;
                     VpData->GuestVmcb.ControlArea.TlbControl = 1;
                     yghv_protect_fake_restore(slot & ~1ULL);
+                } else if (slot & 2ULL) {
+                    /*
+                     * 9.327 (INT3 mode): the #BP handler restored the real
+                     * instruction and set TF; the instruction has now run, so
+                     * put the 0xCC back for the next visit. bit1 marks this
+                     * slot, so it cannot be confused with an NPT page (whose
+                     * slot is a plain GPA with bit0 clear).
+                     */
+                    UINT64 int3Va = slot & ~3ULL;
+                    UINT64 int3Gpa = yghv_protect_guest_va_to_pa(
+                                         VpData->HostStackLayout.Padding1,
+                                         int3Va);
+                    if (int3Gpa) {
+                        UINT8 cc = 0xCC;
+                        (void)yghv_pa_write(int3Gpa, &cc, 1);
+                    }
+                    VpData->GuestVmcb.ControlArea.TlbControl = 1;
                 } else {
                     yghv_protect_arm_page_bare(slot);
                     /*

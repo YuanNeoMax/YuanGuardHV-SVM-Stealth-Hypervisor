@@ -7903,3 +7903,129 @@ guest 写 → NPT 无写权限 → #NPF → bp 记录(CR3/RIP/GPA/kind/CPL)
 9.313 封存 4.6 时缺的正是"记录 → 恢复权限 → 单步 → 重新武装"这个循环。
 **4.4 已经把它实现并验证了。** 4.6 只需在 `yghv_bp_is_armed` 旁边加一个
 `yghv_watch_is_armed`，复用同一套 NPF 分支即可。
+
+
+### 9.317 2026-10-17 **Tier 4 全部完成** —— 4.4 三机制 + 4.6 + 4.5，24/24 PASS
+
+#### 9.317.1 4.4 扩展：三机制超集（13/13 PASS）
+
+原本只有 NPF 一种机制，现在**三种并存，每种一个 `mode`**：
+
+| mode | 机制 | 粒度 | 代价 | 可检测性 |
+|---|---|---|---|---|
+| **NPF** (1) | 撤销 NPT 权限 | 页 | 每次访问一次 VMEXIT | 不可检测 |
+| **INT3** (2) | 写 0xCC | 指令 | 无（武装后零成本） | 代码字节被改 |
+| **DR** (4) | 调试寄存器 | 地址 | 无（触发才停） | 占 4 个硬件槽 |
+
+**四个维度全部改进（对应最初的目标）**：
+
+| 维度 | 之前 | 现在 |
+|---|---|---|
+| 数量 | 8 | **64** |
+| 改代码字节 | 否 | **是（INT3）** |
+| 动 DR 寄存器 | 否 | **是（DR + 虚拟 bank）** |
+| 记录 CR3/CPL | 有 | **+ rip/va/gpa/kind/mode/seq** |
+
+**INT3 实测**（B1-B3）：
+```
+byte before: 0x00
+mem-bp int3 OK
+byte after : 0xCC        ← 真的改写了代码字节
+mem-bp del OK
+byte after del: 0x00     ← 真的恢复了
+```
+
+**DR 实测**（C1-C5）：
+```
+4 个 slot 全部可用
+第 5 个: stage -8 (no DR slot free)
+clear: 清除 4 个
+```
+
+**#BP 处理链**（`svm_simplevm206.cpp` 新增 `VMEXIT_EXCEPTION_BP`）：
+```
+#BP → 记录 → 恢复原字节 → TF 单步 → #DB → 重新写 0xCC
+```
+与 NPF 的 ALLOW 循环同构。`GuestPaOfGhcb` 用 bit1 标记 INT3（bit0 已给 fake-write）。
+
+#### 9.317.2 三个实现 bug（本轮修复）
+
+| # | 问题 | 真相 |
+|---|---|---|
+| 1 | `bp_add` 返回 -6 "bad mode" | **NPF 分支设完权限后没有分配槽位**，直接落到函数末尾的 `return -6`。权限已撤销但报失败 —— 最坏情况：报坏了，实际改了一半 |
+| 2 | `clear` 只清 2/4 | `clear_mode` 委托 `remove`，而 `remove` 只查 NPF/INT3，**DR 项按 VA 不可达** |
+| 3 | `mem-engine pte` 后引擎被重置 | 9.326 的旧 bug（`req_engine <= SELFMAP` 让 0 也覆盖） |
+
+**bug 1 的诊断方法**：参数已经正确（`kinds=2, mode=1` 都验证过），
+用 `g_dbg_args[]` 把驱动实际收到的值导出，一眼看出不是参数问题，而是控制流漏了。
+
+#### 9.317.3 4.6 页级监控：委托给 bp（不再是独立实现）
+
+**关键洞察：4.6 就是 4.4 的 NPF 模式（rip=0）。**
+
+9.313 封存 4.6 是因为缺 ALLOW 循环；4.4 已经把它实现并验证。
+所以 `yghv_watch_add()` 现在直接调 `yghv_bp_add(page, 0, kinds)`：
+
+```c
+/* 页级监控 = 无指令过滤的断点 */
+rc = yghv_bp_add(page, 0 /* any instruction */, kinds);
+```
+
+**好处**：只有一份实现要维护，环、统计、循环全部复用已验证的路径。
+
+**实测（W1-W4）**：
+```
+mem-watch add OK
+guest 写 → mem-bp drain: #1 NPF W cpl=3 gpa=0x199109000
+mem-watch del OK
+```
+
+#### 9.317.4 ★ 4.5 帧所有权接管：完成（F1-F7 PASS）
+
+**honest 定义**：帧在我们保留的那一刻起，内容就归我们所有，**跨进程退出存活**。
+
+```c
+yghv_frame_reserve(gpa, len):
+    buf = ExAllocatePoolWithTag(NonPagedPool, len, 'MRFY')
+    yghv_pa_read(gpa, buf, len)      /* MmCopyMemory，不经 guest 映射 */
+    /* 从此 buf 只属于我们，直到 release */
+```
+
+**决定性验证（F4）**：
+```
+owner pid=13784 gone: True          ← Stop-Process 杀掉
+mem-frame read: 4096 byte(s)
+  00 00 ED FE 00 00 ED FE ...       ← 内容仍在（0xFEED0000FEED0000 小端）
+```
+
+**宿主做不到**：帧释放后 Windows 随时可能回收，
+"稍后读"是必输的竞态。自己的副本让"稍后"变成无限期。
+
+**诚实边界**（写在头文件里）：
+- **不**拦截释放路径
+- **不**给新持有者伪造内容（那需要内存管理器的 free/realloc 钩子，9.307 证明
+  碰 PFN 记账是危险区）
+- 需要"新持有者看到别的内容"时，用 4.1 的 split view：
+  把新持有者注册为 observer，喂它诱饵帧。**两者可组合，但组合是调用方的事**
+
+#### 9.317.5 Tier 4 完成情况：7/7
+
+| 项 | 分数 | 核心能力 |
+|---|---|---|
+| 4.1 视图分裂 | 9/9 | 同一 GPA，不同观察者不同内容 |
+| 4.2 时间维度 | 8/8 | O(1) 版本切换，零拷贝 |
+| 4.3 跨进程别名 | 9/9 | A 读 B 的帧，零 IPC 零句柄 |
+| **4.4 指令级断点** | **13/13** | **NPF/INT3/DR 三机制，64 槽** |
+| **4.5 帧所有权** | **7/7** | **跨进程退出保留内容** |
+| **4.6 页级监控** | **4/4** | **委托 bp NPF，复用 ALLOW 循环** |
+| 4.7 缓存控制 | 5/5 | NPT PWT/PCD 按页设置 |
+
+**Tier 4 全部完成。**
+
+#### 9.317.6 状态
+- IOCTL：0x815-0x824（37 个）
+- 命令数：50
+- 镜像：`206s1_45_46`（md5 `E52BD1C7`）
+- 静态检查：IOCTL C=37/PS=37/Java=37，Command PS=50/Java=18 全 PASS
+- 系统干净，**uptime 61 min 未重启**
+- **未推送**（本地领先 18 个提交）

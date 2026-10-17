@@ -67,6 +67,8 @@ public class YghvCtl {
     private static final int FN_CACHE = 0x822;
     /* Tier 4.4 (2026-10-17): instruction-level breakpoints. */
     private static final int FN_BP = 0x823;
+    /* Tier 4.5 (2026-10-17): frame ownership takeover. */
+    private static final int FN_FRAME = 0x824;
 
     private static native long openHandle();
     private static native void closeHandle(long handle);

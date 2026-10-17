@@ -1,19 +1,26 @@
 /*
  * mem_bp.c — Tier 4.4: instruction-level access control.
- * See common/mem_bp.h for the semantics and the honest limits.
+ * See common/mem_bp.h for the three mechanisms and when to use which.
  */
 
 #include "mem_bp.h"
 #include "protect.h"
 #include "npt.h"
 #include "common/mem_engine.h"
+#include "mem_pa.h"
 
 static yghv_bp_t g_bp[YGHV_BP_MAX];
 static volatile LONG g_bp_count;
 
-/* Hit ring (same single-producer discipline as mem_watch.c). */
-#define YGHV_BP_RING 64
-static uint64_t g_ring[YGHV_BP_RING * 4];   /* rip, gpa, kind|cpl<<8, cr3 */
+/* Virtual DR bank (9.327). The guest's DR0-DR3 accesses are intercepted, so
+ * these values are what the target sees; the real DRs are ours. */
+static uint64_t g_dr_shadow[YGHV_BP_DR_SLOTS];
+static volatile LONG g_dr_used;
+
+/* Hit ring (single-producer discipline: island appends, PASSIVE drains).
+ * 6 qwords per entry. */
+#define YGHV_BP_RING 128
+static uint64_t g_ring[YGHV_BP_RING * 6];
 static volatile LONG g_head;
 static volatile LONG g_tail;
 
@@ -29,6 +36,15 @@ static volatile LONG64 g_bp_fail_engine;
 static volatile LONG64 g_bp_fail_split;
 static volatile LONG64 g_bp_fail_perm;
 static volatile LONG64 g_bp_fail_table;
+static volatile LONG64 g_bp_fail_mode;
+static volatile LONG64 g_bp_fail_va;
+static volatile LONG64 g_bp_fail_drslot;
+static volatile LONG64 g_bp_fail_patch;
+
+static volatile LONG64 g_bp_seq;
+uint64_t g_dbg_args[8];   /* 9.327: last bp_add_ex arguments, for diagnosis */
+
+/* ---------- lookup ---------- */
 
 static int yghv_bp_find(uint64_t gpa, uint64_t rip) {
     int i;
@@ -36,202 +52,402 @@ static int yghv_bp_find(uint64_t gpa, uint64_t rip) {
     int n = (int)InterlockedCompareExchange(&g_bp_count, 0, 0);
 
     for (i = 0; i < n && i < YGHV_BP_MAX; i++) {
-        if (InterlockedCompareExchange(&g_bp[i].active, 0, 0) &&
-            g_bp[i].gpa == page &&
+        if (!InterlockedCompareExchange(&g_bp[i].active, 0, 0))
+            continue;
+        if (g_bp[i].mode != YGHV_BP_MODE_NPF)
+            continue;
+        if (g_bp[i].gpa == page &&
             (g_bp[i].rip == 0 || g_bp[i].rip == rip))
             return i;
     }
     return -1;
 }
 
+int yghv_bp_find_int3(uint64_t va) {
+    int i;
+    int n = (int)InterlockedCompareExchange(&g_bp_count, 0, 0);
+
+    for (i = 0; i < n && i < YGHV_BP_MAX; i++) {
+        if (!InterlockedCompareExchange(&g_bp[i].active, 0, 0))
+            continue;
+        if (g_bp[i].mode == YGHV_BP_MODE_INT3 && g_bp[i].va == va)
+            return i;
+    }
+    return -1;
+}
+
+int yghv_bp_int3_armed(uint64_t va) {
+    return yghv_bp_find_int3(va) >= 0 ? 1 : 0;
+}
+
+int yghv_bp_int3_orig(uint64_t va, uint8_t *out) {
+    int slot = yghv_bp_find_int3(va);
+    if (slot < 0 || !out)
+        return 0;
+    *out = g_bp[slot].orig_byte;
+    return 1;
+}
+
+int yghv_bp_is_armed(uint64_t gpa) {
+    return yghv_bp_find(gpa, 0) >= 0 ? 1 : 0;
+}
+
+int yghv_bp_dr_slot_for_va(uint64_t va) {
+    int i;
+    int n = (int)InterlockedCompareExchange(&g_bp_count, 0, 0);
+
+    for (i = 0; i < n && i < YGHV_BP_MAX; i++) {
+        if (InterlockedCompareExchange(&g_bp[i].active, 0, 0) &&
+            g_bp[i].mode == YGHV_BP_MODE_DR && g_bp[i].va == va)
+            return (int)g_bp[i].dr_slot;
+    }
+    return -1;
+}
+
+uint64_t yghv_bp_dr_get(int slot) {
+    if (slot < 0 || slot >= YGHV_BP_DR_SLOTS)
+        return 0;
+    return g_dr_shadow[slot];
+}
+
+int yghv_bp_dr_set(int slot, uint64_t value) {
+    if (slot < 0 || slot >= YGHV_BP_DR_SLOTS)
+        return 0;
+    g_dr_shadow[slot] = value;
+    return 1;
+}
+
+/* ---------- record ---------- */
+
+static void yghv_bp_record(uint64_t rip, uint64_t gpa, uint64_t va,
+                           uint32_t kind, uint32_t cpl, uint32_t mode,
+                           uint64_t cr3) {
+    LONG head = InterlockedCompareExchange(&g_head, 0, 0);
+    LONG tail = InterlockedCompareExchange(&g_tail, 0, 0);
+    uint64_t *e;
+
+    if (((head + 1) & (YGHV_BP_RING - 1)) == (tail & (YGHV_BP_RING - 1))) {
+        InterlockedIncrement64(&g_bp_missed);
+        return;                         /* full: drop, never block */
+    }
+
+    e = &g_ring[(head & (YGHV_BP_RING - 1)) * 6];
+    e[0] = rip;
+    e[1] = gpa & ~(uint64_t)0xFFFULL;
+    e[2] = (uint64_t)kind | ((uint64_t)(cpl & 0xFF) << 8)
+                          | ((uint64_t)(mode & 0xFF) << 16);
+    e[3] = cr3;
+    e[4] = va;
+    e[5] = (uint64_t)InterlockedIncrement64(&g_bp_seq);
+
+    InterlockedExchange(&g_head, head + 1);
+    InterlockedIncrement64(&g_bp_recorded);
+}
+
+/* ---------- add ---------- */
+
 int yghv_bp_add(uint64_t gpa, uint64_t rip, uint32_t kinds) {
+    return yghv_bp_add_ex(gpa, 0, rip, kinds, YGHV_BP_MODE_NPF);
+}
+
+int yghv_bp_add_ex(uint64_t gpa, uint64_t va, uint64_t rip,
+                   uint32_t kinds, uint32_t mode) {
     uint64_t page = gpa & ~(uint64_t)0xFFFULL;
+    int slot = -1;
     int i;
 
-    /*
-     * 9.325: RE-ENABLED, with stage-coded returns for diagnosis.
-     *
-     * The five crashes (21:59-22:59) were not in this function: they came
-     * from the TEST calling mem-write on the very page the breakpoint had
-     * just armed. A breakpoint OBSERVES the guest; writing through it was
-     * never part of the feature. pte_write now declines such writes with
-     * STATUS_ACCESS_DENIED, which removes the crash path.
-     *
-     * Return codes (all negatives are failures, mapped to a stage):
-     *   1  success
-     *  -1  wrong IRQL (must be PASSIVE)
-     *  -2  engine is not PTE (Engine A would fault on the revoked page)
-     *  -3  could not split the 2MB page to 4K
-     *  -4  could not set the NPT permission
-     *  -5  breakpoint table full
-     */
-    if (!page || !kinds)
-        return 0;
+    /* 9.327 debug: stash the raw arguments so a single run shows what the
+     * driver actually received (the PS side already prints what it sent). */
+    g_dbg_args[0] = gpa;
+    g_dbg_args[1] = va;
+    g_dbg_args[2] = rip;
+    g_dbg_args[3] = (uint64_t)kinds | ((uint64_t)mode << 32);
+
+    if (!kinds) {
+        InterlockedIncrement64(&g_bp_fail_mode);
+        return -10;                     /* 9.327: distinct from a bad mode */
+    }
+    if (mode != YGHV_BP_MODE_NPF && mode != YGHV_BP_MODE_INT3 &&
+        mode != YGHV_BP_MODE_DR) {
+        InterlockedIncrement64(&g_bp_fail_mode);
+        /* 9.327: encode the offending value so one run names it. */
+        return -(20 + (int)(mode & 0xFF));
+    }
     if (KeAreAllApcsDisabled()) {
         InterlockedIncrement64(&g_bp_fail_irql);
         return -1;
     }
 
-    if (yghv_bp_find(page, rip) >= 0)
-        return 1;                       /* already armed: idempotent */
+    /* ---- NPF mode: revoke the page's NPT write permission ---- */
+    if (mode == YGHV_BP_MODE_NPF) {
+        if (!page) {
+            InterlockedIncrement64(&g_bp_fail_mode);
+            return -6;
+        }
+        if (yghv_bp_find(page, rip) >= 0)
+            return 1;                   /* idempotent */
 
-    if (yghv_mem_engine_get() != YGHV_ENGINE_PTE) {
-        InterlockedIncrement64(&g_bp_fail_engine);
-        InterlockedIncrement64(&g_bp_refusals);
-        return -2;
-    }
+        if (yghv_mem_engine_get() != YGHV_ENGINE_PTE) {
+            InterlockedIncrement64(&g_bp_fail_engine);
+            InterlockedIncrement64(&g_bp_refusals);
+            return -2;
+        }
+        /* 9.319: split first. npt_set_page_perm targets the PDE when the
+         * containing entry is a large page, which would make the WHOLE 2MB
+         * read-only. */
+        if (!yghv_protect_npt_split_4k(page)) {
+            InterlockedIncrement64(&g_bp_fail_split);
+            return -3;
+        }
+        if (!yghv_protect_npt_set_perm(page, NPT_PERM_PRESENT)) {
+            InterlockedIncrement64(&g_bp_fail_perm);
+            return -4;
+        }
 
-    if (!yghv_protect_npt_split_4k(page)) {
-        InterlockedIncrement64(&g_bp_fail_split);
-        return -3;
-    }
-    if (!yghv_protect_npt_set_perm(page, NPT_PERM_PRESENT)) {
-        InterlockedIncrement64(&g_bp_fail_perm);
-        return -4;
-    }
-
-    for (i = 0; i < YGHV_BP_MAX; i++) {
-        if (!InterlockedCompareExchange(&g_bp[i].active, 0, 0)) {
-            g_bp[i].gpa   = page;
-            g_bp[i].rip   = rip;
+        /* 9.327 FIX: claim the table slot HERE. The first version left this
+         * to the shared tail, which does not exist — the permission went in
+         * and the function then fell through to the final `return -6`
+         * ("bad mode"), so a perfectly valid NPF add reported failure while
+         * having already revoked the page's write permission. That is the
+         * worst of both: reported as broken, actually half-applied. */
+        for (i = 0; i < YGHV_BP_MAX; i++) {
+            if (InterlockedCompareExchange(&g_bp[i].active, 0, 0))
+                continue;
+            g_bp[i].gpa = page;
+            g_bp[i].va = 0;
+            g_bp[i].rip = rip;
             g_bp[i].kinds = kinds;
-            g_bp[i].hits  = 0;
+            g_bp[i].mode = mode;
+            g_bp[i].orig_byte = 0;
+            g_bp[i].dr_slot = YGHV_BP_NO_SLOT;
+            g_bp[i].hits = 0;
             InterlockedExchange(&g_bp[i].active, 1);
             InterlockedIncrement(&g_bp_count);
             return 1;
         }
+        /* Table full: undo the permission change so the page is not left
+         * faulting with nobody listening. */
+        InterlockedIncrement64(&g_bp_fail_table);
+        (void)yghv_protect_npt_set_perm(page,
+                                        NPT_PERM_PRESENT | NPT_PERM_WRITABLE);
+        return -5;
     }
 
-    /* Table full: give the page its access back so it is not left faulting
-     * with nobody listening. */
-    InterlockedIncrement64(&g_bp_fail_table);
-    (void)yghv_protect_npt_set_perm(page,
-                                    NPT_PERM_PRESENT | NPT_PERM_WRITABLE);
-    return -5;
-}
+    /* ---- INT3 mode: overwrite the instruction's first byte ---- */
+    if (mode == YGHV_BP_MODE_INT3) {
+        uint8_t orig = 0;
+        uint64_t off;
 
-static int yghv_bp_add_unsafe_do_not_call(uint64_t gpa, uint64_t rip, uint32_t kinds) {
-    uint64_t page = gpa & ~(uint64_t)0xFFFULL;
-    int i;
+        if (!va || !page) {
+            InterlockedIncrement64(&g_bp_fail_va);
+            return -7;
+        }
+        if (yghv_bp_find_int3(va) >= 0)
+            return 1;                   /* idempotent */
 
-    if (!page || !kinds)
-        return 0;
-    if (KeAreAllApcsDisabled())
-        return 0;                       /* PASSIVE-only */
-    if (yghv_bp_find(page, rip) >= 0)
-        return 1;                       /* already there */
+        off = va & 0xFFF;
+        if (!yghv_pa_read(page + off, &orig, 1)) {
+            InterlockedIncrement64(&g_bp_fail_patch);
+            return -9;
+        }
+        /* Remember the byte BEFORE patching, so a failure here cannot leave
+         * an instruction we cannot restore. */
+        g_dr_shadow[0] = g_dr_shadow[0];    /* no-op, keeps the compiler quiet */
 
-    /*
-     * 9.318 SAFETY VALVE: refuse while the engine is not PTE.
-     *
-     * Measured 2026-10-17 22:05 (0x3B / 0xC0000005): a breakpoint page has its
-     * NPT write permission revoked, so ANY guest store to that VA faults in
-     * the NPT layer. Engine A (MmCopyVirtualMemory) performs exactly such a
-     * store from the IOCTL thread — it is not in the VMEXIT path, so our NPF
-     * branch never runs, and KiPageFault escalates the nested fault to a
-     * bugcheck. The stack proved it (KiPageFault -> yghv_g16, no SvHandleVmExit
-     * frame anywhere).
-     *
-     * Engine B writes the PHYSICAL FRAME through an MDL, which does not go
-     * through the guest's NPT mapping at all — so it is safe.
-     *
-     * The caller must select Engine B before arming a breakpoint. Rather than
-     * silently switching it (which would surprise the caller), refuse.
-     */
-    if (yghv_mem_engine_get() != YGHV_ENGINE_PTE) {
-        InterlockedIncrement64(&g_bp_refusals);
-        return 0;
-    }
-
-    /*
-     * THE COMPLETE MECHANISM, not half of it.
-     *
-     * 4.6 froze the machine because it revoked the permission and never put
-     * it back: the NPF handler had no branch for the page, injected #PF, and
-     * the guest spun. Here the permission is revoked AND the handler has the
-     * matching branch (yghv_bp_on_npf, wired in svm_simplevm206.cpp), which
-     * restores the permission and single-steps. The pair is the feature.
-     */
-    /*
-     * 9.319 FIX: SPLIT FIRST, then revoke.
-     *
-     * npt_set_page_perm() writes `e = &pd[p1]` when the containing entry is a
-     * large page — that is the PDE, so clearing the write bit there makes the
-     * ENTIRE 2MB region read-only. Measured three times as 0x3B / 0xC0000005
-     * (registers showed Rdx = the value we were writing, Rcx = an MDL mapping
-     * VA in the same 2MB window as the breakpoint page).
-     *
-     * The armed-page path has always done this in the right order:
-     *   npt_split_2mb_to_4kb(&g_npt, gpa);   // 2MB PDE -> 512 4K PTEs
-     *   npt_set_page_perm(&g_npt, gpa, ...); // now e = &pt[p0], one page only
-     * Skipping the split is why the first three bp attempts took the box down.
-     */
-    /*
-     * 9.319 FIX: SPLIT FIRST, then revoke.
-     *
-     * npt_set_page_perm() writes `e = &pd[p1]` when the containing entry is a
-     * large page — that is the PDE, so clearing the write bit there makes the
-     * ENTIRE 2MB region read-only. Measured three times as 0x3B / 0xC0000005
-     * (registers showed Rdx = the value we were writing, Rcx = an MDL mapping
-     * VA in the same 2MB window as the breakpoint page).
-     *
-     * The armed-page path has always done this in the right order:
-     *   npt_split_2mb_to_4kb(&g_npt, gpa);   // 2MB PDE -> 512 4K PTEs
-     *   npt_set_page_perm(&g_npt, gpa, ...); // now e = &pt[p0], one page only
-     * Skipping the split is why the first three bp attempts took the box down.
-     */
-    if (!yghv_protect_npt_split_4k(page))
-        return 0;
-    if (!yghv_protect_npt_set_perm(page, NPT_PERM_PRESENT))
-        return 0;
-
-    for (i = 0; i < YGHV_BP_MAX; i++) {
-        if (!InterlockedCompareExchange(&g_bp[i].active, 0, 0)) {
-            g_bp[i].gpa   = page;
-            g_bp[i].rip   = rip;
+        for (i = 0; i < YGHV_BP_MAX; i++) {
+            if (InterlockedCompareExchange(&g_bp[i].active, 0, 0))
+                continue;
+            g_bp[i].gpa = page;
+            g_bp[i].va = va;
+            g_bp[i].rip = va;
             g_bp[i].kinds = kinds;
-            g_bp[i].hits  = 0;
+            g_bp[i].mode = mode;
+            g_bp[i].orig_byte = orig;
+            g_bp[i].dr_slot = YGHV_BP_NO_SLOT;
+            g_bp[i].hits = 0;
             InterlockedExchange(&g_bp[i].active, 1);
             InterlockedIncrement(&g_bp_count);
+            /* Publish the slot BEFORE patching, so the #BP handler can always
+             * find it once the 0xCC is in place. */
+            {
+                uint8_t cc = 0xCC;
+                if (!yghv_pa_write(page + off, &cc, 1)) {
+                    InterlockedExchange(&g_bp[i].active, 0);
+                    InterlockedDecrement(&g_bp_count);
+                    InterlockedIncrement64(&g_bp_fail_patch);
+                    return -9;
+                }
+            }
             return 1;
         }
+        InterlockedIncrement64(&g_bp_fail_table);
+        return -5;
     }
 
-    /* Table full: undo the permission change so we do not leave the page
-     * faulting with nobody listening. */
-    (void)yghv_protect_npt_set_perm(page,
-                                    NPT_PERM_PRESENT | NPT_PERM_WRITABLE);
-    return 0;
+    /* ---- DR mode: claim one of the four hardware slots ---- */
+    if (mode == YGHV_BP_MODE_DR) {
+        uint32_t s;
+        uint32_t used = (uint32_t)InterlockedCompareExchange(&g_dr_used, 0, 0);
+
+        if (yghv_bp_dr_slot_for_va(va) >= 0)
+            return 1;                   /* idempotent */
+
+        for (s = 0; s < YGHV_BP_DR_SLOTS; s++) {
+            if (!(used & (1u << s)))
+                break;
+        }
+        if (s >= YGHV_BP_DR_SLOTS) {
+            InterlockedIncrement64(&g_bp_fail_drslot);
+            return -8;
+        }
+
+        for (i = 0; i < YGHV_BP_MAX; i++) {
+            if (InterlockedCompareExchange(&g_bp[i].active, 0, 0))
+                continue;
+            g_bp[i].gpa = page;
+            g_bp[i].va = va;
+            g_bp[i].rip = va;
+            g_bp[i].kinds = kinds;
+            g_bp[i].mode = mode;
+            g_bp[i].orig_byte = 0;
+            g_bp[i].dr_slot = s;
+            g_bp[i].hits = 0;
+            InterlockedExchange(&g_bp[i].active, 1);
+            InterlockedIncrement(&g_bp_count);
+            InterlockedOr(&g_dr_used, (LONG)(1u << s));
+            g_dr_shadow[s] = va;
+            return 1;
+        }
+        InterlockedIncrement64(&g_bp_fail_table);
+        return -5;
+    }
+
+    (void)slot;
+    InterlockedIncrement64(&g_bp_fail_mode);
+    return -6;
 }
+
+/* ---------- remove ---------- */
 
 int yghv_bp_remove(uint64_t gpa, uint64_t rip) {
-    int slot = yghv_bp_find(gpa, rip);
+    uint64_t page = gpa & ~(uint64_t)0xFFFULL;
+    int slot = yghv_bp_find(page, rip);
+    int i;
 
+    if (slot < 0) {
+        /* Also try INT3, whose key is the VA not the page. */
+        slot = yghv_bp_find_int3(rip);
+        if (slot < 0 && gpa)
+            slot = yghv_bp_find_int3(gpa);
+    }
+    if (slot < 0) {
+        /* 9.327 FIX: DR entries are keyed by VA too, and were not reachable
+         * from remove at all — clear_mode() reported 0 removed because every
+         * DR slot lookup failed. */
+        int d = yghv_bp_dr_slot_for_va(rip);
+        if (d < 0 && gpa)
+            d = yghv_bp_dr_slot_for_va(gpa);
+        if (d >= 0) {
+            for (i = 0; i < YGHV_BP_MAX; i++) {
+                if (InterlockedCompareExchange(&g_bp[i].active, 0, 0) &&
+                    g_bp[i].mode == YGHV_BP_MODE_DR &&
+                    g_bp[i].dr_slot == (uint32_t)d) {
+                    slot = i;
+                    break;
+                }
+            }
+        }
+    }
     if (slot < 0)
         return 0;
     if (KeAreAllApcsDisabled())
         return 0;
 
-    /* Give the page its normal access back BEFORE dropping the slot. */
-    (void)yghv_protect_npt_set_perm(g_bp[slot].gpa,
-                                    NPT_PERM_PRESENT | NPT_PERM_WRITABLE);
+    if (g_bp[slot].mode == YGHV_BP_MODE_NPF) {
+        /* Give the page its normal access back BEFORE dropping the slot. */
+        (void)yghv_protect_npt_set_perm(g_bp[slot].gpa,
+                                        NPT_PERM_PRESENT | NPT_PERM_WRITABLE);
+    } else if (g_bp[slot].mode == YGHV_BP_MODE_INT3) {
+        uint64_t off = g_bp[slot].va & 0xFFF;
+        uint8_t orig = g_bp[slot].orig_byte;
+        /* Drop the slot FIRST so a concurrent #BP cannot find a half-removed
+         * entry, then restore the instruction byte. */
+        InterlockedExchange(&g_bp[slot].active, 0);
+        InterlockedDecrement(&g_bp_count);
+        (void)yghv_pa_write(g_bp[slot].gpa + off, &orig, 1);
+        RtlZeroMemory(&g_bp[slot], sizeof(g_bp[slot]));
+        return 1;
+    } else if (g_bp[slot].mode == YGHV_BP_MODE_DR) {
+        uint32_t s = g_bp[slot].dr_slot;
+        if (s < YGHV_BP_DR_SLOTS) {
+            g_dr_shadow[s] = 0;
+            InterlockedAnd(&g_dr_used, (LONG)~(1u << s));
+        }
+    }
+
     InterlockedExchange(&g_bp[slot].active, 0);
     InterlockedDecrement(&g_bp_count);
+    RtlZeroMemory(&g_bp[slot], sizeof(g_bp[slot]));
     return 1;
 }
 
-/*
- * ISLAND-SAFE. The caller (the NPF handler) is responsible for the ALLOW
- * path: restore the permission, set TF, and re-arm on #DB. This function
- * only decides whether the fault is ours and records it.
- */
+int yghv_bp_clear_mode(uint32_t mode) {
+    int i, n = 0;
+
+    if (KeAreAllApcsDisabled())
+        return 0;
+
+    /*
+     * 9.327 FIX: undo each entry HERE instead of delegating to
+     * yghv_bp_remove(). remove() looks entries up by (gpa, rip) and, for DR
+     * mode, by the VA — a chain that missed half the entries and reported
+     * "2 cleared" when 4 were registered. Clearing in place removes the
+     * lookup entirely: we already hold the index.
+     */
+    for (i = 0; i < YGHV_BP_MAX; i++) {
+        uint32_t m;
+
+        if (!InterlockedCompareExchange(&g_bp[i].active, 0, 0))
+            continue;
+        m = g_bp[i].mode;
+        if (mode && m != mode)
+            continue;
+
+        if (m == YGHV_BP_MODE_NPF) {
+            (void)yghv_protect_npt_set_perm(g_bp[i].gpa,
+                                            NPT_PERM_PRESENT | NPT_PERM_WRITABLE);
+        } else if (m == YGHV_BP_MODE_INT3) {
+            uint64_t off = g_bp[i].va & 0xFFF;
+            uint8_t orig = g_bp[i].orig_byte;
+            InterlockedExchange(&g_bp[i].active, 0);
+            InterlockedDecrement(&g_bp_count);
+            (void)yghv_pa_write(g_bp[i].gpa + off, &orig, 1);
+            RtlZeroMemory(&g_bp[i], sizeof(g_bp[i]));
+            n++;
+            continue;
+        } else if (m == YGHV_BP_MODE_DR) {
+            uint32_t s = g_bp[i].dr_slot;
+            if (s < YGHV_BP_DR_SLOTS) {
+                g_dr_shadow[s] = 0;
+                InterlockedAnd(&g_dr_used, (LONG)~(1u << s));
+            }
+        }
+
+        InterlockedExchange(&g_bp[i].active, 0);
+        InterlockedDecrement(&g_bp_count);
+        RtlZeroMemory(&g_bp[i], sizeof(g_bp[i]));
+        n++;
+    }
+    return n;
+}
+/* ---------- fault handlers ---------- */
+
 int yghv_bp_on_npf(uint64_t gpa, uint64_t rip, uint32_t kind, uint32_t cpl,
                    uint64_t cr3) {
     int slot;
     uint64_t page = gpa & ~(uint64_t)0xFFFULL;
-    LONG head, tail;
-
     int n = (int)InterlockedCompareExchange(&g_bp_count, 0, 0);
+
     if (n <= 0)
         return 0;
 
@@ -247,26 +463,62 @@ int yghv_bp_on_npf(uint64_t gpa, uint64_t rip, uint32_t kind, uint32_t cpl,
 
     InterlockedIncrement((volatile LONG *)&g_bp[slot].hits);
     InterlockedIncrement64(&g_bp_hits);
-
-    /* Record. Ring full -> count the miss, never block. */
-    head = InterlockedCompareExchange(&g_head, 0, 0);
-    tail = InterlockedCompareExchange(&g_tail, 0, 0);
-    if (((head + 1) & (YGHV_BP_RING - 1)) == (tail & (YGHV_BP_RING - 1))) {
-        InterlockedIncrement64(&g_bp_missed);
-        return 1;                       /* still a match, just not recorded */
-    }
-
-    {
-        LONG s = head & (YGHV_BP_RING - 1);
-        g_ring[s*4+0] = rip;
-        g_ring[s*4+1] = page;
-        g_ring[s*4+2] = (uint64_t)kind | ((uint64_t)cpl << 8);
-        g_ring[s*4+3] = cr3;
-        InterlockedExchange(&g_head, head + 1);
-        InterlockedIncrement64(&g_bp_recorded);
-    }
+    yghv_bp_record(rip, page, 0, kind, cpl, YGHV_BP_MODE_NPF, cr3);
     return 1;
 }
+
+int yghv_bp_on_int3(uint64_t va, uint32_t cpl, uint64_t cr3) {
+    int slot;
+    uint32_t kind = YGHV_BP_EXEC;
+    int n = (int)InterlockedCompareExchange(&g_bp_count, 0, 0);
+
+    if (n <= 0)
+        return 0;
+
+    slot = yghv_bp_find_int3(va);
+    if (slot < 0) {
+        InterlockedIncrement64(&g_bp_refusals);
+        return 0;
+    }
+    if (!(g_bp[slot].kinds & kind))
+        kind = g_bp[slot].kinds;        /* report what it was armed for */
+
+    InterlockedIncrement((volatile LONG *)&g_bp[slot].hits);
+    InterlockedIncrement64(&g_bp_hits);
+    yghv_bp_record(va, g_bp[slot].gpa, va, kind, cpl,
+                   YGHV_BP_MODE_INT3, cr3);
+    return 1;
+}
+
+int yghv_bp_on_dr(uint64_t dr6, uint64_t rip, uint32_t cpl, uint64_t cr3) {
+    int i;
+    int n = (int)InterlockedCompareExchange(&g_bp_count, 0, 0);
+
+    if (n <= 0)
+        return -1;
+
+    /* DR6 bits 0-3 report which of DR0-DR3 matched. */
+    for (i = 0; i < n && i < YGHV_BP_MAX; i++) {
+        uint32_t s;
+        if (!InterlockedCompareExchange(&g_bp[i].active, 0, 0))
+            continue;
+        if (g_bp[i].mode != YGHV_BP_MODE_DR)
+            continue;
+        s = g_bp[i].dr_slot;
+        if (s >= YGHV_BP_DR_SLOTS)
+            continue;
+        if (!(dr6 & (1ULL << s)))
+            continue;
+        InterlockedIncrement((volatile LONG *)&g_bp[i].hits);
+        InterlockedIncrement64(&g_bp_hits);
+        yghv_bp_record(rip, g_bp[i].gpa, g_bp[i].va, g_bp[i].kinds,
+                       cpl, YGHV_BP_MODE_DR, cr3);
+        return i;
+    }
+    return -1;
+}
+
+/* ---------- drain ---------- */
 
 uint32_t yghv_bp_drain(uint64_t *out, uint32_t max) {
     uint32_t n = 0;
@@ -278,27 +530,46 @@ uint32_t yghv_bp_drain(uint64_t *out, uint32_t max) {
     for (;;) {
         tail = InterlockedCompareExchange(&g_tail, 0, 0);
         head = InterlockedCompareExchange(&g_head, 0, 0);
-        if (tail == head || n + 4 > max)
+        if (tail == head || n + 6 > max)
             break;
-
-        out[n+0] = g_ring[(tail & (YGHV_BP_RING - 1))*4 + 0];
-        out[n+1] = g_ring[(tail & (YGHV_BP_RING - 1))*4 + 1];
-        out[n+2] = g_ring[(tail & (YGHV_BP_RING - 1))*4 + 2];
-        out[n+3] = g_ring[(tail & (YGHV_BP_RING - 1))*4 + 3];
-        n += 4;
+        RtlCopyMemory(out + n, &g_ring[(tail & (YGHV_BP_RING - 1)) * 6],
+                      6 * sizeof(uint64_t));
+        n += 6;
         InterlockedExchange(&g_tail, tail + 1);
     }
     return n;
 }
 
+/* ---------- stats ---------- */
+
 void yghv_bp_stats_get(yghv_bp_stats_t *out) {
+    int i;
+
     if (!out)
         return;
+    RtlZeroMemory(out, sizeof(*out));
     out->count    = (uint64_t)InterlockedCompareExchange(&g_bp_count, 0, 0);
     out->hits     = (uint64_t)InterlockedCompareExchange64(&g_bp_hits, 0, 0);
     out->recorded = (uint64_t)InterlockedCompareExchange64(&g_bp_recorded, 0, 0);
     out->missed   = (uint64_t)InterlockedCompareExchange64(&g_bp_missed, 0, 0);
     out->refusals = (uint64_t)InterlockedCompareExchange64(&g_bp_refusals, 0, 0);
+    out->fail_irql    = (uint64_t)InterlockedCompareExchange64(&g_bp_fail_irql, 0, 0);
+    out->fail_engine  = (uint64_t)InterlockedCompareExchange64(&g_bp_fail_engine, 0, 0);
+    out->fail_split   = (uint64_t)InterlockedCompareExchange64(&g_bp_fail_split, 0, 0);
+    out->fail_perm    = (uint64_t)InterlockedCompareExchange64(&g_bp_fail_perm, 0, 0);
+    out->fail_table   = (uint64_t)InterlockedCompareExchange64(&g_bp_fail_table, 0, 0);
+    out->fail_mode    = (uint64_t)InterlockedCompareExchange64(&g_bp_fail_mode, 0, 0);
+    out->fail_va      = (uint64_t)InterlockedCompareExchange64(&g_bp_fail_va, 0, 0);
+    out->fail_drslot  = (uint64_t)InterlockedCompareExchange64(&g_bp_fail_drslot, 0, 0);
+    out->fail_patch   = (uint64_t)InterlockedCompareExchange64(&g_bp_fail_patch, 0, 0);
+
+    for (i = 0; i < YGHV_BP_MAX; i++) {
+        if (!InterlockedCompareExchange(&g_bp[i].active, 0, 0))
+            continue;
+        if (g_bp[i].mode == YGHV_BP_MODE_NPF)       out->npf++;
+        else if (g_bp[i].mode == YGHV_BP_MODE_INT3) out->int3++;
+        else if (g_bp[i].mode == YGHV_BP_MODE_DR)   out->dr++;
+    }
 }
 
 void yghv_bp_stats_reset(void) {
@@ -306,23 +577,15 @@ void yghv_bp_stats_reset(void) {
     InterlockedExchange64(&g_bp_recorded, 0);
     InterlockedExchange64(&g_bp_missed, 0);
     InterlockedExchange64(&g_bp_refusals, 0);
+    InterlockedExchange64(&g_bp_fail_irql, 0);
+    InterlockedExchange64(&g_bp_fail_engine, 0);
+    InterlockedExchange64(&g_bp_fail_split, 0);
+    InterlockedExchange64(&g_bp_fail_perm, 0);
+    InterlockedExchange64(&g_bp_fail_table, 0);
+    InterlockedExchange64(&g_bp_fail_mode, 0);
+    InterlockedExchange64(&g_bp_fail_va, 0);
+    InterlockedExchange64(&g_bp_fail_drslot, 0);
+    InterlockedExchange64(&g_bp_fail_patch, 0);
     InterlockedExchange(&g_head, 0);
     InterlockedExchange(&g_tail, 0);
-}
-
-/*
- * Tier 4.4 (2026-10-17): is this GPA guarded by an active breakpoint?
- *
- * Called by the write engine before touching a frame. Returns 1 when the page
- * is armed, and the caller must then refuse the write with a clear status
- * instead of attempting it.
- *
- * Why this exists: five crashes (0x3B x4, 0x50 x1) all came from our own
- * engine writing a frame whose NPT write permission a breakpoint had just
- * revoked. Every storage strategy we tried (MDL mapping, kernel direct map)
- * faulted on the destination. A breakpoint is an OBSERVER; writing through it
- * is not part of the feature, so the write is declined.
- */
-int yghv_bp_is_armed(uint64_t gpa) {
-    return yghv_bp_find(gpa, 0) >= 0 ? 1 : 0;
 }

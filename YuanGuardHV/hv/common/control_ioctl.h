@@ -152,6 +152,15 @@ typedef struct {
    Zero-length input = 6 qwords diagnostics.
    32-byte input {ULONG op, pad, ULONG_PTR gpa, rip, kinds}: op 0 add,
    1 remove, 2 drain(a = max qwords). */
+/* Tier 4.5 (2026-10-17): frame ownership takeover.
+   Zero-length input = 8 qwords diagnostics.
+   32-byte input {ULONG op, pad, ULONG_PTR a, b, c}:
+     op 0 reserve(gpa, len)   op 1 release(slot)
+     op 2 read(slot, off)     -> out[0..] = bytes
+     op 3 list                -> out[0] = count, then per item 5 qwords */
+#define IOCTL_YGHV_FRAME \
+    YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x824, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
+#define YGHV_FRAME_OUT_QWORDS 8
 #define IOCTL_YGHV_BP \
     YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x823, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
 /* Tier 4 prerequisite (2026-10-11): NPT remap experiment.

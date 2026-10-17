@@ -1501,72 +1501,216 @@ try {
             $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x822)) -InBytes $req -OutputLength 8
             Write-Host ("mem-cache: {0} {1}" -f $v, $(if([BitConverter]::ToUInt64($out,0)){'OK'}else{'FAILED'}))
         }
-        'mem-bp' {
-            # Tier 4.4 (2026-10-17): instruction-level access control.
+        'mem-frame' {
+            # Tier 4.5 (2026-10-17): frame ownership takeover.
             #
-            # A watchpoint that fires on ONE instruction, not on a page: the
-            # page's permission is revoked, and the #NPF handler compares the
-            # faulting RIP against the registered instruction's RIP. Match ->
-            # record, restore permission, single-step (TF), let it land, and
-            # re-arm on #DB. That ALLOW loop is the part 4.6 was missing.
+            # Reserve copies a frame's content into a private nonpaged buffer
+            # that ONLY we hold. The content then survives:
+            #   - the owner process exiting (the frame returns to the PFN free list)
+            #   - the frame being handed to a different process
+            #   - the original page being reused for something else
             #
-            # rip = 0 means "any instruction on this page" (degrades to 4.6).
+            # That is the property the host kernel cannot give you: once a
+            # frame is freed, Windows may recycle it at any moment, so reading
+            # it "later" is a race you lose. Our own copy makes "later" unbounded.
+            #
+            # NOT claimed: intercepting the free path, or serving forged
+            # content to whoever gets the frame next. For the second half use
+            # mem-view (Tier 4.1): register the new owner as an observer.
+            #
             # usage:
-            #   mem-bp                              diagnostics
-            #   mem-bp add <gpa> <rip|0> <r|w|rw>
-            #   mem-bp del <gpa> <rip|0>
-            #   mem-bp drain [max]
+            #   mem-frame                            diagnostics
+            #   mem-frame reserve <hex_gpa> [len]    copy the frame, keep it
+            #   mem-frame read <slot> [off] [len]    read the retained bytes
+            #   mem-frame list                       what is retained
+            #   mem-frame release <slot>
             if ($null -eq $Arg1) {
-                $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x823)) -OutputLength 48
-                Write-Host ("mem-bp: count={0} hits={1} recorded={2} refusals={3}" -f `
+                $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x824)) -OutputLength 64
+                Write-Host ("mem-frame: active={0} reserved={1} released={2} bytes={3} fail={4}" -f `
                     [BitConverter]::ToUInt64($out,16), [BitConverter]::ToUInt64($out,24),
-                    [BitConverter]::ToUInt64($out,32), [BitConverter]::ToUInt64($out,40))
+                    [BitConverter]::ToUInt64($out,32), [BitConverter]::ToUInt64($out,40),
+                    [BitConverter]::ToUInt64($out,48))
                 return
             }
             $v = "$Arg1".ToLower()
-            $op = -1; $a=[uint64]0; $b=[uint64]0; $k=[uint64]3
+            $op = -1; $a=[uint64]0; $b=[uint64]0
             switch ($v) {
-                'add'    { $op = 0 }
-                'del'    { $op = 1 }
-                'drain'  { $op = 2 }
-                default  { throw 'mem-bp: use add|del|drain' }
+                'reserve' { $op = 0 }
+                'release' { $op = 1 }
+                'read'    { $op = 2 }
+                'list'    { $op = 3 }
+                default   { throw 'mem-frame: use reserve|read|list|release' }
             }
-            if ($op -eq 0 -or $op -eq 1) {
-                if ($null -eq $Arg2) { throw "mem-bp ${v}: usage: mem-bp ${v} <gpa> <rip|0> [kinds]" }
+            if ($op -eq 0) {
+                if ($null -eq $Arg2) { throw 'mem-frame reserve: usage: mem-frame reserve <hex_gpa> [len]' }
                 $a = [Convert]::ToUInt64(("$Arg2" -replace '^0[xX]',''),16)
-                if ($null -ne $Arg3) { $b = [Convert]::ToUInt64(("$Arg3" -replace '^0[xX]',''),16) }
-                if ($null -ne $Arg4) {
-                    $ks = "$Arg4".ToLower(); $k = 0
-                    if ($ks -match 'r') { $k = $k -bor 1 }
-                    if ($ks -match 'w') { $k = $k -bor 2 }
-                    if ($k -eq 0) { $k = 2 }
-                }
+                $b = 4096
+                if ($null -ne $Arg3) { $b = [uint64]::Parse($Arg3) }
+            } elseif ($op -eq 1) {
+                if ($null -eq $Arg2) { throw 'mem-frame release: usage: mem-frame release <slot>' }
+                $a = [uint64]::Parse($Arg2)
             } elseif ($op -eq 2) {
-                $a = 32
-                if ($null -ne $Arg2) { $a = [uint64]::Parse($Arg2) }
+                if ($null -eq $Arg2) { throw 'mem-frame read: usage: mem-frame read <slot> [off] [len]' }
+                $a = [uint64]::Parse($Arg2)
+                if ($null -ne $Arg3) { $b = [uint64]::Parse($Arg3) }
             }
             $req = New-Object byte[] 32
             [BitConverter]::GetBytes([uint32]$op).CopyTo($req, 0)
             [BitConverter]::GetBytes([uint64]$a).CopyTo($req, 8)
             [BitConverter]::GetBytes([uint64]$b).CopyTo($req, 16)
+
+            if ($op -eq 0 -or $op -eq 1) {
+                $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x824)) -InBytes $req -OutputLength 8
+                $rc = [BitConverter]::ToInt64($out, 0)
+                if ($op -eq 0) {
+                    if ($rc -ge 0) { Write-Host ("mem-frame: reserve OK slot={0}" -f $rc) }
+                    else { Write-Host 'mem-frame: reserve FAILED' }
+                } else {
+                    Write-Host ("mem-frame: release {0}" -f $(if($rc -gt 0){'OK'}else{'FAILED'}))
+                }
+                return
+            }
+            if ($op -eq 3) {
+                $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x824)) -InBytes $req -OutputLength 264
+                $n = [BitConverter]::ToUInt64($out, 0)
+                Write-Host ("mem-frame list: {0} reservation(s)" -f $n)
+                for ($i = 0; $i -lt $n; $i++) {
+                    $o = 8 + $i*32
+                    Write-Host ("  [{0}] gpa=0x{1:X} seq={2} len={3} alive={4}" -f `
+                        $i, [BitConverter]::ToUInt64($out,$o), [BitConverter]::ToUInt64($out,$o+8),
+                        [BitConverter]::ToUInt64($out,$o+16), [BitConverter]::ToUInt64($out,$o+24))
+                }
+                return
+            }
+            # read
+            $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x824)) -InBytes $req -OutputLength 4136
+            $got = [BitConverter]::ToUInt64($out, 0)
+            Write-Host ("mem-frame read: {0} byte(s)" -f $got)
+            if ($got -gt 0) {
+                $n = [Math]::Min(64, [int]$got)
+                $hex = ($out[8..(8+$n-1)] | ForEach-Object { $_.ToString('X2') }) -join ' '
+                Write-Host ("  {0}" -f $hex)
+            }
+        }
+        'mem-bp' {
+            # Tier 4.4 (2026-10-17): instruction-level access control, three mechanisms.
+            #
+            #   npf   page's NPT permission revoked. No code byte changes, no DR
+            #         register touched -> invisible to the target. PAGE granularity,
+            #         one VMEXIT per access.
+            #   int3  0xCC written at the instruction. True instruction granularity,
+            #         no per-access exit cost. The code byte REALLY changes (a target
+            #         that checksums its own code sees it).
+            #   dr    one of the four hardware debug registers. Exact per address,
+            #         free until it fires, but only four slots. The guest's DR access
+            #         is intercepted, so the target sees our shadow bank, not the real
+            #         breakpoint.
+            #
+            # usage:
+            #   mem-bp                                 diagnostics (mode breakdown)
+            #   mem-bp add <gpa> <rip|0> [kinds]       NPF mode (default)
+            #   mem-bp int3 <gpa> <hex_va> [kinds]     INT3 mode (needs the VA's PA)
+            #   mem-bp dr <hex_va> [kinds]             DR mode
+            #   mem-bp del <gpa> <rip|0>               remove one
+            #   mem-bp clear [1|2|4]                   remove all / one mode
+            #   mem-bp drain [max]                     drain the hit ring
+            # kinds: r (read), w (write), x (execute); default w for npf, x for int3/dr
+            if ($null -eq $Arg1) {
+                $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x823)) -OutputLength 112
+                Write-Host ("mem-bp: count={0}  hits={1} recorded={2} refusals={3} missed={4}" -f `
+                    [BitConverter]::ToUInt64($out,16), [BitConverter]::ToUInt64($out,24),
+                    [BitConverter]::ToUInt64($out,32), [BitConverter]::ToUInt64($out,40),
+                    [BitConverter]::ToUInt64($out,72))
+                Write-Host ("  by mode: npf={0}  int3={1}  dr={2}" -f `
+                    [BitConverter]::ToUInt64($out,48), [BitConverter]::ToUInt64($out,56),
+                    [BitConverter]::ToUInt64($out,64))
+                Write-Host ("  last add raw: gpa=0x{0:X} va=0x{1:X} rip=0x{2:X} kinds={3} mode={4}" -f `
+                    [BitConverter]::ToUInt64($out,80), [BitConverter]::ToUInt64($out,88),
+                    [BitConverter]::ToUInt64($out,96),
+                    ([BitConverter]::ToUInt64($out,104) -band 0xFFFFFFFF),
+                    ([BitConverter]::ToUInt64($out,104) -shr 32))
+                return
+            }
+            $v = "$Arg1".ToLower()
+            $op = -1; $a=[uint64]0; $b=[uint64]0; $k=[uint64]0; $va=[uint64]0; $mode=[uint64]0
+            $defk = 'w'
+            switch ($v) {
+                'add'   { $op = 0; $mode = 1 }
+                'int3'  { $op = 0; $mode = 2; $defk = 'x' }
+                'dr'    { $op = 0; $mode = 4; $defk = 'x' }
+                'del'   { $op = 1 }
+                'drain' { $op = 2 }
+                'clear' { $op = 3 }
+                default { throw 'mem-bp: use add|int3|dr|del|drain|clear' }
+            }
+
+            if ($op -eq 0) {
+                if ($mode -eq 4) {
+                    if ($null -eq $Arg2) { throw 'mem-bp dr: usage: mem-bp dr <hex_va> [kinds]' }
+                    $va = [Convert]::ToUInt64(("$Arg2" -replace '^0[xX]',''),16)
+                    if ($null -ne $Arg3) { $defk = "$Arg3" }
+                } elseif ($mode -eq 2) {
+                    if ($null -eq $Arg3) { throw 'mem-bp int3: usage: mem-bp int3 <hex_gpa> <hex_va> [kinds]' }
+                    $a  = [Convert]::ToUInt64(("$Arg2" -replace '^0[xX]',''),16)
+                    $va = [Convert]::ToUInt64(("$Arg3" -replace '^0[xX]',''),16)
+                    if ($null -ne $Arg4) { $defk = "$Arg4" }
+                } else {
+                    if ($null -eq $Arg2) { throw 'mem-bp add: usage: mem-bp add <hex_gpa> <rip|0> [kinds]' }
+                    $a = [Convert]::ToUInt64(("$Arg2" -replace '^0[xX]',''),16)
+                    if ($null -ne $Arg3) { $b = [Convert]::ToUInt64(("$Arg3" -replace '^0[xX]',''),16) }
+                    if ($null -ne $Arg4) { $defk = "$Arg4" }
+                }
+                $ks = "$defk".ToLower(); $k = 0
+                if ($ks -match 'r') { $k = $k -bor 1 }
+                if ($ks -match 'w') { $k = $k -bor 2 }
+                if ($ks -match 'x') { $k = $k -bor 4 }
+                if ($k -eq 0) { $k = 2 }
+                if ($mode -eq 1) { $b = $b } else { $b = $va }
+            } elseif ($op -eq 1) {
+                if ($null -eq $Arg2) { throw 'mem-bp del: usage: mem-bp del <hex_gpa> <rip|0>' }
+                $a = [Convert]::ToUInt64(("$Arg2" -replace '^0[xX]',''),16)
+                if ($null -ne $Arg3) { $b = [Convert]::ToUInt64(("$Arg3" -replace '^0[xX]',''),16) }
+            } elseif ($op -eq 3) {
+                if ($null -ne $Arg2) { $a = [uint64]::Parse($Arg2) }
+            } elseif ($op -eq 2) {
+                $a = 48
+                if ($null -ne $Arg2) { $a = [uint64]::Parse($Arg2) }
+            }
+
+            if ($env:YGHV_BP_DEBUG) { Write-Host ("  DBG op=$op gpa=0x{0:X} rip=0x{1:X} kinds={2} va=0x{3:X} mode={4}" -f $a,$b,$k,$va,$mode) }
+            $req = New-Object byte[] 48
+            [BitConverter]::GetBytes([uint32]$op).CopyTo($req, 0)
+            [BitConverter]::GetBytes([uint64]$a).CopyTo($req, 8)
+            [BitConverter]::GetBytes([uint64]$b).CopyTo($req, 16)
             [BitConverter]::GetBytes([uint64]$k).CopyTo($req, 24)
+            [BitConverter]::GetBytes([uint64]$va).CopyTo($req, 32)
+            [BitConverter]::GetBytes([uint64]$mode).CopyTo($req, 40)
+
             if ($op -eq 2) {
                 $outLen = 8 + [int]$a * 8
                 $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x823)) -InBytes $req -OutputLength $outLen
                 $got = [BitConverter]::ToUInt64($out, 0)
                 Write-Host ("mem-bp drain: {0} qword(s)" -f $got)
-                for ($i = 0; $i -lt $got; $i += 4) {
-                    $rip  = [BitConverter]::ToUInt64($out, 8 + $i*8)
-                    $gpa  = [BitConverter]::ToUInt64($out, 8 + ($i+1)*8)
-                    $kd   = [BitConverter]::ToUInt64($out, 8 + ($i+2)*8)
-                    $cr3  = [BitConverter]::ToUInt64($out, 8 + ($i+3)*8)
-                    Write-Host ("  hit rip=0x{0:X} gpa=0x{1:X} kind={2} cpl={3} cr3=0x{4:X}" -f `
-                        $rip, $gpa, ($kd -band 0xFF), (($kd -shr 8) -band 0xFF), $cr3)
+                $names = @{ 1='NPF'; 2='INT3'; 4='DR' }
+                for ($i = 0; $i -lt $got; $i += 6) {
+                    $rip = [BitConverter]::ToUInt64($out, 8 + $i*8)
+                    $gpa = [BitConverter]::ToUInt64($out, 8 + ($i+1)*8)
+                    $kd  = [BitConverter]::ToUInt64($out, 8 + ($i+2)*8)
+                    $cr3 = [BitConverter]::ToUInt64($out, 8 + ($i+3)*8)
+                    $hva = [BitConverter]::ToUInt64($out, 8 + ($i+4)*8)
+                    $seq = [BitConverter]::ToUInt64($out, 8 + ($i+5)*8)
+                    $kind = $kd -band 0xFF
+                    $cpl  = ($kd -shr 8) -band 0xFF
+                    $md   = ($kd -shr 16) -band 0xFF
+                    $ks = @(); if ($kind -band 1) { $ks += 'R' }
+                    if ($kind -band 2) { $ks += 'W' }; if ($kind -band 4) { $ks += 'X' }
+                    Write-Host ("  #{0} {1,-4} {2} cpl={3} rip=0x{4:X} va=0x{5:X} gpa=0x{6:X} cr3=0x{7:X}" -f `
+                        $seq, $names[[int]$md], ($ks -join ''), $cpl, $rip, $hva, $gpa, $cr3)
                 }
                 return
             }
             $out2 = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x823)) -InBytes $req -OutputLength 8
-                        $rc = [BitConverter]::ToInt64($out2, 0)
+            $rc = [BitConverter]::ToInt64($out2, 0)
             $stage = switch ($rc) {
                 1  { 'OK' }
                 -1 { 'FAILED (stage -1: wrong IRQL, must be PASSIVE)' }
@@ -1574,11 +1718,19 @@ try {
                 -3 { 'FAILED (stage -3: could not split 2MB page to 4K)' }
                 -4 { 'FAILED (stage -4: could not set NPT permission)' }
                 -5 { 'FAILED (stage -5: breakpoint table full)' }
+                -6 { 'FAILED (stage -6: bad mode or arguments)' }
+                -7 { 'FAILED (stage -7: INT3 needs a VA)' }
+                -8 { 'FAILED (stage -8: no DR slot free)' }
+                -9 { 'FAILED (stage -9: could not patch the instruction byte)' }
+                -10 { 'FAILED (stage -10: kinds is 0)' }
                 0  { 'FAILED (stage 0: bad arguments)' }
                 default { "FAILED (rc=$rc)" }
             }
-            if ($v -eq 'add') { Write-Host ("mem-bp: {0} {1}" -f $v, $stage) }
-            else { Write-Host ("mem-bp: {0} {1}" -f $v, $(if($rc -gt 0){'OK'}else{'FAILED'})) }
+            if ($op -eq 0) { Write-Host ("mem-bp: {0} {1}" -f $v, $stage) }
+            else {
+                if ($rc -gt 0) { Write-Host ("mem-bp: {0} OK ({1})" -f $v, $rc) }
+                else { Write-Host ("mem-bp: {0} FAILED" -f $v) }
+            }
         }
         'mem-watch' {
             # Tier 4.6 (2026-10-17): NPF watchpoints — the debug-register superset.

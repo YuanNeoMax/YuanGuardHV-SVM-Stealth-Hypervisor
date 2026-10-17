@@ -13,6 +13,7 @@
 #include "mem_time.h"     /* Tier 4.2: O(1) snapshot/rollback */
 #include "mem_cache.h"    /* Tier 4.7: cache behaviour control */
 #include "mem_bp.h"       /* Tier 4.4: instruction-level access control */
+#include "mem_frame.h"    /* Tier 4.5: frame ownership takeover */
 #include "debug.h"
 
 NTKERNELAPI PEPROCESS IoGetRequestorProcess(PIRP Irp);
@@ -847,12 +848,88 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
         status = STATUS_INVALID_PARAMETER;
         break;
     }
+    case IOCTL_YGHV_FRAME: {
+        /* Tier 4.5: frame ownership takeover (retained copy survives release). */
+        if (in_len == 0 && out_len >= 8 * sizeof(UINT64)) {
+            UINT64 *out = (UINT64 *)buf;
+            yghv_frame_stats_t fs;
+            yghv_frame_stats_get(&fs);
+            out[0] = 1;
+            out[1] = 0;
+            out[2] = fs.active;
+            out[3] = fs.reserved;
+            out[4] = fs.released;
+            out[5] = fs.bytes;
+            out[6] = fs.failures;
+            out[7] = 0;
+            info = 8 * sizeof(UINT64);
+            status = STATUS_SUCCESS;
+            break;
+        }
+        if (in_len >= 32) {
+            UINT64 *in = (UINT64 *)buf;
+            UINT64 *out = (UINT64 *)buf;
+            ULONG op = (ULONG)in[0];
+            ULONG_PTR a = (ULONG_PTR)in[1];
+            ULONG_PTR b = (ULONG_PTR)in[2];
+            int rc = 0;
+
+            switch (op) {
+            case 0:
+                rc = yghv_frame_reserve((uint64_t)a, (uint32_t)b);
+                out[0] = (UINT64)(INT64)rc;   /* slot, or -1 */
+                info = 8;
+                break;
+            case 1:
+                rc = yghv_frame_release((int)a);
+                out[0] = (UINT64)(rc ? 1 : 0);
+                info = 8;
+                break;
+            case 2: {
+                /* read(slot, off) — the payload goes into out[1..], with the
+                 * byte count in out[0]. Works after the owner is gone. */
+                uint32_t want = (uint32_t)((out_len - 8) / 1);
+                uint32_t got;
+                if (want > 4096)
+                    want = 4096;
+                got = yghv_frame_read((int)a, (void *)(out + 1), want,
+                                      (uint32_t)b);
+                out[0] = (UINT64)got;
+                info = (ULONG)(8 + got);
+                break;
+            }
+            case 3: {
+                yghv_frame_info_t fi[8];
+                uint32_t n, i;
+                n = yghv_frame_list(fi, 8);
+                out[0] = (UINT64)n;
+                for (i = 0; i < n && (i + 1) * 4 + 1 <= (out_len / sizeof(UINT64)); i++) {
+                    out[1 + i*4 + 0] = fi[i].gpa;
+                    out[1 + i*4 + 1] = fi[i].seq;
+                    out[1 + i*4 + 2] = fi[i].len;
+                    out[1 + i*4 + 3] = fi[i].alive;
+                }
+                info = (ULONG)(8 + (SIZE_T)n * 4 * sizeof(UINT64));
+                break;
+            }
+            default:
+                out[0] = 0;
+                info = 8;
+                break;
+            }
+            status = STATUS_SUCCESS;
+            break;
+        }
+        status = STATUS_INVALID_PARAMETER;
+        break;
+    }
     case IOCTL_YGHV_BP: {
+
         /* Tier 4.4: instruction-level access control.
          * Zero-length input = diagnostics.
          * 32-byte input {ULONG op, pad, ULONG_PTR a(gpa), b(rip), c(kinds)}:
          *   op 0 = add   op 1 = remove   op 2 = drain(a = max qwords) */
-        if (in_len == 0 && out_len >= 6 * sizeof(UINT64)) {
+        if (in_len == 0 && out_len >= 10 * sizeof(UINT64)) {
             UINT64 *out = (UINT64 *)buf;
             yghv_bp_stats_t bs;
             yghv_bp_stats_get(&bs);
@@ -862,7 +939,17 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
             out[3] = bs.hits;
             out[4] = bs.recorded;
             out[5] = bs.refusals;
-            info = 6 * sizeof(UINT64);
+            out[6] = bs.npf;      /* 9.327: mode breakdown */
+            out[7] = bs.int3;
+            out[8] = bs.dr;
+            out[9] = bs.missed;
+            /* 9.327: what the driver last received in bp_add_ex — compared
+             * against the PowerShell-side print to catch offset mistakes. */
+            out[10] = g_dbg_args[0];
+            out[11] = g_dbg_args[1];
+            out[12] = g_dbg_args[2];
+            out[13] = g_dbg_args[3];
+            info = 14 * sizeof(UINT64);
             status = STATUS_SUCCESS;
             break;
         }
@@ -877,15 +964,33 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
 
             switch (op) {
             case 0:
-                /* 9.325: pass the stage code through (a negative value names
-                 * the guard that refused). PowerShell prints it. */
-                ok = yghv_bp_add((uint64_t)a, (uint64_t)b, (uint32_t)c);
+                /* 9.327: pass the stage code through (a negative value names
+                 * the guard that refused). PowerShell prints it.
+                 * `mode` 0 means NPF, the previously-implied default; a
+                 * 48-byte request additionally carries (va, mode). */
+                {
+                    uint32_t mode = (in_len >= 48) ? (uint32_t)in[5] : 0;
+                    if (mode == 0)
+                        mode = YGHV_BP_MODE_NPF;
+                    ok = yghv_bp_add_ex((uint64_t)a,
+                                        (in_len >= 48) ? (uint64_t)in[4] : 0,
+                                        (uint64_t)b, (uint32_t)c, mode);
+                }
                 out[0] = (UINT64)(INT64)ok;
                 info = 8;
                 break;
             case 1:
                 ok = yghv_bp_remove((uint64_t)a, (uint64_t)b);
                 out[0] = (UINT64)(ok ? 1 : 0);
+                info = 8;
+                break;
+            case 3:
+                /* 9.327: clear every breakpoint of one mode (a = mode, 0 = all).
+                 * Returns how many were removed. */
+                {
+                    int ncleared = yghv_bp_clear_mode((uint32_t)a);
+                    out[0] = (UINT64)(ncleared > 0 ? (UINT64)ncleared : 0);
+                }
                 info = 8;
                 break;
             case 2: {
