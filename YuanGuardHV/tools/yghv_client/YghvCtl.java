@@ -57,6 +57,8 @@ public class YghvCtl {
     private static final int FN_ISLAND = 0x81D;
     /* Tier 4 prerequisite (2026-10-11): NPT remap experiment. */
     private static final int FN_NPT_REMAP = 0x81E;
+    /* Tier 4.1/4.3 (2026-10-11): split view + aliasing. */
+    private static final int FN_VIEW = 0x81F;
 
     private static native long openHandle();
     private static native void closeHandle(long handle);

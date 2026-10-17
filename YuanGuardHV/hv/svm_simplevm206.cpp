@@ -51,6 +51,8 @@ void yghv_protect_fake_invpga_armeds(UINT32 asid);
 LONG yghv_protect_fake_alt_active(void);   /* 9.289 C6.1 */
 void SvInvlpgaByVa(UINT64 gva, UINT32 asid);         // asm helper
 UINT64 yghv_protect_fake_alt_pa(void);
+/* Tier 4.1: split-view NPT selection (island-safe, no calls). */
+extern UINT64 yghv_view_pick_ncr3(UINT64 guest_cr3);
 UINT64 yghv_protect_fake_main_pa(void);
 void yghv_protect_reopen_page_bare(UINT64 gpa);
 UINT64 yghv_protect_guest_va_to_pa(UINT64 cr3, UINT64 va);
@@ -1740,6 +1742,29 @@ SvHandleVmExit (
     // RAX is loaded from VMCB on VMRUN.
     //
     VpData->GuestVmcb.StateSaveArea.Rax = guestContext.VpRegs->Rax;
+
+    //
+    // Tier 4.1 (2026-10-11): split-view selection.
+    //
+    // This is the last point before the guest resumes, so it is where the
+    // nested-page-table base for the NEXT run gets chosen. The choice is
+    // per-CORE (the VMCB is per-VCPU), not per-access: if the target and an
+    // observer share a core within one time slice, the last VMRUN wins. That
+    // is the documented limit of this approach (see common/mem_view.h).
+    //
+    // Lock-free and call-free — yghv_view_pick_ncr3 only scans a nonpaged
+    // array, so it is legal at DISPATCH with GIF=0.
+    //
+    {
+        UINT64 viewNcr3 = yghv_view_pick_ncr3(
+            VpData->GuestVmcb.StateSaveArea.Cr3);
+        if (viewNcr3 != 0 &&
+            VpData->GuestVmcb.ControlArea.NCr3 != viewNcr3)
+        {
+            VpData->GuestVmcb.ControlArea.NCr3 = viewNcr3;
+            VpData->GuestVmcb.ControlArea.VmcbClean = 0;
+        }
+    }
 
 Exit:
     NT_ASSERT(VpData->HostStackLayout.Reserved1 == MAXUINT64);

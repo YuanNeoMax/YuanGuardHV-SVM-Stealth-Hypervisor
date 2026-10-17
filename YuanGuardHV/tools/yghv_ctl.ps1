@@ -1460,7 +1460,69 @@ try {
                                     -OutputLength 8
             Write-Host ("mem-selfmap: {0} OK" -f "$Arg1")
         }
-                'npt-remap' {
+                        'mem-view' {
+            # Tier 4.1/4.3 (2026-10-11): split-view memory + cross-process aliasing.
+            #
+            # 4.1: the SAME guest-physical page shows different content
+            #      depending on who reads it — the target sees its real frame,
+            #      a registered observer sees a decoy frame.
+            # 4.3: process A's VA points at process B's frame, established
+            #      unilaterally (no IPC, no handle, neither process told).
+            #
+            # Both reduce to one primitive, and 9.311 measured that it works
+            # on this CPU: rewriting an NPT entry so a GPA resolves to a
+            # different SPA IS observed. (9.297/9.298's "NPT ignores software
+            # flushes" was about PERMISSION flips — a different mechanism.)
+            #
+            # Selection is per-CORE (VMCB is per-VCPU), not per-access.
+            # usage:
+            #   mem-view                                   diagnostics
+            #   mem-view init | stop
+            #   mem-view split <hex_gpa> <hex_real> <hex_decoy>
+            #   mem-view unsplit <hex_gpa>
+            #   mem-view observer <hex_cr3>
+            #   mem-view unobserver <hex_cr3>
+            #   mem-view pick <hex_cr3>                    which NPT that CR3 gets
+            if ($null -eq $Arg1) {
+                $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x81F)) -OutputLength 64
+                Write-Host ("mem-view: ready={0} main=0x{1:X} alt=0x{2:X}" -f `
+                    [BitConverter]::ToUInt64($out,0), [BitConverter]::ToUInt64($out,8), [BitConverter]::ToUInt64($out,16))
+                Write-Host ("  pages={0} observers={1} to_alt={2} to_main={3} failures={4}" -f `
+                    [BitConverter]::ToUInt64($out,24), [BitConverter]::ToUInt64($out,32),
+                    [BitConverter]::ToUInt64($out,40), [BitConverter]::ToUInt64($out,48),
+                    [BitConverter]::ToUInt64($out,56))
+                return
+            }
+            $v = "$Arg1".ToLower()
+            $op = -1; $a=[uint64]0; $b=[uint64]0; $c2=[uint64]0
+            switch ($v) {
+                'init'        { $op = 0 }
+                'stop'        { $op = 1 }
+                'split'       { $op = 2 }
+                'unsplit'     { $op = 3 }
+                'observer'    { $op = 4 }
+                'unobserver'  { $op = 5 }
+                'pick'        { $op = 6 }
+                default       { throw 'mem-view: use init|stop|split|unsplit|observer|unobserver|pick' }
+            }
+            if ($null -ne $Arg2) { $a = [Convert]::ToUInt64(("$Arg2" -replace '^0[xX]',''),16) }
+            if ($null -ne $Arg3) { $b = [Convert]::ToUInt64(("$Arg3" -replace '^0[xX]',''),16) }
+            if ($null -ne $Arg4) { $c2 = [Convert]::ToUInt64(("$Arg4" -replace '^0[xX]',''),16) }
+
+            $req = New-Object byte[] 32
+            [BitConverter]::GetBytes([uint32]$op).CopyTo($req, 0)
+            [BitConverter]::GetBytes([uint64]$a).CopyTo($req, 8)
+            [BitConverter]::GetBytes([uint64]$b).CopyTo($req, 16)
+            [BitConverter]::GetBytes([uint64]$c2).CopyTo($req, 24)
+
+            $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x81F)) -InBytes $req -OutputLength 64
+            if ($op -eq 6) {
+                Write-Host ("mem-view: cr3=0x{0:X} -> ncr3=0x{1:X}" -f $a, [BitConverter]::ToUInt64($out,0))
+            } else {
+                Write-Host ("mem-view: {0} {1}" -f $v, $(if([BitConverter]::ToUInt64($out,0)){'OK'}else{'FAILED'}))
+            }
+        }
+        'npt-remap' {
             # Tier 4 prerequisite (2026-10-11): rewrite one NPT entry so a GPA
             # points at a different frame, then let the caller observe whether
             # the guest actually sees the change.

@@ -8,6 +8,7 @@
 #include "mem_selfmap.h"  /* Phase 2b: self-built mapping window */
 #include "mem_coop.h"     /* Phase 7: guard cooperation */
 #include "mem_island.h"   /* Phase 6: island (direct-map) access */
+#include "mem_view.h"     /* Tier 4.1/4.3: split view + aliasing */
 #include "debug.h"
 
 NTKERNELAPI PEPROCESS IoGetRequestorProcess(PIRP Irp);
@@ -787,6 +788,51 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
                 break;
             }
             status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+        status = STATUS_INVALID_PARAMETER;
+        break;
+    }
+    case IOCTL_YGHV_VIEW: {
+        /* Tier 4.1/4.3: split-view + cross-process aliasing.
+         * Every op is PASSIVE (they call npt remap, which needs it). */
+        if (in_len == 0 && out_len >= YGHV_VIEW_OUT_QWORDS * sizeof(UINT64)) {
+            UINT64 *out = (UINT64 *)buf;
+            yghv_view_stats_t vs;
+            yghv_view_stats_get(&vs);
+            out[0] = (UINT64)(yghv_view_ready() ? 1 : 0);
+            out[1] = yghv_view_main_pa();
+            out[2] = yghv_view_alt_pa();
+            out[3] = vs.pages;
+            out[4] = vs.observers;
+            out[5] = vs.switches_to_alt;
+            out[6] = vs.switches_to_main;
+            out[7] = vs.failures;
+            info = YGHV_VIEW_OUT_QWORDS * sizeof(UINT64);
+            status = STATUS_SUCCESS;
+            break;
+        }
+        if (in_len >= sizeof(yghv_ioctl_view_t)) {
+            yghv_ioctl_view_t *req = (yghv_ioctl_view_t *)buf;
+            UINT64 *out = (UINT64 *)buf;
+            ULONG op = req->op;
+            ULONG_PTR a = req->a, b = req->b, c = req->c;
+            int ok = 0;
+
+            switch (op) {
+            case 0: ok = yghv_view_init(); break;
+            case 1: yghv_view_stop(); ok = 1; break;
+            case 2: ok = yghv_view_add((uint64_t)a, (uint64_t)b, (uint64_t)c); break;
+            case 3: ok = yghv_view_remove((uint64_t)a); break;
+            case 4: ok = yghv_view_add_observer((uint64_t)a); break;
+            case 5: ok = yghv_view_remove_observer((uint64_t)a); break;
+            case 6: out[0] = yghv_view_pick_ncr3((uint64_t)a); ok = 1; break;
+            default: ok = 0; break;
+            }
+            if (op != 6)
+                out[0] = (UINT64)(ok ? 1 : 0);
+            info = 8 * sizeof(UINT64);
+            status = STATUS_SUCCESS;
             break;
         }
         status = STATUS_INVALID_PARAMETER;

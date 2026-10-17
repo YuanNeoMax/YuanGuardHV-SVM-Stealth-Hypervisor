@@ -175,6 +175,11 @@ void yghv_protect_sync_disarm(uint64_t gpa);
 int  yghv_protect_sync_resnapshot(uint64_t gpa);   /* Phase 7: cooperative write */
 int  yghv_protect_sync_is_guarded(uint64_t gpa);   /* Phase 7: guard query */
 /* Tier 4 prerequisite: remap one GPA to a different SPA (returns 1 on ok). */
+/* NPT table bases (0 when the table is not built). Used by the split-view
+   module to program VMCB ControlArea.NCr3. */
+UINT64 yghv_protect_fake_main_pa(void);
+UINT64 yghv_protect_fake_alt_pa(void);
+
 int  yghv_protect_npt_remap(uint64_t gpa, uint64_t spa, int use_alt,
                             uint64_t *prev_spa);
 void yghv_protect_sync_init(void);

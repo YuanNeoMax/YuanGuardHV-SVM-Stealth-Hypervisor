@@ -113,6 +113,21 @@ typedef struct {
 #define IOCTL_YGHV_ISLAND \
     YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x81D, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
 #define YGHV_ISLAND_OUT_QWORDS 8
+/* Tier 4.1/4.3 (2026-10-11): split-view + cross-process aliasing.
+   Zero-length input = 8 qwords of diagnostics.
+   40-byte input {ULONG op, pad, ULONG_PTR a, b, c}:
+     op 0 init / 1 stop / 2 split(gpa,real,decoy) / 3 unsplit(gpa)
+     op 4 add-observer(cr3) / 5 remove-observer(cr3) / 6 pick(cr3) */
+#define IOCTL_YGHV_VIEW \
+    YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x81F, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
+#define YGHV_VIEW_OUT_QWORDS 8
+typedef struct {
+    ULONG     op;
+    ULONG     _pad;
+    ULONG_PTR a;
+    ULONG_PTR b;
+    ULONG_PTR c;
+} yghv_ioctl_view_t;
 /* Tier 4 prerequisite (2026-10-11): NPT remap experiment.
    Rewrites one GPA's NPT entry to point at a different SPA, then reports
    whether the guest actually observes the change.
