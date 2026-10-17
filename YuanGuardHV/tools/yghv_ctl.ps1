@@ -1460,7 +1460,62 @@ try {
                                     -OutputLength 8
             Write-Host ("mem-selfmap: {0} OK" -f "$Arg1")
         }
-                'mem-scan-rev' {
+        'mem-island' {
+            # Phase 6 (2026-10-11): island (direct-map) access.
+            #
+            # The NPF handler runs at DISPATCH with GIF=0 and cannot call any
+            # of the transfer primitives: MmCopyMemory is APC_LEVEL max,
+            # MmMapLockedPagesSpecifyCache and MmMapIoSpace are PASSIVE, and
+            # MmGetVirtualForPhysical only maps system pages. What is left is
+            # the kernel's direct map — reading a frame becomes a plain load
+            # at (base + pa), which works at any IRQL.
+            #
+            # The base is not exported, so it is derived from two (VA, PA)
+            # pairs that must agree, then cached.
+            #   mem-island                          read diagnostics
+            #   mem-island init <va_a> <pa_a> <va_b> <pa_b>
+            #   mem-island read <hex_pa> [len]      island read probe
+            if ($null -eq $Arg1) {
+                $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x81D)) -OutputLength 64
+                $rdy = [BitConverter]::ToUInt64($out, 0)
+                $base = [BitConverter]::ToUInt64($out, 8)
+                Write-Host ("mem-island: ready={0} base=0x{1:X}" -f $rdy, $base)
+                Write-Host ("  reads={0} writes={1} refusals={2} probes={3}" -f `
+                    [BitConverter]::ToUInt64($out,16), [BitConverter]::ToUInt64($out,24),
+                    [BitConverter]::ToUInt64($out,32), [BitConverter]::ToUInt64($out,40))
+                return
+            }
+            $v = "$Arg1".ToLower()
+            if ($v -eq 'init') {
+                if ($null -eq $Arg5) { throw 'mem-island init: usage: mem-island init <va_a> <pa_a> <va_b> <pa_b>' }
+                $req = New-Object byte[] 32
+                [BitConverter]::GetBytes([uint64][Convert]::ToUInt64(("$Arg2" -replace '^0[xX]',''),16)).CopyTo($req, 0)
+                [BitConverter]::GetBytes([uint64][Convert]::ToUInt64(("$Arg3" -replace '^0[xX]',''),16)).CopyTo($req, 8)
+                [BitConverter]::GetBytes([uint64][Convert]::ToUInt64(("$Arg4" -replace '^0[xX]',''),16)).CopyTo($req, 16)
+                [BitConverter]::GetBytes([uint64][Convert]::ToUInt64(("$Arg5" -replace '^0[xX]',''),16)).CopyTo($req, 24)
+                Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x81D)) -InBytes $req | Out-Null
+                Write-Host 'mem-island: base discovered and validated'
+                return
+            }
+            if ($v -eq 'read') {
+                if ($null -eq $Arg2) { throw 'mem-island read: usage: mem-island read <hex_pa> [len]' }
+                $pa = [Convert]::ToUInt64(("$Arg2" -replace '^0[xX]',''),16)
+                $len = 8
+                if ($null -ne $Arg3) { $len = [uint32]::Parse($Arg3) }
+                $req = New-Object byte[] 16
+                [BitConverter]::GetBytes([uint64]$pa).CopyTo($req, 0)
+                [BitConverter]::GetBytes([uint64]$len).CopyTo($req, 8)
+                $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x81D)) -InBytes $req -OutputLength 64
+                $ok = [BitConverter]::ToUInt64($out, 0)
+                $n  = [BitConverter]::ToUInt64($out, 8)
+                if (-not $ok) { Write-Host ("mem-island read: REFUSED pa=0x{0:X}" -f $pa); return }
+                $hex = (16..(16+$n-1) | ForEach-Object { '{0:X2}' -f $out[$_] }) -join ' '
+                Write-Host ("mem-island read: pa=0x{0:X} n={1} bytes={2}" -f $pa, $n, $hex)
+                return
+            }
+            throw 'mem-island: usage: mem-island [init ...|read <pa> [len]]'
+        }
+        'mem-scan-rev' {
             # Phase 4b (2026-10-11): reverse scan — find the VAs mapping a frame.
             # Forward scan asks "what is at this VA"; this asks "who points at
             # this frame". Engine A cannot express the second question: it has

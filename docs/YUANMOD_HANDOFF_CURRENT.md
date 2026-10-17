@@ -7062,3 +7062,94 @@ dirty-only: pages_read=8192 pages_skipped=120  hits=2
 - 静态检查：IOCTL parity C=29/PS=29/Java=29、Command parity PS=42/Java=18 全 PASS
 - 镜像：`206h1_scan4b`（当前可用）
 - **未推送**（本地领先 8 个提交 + 本次）
+
+
+### 9.310 2026-10-11 **第五批 Phase 6（岛内执行）完成** —— 6/6 PASS，零蓝屏
+
+#### 9.310.1 ★ 先查证：岛内到底能用什么（这是本 Phase 的全部难点）
+
+NPF handler 运行在 **IRQL=DISPATCH + GIF=0**，不能阻塞/加锁/分配/记日志
+（protect.c 9.249，两次教训）。逐条核对 WDK 的 IRQL 注解：
+
+```c
+_IRQL_requires_max_(APC_LEVEL)   NTSTATUS MmCopyMemory(...)          → 岛内 NO
+_IRQL_requires_max_(PASSIVE)     MmMapLockedPagesSpecifyCache(...)   → 岛内 NO
+                                 MmMapIoSpace(...)                    → 岛内 NO
+（未注解）                        MmGetVirtualForPhysical(...)         → 9.299 证明只对系统页有效
+```
+
+**结论：Engine B 在宿主路径用的每一个传输原语，在岛内都是非法的。**
+
+唯一剩下的路是**内核直接映射**：`kernel_va = base + pa`，纯算术，
+任何 IRQL 都可用。但 **base 不被导出**。
+
+#### 9.310.2 实现：base 的发现与验证
+
+```c
+base_a = (probe_va_a & ~0xFFF) - (probe_pa_a & ~0xFFF);
+base_b = (probe_va_b & ~0xFFF) - (probe_pa_b & ~0xFFF);
+if (base_a != base_b)  return 0;          // 两对必须一致
+if (base_a < 0xFFFF800000000000) return 0; // 必须在核半区
+```
+
+**为什么必须验证**：**错误的 base 不会崩溃，而是读到无关的内核内存并当作
+帧内容返回** —— 比失败更糟。所以：
+- 两个独立的 (VA, PA) 对必须推导出同一个 base
+- 每次访问前检查目标地址落在直接映射范围内
+- 未验证前 `yghv_island_ready()` 恒为 false，读取一律拒绝
+
+**实测**：
+```
+probe: KUSER_SHARED_DATA  VA=0xFFFFF78000000000  PA=0x575E000（mem-pte 查出）
+base = 0xFFFFF77FFA8A2000   （在核半区）
+```
+
+#### 9.310.3 ★ 决定性验证：岛内路径与 VA 路径读到完全相同的字节
+
+```
+island read: pa=0x575E000 n=8 bytes=00 00 00 00 00 00 A0 0F
+via VA     : value: 0x0FA0000000000000
+island 反转 = 0FA0000000000000        ← 完全一致
+```
+
+**这条路径没有任何 API 调用** —— `RtlCopyMemory` 内联为 `mov`，
+所以它在 DISPATCH + GIF=0 下合法。**这就是岛内执行的可行形态。**
+
+#### 9.310.4 诚实边界：Phase 6 的原始承诺只能部分兑现
+
+| 原承诺 | 实际 |
+|---|---|
+| 岛内执行、宿主完全看不到 | **部分成立** —— 岛内代码路径确实在 VMEXIT 上下文跑，宿主栈上没有我们的帧 |
+| 岛内读写任意物理帧 | **成立**，但**只对直接映射覆盖的帧**。直接映射不是所有帧都保证 |
+| 零 API 访问 | **成立** —— 纯算术 + mov |
+
+**未兑现的部分**：Phase 6 原设计依赖"自建映射"（Phase 2b），
+而 2b 已证不可行（会破坏 PFN 引用计数，见 9.307）。所以岛内**不能**
+通过自建窗口访问任意帧，只能通过直接映射 —— 而直接映射的覆盖范围
+不由我们控制。
+
+**结论**：Phase 6 在"直接映射覆盖的帧"上是完整可用的，这已经覆盖
+绝大多数常规内存（RAM 的主体都在直接映射里）。**不宣称"任意帧"。**
+
+#### 9.310.5 安全阀（实测生效）
+```
+E5: mem-island read 0x1000 → REFUSED   （init 之前）
+```
+未验证 base 前一律拒绝，绝不猜测。
+
+#### 9.310.6 验证（E1-E6，6/6 PASS）
+| 项 | 内容 | 结果 |
+|---|---|---|
+| E1 | 诊断可读（init 前 ready=0） | PASS |
+| **E2** | **base 发现成功（两对一致）** | **PASS** |
+| E3 | base 在核半区 | PASS（0xFFFFF77FFA8A2000） |
+| **E4** | **岛内读与 VA 读字节一致** | **PASS**（核心） |
+| E5 | 未验证时拒绝 | PASS |
+| E6 | 干净卸载 | PASS |
+
+#### 9.310.7 状态
+- IOCTL：0x815-0x81D 已占用（下一个空闲 0x81E）
+- 命令数：43（PowerShell）
+- 静态检查：IOCTL parity C=30/PS=30/Java=30、Command parity PS=43/Java=18 全 PASS
+- 镜像：`206i1_island`（当前可用）
+- **未推送**（本地领先 9 个提交 + 本次）

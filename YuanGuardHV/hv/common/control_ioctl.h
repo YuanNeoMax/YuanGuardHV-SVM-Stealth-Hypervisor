@@ -106,6 +106,13 @@ typedef struct {
     ULONG_PTR range_end;
 } yghv_ioctl_scan_rev_t;
 #define YGHV_SCAN_REV_OUT_HDR_QWORDS 3
+/* Phase 6 (2026-10-11): island (direct-map) access.
+   Zero-length input = read 8 qwords of diagnostics.
+   32-byte input {ULONG64 va_a, pa_a, va_b, pa_b} = init with two probes.
+   16-byte input {ULONG64 pa, ULONG64 len} = island read probe. */
+#define IOCTL_YGHV_ISLAND \
+    YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x81D, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
+#define YGHV_ISLAND_OUT_QWORDS 8
 
 #define YGHV_DEVICE_NAME_STRING     L"\\Device\\YuanGuardHV"
 #define YGHV_DOS_DEVICE_NAME_STRING L"\\DosDevices\\YuanGuardHV"

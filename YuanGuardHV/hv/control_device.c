@@ -7,6 +7,7 @@
 #include "mem_pa.h"       /* Phase 2: physical frame primitives */
 #include "mem_selfmap.h"  /* Phase 2b: self-built mapping window */
 #include "mem_coop.h"     /* Phase 7: guard cooperation */
+#include "mem_island.h"   /* Phase 6: island (direct-map) access */
 #include "debug.h"
 
 NTKERNELAPI PEPROCESS IoGetRequestorProcess(PIRP Irp);
@@ -786,6 +787,56 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
                 break;
             }
             status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+        status = STATUS_INVALID_PARAMETER;
+        break;
+    }
+    case IOCTL_YGHV_ISLAND: {
+        /* Phase 6 (2026-10-11): island-context access via the direct map.
+         *   in_len == 0                        -> 8 qwords of diagnostics
+         *   in_len >= 32 {va_a,pa_a,va_b,pa_b} -> discover + validate base
+         *   in_len >= 16 {pa,len}              -> island read probe */
+        if (in_len == 0 && out_len >= YGHV_ISLAND_OUT_QWORDS * sizeof(UINT64)) {
+            UINT64 *out = (UINT64 *)buf;
+            yghv_island_stats_t is;
+            yghv_island_stats_get(&is);
+            out[0] = (UINT64)(yghv_island_ready() ? 1 : 0);
+            out[1] = is.base;
+            out[2] = is.reads;
+            out[3] = is.writes;
+            out[4] = is.refusals;
+            out[5] = is.probes;
+            out[6] = 0;
+            out[7] = 0;
+            info = YGHV_ISLAND_OUT_QWORDS * sizeof(UINT64);
+            status = STATUS_SUCCESS;
+            break;
+        }
+        if (in_len >= 4 * sizeof(UINT64)) {
+            UINT64 *in = (UINT64 *)buf;
+            int ok = yghv_island_init(in[0], in[1], in[2], in[3]);
+            info = 0;
+            status = ok ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+            break;
+        }
+        if (in_len >= 2 * sizeof(UINT64) && out_len >= 32) {
+            UINT64 *in = (UINT64 *)buf;
+            UINT64 pa = in[0];
+            UINT64 len = in[1];
+            UINT64 *out = (UINT64 *)buf;
+            UCHAR tmp[32];
+            SIZE_T n = (SIZE_T)(len > sizeof(tmp) ? sizeof(tmp) : len);
+            int ok;
+            if (n == 0)
+                n = 8;
+            ok = yghv_island_read(pa, tmp, n);
+            out[0] = (UINT64)(ok ? 1 : 0);
+            out[1] = (UINT64)n;
+            if (ok)
+                RtlCopyMemory((UCHAR *)buf + 16, tmp, n);
+            info = (ULONG)(16 + (ok ? n : 0));
+            status = STATUS_SUCCESS;
             break;
         }
         status = STATUS_INVALID_PARAMETER;
