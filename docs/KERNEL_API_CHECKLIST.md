@@ -316,3 +316,50 @@ kd -z <dmp> -y "srv*C:\symbols*https://msdl.microsoft.com/download/symbols" -c "
 
 **规则**：崩溃后**第一件事**是用本地符号 kd 取证，
 不要猜，也不要因为一次工具失败就放弃工具。
+---
+
+## 十六、★ direct map **不覆盖全部物理内存**（第十一次教训）
+
+**Phase 6（9.310）曾断言"直接映射路径打通"。这个结论只在低地址成立。**
+
+```
+kd 证据（2026-10-17 22:59, 0x50 PAGE_FAULT_IN_NONPAGED_AREA）
+  base = 0xFFFFF77FFA8A1000   （由 KUSER_SHARED_DATA VA-PA 推出）
+  P1   = 0xFFFFF783504B8000 = base + 0x355C17000   (13.34 GB)
+  yghv_pa_write+0x6A -> memcpy+0x17
+```
+
+| PA 范围 | direct map 可用 |
+|---|---|
+| 低地址（如 KUSER_SHARED_DATA 87 MB） | ✅ 9.310 验证通过 |
+| 13+ GB | ❌ 0x50 |
+
+**原因**：Windows x64 的 direct map 不保证覆盖 `[0, RAM_SIZE)` 全区间，
+中间存在未映射/MMIO 区域。
+
+**规则**：
+1. **不要用 direct map 写任意 PA** —— 只对**已知在低地址**的帧可用
+2. 写 PA 用 **MDL 路径**（`MmMapLockedPagesSpecifyCache`），Phase 2-7 全验证
+3. 若要用 direct map，必须先做**范围检查**（但我们没有可靠的上界）
+4. **Phase 6 的岛内读也应视为"仅低地址可用"**
+
+**为什么 MDL 更可靠**：MDL 让内存管理器按 PFN 建映射，
+不依赖 direct map 的覆盖范围。
+
+---
+
+## 十七、★ 五次崩溃后仍未解决的问题（Tier 4.4）
+
+**现象**：目标页在进程正常运行时是可写的私有页；bp 撤销其 NPT 写权限后，
+无论走 MDL 还是 direct map，写同一物理帧都失败（0x3B / 0x50 各一次以上）。
+
+**四个假设全部证伪**（每个一次崩溃）：
+1. `GuestPaOfGhcb` 未设 → 设了还崩
+2. Engine A 走 guest NPT → 拒绝非 PTE 还崩
+3. `npt_set_page_perm` 打到 2MB PDE → 先 split 还崩
+4. 假 VA 的 MDL 不可写 → 换 direct map 崩得不一样
+
+**未建模的交互**：NPT 权限撤销 ↔ 宿主对该帧的写能力。
+
+**结论**：在建立这个模型之前，**不要重新启用 Tier 4.4**。
+试错的代价是每次一个重启。

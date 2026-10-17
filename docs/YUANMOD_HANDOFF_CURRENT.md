@@ -7652,3 +7652,135 @@ Tier 4.7      5/5    缓存行为控制（PWT/PCD）
 ```
 
 **8 项，零蓝屏。**
+
+
+### 9.315 2026-10-17 **Tier 4.4 五次崩溃最终结论 + Tier 4.7 完成** —— 7/7 PASS
+
+#### 9.315.1 ★ kd 本地符号取证：完整证据链（本轮最大收获）
+
+**前提纠正**：kd 在本机**完全可用**。之前两次挂起是**符号服务器联网超时**。
+
+```bash
+# 可用（本地 38 个内核符号，90 秒内稳定返回）
+kd -z <dmp> -y C:\symbols -c "k; q"                              # 栈
+kd -z <dmp> -y C:\symbols -c "dt nt!_CONTEXT <P3>; q"            # 异常现场
+kd -z <dmp> -y 'C:\symbols;C:\' -c "u yghv_g16+0x<RVA>; q"       # 反汇编
+
+# 挂起
+kd -z <dmp> -y "srv*C:\symbols*https://msdl.microsoft.com/..." -c "!analyze -v; q"
+```
+
+**技巧**：把镜像放回 `C:\<svcname>.sys`，kd 才能反汇编它。
+
+#### 9.315.2 五次崩溃的完整调用链（同一位置）
+
+```
+yghv_control_dispatch_ioctl+0x187C
+  yghv_mem_write+0x83
+    pte_write+0xC1
+      yghv_coop_write+0x96
+        yghv_pa_write+0xDC   (MDL path)      <- 0x3B × 4
+        yghv_pa_write+0x6A   (direct-map)    <- 0x50 × 1
+          memcpy/memset+0x17    mov [rcx],r11
+```
+
+**寄存器（`dt nt!_CONTEXT`）**：
+```
+Rcx = R12 = 0xffffe681f58df000   MDL 映射 VA（目标）
+Rdx = R11 = 0xd00d0000d00d0000   要写的值
+Rbx = 0x53ad7000                 GPA
+R8  = 8                          长度
+```
+
+#### 9.315.3 四个假设全部证伪（每次一个崩溃）
+
+| # | 假设 | 修复 | 结果 |
+|---|---|---|---|
+| 1 | `#DB` 读不到 rearm 目标 | 设 `GuestPaOfGhcb` | ❌ 0x3B |
+| 2 | Engine A 走 guest NPT | 拒绝非 PTE 引擎 | ❌ 0x3B |
+| 3 | `npt_set_page_perm` 打到 2MB PDE | 先 `npt_split_2mb_to_4kb` | ❌ 0x3B |
+| 4 | 假 VA 的 MDL 不可写（9.321） | 改用 direct map | ❌ 0x50 |
+
+**第 4 次最有教育意义**：direct map 对**低地址**（KUSER_SHARED_DATA，PA 87MB）
+Phase 6 验证通过，但写**高地址**（PA 13.34 GB）直接 `0x50`
+`PAGE_FAULT_IN_NONPAGED_AREA`：
+
+```
+base = 0xFFFFF77FFA8A1000
+P1   = 0xFFFFF783504B8000 = base + 0x355C17000 (13.34 GB)
+```
+
+**Windows 的 direct map 不覆盖全部物理内存** —— Phase 6 的结论（"直接映射可用"）
+只在低地址成立，这一条必须修正。
+
+#### 9.315.4 真正的未解问题（诚实记录）
+
+```
+目标页在进程正常运行时是可写的普通私有页；
+bp 撤销其 NPT 写权限后，无论走 MDL 映射还是 direct map，
+写同一个物理帧都失败（两种不同的 bugcheck）。
+```
+
+**两种存储策略都失败，且失败 PA 都在 13-15 GB 区间。**
+这指向**帧本身在该状态下不可由宿主写**，而不是 bp 逻辑或映射技术。
+
+**未建模的交互**：NPT 权限撤销 ↔ 宿主对该帧的写能力。
+
+#### 9.315.5 处置
+
+- `yghv_bp_add()` **永久禁用**（9.324），返回失败
+- `pa_write` **回退到 MDL**（9.323），移除 direct map 分支
+- 两条注释都完整记录了证据链和证伪过程
+- 镜像：`206p1_final`（md5 `C7183C8A`）
+
+#### 9.315.6 Tier 4.7 完成验证（7/7 PASS，零崩溃）
+
+```
+D0  island init         PASS  base=0xFFFFF77FFA8A1000
+C1  mem-cache 诊断       PASS
+C2  set uncached (mode 2) PASS
+C3  读仍正常            PASS  0xCAFE0000CAFE0000
+C4  写仍正常            PASS  → 0xBEEF0000BEEF0000
+C5  reset writeback     PASS
+    unload              PASS
+```
+
+**关键**：目标页 GPA = `0x1D1135000` = **7.3 GB**，
+`mem-write` 在这个高地址 PA 上**成功** —— 证明 MDL 回退对高位页工作正常，
+而 direct map 在同样量级会崩。**这是回退正确性的直接证据。**
+
+**9.311 的教训被再次验证**：设置 PWT/PCD 时如果不保留完整属性位，
+读和写都会被破坏。C3/C4 同时通过说明属性位处理正确。
+
+#### 9.315.7 累计完成
+
+| 项 | 分数 | 状态 |
+|---|---|---|
+| Phase 1-5 | 10/10 | ✅ |
+| Phase 7 | 7/7 | ✅ |
+| Phase 4b | 6/6 | ✅ |
+| Phase 6 | 6/6 | ✅ |
+| Tier 4.1 | 9/9 | ✅ |
+| Tier 4.3 | 9/9 | ✅ |
+| Tier 4.2 | 8/8 | ✅ |
+| **Tier 4.7** | **7/7** | **✅** |
+| Tier 4.4 | — | ❌ 5 次崩溃，永久禁用 |
+| Tier 4.6 | — | ❌ 冻结，禁用 |
+| Tier 4.5 | — | ❌ 未实现（无钩子） |
+| Phase 2b | — | ❌ 0x1A，禁用 |
+
+#### 9.315.8 ★ Phase 6 结论需要修正
+
+**9.310 写的"直接映射路径打通"是不完整的。**
+
+- ✅ 低地址帧（< 数 GB，如 KUSER_SHARED_DATA 87MB）：可用
+- ❌ 高地址帧（13+ GB）：`0x50` 崩溃
+
+**Phase 6 只能用于低地址帧的岛内读。** 已在代码注释标注。
+
+#### 9.315.9 状态
+- IOCTL：0x815-0x823
+- 命令数：49
+- 镜像：`206p1_final`（md5 `C7183C8A`）
+- 系统干净，未崩溃（本轮最后一次验证）
+- **未推送**（本地领先 15 个提交）

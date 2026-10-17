@@ -18,6 +18,7 @@
  */
 
 #include "mem_pa.h"
+#include "mem_island.h"
 
 static volatile LONG64 g_pa_reads;
 static volatile LONG64 g_pa_reads_fail;
@@ -76,6 +77,21 @@ int yghv_pa_write(uint64_t pa, const void *src, SIZE_T len) {
         uint64_t page_base = cur & ~(uint64_t)0xFFF;
         PVOID mapped;
 
+        /*
+         * 9.323 REVERT: back to the MDL path.
+         *
+         * 9.321 tried the kernel direct map (kernel_va = base + pa), which is
+         * correct for LOW frames — Phase 6 validated it on KUSER_SHARED_DATA
+         * at PA 0x575F000. But the direct map does NOT cover every physical
+         * frame: writing a target frame at PA 0x355C17000 (13.34 GB) faulted
+         * 0x50 PAGE_FAULT_IN_NONPAGED_AREA at base+PA. Verified by the stack
+         *   yghv_pa_write+0x6A -> memcpy+0x17
+         * with the faulting address exactly base + that PA.
+         *
+         * So the direct map is only usable when the frame is known to be
+         * covered. Rather than add a fragile range check, revert to the MDL
+         * path — it is the one Phase 2-7 validated end to end.
+         */
         RtlZeroMemory(&mdl, sizeof(mdl));
         /* Give MmInitializeMdl a page-aligned "virtual" address so it builds
          * a one-page descriptor; we then replace the PFN it derived with the

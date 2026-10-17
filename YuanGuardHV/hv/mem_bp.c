@@ -37,51 +37,42 @@ static int yghv_bp_find(uint64_t gpa, uint64_t rip) {
 }
 
 int yghv_bp_add(uint64_t gpa, uint64_t rip, uint32_t kinds) {
-    uint64_t page = gpa & ~(uint64_t)0xFFFULL;
-    int i;
-
     /*
-     * ===== 9.320 DISABLED — this path took the box down FOUR times =====
+     * ===== 9.324 DISABLED (final) — five crashes, three wrong theories =====
      *
-     * 2026-10-17: four consecutive 0x3B / 0xC0000005 crashes (21:59, 22:05,
-     * 22:20, 22:38), each with the same signature: an access violation on a
-     * store inside our own IOCTL thread, with the value being written sitting
-     * in Rdx and the destination (an MDL mapping VA) in Rcx.
+     * 2026-10-17, 21:59 -> 22:59:
      *
-     * What each attempt fixed, and why none of them was the root cause:
+     *   21:59  0x3B C0000005   pa_write+0xDC  (MDL path)
+     *   22:05  0x3B C0000005   same
+     *   22:20  0x3B C0000005   same
+     *   22:38  0x3B C0000005   same
+     *   22:59  0x50             pa_write+0x6A  (direct-map path)
      *
-     *   1. GuestPaOfGhcb not set for the bp path      -> set it, still crashed
-     *   2. engine not switched to PTE                 -> refused non-PTE, still crashed
-     *   3. npt_set_page_perm hitting a 2MB PDE       -> split first, still crashed
+     * Theories tested and DISPROVEN, each costing one crash:
+     *   1. GuestPaOfGhcb not set on the bp path        -> set it, still crashed
+     *   2. Engine A stores through the guest NPT       -> refused non-PTE, still crashed
+     *   3. npt_set_page_perm hits the 2MB PDE          -> split first, still crashed
+     *   4. fake-VA MDL is not writable (9.321)         -> direct map, crashed differently
      *
-     * The evidence chain (kd with LOCAL symbols, which does work — the earlier
-     * hangs were the symbol SERVER, not kd):
+     * What the kd evidence actually shows (local symbols, which DO work):
+     * every crash is inside yghv_pa_write's copy, faulting on the destination
+     * address. Both storage strategies faulted, and the failing PA was in the
+     * 13-15 GB range both times. That points at the FRAME ITSELF not being
+     * ordinarily writable from the host in this state — not at the bp logic
+     * and not at the mapping technique.
      *
-     *   nt!KiPageFault+0x452
-     *   yghv_g16+0x19d17   mov [rcx],r11     <- Rcx = 0xffffce01107be000
-     *   yghv_g16+0x11f3c   mov rcx,r12 / mov rdx,r14 / call [imp]
+     * The unresolved question, stated plainly: a target frame that is a
+     * normal private page when the process runs is, after the bp revokes its
+     * NPT write permission, apparently no longer writable through the paths we
+     * have (MDL mapping or direct map). Until that is understood, this feature
+     * cannot be made safe, and trial-and-error costs a reboot per attempt.
      *
-     *   CONTEXT: Rdx = 0xd00d0000d00d0000 (the value we were writing)
-     *            R11 = 0xd00d0000d00d0000
-     *            Rcx = R12 = 0xffffce01107be000 (the destination)
-     *            R8  = 8
-     *
-     * So a memcpy into a kernel VA that is not writable. The VA is an MDL
-     * mapping produced by yghv_pa_write — i.e. the write path itself is being
-     * blocked by something we did to the NPT.
-     *
-     * The part still not understood: yghv_pa_write maps the frame through
-     * MmMapLockedPagesSpecifyCache and writes through that KERNEL mapping,
-     * which is a GVA->GPA translation and should not consult the NPT at all.
-     * Yet it faults. Four hypotheses were tested and all four were wrong, so
-     * there is a mechanism here that is not yet modelled — and modelling it by
-     * trial costs the user a reboot each time.
-     *
-     * Do not re-enable without a full model of how the NPT entry for a page
-     * relates to the host page-table entry that backs an MDL mapping of the
-     * same frame. That is the open question.
+     * The breakpoint TABLE, the NPF hook and the re-arm path are all still
+     * present and are believed correct — it is the write path under a revoked
+     * permission that is not modelled. Re-enable only with a full model of
+     * that interaction.
      */
-    (void)page; (void)rip; (void)kinds; (void)i;
+    (void)gpa; (void)rip; (void)kinds;
     InterlockedIncrement64(&g_bp_refusals);
     return 0;
 }
