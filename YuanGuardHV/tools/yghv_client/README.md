@@ -84,7 +84,9 @@ yghv_ctl.ps1 mem-bp [add|int3|dr|del|clear|drain] ...
 yghv_ctl.ps1 mem-frame [reserve <gpa> [len]|read <slot> [off] [len]|list|release <slot>]
 yghv_ctl.ps1 sys-health                                # Tier 7.2/7.7 降级计数器
 yghv_ctl.ps1 pa-io read <hex_pa> [len] [off]|write <hex_pa> <value>
-yghv_ctl.ps1 sys-guard
+yghv_ctl.ps1 sys-crypto
+yghv_ctl.ps1 sys-sentry [surface|reset]
+yghv_ctl.ps1 sys-guard [arm|hidecore|add|del|verify|list|uncovered]
 ```
 
 `protect` sets the target, enumerates committed pages of the real Java process,

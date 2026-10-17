@@ -51,7 +51,7 @@
 
 typedef struct {
     uint64_t gpa;        /* physical page being guarded */
-    uint64_t hash;       /* FNV-1a over the OBJECT bytes at arm time */
+    uint8_t  digest[32]; /* 9.342: SHA-256 over the OBJECT bytes at arm time */
     uint32_t hash_off;   /* 9.339: where the object starts in the page */
     uint32_t hash_len;   /* 9.339: how many bytes of it are hashed */
     uint64_t checks;     /* times re-verified */
@@ -91,6 +91,18 @@ int yghv_guard_add_range(uint64_t gpa, uint32_t off, uint32_t len,
 
 /* Stop guarding one page, restoring the guest's access if we removed it. */
 int yghv_guard_add_va(const void *va, uint32_t len, const char *tag, int hide);
+/*
+ * 9.344: island-safe remap. The PASSIVE-gated yghv_protect_npt_remap_flags()
+ * returns 0 inside an NPF handler (DISPATCH + GIF=0 IS "APCs disabled"), which
+ * is why the first ALLOW loop could never restore a page and delivered an
+ * unresolvable violation instead.
+ */
+int yghv_guard_remap_bare(uint64_t gpa);
+/* 9.348: island-safe reopen for the breakpoint ALLOW loop. */
+int yghv_guard_reopen_bare(uint64_t gpa);
+int yghv_guard_decoy_bare(uint64_t gpa);
+int yghv_guard_hiding_armed(void);
+
 int yghv_guard_remove(uint64_t gpa);
 
 /*
@@ -124,6 +136,8 @@ uint32_t yghv_guard_list(yghv_guard_info_t *out, uint32_t max);
  * breakpoint table and the frame table. Returns how many pages were guarded.
  */
 uint32_t yghv_guard_arm_core(void);
+/* 9.343 #1: hide the Tier-4 tables (needs a code range + a decoy). */
+uint32_t yghv_guard_hide_core(void);
 
 typedef struct {
     uint64_t guarded;
@@ -135,6 +149,71 @@ typedef struct {
     uint64_t hash_fail;
 } yghv_guard_stats_t;
 
+
+/* ===== 9.343: the three upgrades ===== */
+
+/*
+ * #1 Hide our OWN tables, despite IOCTL code running in guest mode.
+ *
+ * 9.320.1 established that hiding a page we read with plain C removes it from
+ * us too. The answer is not to give up on hiding it — it is to make the fault
+ * recoverable:
+ *
+ *   - the page is hidden (NPT leaf removed)
+ *   - our own access faults
+ *   - the handler sees RIP inside THIS DRIVER's image and CPL == 0, so it
+ *     restores the page, sets TF, lets the instruction run, and the #DB
+ *     handler re-hides it
+ *
+ * That is exactly the ALLOW loop 4.4 proved for breakpoints, with the match
+ * condition changed from "registered RIP" to "RIP inside our image". A guest
+ * store cannot take this path because its RIP is outside the image and its CPL
+ * is 3.
+ *
+ * Register the driver's code range once, at load.
+ */
+void yghv_guard_set_code_range(uint64_t start, uint64_t size);
+
+/*
+ * ISLAND-SAFE: is this fault ours? RIP inside our image AND CPL 0.
+ * Called from the NPF handler before the hidden-page verdict.
+ */
+int yghv_guard_fault_is_ours(uint64_t rip, uint32_t cpl);
+
+/* ===== end 9.343 ===== */
+
+/*
+ * #2 Address-space continuity: serve a DECOY instead of a hole.
+ *
+ * 9.320.5 noted that a guest comparing its memory descriptors against what it
+ * can actually touch sees holes where we hid pages. Removing the entry makes
+ * the walk fail; that is detectable by inventory.
+ *
+ * Answer: point the hidden entry at a decoy frame instead of clearing it. The
+ * guest then:
+ *   - reads -> gets zeros (what reserved/MMIO-adjacent memory looks like)
+ *   - writes -> lands in the decoy and is discarded
+ * and the physical range stays present, so the map is continuous.
+ *
+ * Allocate the decoy once. Returns 1 when a decoy frame is available.
+ */
+int yghv_guard_decoy_init(void);
+int yghv_guard_decoy_ready(void);
+uint64_t yghv_guard_decoy_pa(void);
+
+/*
+ * #3 Unregistered-page report.
+ *
+ * Guarding only reports changes on pages that were REGISTERED — a page nobody
+ * listed can be edited freely and say nothing. This walks the driver's own
+ * writable data range and counts the pages that are not covered by any guard
+ * entry, so "we are watching everything we care about" is a measured statement
+ * rather than an assumption.
+ *
+ * PASSIVE. Returns the number of uncovered pages; writes up to `max` of them.
+ */
+uint32_t yghv_guard_uncovered(uint64_t start, uint64_t size, uint64_t *out,
+                              uint32_t max);
 void yghv_guard_stats_get(yghv_guard_stats_t *out);
 void yghv_guard_stats_reset(void);
 

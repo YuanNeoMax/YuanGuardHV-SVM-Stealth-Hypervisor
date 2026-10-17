@@ -436,7 +436,7 @@ static void yghv_exclude_driver(PDRIVER_OBJECT d) {
 #if YGHV_R1_EXCLUDE_PRIVATE
 static void yghv_exclude_hv_private(PDRIVER_OBJECT d) {
     ULONG i;
-    (void)d;
+
 
     /* R1 bare-metal: remove hypervisor-owned pages from the guest NPT.
        The synthetic guest executes from the driver image, so the driver
@@ -461,7 +461,7 @@ static void yghv_exclude_hv_private(PDRIVER_OBJECT d) {
                               SVM_IOPM_PAGES * HV_PAGE_SIZE);
     }
     npt_exclude_self(&g_npt);
-}
+
 
 static NTSTATUS yghv_r1_exclude_check(void) {
     svm_vcpu_t *v = svm_core_get_vcpu(0);
@@ -5105,6 +5105,31 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
 #else
     yghv_trace("exclude private n/a");
 #endif
+    /*
+     * 9.343 (Tier 7.1): register our code range and allocate the decoy frame.
+     *
+     * MUST BE OUTSIDE the YGHV_R1_EXCLUDE_PRIVATE conditional. The first version
+     * of this block was placed inside yghv_exclude_hv_private(), which the
+     * default build does not compile (the macro defaults to 0) — so the code
+     * range stayed 0, yghv_guard_hide_core() refused to hide anything, and the
+     * feature silently did nothing while reporting success. Measured: hidecore
+     * returned "hid 0 page(s)".
+     *
+     * The code range is what lets the NPF handler tell "our own access to a page
+     * we hid" (RIP inside this image, CPL 0) from "a guest reaching for it"
+     * (guest RIP, CPL 3). Without it, hiding our own tables takes the driver out
+     * with them — the 13th crash. Without the decoy, a hidden page leaves a hole
+     * an inventory comparison can see.
+     */
+    {
+        extern void yghv_guard_set_code_range(uint64_t start, uint64_t size);
+        extern int yghv_guard_decoy_init(void);
+        yghv_guard_set_code_range((uint64_t)d->DriverStart,
+                                  (uint64_t)d->DriverSize);
+        (void)yghv_guard_decoy_init();
+        yghv_trace("guard: code range + decoy registered");
+    }
+
     yghv_trace("guest code exec n/a");
 
     for (i = 0; i < online; i++) {

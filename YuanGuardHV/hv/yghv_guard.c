@@ -6,11 +6,15 @@
 #include "yghv_guard.h"
 #include "protect.h"
 #include "npt.h"
+#include "yghv_crypto.h"
 #include "mem_pa.h"
+
+/* 9.344: the main NPT manager, needed by the island-safe remap helpers. */
+extern npt_mgr_t g_npt;
 
 typedef struct {
     uint64_t gpa;
-    uint64_t hash;
+    uint8_t  digest[YGHV_SHA256_DIGEST];   /* 9.342: cryptographic */
     /* 9.339: which bytes of the page form the guarded OBJECT.
      * .bss packs unrelated globals together (g_frame and g_guard share page
      * 0x34000), so a whole-page hash reports a change the moment any of them
@@ -28,8 +32,8 @@ typedef struct {
     volatile LONG active;
 } yghv_guard_t;
 
-static yghv_guard_t g_guard[YGHV_GUARD_MAX];
-static volatile LONG g_guard_count;
+DECLSPEC_ALIGN(4096) static yghv_guard_t g_guard[YGHV_GUARD_MAX];
+DECLSPEC_ALIGN(4096) static volatile LONG g_guard_count;
 
 static volatile LONG64 g_g_guarded;
 static volatile LONG64 g_g_hidden;
@@ -38,6 +42,19 @@ static volatile LONG64 g_g_changed;
 static volatile LONG64 g_g_probes;
 static volatile LONG64 g_g_hidefail;
 static volatile LONG64 g_g_hashfail;
+
+/* 9.343: our own code range (RIP whitelist) and the decoy frame. Declared
+ * here because the guard/decoy checks run in add paths defined below. */
+static uint64_t g_code_start;
+static uint64_t g_code_size;
+static uint64_t g_decoy_pa;
+static void *g_decoy_va;
+/* 9.346: forward declarations — the add paths below use these. */
+static int yghv_guard_owns_page(uint64_t gpa);
+static int yghv_guard_state_page(uint64_t gpa);
+static int yghv_guard_target_page(uint64_t gpa);
+static int yghv_guard_find(uint64_t gpa);
+
 
 /*
  * FNV-1a over one page.
@@ -72,43 +89,45 @@ static volatile LONG64 g_g_hashfail;
 /* 9.340: forward declarations — add_va is used before these are defined. */
 static int yghv_guard_owns_page(uint64_t gpa);
 static int yghv_guard_find(uint64_t gpa);
-static uint64_t yghv_guard_hash_region(uint64_t gpa, uint32_t off, uint32_t len) {
+static int yghv_guard_hash_region(uint64_t gpa, uint32_t off, uint32_t len,
+                                  uint8_t out[YGHV_SHA256_DIGEST]) {
     uint8_t buf[256];
-    uint64_t h = 0xcbf29ce484222325ULL;
+    yghv_sha256_ctx_t ctx;
     uint64_t done = 0;
     uint64_t base = gpa + off;
 
-    if (len == 0 || len > 0x1000 || off + len > 0x1000)
+    if (len == 0 || len > 0x1000 || off + len > 0x1000 || !out)
         return 0;
 
+    yghv_sha256_init(&ctx);
     while (done < len) {
         uint32_t chunk = (uint32_t)((len - done) < sizeof(buf)
                                     ? (len - done) : sizeof(buf));
-        int i;
         if (!yghv_pa_read(base + done, buf, chunk))
-            return 0;                    /* 0 = "could not hash" */
-        for (i = 0; i < (int)chunk; i++) {
-            h ^= (uint64_t)buf[i];
-            h *= 0x100000001b3ULL;
-        }
+            return 0;
+        yghv_sha256_update(&ctx, buf, chunk);
         done += chunk;
     }
-    return h ? h : 1;                    /* keep 0 reserved for failure */
+    yghv_sha256_final(&ctx, out);
+    return 1;
 }
-static uint64_t yghv_guard_hash_va(const void *va, uint32_t len) {
-    const uint8_t *p = (const uint8_t *)va;
-    uint64_t h = 0xcbf29ce484222325ULL;
-    uint32_t i;
-
-    if (!va || len == 0)
+/*
+ * 9.342: SHA-256 over the object's exact bytes.
+ *
+ * FNV-1a answered "did this change by accident", which is not the question. A
+ * guest editing a guarded table only has to make its edit hash-neutral, and a
+ * multiply-and-xor hash over bytes it controls is trivial to steer. SHA-256
+ * turns that into a second-preimage problem instead.
+ *
+ * Returns 0 only when the read failed; otherwise a digest is always written.
+ */
+static int yghv_guard_hash_va(const void *va, uint32_t len,
+                              uint8_t out[YGHV_SHA256_DIGEST]) {
+    if (!va || len == 0 || !out)
         return 0;
-    for (i = 0; i < len; i++) {
-        h ^= (uint64_t)p[i];
-        h *= 0x100000001b3ULL;
-    }
-    return h ? h : 1;
+    yghv_sha256(va, len, out);
+    return 1;
 }
-
 /*
  * Guard an object at its VA: hash its exact bytes.
  * PASSIVE. `hide` is normally 0 — see yghv_guard_owns_page() for why our own
@@ -124,7 +143,17 @@ int yghv_guard_add_va(const void *va, uint32_t len, const char *tag, int hide) {
         return -2;
     if (KeAreAllApcsDisabled())
         return -1;
-    if (hide && yghv_guard_owns_page(page))
+    /*
+     * 9.343: hiding our own tables is now ALLOWED.
+     *
+     * 9.337 refused because the fault was unrecoverable — hiding removed the
+     * page from the driver too (13th crash). With the RIP-whitelist ALLOW loop
+     * in svm_simplevm206.cpp, our own access faults and is then served, so
+     * hiding is survivable. The refusal remains only as a fallback for when
+     * the code range was never registered, i.e. the loop cannot recognise us.
+     */
+    if (hide && yghv_guard_state_page(page) &&
+        (!g_code_size || !g_decoy_pa))
         hide = 0;
 
     {
@@ -160,12 +189,12 @@ int yghv_guard_add_va(const void *va, uint32_t len, const char *tag, int hide) {
         return -3;
 
     {
-        uint64_t h = yghv_guard_hash_va(va, len);
-        if (!h) {
+        uint8_t sha[YGHV_SHA256_DIGEST];
+        if (!yghv_guard_hash_va(va, len, sha)) {
             InterlockedIncrement64(&g_g_hashfail);
             return -5;
         }
-        g_guard[slot].hash = h;
+        RtlCopyMemory(g_guard[slot].digest, sha, YGHV_SHA256_DIGEST);
     }
     g_guard[slot].hash_off = 0;
     g_guard[slot].hash_len = len;
@@ -244,46 +273,81 @@ int yghv_guard_add_va(const void *va, uint32_t len, const char *tag, int hide) {
  * The refusal is explicit rather than silent, so a caller learns the boundary
  * instead of getting a page that vanishes under their own feet.
  */
-static int yghv_guard_owns_page(uint64_t gpa) {
+/*
+ * 9.346: TWO questions, and they were being conflated.
+ *
+ * owns_page() was written for 9.337, when the refusal was "never hide a page the
+ * driver reads with plain C" — so it named the guard's own state AND all three
+ * Tier-4 tables, because at that time hiding any of them was fatal.
+ *
+ * 9.343 changed one half of that: with the RIP-whitelist ALLOW loop, hiding the
+ * three TABLES is exactly what hidecore is for. But the split-page problem
+ * (9.345) has nothing to do with the tables — it is about the guard's own
+ * bookkeeping sharing their pages.
+ *
+ * Feeding one predicate to both decisions inverted hidecore: it skipped the very
+ * pages it was asked to hide and reported "hid 0 page(s)" while claiming success.
+ * So the question is split:
+ *
+ *   guard_state(gpa)  — is this page the guard's OWN state?
+ *                       Hiding it recurses (9.345 hang) and can never be right.
+ *   target_table(gpa) — is this page one of the Tier-4 tables?
+ *                       Hiding it is the feature; the ALLOW loop serves our
+ *                       subsequent accesses.
+ */
+
+/* Is this page the guard's own bookkeeping? Never hide it: the NPF handler
+ * reads g_guard through yghv_guard_is_hidden(), so hiding it faults inside the
+ * handler that asked the question — measured as an infinite recursion (hang). */
+static int yghv_guard_state_page(uint64_t gpa) {
     uint64_t page = gpa & ~(uint64_t)0xFFFULL;
     uint64_t lo, hi;
 
-    /* the guard's own table + counters */
     lo = (uint64_t)(ULONG_PTR)&g_guard[0];
     hi = (uint64_t)(ULONG_PTR)&g_guard[YGHV_GUARD_MAX - 1] + sizeof(g_guard[0]);
     if (page >= (lo & ~(uint64_t)0xFFFULL) && page <= (hi & ~(uint64_t)0xFFFULL))
         return 1;
     if (page == ((uint64_t)(ULONG_PTR)&g_guard_count & ~(uint64_t)0xFFFULL))
         return 1;
-
-    /* the three tables arm_core wants to protect — same argument applies to
-     * each: we read them with plain C from IOCTL context, so hiding any of
-     * them hides it from us. */
-    {
-        extern uint64_t *yghv_bp_table_va(uint32_t *bytes);
-        extern uint64_t *yghv_frame_table_va(uint32_t *bytes);
-        extern uint64_t *yghv_view_table_va(uint32_t *bytes);
-        uint32_t bytes = 0;
-        uint64_t *va = yghv_bp_table_va(&bytes);
-        if (va && bytes &&
-            page >= (((uint64_t)(ULONG_PTR)va) & ~(uint64_t)0xFFFULL) &&
-            page <= (((uint64_t)(ULONG_PTR)va + bytes) & ~(uint64_t)0xFFFULL))
-            return 1;
-        va = yghv_frame_table_va(&bytes);
-        if (va && bytes &&
-            page >= (((uint64_t)(ULONG_PTR)va) & ~(uint64_t)0xFFFULL) &&
-            page <= (((uint64_t)(ULONG_PTR)va + bytes) & ~(uint64_t)0xFFFULL))
-            return 1;
-        va = yghv_view_table_va(&bytes);
-        if (va && bytes &&
-            page >= (((uint64_t)(ULONG_PTR)va) & ~(uint64_t)0xFFFULL) &&
-            page <= (((uint64_t)(ULONG_PTR)va + bytes) & ~(uint64_t)0xFFFULL))
-            return 1;
-    }
-
+    if (page == ((uint64_t)(ULONG_PTR)&g_code_size & ~(uint64_t)0xFFFULL))
+        return 1;
+    if (page == ((uint64_t)(ULONG_PTR)&g_decoy_pa & ~(uint64_t)0xFFFULL))
+        return 1;
     return 0;
 }
 
+/* Is this page one of the tables arm_core/hidecore target? */
+static int yghv_guard_target_page(uint64_t gpa) {
+    uint64_t page = gpa & ~(uint64_t)0xFFFULL;
+    extern uint64_t *yghv_bp_table_va(uint32_t *bytes);
+    extern uint64_t *yghv_frame_table_va(uint32_t *bytes);
+    extern uint64_t *yghv_view_table_va(uint32_t *bytes);
+    uint32_t bytes = 0;
+    uint64_t *va;
+
+    va = yghv_bp_table_va(&bytes);
+    if (va && bytes && page >= ((uint64_t)(ULONG_PTR)va & ~(uint64_t)0xFFFULL) &&
+        page <= (((uint64_t)(ULONG_PTR)va + bytes) & ~(uint64_t)0xFFFULL))
+        return 1;
+    va = yghv_frame_table_va(&bytes);
+    if (va && bytes && page >= ((uint64_t)(ULONG_PTR)va & ~(uint64_t)0xFFFULL) &&
+        page <= (((uint64_t)(ULONG_PTR)va + bytes) & ~(uint64_t)0xFFFULL))
+        return 1;
+    va = yghv_view_table_va(&bytes);
+    if (va && bytes && page >= ((uint64_t)(ULONG_PTR)va & ~(uint64_t)0xFFFULL) &&
+        page <= (((uint64_t)(ULONG_PTR)va + bytes) & ~(uint64_t)0xFFFULL))
+        return 1;
+    return 0;
+}
+
+/*
+ * 9.337's original refusal, kept for the callers that predate the ALLOW loop:
+ * hiding a page we read with plain C is only safe when the ALLOW loop is
+ * available to serve our own subsequent access.
+ */
+static int yghv_guard_owns_page(uint64_t gpa) {
+    return (yghv_guard_state_page(gpa) || yghv_guard_target_page(gpa)) ? 1 : 0;
+}
 static int yghv_guard_find(uint64_t gpa) {
     uint64_t page = gpa & ~(uint64_t)0xFFFULL;
     int i;
@@ -325,7 +389,17 @@ int yghv_guard_add_range(uint64_t gpa, uint32_t off, uint32_t len,
     if (KeAreAllApcsDisabled())
         return -1;
 
-    if (hide && yghv_guard_owns_page(page))
+    /*
+     * 9.343: hiding our own tables is now ALLOWED.
+     *
+     * 9.337 refused because the fault was unrecoverable — hiding removed the
+     * page from the driver too (13th crash). With the RIP-whitelist ALLOW loop
+     * in svm_simplevm206.cpp, our own access faults and is then served, so
+     * hiding is survivable. The refusal remains only as a fallback for when
+     * the code range was never registered, i.e. the loop cannot recognise us.
+     */
+    if (hide && yghv_guard_state_page(page) &&
+        (!g_code_size || !g_decoy_pa))
         hide = 0;
 
     {
@@ -361,12 +435,12 @@ int yghv_guard_add_range(uint64_t gpa, uint32_t off, uint32_t len,
         return -3;
 
     if (hash) {
-        uint64_t h = yghv_guard_hash_region(page, off, len);
-        if (!h) {
+        uint8_t sha[YGHV_SHA256_DIGEST];
+        if (!yghv_guard_hash_region(page, off, len, sha)) {
             InterlockedIncrement64(&g_g_hashfail);
             return -5;
         }
-        g_guard[slot].hash = h;
+        RtlCopyMemory(g_guard[slot].digest, sha, YGHV_SHA256_DIGEST);
         g_guard[slot].hash_off = off;
         g_guard[slot].hash_len = len;
     }
@@ -429,26 +503,36 @@ int yghv_guard_remove(uint64_t gpa) {
 
 int yghv_guard_verify(uint64_t gpa) {
     int slot = yghv_guard_find(gpa);
-    uint64_t h;
+    uint8_t now[YGHV_SHA256_DIGEST];
+    int have;
 
     if (slot < 0)
         return -1;
-    if (!g_guard[slot].hash)
-        return 1;                        /* hash-only wasn't requested */
+
+    /* A digest of all zeros means hashing was not requested for this entry. */
+    {
+        int allzero = 1, z;
+        for (z = 0; z < YGHV_SHA256_DIGEST; z++) {
+            if (g_guard[slot].digest[z]) { allzero = 0; break; }
+        }
+        if (allzero)
+            return 1;
+    }
 
     if (g_guard[slot].hash_va)
-            h = yghv_guard_hash_va((const void *)g_guard[slot].hash_va,
-                                   g_guard[slot].hash_len);
-        else
-            h = yghv_guard_hash_region(g_guard[slot].gpa, g_guard[slot].hash_off,
-                                       g_guard[slot].hash_len);
-    if (!h)
+        have = yghv_guard_hash_va((const void *)g_guard[slot].hash_va,
+                                  g_guard[slot].hash_len, now);
+    else
+        have = yghv_guard_hash_region(g_guard[slot].gpa,
+                                      g_guard[slot].hash_off,
+                                      g_guard[slot].hash_len, now);
+    if (!have)
         return -1;
 
     g_guard[slot].checks++;
     InterlockedIncrement64(&g_g_verified);
 
-    if (h != g_guard[slot].hash) {
+    if (!yghv_sha256_equal(now, g_guard[slot].digest)) {
         g_guard[slot].changes++;
         InterlockedIncrement64(&g_g_changed);
         return 0;
@@ -479,7 +563,7 @@ uint32_t yghv_guard_list(yghv_guard_info_t *out, uint32_t max) {
         if (!InterlockedCompareExchange(&g_guard[i].active, 0, 0))
             continue;
         out[n].gpa = g_guard[i].gpa;
-        out[n].hash = g_guard[i].hash;
+        RtlCopyMemory(out[n].digest, g_guard[i].digest, YGHV_SHA256_DIGEST);
         out[n].checks = g_guard[i].checks;
         out[n].changes = g_guard[i].changes;
         out[n].hidden = g_guard[i].hidden;
@@ -572,3 +656,258 @@ void yghv_guard_stats_reset(void) {
  * anything whose address we already hold. yghv_pa_read stays for frames we do
  * not have a VA for (a breakpoint target, a foreign process's page).
  */
+
+
+/* ============================================================================
+ * 9.343: three upgrades over the first cut of 7.1/7.3
+ * ==========================================================================*/
+
+/* ---- #1 hide our OWN tables: RIP-whitelist ALLOW loop ---- */
+
+static uint64_t g_code_start;
+static uint64_t g_code_size;
+
+void yghv_guard_set_code_range(uint64_t start, uint64_t size) {
+    g_code_start = start;
+    g_code_size = size;
+}
+
+/*
+ * ISLAND-SAFE. A fault is "ours" when it comes from code inside this driver's
+ * image at CPL 0. A guest store cannot satisfy both: its RIP is somewhere in
+ * guest code and its CPL is 3.
+ *
+ * This is what makes hiding our own tables possible. 9.320.1 showed the naive
+ * approach removes the page from us as well; with this whitelist the fault is
+ * recoverable, so hiding becomes survivable rather than self-destructive.
+ */
+int yghv_guard_fault_is_ours(uint64_t rip, uint32_t cpl) {
+    if (!g_code_size)
+        return 0;
+    if (cpl != 0)
+        return 0;
+    return (rip >= g_code_start && rip < g_code_start + g_code_size) ? 1 : 0;
+}
+
+/* ---- #2 decoy frame for address-space continuity ---- */
+
+static uint64_t g_decoy_pa;
+static void *g_decoy_va;
+
+int yghv_guard_decoy_init(void) {
+    if (g_decoy_va)
+        return 1;
+    if (KeAreAllApcsDisabled())
+        return 0;
+
+    g_decoy_va = ExAllocatePoolWithTag(NonPagedPool, 0x1000, 'Ydcy');
+    if (!g_decoy_va)
+        return 0;
+    RtlZeroMemory(g_decoy_va, 0x1000);
+    g_decoy_pa = MmGetPhysicalAddress(g_decoy_va).QuadPart;
+    return g_decoy_pa ? 1 : 0;
+}
+
+int yghv_guard_decoy_ready(void) {
+    return (g_decoy_pa && g_decoy_va) ? 1 : 0;
+}
+
+uint64_t yghv_guard_decoy_pa(void) {
+    return g_decoy_pa;
+}
+
+/* ---- #3 unregistered pages ---- */
+
+uint32_t yghv_guard_uncovered(uint64_t start, uint64_t size, uint64_t *out,
+                              uint32_t max) {
+    uint64_t page;
+    uint32_t n = 0;
+
+    if (!size)
+        return 0;
+    if (KeAreAllApcsDisabled())
+        return 0;
+
+    for (page = start & ~(uint64_t)0xFFFULL;
+         page < (start + size);
+         page += 0x1000) {
+        if (yghv_guard_find(page) >= 0)
+            continue;
+        if (out && n < max)
+            out[n] = page;
+        n++;
+    }
+    return n;
+}
+
+/*
+ * 9.343 #1: hide the Tier-4 tables for real.
+ *
+ * Requiring a registered code range and a decoy is not cosmetic: hiding a page
+ * we read with plain C is only survivable because the NPF handler recognises
+ * our own fault (RIP whitelist) and the decoy keeps the address space looking
+ * continuous. With neither, this is the 13th crash again. So refuse unless both
+ * are in place, and say so in the return value.
+ */
+uint32_t yghv_guard_hide_core(void) {
+    extern uint64_t *yghv_bp_table_va(uint32_t *bytes);
+    extern uint64_t *yghv_frame_table_va(uint32_t *bytes);
+    extern uint64_t *yghv_view_table_va(uint32_t *bytes);
+    uint32_t hid = 0;
+    uint32_t bytes = 0;
+    uint64_t *va;
+    int i;
+
+    if (!yghv_guard_hiding_armed())
+        return 0;
+
+    for (i = 0; i < 3; i++) {
+        va = (i == 0) ? yghv_bp_table_va(&bytes)
+                      : (i == 1) ? yghv_frame_table_va(&bytes)
+                                 : yghv_view_table_va(&bytes);
+        if (!va || !bytes)
+            continue;
+        {
+            uint64_t gpa = MmGetPhysicalAddress(va).QuadPart;
+            uint32_t off;
+            for (off = 0; off < bytes; off += 0x1000) {
+                /*
+                 * 9.345: never hide a page carrying our OWN bookkeeping.
+                 *
+                 * Measured consequence of skipping this: after DECLSPEC_ALIGN
+                 * moved the tables, the linker filled their spare page space
+                 * with g_guard itself (g_frame @0x3B000 ... g_guard @0x3B5B0).
+                 * hidecore hid that page, yghv_guard_is_hidden() — which reads
+                 * g_guard — faulted inside the NPF handler, which called
+                 * yghv_guard_is_hidden() again: infinite recursion. The machine
+                 * hung; it did not bugcheck, which is why this one read as a
+                 * timeout rather than a dump.
+                 */
+                if (yghv_guard_state_page(gpa + off))
+                    continue;
+                {
+                    int s = yghv_guard_find(gpa + off);
+                    if (s < 0)
+                        continue;
+                    if (g_guard[s].hidden)
+                        continue;
+                    if (yghv_protect_npt_unmap_page(gpa + off)) {
+                        g_guard[s].hidden = 1;
+                        InterlockedIncrement64(&g_g_hidden);
+                        hid++;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/* ============================================================================
+ * 9.344: ISLAND-SAFE remap, and the reason the first version could not work.
+ *
+ * The 15th crash (0x3B at yghv_mem_read+0x2A) was not a subtle detail — it was
+ * a wrong API choice, and the mechanism is worth stating plainly:
+ *
+ *   yghv_protect_npt_remap_flags() begins with
+ *
+ *       if (KeAreAllApcsDisabled()) return 0;
+ *
+ *   An NPF handler runs at DISPATCH_LEVEL with GIF=0, which IS "all APCs
+ *   disabled". So every call to it from the fault path returned 0:
+ *
+ *     - the ALLOW branch's if(...) was always false, so the page was never
+ *       restored and execution fell through;
+ *     - the decoy branch called the same function and also got 0;
+ *     - the delivered access violation (CR2 = 0) was unresolvable by the
+ *       guest's own fault handler -> 0x3B.
+ *
+ *   Measured exactly that: hidecore succeeded (it runs at PASSIVE), then the
+ *   first yghv_mem_read touching a hidden page crashed.
+ *
+ * 4.4's ALLOW loop works because it uses the island-safe *_bare family
+ * (yghv_protect_arm_page_bare uses npt_set_page_perm directly, with no IRQL
+ * gate). The guard path needs the same treatment.
+ * ==========================================================================*/
+
+/*
+ * ISLAND-SAFE. Restore a hidden page's leaf entry to its real frame.
+ * No IRQL check, no allocation, no lock — only NPT arithmetic, the same
+ * discipline as yghv_protect_arm_page_bare().
+ */
+int yghv_guard_remap_bare(uint64_t gpa) {
+    uint64_t page = gpa & ~(uint64_t)0xFFFULL;
+    int st;
+
+    if (!page)
+        return 0;
+
+    /* A 2MB mapping must become 4K before its leaf can be touched, exactly as
+     * the arm path does it. */
+    if (npt_split_2mb_to_4kb(&g_npt, page))
+        return 0;
+
+    st = npt_set_page_perm(&g_npt, page, NPT_PERM_PRESENT | NPT_PERM_WRITABLE);
+    return st ? 0 : 1;
+}
+
+/*
+ * ISLAND-SAFE. Point a hidden page's leaf entry at the decoy frame.
+ * Same discipline; the frame was allocated once at load.
+ */
+int yghv_guard_decoy_bare(uint64_t gpa) {
+    uint64_t page = gpa & ~(uint64_t)0xFFFULL;
+
+    if (!page || !g_decoy_pa)
+        return 0;
+    if (npt_split_2mb_to_4kb(&g_npt, page))
+        return 0;
+    if (!NT_SUCCESS(npt_map_page(&g_npt, page, g_decoy_pa & ~(uint64_t)0xFFFULL,
+                                 NPT_4K_PAGE_FLAGS)))
+        return 0;
+    return 1;
+}
+
+/*
+ * ISLAND-SAFE. Has the guard module got everything hiding needs?
+ *
+ * hidecore refuses unless this is true, and the NPF path checks it before
+ * deciding between ALLOW, decoy and violation. Keeping the predicate in one
+ * place is what lets "hiding is armed" be a single fact rather than three
+ * independent conditions that can disagree.
+ */
+int yghv_guard_hiding_armed(void) {
+    return (g_code_size && g_decoy_pa) ? 1 : 0;
+}
+
+/*
+ * 9.348: ISLAND-SAFE page reopen, for the breakpoint/watch ALLOW loop.
+ *
+ * Found by tests/irql_contract_check.ps1, which was written after the 15th crash
+ * and then caught THIS — a second instance of the same mistake, latent in Tier
+ * 4.4 since it was written:
+ *
+ *   svm_simplevm206.cpp:1457 and :1508 (inside SvHandleVmExit, i.e. the NPF
+ *   handler) called yghv_protect_npt_set_perm() to reopen a page after a
+ *   breakpoint matched. That function starts with
+ *
+ *       if (KeAreAllApcsDisabled()) return 0;
+ *
+ *   and an NPF handler IS "all APCs disabled", so the reopen returned 0 on every
+ *   breakpoint hit: the page was never reopened, the ALLOW path fell through,
+ *   and the breakpoint could not do its job. The failure was silent because 0 is
+ *   also what "nothing to do" looks like.
+ *
+ * This is the island-safe form: NPT arithmetic only, exactly the discipline
+ * yghv_protect_arm_page_bare() and yghv_guard_remap_bare() already use.
+ */
+int yghv_guard_reopen_bare(uint64_t gpa) {
+    uint64_t page = gpa & ~(uint64_t)0xFFFULL;
+    int st;
+
+    if (!page)
+        return 0;
+    if (npt_split_2mb_to_4kb(&g_npt, page))
+        return 0;
+    st = npt_set_page_perm(&g_npt, page, NPT_PERM_PRESENT | NPT_PERM_WRITABLE);
+    return st ? 0 : 1;
+}

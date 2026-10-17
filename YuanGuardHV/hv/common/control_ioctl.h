@@ -185,6 +185,15 @@ typedef struct {
      op 0 = read  (a=pa, b=len, c=off)  -> out[0]=got, then the bytes
      op 1 = write (a=pa, b=u64 value)   -> out[0]=ok
      op 2 = write bytes from in[4..]   -> in[1]=pa, in[2]=len */
+/* Tier 7.4/7.5/7.6 (2026-10-18): exit-latency self-measurement, escape attempts,
+   and the current attack surface. 32-byte input {ULONG op, pad, a, b}:
+     op 0 stats   -> 14 qwords: escapes[6], total, last_kind, last_detail,
+                                 last_a, last_b, exits, worst_cycles, total_cycles
+     op 1 surface -> out[0]=count, then 3 qwords per entry (name[2], is_ioctl)
+     op 2 reset   */
+#define IOCTL_YGHV_SENTRY \
+    YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x828, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
+#define YGHV_SENTRY_OUT_QWORDS 14
 #define IOCTL_YGHV_PA \
     YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x827, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
 #define IOCTL_YGHV_GUARD \

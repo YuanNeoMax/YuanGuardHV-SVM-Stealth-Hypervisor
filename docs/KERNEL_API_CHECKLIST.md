@@ -474,3 +474,54 @@ int yghv_guard_add_va(const void *va, uint32_t len, const char *tag, int hide);
 
 **规则**：**每个接收地址的函数都要在签名/注释里写清楚它要的是 VA 还是 PA。**
 本项目的 `mem-write` 要 VA，`pa-io` 要 PA —— 用错一个是蓝屏。
+---
+
+## 二十二、★ 岛内 IRQL 契约：为什么"返回 0"可能是最坏的返回值
+
+**第 15 次崩溃的直接机制，以及它后来又抓到的两个同类缺陷。**
+
+### 症状与机制
+
+```c
+int yghv_protect_npt_remap_flags(...) {
+    if (KeAreAllApcsDisabled()) return 0;   /* PASSIVE 门槛 */
+    ...
+}
+```
+
+NPF/VMEXIT 处理器运行在 **DISPATCH_LEVEL + GIF=0** —— **那正是"APC 全关"**。
+
+于是从岛内调用它：**每一次都返回 0**。
+
+**为什么这是最坏的失败模式：**
+
+> 函数在孤立情况下是**正确的**，返回值是**貌似合理的**。
+> 调用方无法区分「因为上下文不对而拒绝」和「无事可做」。
+> 于是：页没被恢复、诱饵没被装上、落下不可解的访问违例 → `0x3B` → 重启。
+> 而**没有一行日志，没有一次报错**。
+
+### 三个因此被发现的缺陷
+
+| 缺陷 | 潜伏期 | 症状 |
+|---|---|---|
+| guard ALLOW 用 `remap_flags` | 本次 | `0x3B` 崩溃（第 15 次） |
+| `yghv_bp_rearm_bare` 自身带门槛 | **4.4 起** | 断点页从不重装，只是"不再命中" |
+| #DB 重隐藏用 `remap_flags` | 本次 | 页从不重新隐藏，无任何症状 |
+
+**第二个最值得注意**：函数叫 `_bare`，被岛内调用，身体却写 `if (KeAreAllApcsDisabled()) return 0;`。**名字说是岛内安全，身体拒绝在岛内运行。**
+
+### 规则
+
+1. **带 `KeAreAllApcsDisabled()` 门槛的函数 = PASSIVE-only，岛内绝不可调用。**
+   岛内需要时写一个 `*_bare` 版本（只做 NPT 算术 / 纯内存操作）。
+2. **`*_bare` 命名是承诺**：名字带 `_bare` 的函数体内不得出现任何 IRQL 门槛。
+3. **新加岛内入口必须登记进 `tests/irql_contract_check.ps1` 的 `$islandEntries`**，
+   否则检查会漏（这是已知缺口）。
+4. **每个接收地址的函数都要在签名/注释里写清要 VA 还是 PA。**
+
+### 检查
+
+`tests/irql_contract_check.ps1`（规则 3 / 3b / 4）与 `tests/page_layout_check.ps1`。
+
+**规则 4 是支点**：找不到某个已登记岛内入口的函数体 → 直接 FAIL。
+**一个看不见代码的检查，它的 PASS 是谎言。**

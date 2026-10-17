@@ -10,7 +10,23 @@
 #include "mem_view.h"
 #include "protect.h"
 
-static yghv_view_page_t      g_view_pages[YGHV_VIEW_MAX_PAGES];
+/*
+ * 9.344: put this table on a page of its OWN — see mem_bp.c for the full note.
+ *
+ * The 15th crash was hiding per-PAGE when the object is smaller than the page:
+ * g_engine_sel shares 0x2F000 with g_view_pages (62 symbols on that one page),
+ * so hiding the view table removed a counter yghv_mem_read touches every call.
+ */
+DECLSPEC_ALIGN(4096) static yghv_view_page_t g_view_pages[YGHV_VIEW_MAX_PAGES];
+DECLSPEC_ALIGN(4096) static uint8_t g_view_pages_pad[4096];
+/*
+ * 9.347: this table must fit inside ONE page, or the guard layer's assumption
+ * ("hide this object" == "hide this page") is false and hiding it removes
+ * whatever the linker packed alongside. The build fails here with a number
+ * rather than the machine failing with a bugcheck — or hanging, which is what
+ * the 15th failure did and is far worse to diagnose.
+ */
+typedef char yghv_assert_g_view_pages_fits_page[(sizeof(g_view_pages) <= 4096) ? 1 : -1];
 static uint64_t              g_view_observers[YGHV_VIEW_MAX_OBSERVERS];
 static volatile LONG         g_view_page_count;
 static volatile LONG         g_view_obs_count;

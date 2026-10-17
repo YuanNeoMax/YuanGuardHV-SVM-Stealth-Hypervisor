@@ -15,7 +15,43 @@ typedef struct {
     volatile LONG active;
 } yghv_frame_t;
 
-static yghv_frame_t g_frame[YGHV_FRAME_MAX];
+/*
+ * 9.344: put this table on a page of its OWN.
+ *
+ * THIS IS THE THIRD TIME the same mistake appeared, and the fix is structural
+ * rather than another special case.
+ *
+ * 9.339 fixed it for HASHING: .bss packs unrelated globals into one page, so a
+ * whole-page hash reported changes from its neighbours and a whole page could
+ * not be hidden without removing them too. Hashing was narrowed to the object's
+ * bytes — but HIDING was still per-PAGE, and the 15th crash was exactly that:
+ *
+ *     yghv_mem_read+0x2A: lock cmpxchg [yghv_g25+0x2fed8], ecx
+ *                         0x2fed8 = g_engine_sel
+ *
+ *   g_engine_sel shares page 0x2F000 with g_view_pages, so hiding the view table
+ *   removed the engine selector — a counter yghv_mem_read touches on every call.
+ *   Measured: page 0x2F000 held 62 symbols, 0x33000 held 12, 0x35000 held 22.
+ *
+ * Alignment + padding gives each table its own page, so "hide this object" and
+ * "hide this page" become the same statement. Only after that is hiding our own
+ * tables a well-defined operation at all.
+ *
+ * The array is not accessed through a pointer: every use in this file and the
+ * extern declarations elsewhere keep compiling unchanged, and DECLSPEC_ALIGN
+ * plus the padding forces the layout.
+ */
+DECLSPEC_ALIGN(4096) static yghv_frame_t g_frame[YGHV_FRAME_MAX];
+/* padding: extend to a multiple of 4K so no neighbour shares the page */
+DECLSPEC_ALIGN(4096) static uint8_t g_frame_pad[4096];
+/*
+ * 9.347: this table must fit inside ONE page, or the guard layer's assumption
+ * ("hide this object" == "hide this page") is false and hiding it removes
+ * whatever the linker packed alongside. The build fails here with a number
+ * rather than the machine failing with a bugcheck — or hanging, which is what
+ * the 15th failure did and is far worse to diagnose.
+ */
+typedef char yghv_assert_g_frame_fits_page[(sizeof(g_frame) <= 4096) ? 1 : -1];
 static volatile LONG g_frame_count;
 
 static volatile LONG64 g_frm_reserved;

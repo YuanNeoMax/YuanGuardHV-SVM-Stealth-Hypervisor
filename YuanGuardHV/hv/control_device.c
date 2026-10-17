@@ -15,7 +15,9 @@
 #include "mem_bp.h"       /* Tier 4.4: instruction-level access control */
 #include "mem_frame.h"    /* Tier 4.5: frame ownership takeover */
 #include "yghv_fail.h"     /* Tier 7.2/7.7: graceful degradation */
+#include "yghv_crypto.h"   /* 9.342: SHA-256 */
 #include "yghv_guard.h"    /* Tier 7.1/7.3: self-hiding + integrity */
+#include "yghv_sentry.h"   /* Tier 7.4/7.5/7.6: timing/escape/surface */
 #include "debug.h"
 
 NTKERNELAPI PEPROCESS IoGetRequestorProcess(PIRP Irp);
@@ -867,6 +869,60 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
         status = STATUS_INVALID_PARAMETER;
         break;
     }
+    case IOCTL_YGHV_SENTRY: {
+        /* Tier 7.4/7.5/7.6: what is being attempted against us, how slow our
+         * exits are, and what we currently expose. */
+        UINT64 *out = (UINT64 *)buf;
+        ULONG op = 0;
+        if (in_len >= 32)
+            op = (ULONG)((UINT64 *)buf)[0];
+
+        if (op == 1) {
+            yghv_sentry_surface_entry_t se[YGHV_SENTRY_MAX_SURFACE];
+            uint32_t n, i;
+            n = yghv_sentry_surface_list(se, YGHV_SENTRY_MAX_SURFACE);
+            out[0] = n;
+            for (i = 0; i < n && (1 + (i + 1) * 3) <= (out_len / sizeof(UINT64)); i++) {
+                UINT64 *e = &out[1 + i * 3];
+                RtlCopyMemory(&e[0], se[i].name, 16);
+                e[2] = (se[i].is_ioctl ? 1ULL : 0ULL) | ((UINT64)se[i].count << 8);
+            }
+            info = (ULONG)(8 + (SIZE_T)n * 3 * sizeof(UINT64));
+            if (info > out_len)
+                info = out_len;
+            status = STATUS_SUCCESS;
+            break;
+        }
+        if (op == 2) {
+            yghv_sentry_reset();
+            out[0] = 1;
+            info = 8;
+            status = STATUS_SUCCESS;
+            break;
+        }
+        if (out_len >= YGHV_SENTRY_OUT_QWORDS * sizeof(UINT64)) {
+            yghv_sentry_escape_stats_t es;
+            yghv_sentry_timing_t tt;
+            int i;
+            yghv_sentry_escape_stats_get(&es);
+            yghv_sentry_timing_get(&tt);
+            for (i = 0; i < 6; i++)
+                out[i] = es.escapes[i];
+            out[6] = es.escapes_total;
+            out[7] = es.last_kind;
+            out[8] = es.last_detail;
+            out[9] = es.last_a;
+            out[10] = es.last_b;
+            out[11] = tt.exits;
+            out[12] = tt.worst_cycles;
+            out[13] = tt.total_cycles;
+            info = YGHV_SENTRY_OUT_QWORDS * sizeof(UINT64);
+            status = STATUS_SUCCESS;
+            break;
+        }
+        status = STATUS_BUFFER_TOO_SMALL;
+        break;
+    }
     case IOCTL_YGHV_PA: {
         /* 9.338: physical frame read/write. PASSIVE (pa_write uses an MDL). */
         if (in_len >= 32) {
@@ -935,7 +991,10 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
             out[4] = gs.probes;
             out[5] = gs.hide_fail;
             out[6] = gs.hash_fail;
-            out[7] = 0;
+            /* 9.343: the reserved slot carries the SHA-256 self-test outcome.
+             * A hash that is silently wrong makes every "unchanged" answer a
+             * lie, so a reader can check it here instead of assuming it. */
+            out[7] = (UINT64)yghv_crypto_selftest_cached();
             info = 8 * sizeof(UINT64);
             status = STATUS_SUCCESS;
             break;
@@ -977,26 +1036,52 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
                 uint32_t n, i;
                 n = yghv_guard_list(gi, 8);
                 out[0] = (UINT64)n;
-                for (i = 0; i < n && (2 + i * 6) * sizeof(UINT64) <= out_len; i++) {
-                    UINT64 *e = &out[1 + i * 6];
+                /* 9.342: 10 qwords per entry — gpa, checks, changes, hidden,
+                 * armed, hash_off|hash_len, digest[4], tag[2]. */
+                for (i = 0; i < n && (1 + (i + 1) * 10) <= (out_len / sizeof(UINT64)); i++) {
+                    UINT64 *e = &out[1 + i * 10];
                     e[0] = gi[i].gpa;
-                    e[1] = gi[i].hash;
-                    e[2] = gi[i].checks;
-                    e[3] = gi[i].changes;
-                    e[4] = gi[i].hidden;
-                    /* 9.339: pack the object range into the tag slot so a
-                     * test can see WHERE the hash was taken. */
-                    e[5] = ((UINT64)gi[i].hash_off << 32) | (UINT64)gi[i].hash_len;
-                    /* tag packed as 8 bytes */
-                    RtlCopyMemory(&e[5], gi[i].tag, 8);
+                    e[1] = gi[i].checks;
+                    e[2] = gi[i].changes;
+                    e[3] = gi[i].hidden;
+                    e[4] = ((UINT64)gi[i].hash_off << 32) | (UINT64)gi[i].hash_len;
+                    RtlCopyMemory(&e[5], gi[i].digest, 32);
+                    RtlCopyMemory(&e[9], gi[i].tag, 8);
                 }
-                info = (ULONG)(8 + (SIZE_T)n * 6 * sizeof(UINT64));
+                info = (ULONG)(8 + (SIZE_T)n * 10 * sizeof(UINT64));
                 break;
             }
             case 4:
                 out[0] = (UINT64)yghv_guard_arm_core();
                 info = 8;
                 break;
+            case 5: {
+                /* 9.343 #3: pages in [a, a+b) with NO guard entry. A change to
+                 * one of those is invisible, so "we watch everything we care
+                 * about" becomes a measured statement. */
+                uint32_t n;
+                n = yghv_guard_uncovered((uint64_t)a, (uint32_t)b,
+                                         (uint64_t *)&out[1],
+                                         (out_len > 8)
+                                             ? (uint32_t)((out_len - 8) / sizeof(UINT64))
+                                             : 0);
+                out[0] = (UINT64)n;
+                info = (ULONG)(8 + (SIZE_T)((n + 1) > ((out_len - 8) / sizeof(UINT64))
+                                            ? ((out_len - 8) / sizeof(UINT64))
+                                            : (n + 1)) * sizeof(UINT64));
+                if (info > out_len)
+                    info = out_len;
+                break;
+            }
+            case 6: {
+                /* 9.343 #1: hide the Tier-4 tables for real, now that our own
+                 * access is served by the RIP-whitelist ALLOW loop. */
+                uint32_t hid = 0;
+                hid = yghv_guard_hide_core();
+                out[0] = (UINT64)hid;
+                info = 8;
+                break;
+            }
             default:
                 out[0] = 0;
                 info = 8;

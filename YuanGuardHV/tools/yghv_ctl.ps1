@@ -1560,6 +1560,96 @@ try {
             }
             throw 'pa-io: use read|write'
         }
+        'sys-crypto' {
+            # Tier 7.3 (9.342): SHA-256 self-test.
+            #
+            # The integrity monitor's whole claim is "this object did not
+            # change". If the hash itself is silently wrong, that claim is
+            # false in the worst way: it says "unchanged" forever. These are
+            # the published FIPS 180-4 vectors (empty, "abc", and a 56-byte
+            # multi-block case that exercises the padding-into-a-new-block
+            # path), checked at runtime rather than trusted.
+            $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x826)) -OutputLength 64
+            $ok = [BitConverter]::ToUInt64($out, 56)
+            Write-Host ("sys-crypto: SHA-256 selftest " + $(if($ok -eq 1){'PASS (fips-180-4 vectors match)'}else{'FAIL — hashes are NOT trustworthy'}))
+        }
+        'sys-sentry' {
+            # Tier 7.4/7.5/7.6 (2026-10-18): three sides of one subject — how
+            # the hypervisor behaves when someone is looking at it or attacking.
+            #
+            # 7.4 WHAT A GUEST CAN MEASURE ABOUT US
+            #   Time-based detection is the probe a guest can always run on
+            #   itself: rdtsc around a hypervisor call, cpuidex leaf 1 /
+            #   0x40000000. The cost of a VMEXIT is what leaks. This keeps a
+            #   running worst case so a regression that makes us slow — and
+            #   therefore loud — is visible here first.
+            #   HONEST LIMIT: this measures and reports. Hiding the cost needs
+            #   TSC scaling, which Tier 5 (5.1) owns and is a much larger change.
+            #
+            # 7.5 WHAT IS BEING TRIED ON US
+            #   Every value reaching an emulation path is untrusted: MSR index,
+            #   port number, CR value, VMCB field. Rejections are recorded with
+            #   context instead of being silently clamped.
+            #
+            # 7.6 WHAT WE EXPOSE
+            #   The cheapest defence is not having the feature. This lists what
+            #   is currently intercepted and which IOCTLs are accepted, so "what
+            #   can be attacked" is a list that can be read rather than a claim.
+            #
+            # usage:
+            #   sys-sentry                    counters + timing
+            #   sys-sentry surface            current intercept/IOCTL inventory
+            #   sys-sentry reset
+            if ($null -eq $Arg1) {
+                $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x828)) -OutputLength 112
+                $names = @('msr-index','io-port','cr-value','vmcb-field','ioctl-arg','guarded-page')
+                $tot = [BitConverter]::ToUInt64($out,48)
+                Write-Host ("sys-sentry: escapes={0}" -f $tot)
+                for ($i=0; $i -lt 6; $i++) {
+                    $v = [BitConverter]::ToUInt64($out, $i*8)
+                    if ($v -gt 0) { Write-Host ("  {0,-14} {1}" -f $names[$i], $v) }
+                }
+                if ($tot -gt 0) {
+                    $lk = [BitConverter]::ToUInt64($out,56)
+                    Write-Host ("  last: {0} detail=0x{1:X} a=0x{2:X} b=0x{3:X}" -f `
+                        $(if($lk -lt 6){$names[[int]$lk]}else{"kind=$lk"}), `
+                        [BitConverter]::ToUInt64($out,64), [BitConverter]::ToUInt64($out,72),
+                        [BitConverter]::ToUInt64($out,80))
+                }
+                $exits = [BitConverter]::ToUInt64($out,88)
+                Write-Host ("  exit timing: measured={0} worst={1} cycles  avg={2}" -f `
+                    $exits, [BitConverter]::ToUInt64($out,96), `
+                    $(if($exits -gt 0){[Math]::Round([BitConverter]::ToUInt64($out,104) / $exits, 0)}else{0}))
+                if ($exits -eq 0) {
+                    Write-Host "  (no exit measurements yet — the VMEXIT path records them)"
+                }
+                return
+            }
+            $v = "$Arg1".ToLower()
+            if ($v -eq 'reset') {
+                $req = New-Object byte[] 32
+                [BitConverter]::GetBytes([uint64]2).CopyTo($req, 0)
+                $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x828)) -InBytes $req -OutputLength 8
+                Write-Host 'sys-sentry: counters reset'
+                return
+            }
+            if ($v -eq 'surface') {
+                $req = New-Object byte[] 32
+                [BitConverter]::GetBytes([uint64]1).CopyTo($req, 0)
+                $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x828)) -InBytes $req -OutputLength 256
+                $n = [BitConverter]::ToUInt64($out, 0)
+                Write-Host ("sys-sentry surface: {0} entry(s)" -f $n)
+                for ($i = 0; $i -lt $n; $i++) {
+                    $o = 8 + $i*24
+                    $nm = -join (0..11 | ForEach-Object { $ch = $out[$o + $_]; if ($ch -ne 0) { [char]$ch } })
+                    $meta = [BitConverter]::ToUInt64($out, $o + 16)
+                    $kind = if ($meta -band 1) { 'ioctl' } else { 'intercept' }
+                    Write-Host ("  {0,-10} {1,-16} hits={2}" -f $kind, $nm.Trim(), ($meta -shr 8))
+                }
+                return
+            }
+            throw 'sys-sentry: use surface|reset'
+        }
         'sys-guard' {
             # Tier 7.1/7.3 (2026-10-18): self-hiding + integrity self-check.
             #
@@ -1587,10 +1677,12 @@ try {
             #
             # usage:
             #   sys-guard                     diagnostics
-            #   sys-guard arm                 guard the Tier-4 tables (bp/frame/view)
+            #   sys-guard arm                 hash the Tier-4 tables (no hide)
             #   sys-guard add <hex_pa> [hide] [hash] [tag]
             #   sys-guard del <hex_pa>
             #   sys-guard verify              re-hash everything; count changes
+            #   sys-guard hidecore            hide them too (RIP-whitelist ALLOW loop)
+            #   sys-guard uncovered <hex> <len>  pages with no guard entry
             #   sys-guard list
             if ($null -eq $Arg1) {
                 $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x826)) -OutputLength 64
@@ -1614,7 +1706,9 @@ try {
                 'verify' { $op = 2 }
                 'list'   { $op = 3 }
                 'arm'    { $op = 4 }
-                default  { throw 'sys-guard: use arm|add|del|verify|list' }
+                'uncovered' { $op = 5 }
+                'hidecore'  { $op = 6 }
+                default  { throw 'sys-guard: use arm|hidecore|add|del|verify|list|uncovered' }
             }
             if ($op -eq 0) {
                 if ($null -eq $Arg2) { throw 'sys-guard add: usage: sys-guard add <hex_pa> [hide] [hash] [tag]' }
@@ -1625,6 +1719,10 @@ try {
             } elseif ($op -eq 1) {
                 if ($null -eq $Arg2) { throw 'sys-guard del: usage: sys-guard del <hex_pa>' }
                 $a = [Convert]::ToUInt64(("$Arg2" -replace '^0[xX]',''),16)
+            } elseif ($op -eq 5) {
+                if ($null -eq $Arg2 -or $null -eq $Arg3) { throw 'sys-guard uncovered: usage: sys-guard uncovered <hex_start> <len>' }
+                $a = [Convert]::ToUInt64(("$Arg2" -replace '^0[xX]',''),16)
+                $b = [uint64]::Parse($Arg3)
             }
             $req = New-Object byte[] 64
             [BitConverter]::GetBytes([uint32]$op).CopyTo($req, 0)
@@ -1657,6 +1755,20 @@ try {
                 1 { Write-Host ("sys-guard: del {0}" -f $(if($rc -gt 0){'OK'}else{'FAILED'})) }
                 2 { Write-Host ("sys-guard: verify -> {0} page(s) changed" -f $rc) }
                 4 { Write-Host ("sys-guard: armed {0} page(s)" -f $rc) }
+                6 { Write-Host ("sys-guard: hid {0} page(s)" -f $rc) }
+            }
+            if ($op -eq 5) {
+                # 9.343 #3: pages in [start, start+len) with no guard entry.
+                # Reported separately because it uses the 256-byte output form.
+                $out5 = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x826)) -InBytes $req -OutputLength 256
+                $n5 = [BitConverter]::ToUInt64($out5, 0)
+                Write-Host ("sys-guard uncovered: {0} page(s) in [0x{1:X}, +{2}) have no guard entry" -f $n5, $a, $b)
+                $show = [Math]::Min($n5, 6)
+                for ($i = 0; $i -lt $show; $i++) {
+                    Write-Host ("  0x{0:X}" -f [BitConverter]::ToUInt64($out5, 8 + $i*8))
+                }
+                if ($n5 -gt $show) { Write-Host ("  ... and {0} more" -f ($n5 - $show)) }
+                return
             }
         }
         'sys-health' {

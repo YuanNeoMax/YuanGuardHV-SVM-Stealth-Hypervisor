@@ -2767,13 +2767,38 @@ int yghv_protect_npt_set_perm(uint64_t gpa, uint64_t perm) {
  */
 int yghv_bp_rearm_bare(uint64_t gpa) {
     uint64_t page = gpa & ~(uint64_t)0xFFFULL;
+    int st;
 
     if (!page)
         return 0;
-    if (KeAreAllApcsDisabled())
-        return 0;                       /* PASSIVE-only */
 
-    return yghv_protect_npt_set_perm(page, NPT_PERM_PRESENT);
+    /*
+     * 9.347 FIX: this function lied in its name.
+     *
+     * It was called "_bare" and called from the island (#DB re-arm after an
+     * ALLOWed write), but it began with
+     *
+     *     if (KeAreAllApcsDisabled()) return 0;   /* PASSIVE-only */
+     *
+     * and a #DB VMEXIT handler runs at DISPATCH with GIF=0, which IS "all APCs
+     * disabled". So the re-arm returned 0 every time it was reached from the
+     * island: the breakpoint page was NEVER put back, silently, and the only
+     * symptom was a breakpoint that stopped matching. It reported success by
+     * returning a value the caller read as "nothing to do".
+     *
+     * The fix is the same one the guard needed (9.344): use the island-safe NPT
+     * primitives directly, exactly as yghv_protect_arm_page_bare() does. A split
+     * is required first so a 2MB mapping's leaf can be touched at all.
+     *
+     * This was found by tests/irql_contract_check.ps1 — a check written after
+     * the 15th crash, which then caught a second instance of the same mistake
+     * that had been latent in Tier 4.4 since it was written.
+     */
+    st = npt_split_2mb_to_4kb(&g_npt, page);
+    if (st)
+        return st;
+
+    return npt_set_page_perm(&g_npt, page, NPT_PERM_PRESENT);
 }
 /*
  * 9.329: read one NPT leaf entry (the MAIN table).

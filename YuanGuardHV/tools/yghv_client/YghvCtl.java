@@ -75,6 +75,8 @@ public class YghvCtl {
     private static final int FN_GUARD = 0x826;
     /* 9.338: direct physical-frame access. */
     private static final int FN_PA = 0x827;
+    /* Tier 7.4/7.5/7.6: exit timing, escape attempts, attack surface. */
+    private static final int FN_SENTRY = 0x828;
 
     private static native long openHandle();
     private static native void closeHandle(long handle);

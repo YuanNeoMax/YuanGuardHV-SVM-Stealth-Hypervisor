@@ -8,7 +8,7 @@
     @copyright  Copyright (c) 2017-2020, Satoshi Tanda. All rights reserved.
  */
 #define POOL_NX_OPTIN   1
-#include "common/npt.h"   /* NPT_PERM_* / NPT_4K_PAGE_FLAGS */
+#include "common/npt.h"
 #include "svm_simplevm206.hpp"
 
 #include <intrin.h>
@@ -61,6 +61,18 @@ extern void yghv_watch_record(UINT64 cr3, UINT64 rip, UINT64 gpa, UINT32 kind, U
 extern int yghv_bp_on_npf(UINT64 gpa, UINT64 rip, UINT32 kind, UINT32 cpl, UINT64 cr3);
 /* Tier 7.1 (9.336): a page we hid from the guest - never restore it. */
 extern int yghv_guard_is_hidden(UINT64 gpa);
+/* Tier 7.1 (9.343): hide-our-own-tables support. */
+extern int yghv_guard_fault_is_ours(UINT64 rip, UINT32 cpl);
+/* Tier 7.4 (9.343): exit-latency self-measurement. */
+extern void yghv_sentry_exit_begin(UINT64 tsc);
+extern void yghv_sentry_exit_end(UINT64 tsc);
+extern int yghv_guard_remap_bare(UINT64 gpa);
+extern int yghv_guard_reopen_bare(UINT64 gpa);
+extern int yghv_guard_decoy_bare(UINT64 gpa);
+extern int yghv_guard_hiding_armed(void);
+extern int yghv_guard_decoy_ready(void);
+extern UINT64 yghv_guard_decoy_pa(void);
+extern int yghv_protect_npt_remap_flags(UINT64 gpa, UINT64 spa, int use_alt, UINT64 flags);
 /* Tier 4.4: re-arm an instruction-level breakpoint page (PASSIVE). */
 extern int yghv_bp_rearm_bare(UINT64 gpa);
 /* Tier 4.4: change one page's NPT permission (PASSIVE). */
@@ -1236,6 +1248,16 @@ SvHandleVmExit (
     //
     // Handle #VMEXIT according with its reason.
     //
+    /*
+     * 7.4 (9.343): measure our own exit latency.
+     *
+     * rdtsc here is the same instruction a guest uses to time us, so the number
+     * these counters keep is exactly what a detection loop would read. Worst
+     * case is what matters: a single slow path in the handler is a signal, and
+     * sys-sentry reports it before anyone else notices.
+     */
+    yghv_sentry_exit_begin(__rdtsc());
+
     switch (VpData->GuestVmcb.ControlArea.ExitCode)
     {
     case VMEXIT_CPUID:
@@ -1363,6 +1385,49 @@ SvHandleVmExit (
              * from its side is what a reserved range looks like anyway.
              */
             if (yghv_guard_is_hidden(gpa)) {
+                /*
+                 * 9.344: OUR OWN access must be served.
+                 *
+                 * 9.320.1 established that hiding a page the driver reads with
+                 * plain C removes it from the driver too — the 13th crash. The
+                 * answer is 4.4's ALLOW loop with the match condition changed
+                 * from "registered RIP" to "RIP inside our image": restore the
+                 * entry, let the instruction run under TF, and let #DB re-hide.
+                 *
+                 * The first version of this used yghv_protect_npt_remap_flags(),
+                 * which starts with `if (KeAreAllApcsDisabled()) return 0;`. An
+                 * NPF handler runs at DISPATCH with GIF=0, which IS "APCs
+                 * disabled", so every call returned 0: the page was never
+                 * restored, the decoy was never installed, and the fall-through
+                 * access violation was unresolvable -> 0x3B (the 15th crash).
+                 * The *_bare helpers below are the island-safe form, the same
+                 * discipline as yghv_protect_arm_page_bare().
+                 */
+                if (yghv_guard_hiding_armed() &&
+                    yghv_guard_fault_is_ours(
+                        VpData->GuestVmcb.StateSaveArea.Rip,
+                        (UINT32)VpData->GuestVmcb.StateSaveArea.Cpl)) {
+                    if (yghv_guard_remap_bare(gpa)) {
+                        VpData->GuestVmcb.ControlArea.GuestPaOfGhcb =
+                            (gpa & ~(UINT64)0xFFFULL) | 4ULL;  /* bit2 = re-hide */
+                        VpData->GuestVmcb.StateSaveArea.Rflags |= 0x100ULL; /* TF */
+                        VpData->GuestVmcb.ControlArea.TlbControl = 1;
+                        break;
+                    }
+                }
+                /*
+                 * Not ours: serve the DECOY rather than a hole.
+                 *
+                 * 9.320.5 noted that clearing the entry makes the address space
+                 * discontinuous, which an inventory comparison can see. Pointing
+                 * the leaf at a zero frame keeps the physical range present: the
+                 * guest reads zeros (what reserved memory looks like) and its
+                 * writes land in the decoy and are discarded.
+                 */
+                if (yghv_guard_hiding_armed() && yghv_guard_decoy_bare(gpa)) {
+                    VpData->GuestVmcb.ControlArea.TlbControl = 1;
+                    break;
+                }
                 VpData->GuestVmcb.StateSaveArea.Cr2 = 0;
                 VpData->GuestVmcb.ControlArea.EventInj =
                     (1ULL << 31) | (3ULL << 8) | (1ULL << 11) |
@@ -1390,9 +1455,7 @@ SvHandleVmExit (
                 if (yghv_bp_on_npf(gpa, bpRipAny, bpKind,
                                    (UINT32)VpData->GuestVmcb.StateSaveArea.Cpl,
                                    curCr3)) {
-                    if (yghv_protect_npt_set_perm(
-                            gpa & ~(UINT64)0xFFFULL,
-                            NPT_PERM_PRESENT | NPT_PERM_WRITABLE)) {
+                    if (yghv_guard_reopen_bare(gpa & ~(UINT64)0xFFFULL)) {
                         VpData->GuestVmcb.ControlArea.GuestPaOfGhcb = gpa;
                         VpData->GuestVmcb.StateSaveArea.Rflags |= 0x100ULL; /* TF */
                         VpData->GuestVmcb.ControlArea.TlbControl = 1;
@@ -1441,9 +1504,7 @@ SvHandleVmExit (
                 if (yghv_bp_on_npf(gpa, bpRip, 0x2,
                                    (UINT32)VpData->GuestVmcb.StateSaveArea.Cpl,
                                    curCr3)) {
-                    if (!yghv_protect_npt_set_perm(
-                            gpa & ~(UINT64)0xFFFULL,
-                            NPT_PERM_PRESENT | NPT_PERM_WRITABLE)) {
+                    if (!yghv_guard_reopen_bare(gpa & ~(UINT64)0xFFFULL)) {
                         /* Could not reopen: refuse rather than spin. */
                                                  /*
                           * Could not reopen the page. Refusing to spin matters
@@ -1861,6 +1922,15 @@ SvHandleVmExit (
                     VpData->GuestVmcb.ControlArea.VmcbClean = 0;
                     VpData->GuestVmcb.ControlArea.TlbControl = 1;
                     yghv_protect_fake_restore(slot & ~1ULL);
+                } else if (slot & 4ULL) {
+                    /*
+                     * 9.343: re-hide a guarded page after our own access was
+                     * allowed through. Same shape as the breakpoint re-arm.
+                     */
+                    if (yghv_guard_decoy_ready()) {
+                        (void)yghv_guard_decoy_bare(slot & ~7ULL);
+                    }
+                    VpData->GuestVmcb.ControlArea.TlbControl = 1;
                 } else if (slot & 2ULL) {
                     /*
                      * 9.327 (INT3 mode): the #BP handler restored the real
@@ -1940,6 +2010,8 @@ SvHandleVmExit (
     // handler where the developers most likely call the kernel API inadvertently
     // is already executed.
     //
+    yghv_sentry_exit_end(__rdtsc());
+
     if (oldIrql < DISPATCH_LEVEL)
     {
         KeLowerIrql(oldIrql);
