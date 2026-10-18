@@ -8680,3 +8680,147 @@ T12 bp 命中 rip=0x7FF8A8BB5442  PASS
    但没强制"声明得对"。判断依据（自己的表用 UNMAP，外来页用 DECOY）写在 `do_hide`
    的注释里，且有规则 3 的页归属检查兜底。
 3. **10 分钟 soak 仍未做** —— 长时间持续访问隐藏页的稳定性还没验证。
+
+
+### 9.355 2026-10-18 **剩余手工点全部结构性解决 —— 并发现热的表不能隐藏**
+
+#### 9.355.1 点1：岛内清单不再手工维护 —— 可达性分析
+
+**旧问题**：清单是手工数组，新岛内函数忘了登记 → 检查静默失察。
+
+**修法**：**从调用图计算**，方式与编译器判断"哪段代码能在哪个上下文跑"相同：
+
+```
+1. 起点 = VMEXIT 入口（57 个 Sv* 处理器）
+2. 传递闭包：跟随每一条调用边
+3. 可达的即岛内代码 —— 由构造决定，不是由声明决定
+```
+
+**度量（覆盖面提升 10 倍）**：
+```
+              手工清单    可达性分析
+识别函数数      17          173
+```
+
+**负向验证（G）**：注入一个**全新的**、**只被岛内调用**的函数并让它带 PASSIVE 门槛：
+
+```
+[irql] FAIL: yghv_guard_injected_helper is reachable from a VMEXIT root
+              but gates on KeAreAllApcsDisabled() (yghv_guard.c)
+```
+
+**没有任何人登记它，检查照样抓到。** 手写清单**做不到这一点**，这就是改进的证明。
+
+**清单被删除，不是缩短。** 若闭包找不到根，检查 FAIL 而不是"看着空集通过"。
+
+#### 9.355.2 ★ 可达性分析立刻抓到第 4 个同类缺陷
+
+```
+[irql] FAIL: yghv_protect_npt_unmap_page is reachable from a VMEXIT root
+              but gates on KeAreAllApcsDisabled() (protect.c)
+```
+
+调用链：
+```
+SvHandleVmExit（岛内）
+  → yghv_guard_rehide_bare（岛内）
+    → yghv_guard_do_hide（岛内）
+      → yghv_protect_npt_unmap_page（★ 带 PASSIVE 门槛 → 岛内必返回 0）
+```
+
+**所以 9.352 的 `do_hide` 重构在 #DB 路径上仍然是坏的。** 而**运行时测试通过**是因为它只走了 `hidecore`（PASSIVE 上下文），没走 #DB 重隐藏路径。
+
+**修法**：新增 `yghv_guard_unmap_bare`（直接 `npt_exclude_pa`，无门槛）。
+
+**教训**：手工清单给出的"通过"是假安全 —— 它只检查了它知道要检查的。
+
+#### 9.355.3 点2：hide mode 不再由调用方判断
+
+**旧问题**：`do_hide` 的 mode 是必填参数 → 强制"必须声明"，但**没强制"声明得对"**。
+
+**修法**：从**页归属推导**。正确机制根本不是判断题：
+
+```
+自己的状态 / 三张 Tier-4 表
+    -> 必须在 ALLOW 服务后能读回 -> UNMAP 是唯一可行机制
+       用 DECOY 会拿到零，静默清空那里的表（9.350 的 hang）
+
+任何其他页
+    -> 没有我方代码读它，关注点是 guest 内存图连续 -> DECOY
+
+static int yghv_guard_mode_for(uint64_t gpa) {
+    if (yghv_guard_state_page(gpa) || yghv_guard_target_page(gpa))
+        return YGHV_HIDE_UNMAP;
+    return YGHV_HIDE_DECOY;
+}
+```
+
+调用方传 `YGHV_HIDE_AUTO`，**无可选即无可错**。度量：
+```
+AUTO 调用点 6 个，UNMAP 显式调用点 0 个
+```
+
+#### 9.355.4 ★★ 点3 的前置发现：热的表不能隐藏
+
+跑到运行时验证时，`E: HANG`（bp 触发超时）。**用隔离实验确定变量**：让 `hidecore` 跳过 `g_bp`：
+
+```
+跳过 g_bp  → E: PASS（断点正常）
+包含 g_bp  → E: HANG（guest 侧自旋，驱动仍响应其他 IOCTL）
+```
+
+**根因是两个目标的内在冲突**：
+
+```
+UNMAP 隐藏一页 ⇒ 对该页的每次访问都要走 ALLOW 循环：
+    #NPF -> RIP 检查 -> 恢复 -> TF 单步 -> #DB 重隐藏
+    每次访问一整轮 VMEXIT
+
+yghv_bp_on_npf() 在读 g_bp —— 它是断点功能的**热路径**，不是冷 IOCTL 路径。
+隐藏它 ⇒ 热路径付一轮嵌套 VMEXIT 只为读自己的注册表，
+          而触发外层 fault 的 guest store 永远等不到答复。
+```
+
+**这是诚实的边界**：`g_frame` / `g_view_pages` 从 IOCTL 上下文读取，往返可承受，**继续隐藏**；`g_bp` 被它服务的功能在每次 fault 读取，**隐藏它等于把它从读它的功能面前藏起来**。
+
+**设计性排除，不是缺口** —— 理由写在 `hidecore` 的注释里。
+
+#### 9.355.5 顺带修掉的一个重复计数 bug
+
+`hidecore` 里同时调了 `unmap_page` **和** `do_hide`，两者都隐藏、都计数：
+
+```
+if (yghv_protect_npt_unmap_page(gpa + off)) {   ← 第1次隐藏
+    if (yghv_guard_do_hide(s, gpa + off, AUTO)) { hid++; }   ← 第2次
+    InterlockedIncrement64(&g_g_hidden);        ← 还多计一次
+    hid++;
+}
+```
+
+这是 9.354 的 y4 镜像报 `hid 6 page(s)`（实际 3 页）的原因。**`do_hide` 本身就是隐藏**，调用方不该再隐藏一次。
+
+#### 9.355.6 验证矩阵
+
+| 用例 | 结果 |
+|---|---|
+| baseline | PASS（无假阳性） |
+| **G 新增岛内函数带门槛** | **caught（无人登记）** |
+| **H 把 unmap 换回门槛版本** | **caught（第4个缺陷的回归防线）** |
+| 隔离实验：跳过 g_bp | E: PASS |
+| 设计性排除后 T3/T4/T12 | PASS |
+
+运行时：**13/13 ALL PASS，零崩溃零挂起，uptime 438 min 未重启。**
+
+#### 9.355.7 状态
+- 静态检查：5 个全部 PASS；IRQL 检查规则 6 条；岛内集合**零手工维护**
+- 镜像：`206y6_nohot`（md5 `585A71AE`）
+- **未推送**（本地领先 29 个提交）
+
+#### 9.355.8 剩余（诚实）
+1. **`$islandEntriesExplicit` 已彻底删除** —— 但可达性分析有一个已知边界：
+   **函数指针调用不可见**。若某岛内路径经函数指针调用带门槛的函数，检查抓不到。
+   当前代码库里没有这种调用（已核查），但这是结构性盲区，不是"已解决"。
+2. **`g_bp` 不隐藏是权衡，不是免费** —— 攻击面清单里 `g_bp` 的地址可见。
+   若将来要隐藏它，需要先把 `yghv_bp_on_npf` 的读取改成"经缓存的热路径副本"，
+   而不是让它直接触 `g_bp`。
+3. **10 分钟 soak 仍未做。**

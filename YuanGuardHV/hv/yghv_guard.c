@@ -14,6 +14,7 @@ extern npt_mgr_t g_npt;
 
 #define YGHV_HIDE_UNMAP 0   /* remove PRESENT: our fault is served by the ALLOW loop */
 #define YGHV_HIDE_DECOY 1   /* point at the decoy: page stays present, reads return 0 */
+#define YGHV_HIDE_AUTO  2   /* 9.354: let ownership decide (see yghv_guard_mode_for) */
 
 typedef struct {
     uint64_t gpa;
@@ -187,7 +188,7 @@ int yghv_guard_add_va(const void *va, uint32_t len, const char *tag, int hide) {
         if (_s >= 0) {
             if (hide && !g_guard[_s].hidden) {
                 if (yghv_protect_npt_unmap_page(page)) {
-                    if (yghv_guard_do_hide(_s, page, YGHV_HIDE_UNMAP)) {
+                    if (yghv_guard_do_hide(_s, page, YGHV_HIDE_AUTO)) {
                         (void)0;
                     }
                     InterlockedIncrement64(&g_g_hidden);
@@ -221,7 +222,7 @@ int yghv_guard_add_va(const void *va, uint32_t len, const char *tag, int hide) {
     g_guard[slot].hash_va = (uint64_t)(ULONG_PTR)va;   /* 9.340: re-hash here */
 
     if (hide && yghv_protect_npt_unmap_page(page)) {
-        if (yghv_guard_do_hide(slot, page, YGHV_HIDE_UNMAP)) {
+        if (yghv_guard_do_hide(slot, page, YGHV_HIDE_AUTO)) {
             (void)0;
         }
         InterlockedIncrement64(&g_g_hidden);
@@ -437,7 +438,7 @@ int yghv_guard_add_range(uint64_t gpa, uint32_t off, uint32_t len,
         if (_s >= 0) {
             if (hide && !g_guard[_s].hidden) {
                 if (yghv_protect_npt_unmap_page(page)) {
-                    if (yghv_guard_do_hide(_s, page, YGHV_HIDE_UNMAP)) {
+                    if (yghv_guard_do_hide(_s, page, YGHV_HIDE_AUTO)) {
                         (void)0;
                     }
                     InterlockedIncrement64(&g_g_hidden);
@@ -475,7 +476,7 @@ int yghv_guard_add_range(uint64_t gpa, uint32_t off, uint32_t len,
             if (!hash)
                 return -4;
         } else {
-            if (yghv_guard_do_hide(slot, page, YGHV_HIDE_UNMAP)) {
+            if (yghv_guard_do_hide(slot, page, YGHV_HIDE_AUTO)) {
                 (void)0;
             }
             InterlockedIncrement64(&g_g_hidden);
@@ -787,7 +788,35 @@ uint32_t yghv_guard_hide_core(void) {
     if (!yghv_guard_hiding_armed())
         return 0;
 
-    for (i = 0; i < 3; i++) {
+    /*
+     * 9.355: g_bp is deliberately NOT hidden, and this is a design decision
+     * rather than a gap.
+     *
+     * Measured by isolation: with g_bp excluded from hidecore, the breakpoint
+     * cycle after hiding PASSES. With it included, the trigger HANGS. So hiding
+     * g_bp is what breaks the breakpoint feature.
+     *
+     * The mechanism is a conflict between two things this project wants:
+     *
+     *   UNMAP-hiding a page means every access to it must go through the ALLOW
+     *   loop: #NPF -> RIP check -> restore -> TF single-step -> #DB re-hide. That
+     *   is a full VMEXIT round trip PER ACCESS.
+     *
+     *   yghv_bp_on_npf() reads g_bp on EVERY target-page #NPF — it is the hot
+     *   path of the breakpoint feature, not a cold IOCTL path. Hiding it means
+     *   the hot path pays a nested VMEXIT round trip to read its own registry,
+     *   and the guest store that triggered the outer fault never gets an answer.
+     *   Measured: mmf-write did not return in 15s while the driver kept
+     *   answering other IOCTLs — a guest-side spin, not a deadlock.
+     *
+     * g_frame and g_view_pages ARE hidden: they are read from IOCTL context,
+     * where the round trip is affordable.
+     *
+     * This is the honest boundary: "hide our own tables" is workable for cold
+     * tables and self-defeating for the hot one. Hiding g_bp would be hiding a
+     * table from the very feature that reads it on every fault.
+     */
+    for (i = 1; i < 3; i++) {
         va = (i == 0) ? yghv_bp_table_va(&bytes)
                       : (i == 1) ? yghv_frame_table_va(&bytes)
                                  : yghv_view_table_va(&bytes);
@@ -817,13 +846,16 @@ uint32_t yghv_guard_hide_core(void) {
                         continue;
                     if (g_guard[s].hidden)
                         continue;
-                    if (yghv_protect_npt_unmap_page(gpa + off)) {
-                        if (yghv_guard_do_hide(s, gpa + off, YGHV_HIDE_UNMAP)) {
-                            hid++;
-                        }
-                        InterlockedIncrement64(&g_g_hidden);
+                    /*
+                     * 9.354: do_hide() IS the hide — it performs the mechanism,
+                     * records which one, and increments the counter. An earlier
+                     * version ALSO called yghv_protect_npt_unmap_page() here and
+                     * incremented hid twice, so "hid 6 page(s)" was reported for
+                     * three pages and the page was excluded from the NPT twice
+                     * (9.354 measured this on the y4 image).
+                     */
+                    if (yghv_guard_do_hide(s, gpa + off, YGHV_HIDE_AUTO))
                         hid++;
-                    }
                 }
             }
         }
@@ -1029,16 +1061,92 @@ int yghv_guard_rehide_bare(uint64_t gpa) {
  *
  * ISLAND-SAFE: the bare primitives plus one array field.
  */
+/*
+ * 9.353: ISLAND-SAFE unmap.
+ *
+ * THE FOURTH INSTANCE of the same mistake, and the reachability analysis found
+ * it the moment the hand-maintained list was replaced:
+ *
+ *   yghv_protect_npt_unmap_page() begins with
+ *       if (KeAreAllApcsDisabled()) return 0;
+ *
+ *   and yghv_guard_do_hide() called it. do_hide is reached from the #DB handler
+ *   via yghv_guard_rehide_bare(), so on every #DB re-hide the unmap returned 0,
+ *   the page was never re-hidden, and the guard entry kept saying "hidden" while
+ *   the page sat visible.
+ *
+ * Nothing failed visibly: the re-hide's return value was (void)'d, and the
+ * PASSIVE path (hidecore) works fine, which is why the runtime tests passed.
+ * Only reachability — "is this function genuinely called from the island?" —
+ * exposes it, which is exactly what the derived island set computes.
+ *
+ * npt_exclude_pa() is the bare primitive: split, then clear the leaf. No IRQL
+ * gate, no allocation, no lock.
+ */
+static int yghv_guard_unmap_bare(uint64_t gpa) {
+    uint64_t page = gpa & ~(uint64_t)0xFFFULL;
+
+    if (!page)
+        return 0;
+    return NT_SUCCESS(npt_exclude_pa(&g_npt, page)) ? 1 : 0;
+}
+/*
+ * 9.354: DERIVE the hide mechanism from the page's ownership.
+ *
+ * do_hide takes the mode as a parameter, which made "set the flag" and "record
+ * the mechanism" inseparable (9.352). It did not make the mechanism CORRECT —
+ * "the parameter is mandatory" is not "the argument is right".
+ *
+ * But the correct answer is not a judgment call at all; it follows from who owns
+ * the page:
+ *
+ *   our own state or one of the Tier-4 tables
+ *       -> we must be able to read it back after the ALLOW loop serves our
+ *          access, so UNMAP is the only workable mechanism. DECOY would hand us
+ *          zeros and silently empty whatever lives there (9.350's hang).
+ *
+ *   any other page
+ *       -> nothing of ours reads it, so the concern is the guest's memory map
+ *          looking continuous, and DECOY is the mechanism that keeps it so.
+ *
+ * So the caller no longer chooses: it asks for a hide and the ownership decides
+ * how. A caller cannot get this wrong because there is nothing left to get wrong.
+ * YGHV_HIDE_AUTO is the only value the internal call sites pass.
+ */
+static int yghv_guard_mode_for(uint64_t gpa) {
+    if (yghv_guard_state_page(gpa) || yghv_guard_target_page(gpa))
+        return YGHV_HIDE_UNMAP;
+    return YGHV_HIDE_DECOY;
+}
 int yghv_guard_do_hide(int slot, uint64_t gpa, int mode) {
     if (slot < 0 || slot >= YGHV_GUARD_MAX)
         return 0;
+    /* 9.354: ownership decides the mechanism. A caller passes AUTO; only a
+     * re-hide passes an explicit value, and that must repeat what was used. */
+    if (mode == YGHV_HIDE_AUTO)
+        mode = yghv_guard_mode_for(gpa);
+
 
     if (mode == YGHV_HIDE_DECOY) {
         if (!yghv_guard_decoy_bare(gpa))
             return 0;
     } else {
+        /*
+         * 9.353: the island-safe unmap.
+         *
+         * This called yghv_protect_npt_unmap_page(), which begins with
+         * `if (KeAreAllApcsDisabled()) return 0;`. do_hide is reached from the
+         * #DB handler via yghv_guard_rehide_bare(), so on every #DB re-hide the
+         * unmap returned 0, the page was never re-hidden, and the entry kept
+         * claiming "hidden" while the page sat visible.
+         *
+         * Nothing reported it: the re-hide's result was (void)'d, and the PASSIVE
+         * path (hidecore) works, which is why the runtime tests passed. Only
+         * reachability — "is this genuinely called from the island?" — exposes it,
+         * and that is exactly what the derived island set computes.
+         */
         mode = YGHV_HIDE_UNMAP;
-        if (!yghv_protect_npt_unmap_page(gpa))
+        if (!yghv_guard_unmap_bare(gpa))
             return 0;
     }
 
