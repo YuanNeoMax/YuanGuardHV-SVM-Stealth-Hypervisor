@@ -8550,3 +8550,133 @@ v3.2 只跳 * 注释  → 块注释正文误报
 2. **静态检查的岛内入口清单仍手工维护** —— 新入口忘了登记就会漏。
 3. **T3/T4 只验证了"隐藏 3 张表后驱动存活"** —— 没有验证长时间（如 30 分钟）持续
    访问隐藏页的稳定性。10 分钟 soak 是下一步。
+
+
+### 9.352 2026-10-18 **结构化改进：把"必须记得"变成"不可能忘"**
+
+#### 9.352.1 两个问题的共同根源
+
+用户指出的是两个**手工一致性**问题：
+
+1. **岛内入口清单手工维护** —— 新加岛内函数忘了登记，检查就漏
+2. **hide_mode 靠记得设对** —— 新加隐藏入口忘了配对，页就变零页
+
+**两个都是同一类：一条需要人在每个新位置重复遵守的规则。**
+正确修法不是"再强调一遍要记得"，而是**让需要记住的位置数变成 1，或者从命名自动推导**。
+
+#### 9.352.2 改进一：hide 收敛到唯一入口
+
+**重构前**：五处独立代码各自做
+```c
+g_guard[x].hidden = 1;
+g_guard[x].hide_mode = YGHV_HIDE_UNMAP;
+```
+"设标志"和"记机制"是**两条语句**——新增隐藏点可以只做前一半。**这正是 9.350 hang 的结构性原因。**
+
+**重构后**：唯一入口，mode 是**参数**
+```c
+int yghv_guard_do_hide(int slot, uint64_t gpa, int mode);
+```
+- 调用方**无法**只设标志而不声明机制（mode 是必填参数）
+- 调用方**无法**声明机制而不设标志（函数内部一并完成）
+- `rehide_bare` 也委托给它，传记录的 mode
+
+```c
+int yghv_guard_rehide_bare(uint64_t gpa) {
+    int s = yghv_guard_find(gpa);
+    if (s < 0) return 0;
+    return yghv_guard_do_hide(s, gpa, (int)g_guard[s].hide_mode);
+}
+```
+
+**度量**：
+```
+              重构前   重构后
+隐藏位置数     5       1
+裸 .hidden 赋值 5       0
+```
+
+#### 9.352.3 改进二：岛内入口从命名自动推导
+
+代码库**已有约定**：所有岛内安全函数命名带 `_bare`，而"无 IRQL 门槛"正是这个名字为真的原因。
+
+**重构后**：清单 = 自动推导 + 少量显式
+```powershell
+# 扫出所有 *_bare 定义
+foreach ($m in [regex]::Matches($text, '(?m)^[\w\*\s]+?\b(\w+_bare)\s*\(')) { ... }
+
+# 只有命名表达不了的才手写（VMEXIT 调度器 + 两个谓词）
+$islandEntriesExplicit = @(
+    'SvHandleVmExit', 'SvHandleMsrAccess', 'SvHandleCpuid',
+    'SvHandleVmrun', 'SvFakeNcr3Resync',
+    'yghv_guard_is_hidden', 'yghv_guard_hiding_armed'
+)
+```
+
+**度量**：
+```
+岛内入口清单   14 条手工  →  10 自动推导 + 7 显式
+扫描行数       1377      →  1510（覆盖更全）
+```
+
+**关键验证（负向 E）**：注入一个**全新的** `yghv_guard_newthing_bare` 并让它带 PASSIVE 门槛：
+
+```
+[irql] FAIL: yghv_guard_newthing_bare is declared island-safe but gates on
+              KeAreAllApcsDisabled() at yghv_guard.c:1062
+```
+
+**新函数不需要任何人登记就被覆盖了** —— 这正是"忘记登记"这个失效模式被消除的证据。
+
+#### 9.352.4 改进三：新增规则 6（禁止未配对 hide）
+
+```powershell
+# ---- 6. every hide goes through yghv_guard_do_hide() ----
+# 扫描所有 .hidden = 1 赋值，排除 do_hide 自身和注释
+```
+
+**负向验证（D）**：注入一个裸赋值点
+```
+[irql] FAIL: yghv_guard.c:1053 assigns .hidden directly
+IRQL contract FAIL (1 unpaired hide site(s)). A hide that sets .hidden without
+recording its mechanism leaves the page present-but-zeroed, which silently
+empties whatever lived there (9.350). Route it through yghv_guard_do_hide().
+```
+
+#### 9.352.5 完整验证矩阵（6/6 全部有效）
+
+| 用例 | 结果 |
+|---|---|
+| baseline check / layout | PASS（无假阳性） |
+| A 岛内调用门槛函数 | caught（第15次崩溃机制） |
+| B 岛内入口自带门槛 | caught（`bp_rearm_bare` 潜伏缺陷） |
+| **D 未配对 hide** | **caught（9.350 hang 的结构性根源）** |
+| **E 新增 `_bare` 自带门槛** | **caught（自动推导生效，无需登记）** |
+| F 表超出单页 | caught（编译期断言） |
+
+#### 9.352.6 运行时验证
+
+结构化重构**不改变行为**——这是必须证明的：
+
+```
+T3  hidecore hid 3 pages  PASS
+T4  隐藏后驱动存活        PASS
+T12 bp 命中 rip=0x7FF8A8BB5442  PASS
+（13 项全 PASS，零崩溃零挂起）
+```
+
+#### 9.352.7 状态
+- 静态检查：5 个全部 PASS，规则 6 条
+- 镜像：`206y3_structural`（md5 `5B108771`）
+- 机器干净，uptime 342.6 min（本轮未重启）
+- **未推送**（本地领先 28 个提交）
+
+#### 9.352.8 剩余的手工点（诚实）
+
+1. **`$islandEntriesExplicit` 的 7 条仍是手写** —— 但它们都是 VMEXIT 调度器和谓词，
+   **命名天然不含 `_bare`**，所以这个集合是稳定且自解释的（新增 VMEXIT handler 很少）。
+   仍是缺口：新增一个 `SvHandleXxx` 而忘了加入。
+2. **`hide_mode` 的"用哪种机制"仍需调用方判断** —— 参数强制了"必须声明"，
+   但没强制"声明得对"。判断依据（自己的表用 UNMAP，外来页用 DECOY）写在 `do_hide`
+   的注释里，且有规则 3 的页归属检查兜底。
+3. **10 分钟 soak 仍未做** —— 长时间持续访问隐藏页的稳定性还没验证。

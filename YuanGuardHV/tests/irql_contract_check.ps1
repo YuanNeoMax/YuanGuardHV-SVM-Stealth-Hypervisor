@@ -196,22 +196,50 @@ foreach ($f in $sources) {
 Write-Host ("[irql] PASSIVE-gated functions: {0}" -f $gated.Count)
 
 # ---- 2. island entry points (DISPATCH + GIF=0) ----
-$islandEntries = @(
+# ---- 2. island entry points (DISPATCH + GIF=0) ----
+#
+# 9.352: DERIVED, not hand-listed, wherever the naming already decides it.
+#
+# The previous version was a manual array. A manual list has one failure mode
+# this project has already been bitten by twice: a new island-safe function is
+# written, not added to the list, and the check silently stops policing it.
+# "Remember to register it" is not a mechanism.
+#
+# The codebase already has the convention — every island-safe function is named
+# *_bare, and its absence of an IRQL gate is what makes the name true. So the
+# list is built by scanning for that suffix, and only the handful of entries
+# whose names do NOT follow it (the VMEXIT dispatchers and a few island
+# predicates) are written out.
+#
+# The explicit part is small and its contents are self-evidently VMEXIT-side, so
+# it is reviewable; the derived part cannot be forgotten.
+
+$islandEntriesDerived = @()
+foreach ($f in $sources) {
+    $text = [IO.File]::ReadAllText($f.FullName)
+    # a definition of a *_bare function: return type, name ending in _bare, '('
+    foreach ($m in [regex]::Matches($text, '(?m)^[\w\*\s]+?\b(\w+_bare)\s*\(')) {
+        $n = $m.Groups[1].Value
+        if ($islandEntriesDerived -notcontains $n) { $islandEntriesDerived += $n }
+    }
+}
+
+# Names the suffix convention cannot express: the VMEXIT dispatchers themselves,
+# and island predicates whose names read better without _bare.
+$islandEntriesExplicit = @(
     'SvHandleVmExit',        # the dispatcher: NPF, MSR, CR, DB, BP all live here
     'SvHandleMsrAccess',
     'SvHandleCpuid',
     'SvHandleVmrun',
     'SvFakeNcr3Resync',
-    'yghv_bp_rearm_bare',
-    'yghv_protect_arm_page_bare',
-    'yghv_protect_reopen_page_bare',
-    'yghv_protect_on_npf_write_bare',
-    'yghv_protect_fake_bare',
-    'yghv_guard_remap_bare',
-    'yghv_guard_decoy_bare',
-    'yghv_guard_is_hidden',
-    'yghv_guard_hiding_armed'
+    'yghv_guard_is_hidden',      # called from the NPF handler
+    'yghv_guard_hiding_armed'    # 3-line predicate, read by the NPF handler
 )
+
+$islandEntries = @($islandEntriesDerived + $islandEntriesExplicit | Sort-Object -Unique)
+
+Write-Host ("[irql] island entries: {0} derived from the *_bare convention, {1} explicit" -f `
+    $islandEntriesDerived.Count, $islandEntriesExplicit.Count)
 
 $islandHelpers = $islandEntries + @(
     'yghv_guard_fault_is_ours', 'yghv_guard_state_page', 'yghv_guard_target_page',
@@ -312,6 +340,49 @@ if ($violations.Count -gt 0) {
 }
 
 Write-Host '[PASS] IRQL contract: island entries call no PASSIVE-gated function'
+# ---- 6. every hide goes through yghv_guard_do_hide() ----
+#
+# 9.350's hang had a structural cause, not a logic one: "set the hidden flag" and
+# "record which mechanism did it" were two statements, so a new hide site could
+# do one without the other. The #DB re-hide did exactly that and left the page
+# present-but-zeroed — the breakpoint table read as empty, mem-bp add() reported
+# OK while writing into a discarded decoy, and the guest spun forever.
+#
+# 9.352 funnelled every hide through yghv_guard_do_hide(), where the mode is a
+# PARAMETER: neither half can be done alone. This rule is what keeps it true —
+# any assignment to .hidden outside that function is an unpaired hide and fails
+# here, at build time, instead of on a machine.
+$badHide = @()
+foreach ($f in $sources) {
+    $lines = [IO.File]::ReadAllLines($f.FullName)
+    $inDoHide = $false
+    $depth = 0
+    for ($k = 0; $k -lt $lines.Count; $k++) {
+        $l = $lines[$k]
+        if ($l -match '^int\s+yghv_guard_do_hide\s*\(') { $inDoHide = $true; $depth = 0 }
+        if ($inDoHide) {
+            $depth += ([regex]::Matches($l, '\{')).Count
+            $depth -= ([regex]::Matches($l, '\}')).Count
+        }
+        if ($l -match '\.hidden\s*=\s*1\s*;') {
+            # comments are prose, not code
+            if ($l -match '^\s*(\*|/\*|//)') { continue }
+            if (-not $inDoHide) {
+                $badHide += ("{0}:{1} assigns .hidden directly" -f $f.Name, ($k + 1))
+            }
+        }
+        if ($inDoHide -and $depth -le 0 -and $k -gt 0 -and $l -match '\}') { $inDoHide = $false }
+    }
+}
+
+if ($badHide.Count -gt 0) {
+    foreach ($b in $badHide) { Write-Host ("[irql] FAIL: $b") }
+    throw ("IRQL contract FAIL ({0} unpaired hide site(s)). A hide that sets " -f $badHide.Count) +
+          '.hidden without recording its mechanism leaves the page present-but-zeroed, ' +
+          'which silently empties whatever lived there (9.350). Route it through ' +
+          'yghv_guard_do_hide().'
+}
+
 # ---- 5. every path through a non-void function must return ----
 #
 # hide_core() was declared uint32_t and had `return 0` on its early-exit path but

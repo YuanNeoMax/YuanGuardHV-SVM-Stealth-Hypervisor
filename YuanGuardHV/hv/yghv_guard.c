@@ -187,8 +187,9 @@ int yghv_guard_add_va(const void *va, uint32_t len, const char *tag, int hide) {
         if (_s >= 0) {
             if (hide && !g_guard[_s].hidden) {
                 if (yghv_protect_npt_unmap_page(page)) {
-                    g_guard[_s].hidden = 1;
-                    g_guard[_s].hide_mode = YGHV_HIDE_UNMAP;
+                    if (yghv_guard_do_hide(_s, page, YGHV_HIDE_UNMAP)) {
+                        (void)0;
+                    }
                     InterlockedIncrement64(&g_g_hidden);
                 } else {
                     InterlockedIncrement64(&g_g_hidefail);
@@ -220,8 +221,9 @@ int yghv_guard_add_va(const void *va, uint32_t len, const char *tag, int hide) {
     g_guard[slot].hash_va = (uint64_t)(ULONG_PTR)va;   /* 9.340: re-hash here */
 
     if (hide && yghv_protect_npt_unmap_page(page)) {
-        g_guard[slot].hidden = 1;
-                    g_guard[slot].hide_mode = YGHV_HIDE_UNMAP;
+        if (yghv_guard_do_hide(slot, page, YGHV_HIDE_UNMAP)) {
+            (void)0;
+        }
         InterlockedIncrement64(&g_g_hidden);
     }
 
@@ -435,8 +437,9 @@ int yghv_guard_add_range(uint64_t gpa, uint32_t off, uint32_t len,
         if (_s >= 0) {
             if (hide && !g_guard[_s].hidden) {
                 if (yghv_protect_npt_unmap_page(page)) {
-                    g_guard[_s].hidden = 1;
-                    g_guard[_s].hide_mode = YGHV_HIDE_UNMAP;
+                    if (yghv_guard_do_hide(_s, page, YGHV_HIDE_UNMAP)) {
+                        (void)0;
+                    }
                     InterlockedIncrement64(&g_g_hidden);
                 } else {
                     InterlockedIncrement64(&g_g_hidefail);
@@ -472,8 +475,9 @@ int yghv_guard_add_range(uint64_t gpa, uint32_t off, uint32_t len,
             if (!hash)
                 return -4;
         } else {
-            g_guard[slot].hidden = 1;
-                    g_guard[slot].hide_mode = YGHV_HIDE_UNMAP;
+            if (yghv_guard_do_hide(slot, page, YGHV_HIDE_UNMAP)) {
+                (void)0;
+            }
             InterlockedIncrement64(&g_g_hidden);
         }
     }
@@ -814,8 +818,9 @@ uint32_t yghv_guard_hide_core(void) {
                     if (g_guard[s].hidden)
                         continue;
                     if (yghv_protect_npt_unmap_page(gpa + off)) {
-                        g_guard[s].hidden = 1;
-                    g_guard[s].hide_mode = YGHV_HIDE_UNMAP;
+                        if (yghv_guard_do_hide(s, gpa + off, YGHV_HIDE_UNMAP)) {
+                            hid++;
+                        }
                         InterlockedIncrement64(&g_g_hidden);
                         hid++;
                     }
@@ -996,14 +1001,50 @@ int yghv_guard_rehide_bare(uint64_t gpa) {
     if (s < 0)
         return 0;
 
-    if (g_guard[s].hide_mode == YGHV_HIDE_DECOY) {
+    /* 9.352: delegate, passing the mode this entry was hidden with. Re-hiding
+     * with the other mechanism leaves the page present-but-zeroed (9.350),
+     * which silently empties whatever table lived there. */
+    return yghv_guard_do_hide(s, gpa, (int)g_guard[s].hide_mode);
+}
+
+/*
+ * 9.352: THE ONE PLACE that hides a page.
+ *
+ * Before this, five separate sites did
+ *
+ *     g_guard[x].hidden = 1;
+ *
+ * and one of them (the #DB re-hide) used a different mechanism than the setter,
+ * which left the page present-but-zeroed and hung the machine. The root cause
+ * was not the wrong mechanism — it was that "set the flag" and "record which
+ * mechanism" were two statements a new hide site could do half of.
+ *
+ * Funnelling every hide through this function makes the two inseparable: the
+ * mode is a PARAMETER, so a caller cannot set the flag without stating the
+ * mechanism, and cannot state a mechanism without the flag being set.
+ *
+ * The static check (tests/irql_contract_check.ps1, rule 6) verifies that no
+ * other code assigns .hidden = 1, so a new hide path that bypasses this
+ * function fails the build-time check rather than the machine.
+ *
+ * ISLAND-SAFE: the bare primitives plus one array field.
+ */
+int yghv_guard_do_hide(int slot, uint64_t gpa, int mode) {
+    if (slot < 0 || slot >= YGHV_GUARD_MAX)
+        return 0;
+
+    if (mode == YGHV_HIDE_DECOY) {
         if (!yghv_guard_decoy_bare(gpa))
             return 0;
     } else {
+        mode = YGHV_HIDE_UNMAP;
         if (!yghv_protect_npt_unmap_page(gpa))
             return 0;
     }
-    g_guard[s].hidden = 1;
+
+    g_guard[slot].hide_mode = (uint32_t)mode;
+    g_guard[slot].hidden = 1;
+    InterlockedIncrement64(&g_g_hidden);
     return 1;
 }
 

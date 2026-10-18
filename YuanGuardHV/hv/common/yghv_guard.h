@@ -110,6 +110,14 @@ int yghv_guard_hiding_armed(void);
  * a discarded decoy, followed by a guest-side spin.
  */
 int yghv_guard_rehide_bare(uint64_t gpa);
+/*
+ * 9.352: THE ONE PLACE that hides a page. Funnelling every hide through here
+ * makes "set the flag" and "record which mechanism" inseparable — the mode is a
+ * parameter, so neither can be done without the other. Rule 6 of
+ * tests/irql_contract_check.ps1 verifies no code assigns .hidden directly.
+ */
+int yghv_guard_do_hide(int slot, uint64_t gpa, int mode);
+
 int yghv_guard_hide_mode(uint64_t gpa);
 
 int yghv_guard_remove(uint64_t gpa);
