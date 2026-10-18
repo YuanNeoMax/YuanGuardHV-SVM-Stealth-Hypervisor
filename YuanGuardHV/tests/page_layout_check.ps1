@@ -33,13 +33,24 @@ if (-not (Test-Path $mapPath)) {
 }
 
 # Tables the guard layer is allowed to hide.
-$hiddenTables = @('g_bp', 'g_frame', 'g_view_pages')
+#
+# 9.360: g_bp is now a `#define` onto a page-exact union member, so the symbol in
+# the map is the REGION (g_bp_region), not the array. The check must name the
+# symbol that actually exists; requiring 'g_bp' made it report "not found in the
+# map", which is the check telling the truth about a rename rather than a defect.
+# The page-exactness itself is asserted at COMPILE time (YGHV_STATIC_ASSERT_BP in
+# mem_bp.c); what this script adds is the cross-check that the region is really
+# alone on its page in the produced binary.
+$hiddenTables = @('g_bp_region', 'g_frame', 'g_view_pages')
 
 # State the guard layer itself needs while a page is hidden. Anything of ours on
 # the same page as a hidden table means the NPF handler will fault while asking
 # whether the page is hidden — the recursion that hung the machine.
 $mustStayReachable = @(
     'g_guard',            # yghv_guard_is_hidden() reads this
+    'g_bp_region',        # 9.360: the breakpoint registry region (page-exact)
+    'g_hot',              # 9.360: the hot scalars region (page-exact)
+    'g_ring_region',      # 9.360: the hit ring region (two page-exact pages)
     'g_guard_count',
     'g_code_start',       # the RIP whitelist
     'g_code_size',
@@ -85,6 +96,50 @@ foreach ($k in $rvaOf.Keys) {
 
 $problems = @()
 
+# 9.361: the guard-state span, used to decide whether a shared page is reachable
+# by the hide set. g_guard is exactly one page (32 slots x 128 B = 4096) so its
+# neighbours spill onto the NEXT page; the refusal therefore covers a span rather
+# than individual addresses, and this mirrors that span from the map.
+# Which symbols does yghv_guard_state_page() refuse? Read them from the source,
+# so a change in C is automatically reflected here.
+$stateRefusedSymbols = @()
+$guardSrc = Join-Path (Split-Path -Parent $PSScriptRoot) 'hv\yghv_guard.c'
+if (Test-Path $guardSrc) {
+    $gs = [IO.File]::ReadAllText($guardSrc)
+    $si = $gs.IndexOf('static int yghv_guard_state_page(uint64_t gpa) {')
+    if ($si -ge 0) {
+        $depth = 0; $end = $si
+        for ($k = $si; $k -lt $gs.Length; $k++) {
+            if ($gs[$k] -eq '{') { $depth++ } elseif ($gs[$k] -eq '}') { $depth--; if ($depth -eq 0) { $end = $k; break } }
+        }
+        $body = $gs.Substring($si, $end - $si)
+        foreach ($m in [regex]::Matches($body, '&(\w+)\s*&')) {
+        # Two forms appear in state_page():  `&symbol &`  for an address it can name
+        # directly, and  yghv_protect_page_is_npt(page)  for the NPT managers, which
+        # are static in protect.c and therefore cannot be named from the guard
+        # (naming them failed to link — LNK2019, measured). Both forms must be read,
+        # or the check silently stops covering the pages that moved behind the
+        # query — which is what happened on the first attempt: g_npt and g_npt_alt
+        # came back as NOTEs while the code already refused them.
+        if ($body -match 'yghv_protect_page_is_npt') {
+            foreach ($n2 in @('g_npt', 'g_npt_alt')) {
+                if ($stateRefusedSymbols -notcontains $n2) { $stateRefusedSymbols += $n2 }
+            }
+        }
+            if ($stateRefusedSymbols -notcontains $m.Groups[1].Value) { $stateRefusedSymbols += $m.Groups[1].Value }
+        }
+    }
+}
+Write-Host ("[page-layout] state_page refuses: " + $(if($stateRefusedSymbols.Count){($stateRefusedSymbols -join ', ')}else{'none parsed'}))
+
+$statePageLo = 0; $statePageHi = 0
+if ($rvaOf.ContainsKey('g_guard') -and $rvaOf.ContainsKey('g_guard_count')) {
+    $statePageLo = $rvaOf['g_guard'] -band 0xFFFFF000
+    $statePageHi = $rvaOf['g_guard_count'] -band 0xFFFFF000
+}
+Write-Host ("[page-layout] guard-state span: pages 0x{0:X} .. 0x{1:X} are refused as hide targets" -f $statePageLo, $statePageHi)
+
+
 # ---- Rule 1: a hidden table's page must not carry guard state ----
 foreach ($t in $hiddenTables) {
     if (-not $rvaOf.ContainsKey($t)) {
@@ -94,8 +149,12 @@ foreach ($t in $hiddenTables) {
     $page = $rvaOf[$t] -band 0xFFFFF000
     $onPage = $byPage[$page] | Sort-Object
 
+    # A table is in both lists (it is guard-managed state AND a hide target), so
+    # comparing against $mustStayReachable naively made it conflict with ITSELF.
+    # The question is only whether something OTHER than this table is on its page.
     $conflict = @()
     foreach ($n in $mustStayReachable) {
+        if ($n -eq $t) { continue }
         if ($onPage -contains $n) { $conflict += $n }
     }
 
@@ -138,10 +197,46 @@ foreach ($n in $mustStayReachable) {
         $problems += ("guard state '{0}' shares page 0x{1:X} with other guard state: {2}" -f `
                       $n, $page, ($conflict -join ', '))
     } elseif ($others.Count -gt 0) {
-        Write-Host ("[page-layout] NOTE: '{0}' shares page 0x{1:X} with unrelated globals ({2})" -f `
-            $n, $page, ($others.Count))
-        Write-Host ("[page-layout]       Benign while that page is not a hide target; " +
-                    "verify it stays one.")
+        # 9.361: "verify it stays one" was an instruction to a human, and a human
+        # reading six of these stops reading them. The property that makes the
+        # sharing harmless is checkable: yghv_guard_state_page() refuses to hide
+        # the pages the guard's own state occupies, so a page listed there cannot
+        # become a hide target no matter who later edits the hide set.
+        #
+        # So the NOTE now states WHICH of the two cases it is:
+        #   refused by state_page  -> benign, with the mechanism named
+        #   not refused            -> a real exposure, counted as a problem
+        $guardSrc = Join-Path (Split-Path -Parent $PSScriptRoot) 'hv\yghv_guard.c'
+        # 9.361: THE REFUSAL LIST IS READ FROM THE SOURCE, so the check and the
+        # implementation cannot disagree about which pages are refused.
+        #
+        # The first version hardcoded a span (g_guard .. g_guard_count) while
+        # yghv_guard_state_page() refused a longer list, so the check kept printing
+        # NOTEs for pages the code already refused — the reader could not tell
+        # whether the NOTE meant "unprotected" or "the check is out of date". A
+        # check that disagrees with the code it is checking is worse than either
+        # one alone. Extracting the names from state_page() makes them agree by
+        # construction: adding a refusal in C widens what the check accepts.
+        $stateRefuses = $false
+        foreach ($sym in $stateRefusedSymbols) {
+            if ($rvaOf.ContainsKey($sym)) {
+                if ($page -eq ($rvaOf[$sym] -band 0xFFFFF000)) { $stateRefuses = $true; break }
+            }
+        }
+        if (-not $stateRefuses -and $statePageHi -gt 0) {
+            if (($page -ge $statePageLo) -and ($page -le $statePageHi)) { $stateRefuses = $true }
+        }
+        if ($stateRefuses) {
+            Write-Host ("[page-layout] OK: '{0}' shares page 0x{1:X} with {2} unrelated global(s)," -f `
+                $n, $page, $others.Count)
+            Write-Host ("[page-layout]     and that page is inside the guard-state span" +
+                        " yghv_guard_state_page() refuses -> it can never be a hide target.")
+        } else {
+            Write-Host ("[page-layout] NOTE: '{0}' shares page 0x{1:X} with {2} unrelated global(s)," -f `
+                $n, $page, $others.Count)
+            Write-Host ("[page-layout]     and that page is NOT covered by the guard-state refusal." +
+                        " Confirm it is never a hide target.")
+        }
     }
 }
 

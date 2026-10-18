@@ -1739,11 +1739,29 @@ try {
                 $n = [BitConverter]::ToUInt64($out, 0)
                 Write-Host ("sys-guard list: {0} page(s)" -f $n)
                 for ($i = 0; $i -lt $n; $i++) {
-                    $o = 8 + $i*48
-                    $tg = -join (5..12 | ForEach-Object { if($out[$o+40+($_-5)] -ne 0){[char]$out[$o+40+($_-5)]}else{''} })
-                    Write-Host ("  [{0}] pa=0x{1:X} hidden={2} checks={3} changes={4} tag={5}" -f `
-                        $i, [BitConverter]::ToUInt64($out,$o), [BitConverter]::ToUInt64($out,$o+32),
-                        [BitConverter]::ToUInt64($out,$o+16), [BitConverter]::ToUInt64($out,$o+24), $tg)
+                for ($i = 0; $i -lt $n; $i++) {
+                    # 9.363: stride is 10 qwords = 80 bytes, per the C side
+                    # (control_device.c case 3):
+                    #   e[0]=gpa  e[1]=checks  e[2]=changes  e[3]=hidden
+                    #   e[4]=hash_off|hash_len  e[5..8]=digest  e[9]=tag|armed
+                    #
+                    # The parser had $o = 8 + $i*48, i.e. 48-byte entries, so it read
+                    # checks from +32 and changes from +16 — both wrong, and the tag
+                    # from +40..47, which is inside the digest. It looked plausible
+                    # only because a stale value happened to sit where it read.
+                    # Measured: "pa=0x1F1952000 ... tag=lñµ}Yç" — one real entry
+                    # followed by address-shaped garbage, printed with no error.
+                    $o = 8 + $i*80
+                    $tg = -join (0..7 | ForEach-Object {
+                        $ch = $out[$o + 72 + $_]
+                        if ($ch -ne 0) { [char]$ch } else { "" }
+                    })
+                    Write-Host ("  [{0}] pa=0x{1:X} checks={2} changes={3} hidden={4} tag={5}" -f `
+                        $i, [BitConverter]::ToUInt64($out,$o),
+                        [BitConverter]::ToUInt64($out,$o+8),
+                        [BitConverter]::ToUInt64($out,$o+16),
+                        [BitConverter]::ToUInt64($out,$o+24), $tg)
+                }
                 }
                 return
             }

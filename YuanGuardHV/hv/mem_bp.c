@@ -9,6 +9,14 @@
 #include "common/mem_engine.h"
 #include "mem_pa.h"
 
+/*
+ * 9.360: compile-time assert. A negatively-sized array fails the BUILD with a
+ * line and a number, which is the form that reads clearly in a build log.
+ */
+#define YGHV_STATIC_ASSERT_BP(cond, tag) \
+    typedef char yghv_assert_##tag[(cond) ? 1 : -1]
+
+
 /* 9.355: mem_bp.c has its own include scheme, so this is declared directly
  * rather than by including common/yghv_guard.h (which pulls <ntddk.h> in the
  * wrong order and redefines PEPROCESS — measured when wiring svm_simplevm206).
@@ -41,7 +49,44 @@ extern int yghv_guard_is_hidden(uint64_t gpa);
  * extern declarations elsewhere keep compiling unchanged, and DECLSPEC_ALIGN
  * plus the padding forces the layout.
  */
-DECLSPEC_ALIGN(4096) static yghv_bp_t g_bp[YGHV_BP_MAX];
+/*
+ * 9.360: PAGE-EXACT PLACEMENT, and the assertion that keeps it.
+ *
+ * DECLSPEC_ALIGN(4096) alone aligns the START, not the SIZE. Measured on the map:
+ *
+ *     g_bp @ 0x37000, next symbol @ 0x37E00   -> 3584 bytes used, 512 spare
+ *     page 0x37000 held g_bp (HOT) AND g_dr_shadow, g_dbg_args,
+ *         g_bp_fail_mode/irql/engine (COLD)
+ *     page 0x38000 held g_bp_refusals (HOT) AND g_bp_fail_split/table/perm/...
+ *
+ * The linker fills spare space with whatever fits, and the result is a HOT
+ * variable sharing a page with COLD ones. That matters here specifically: the
+ * whole point of hot/cold separation is that hiding a HOT page must not remove
+ * COLD state that the same fault path needs. A 512-byte gap silently defeats it.
+ *
+ * The fix is to make each region occupy EXACTLY one page, so there is no spare
+ * space and the linker has nothing to put there. A union of the array and a
+ * page-sized byte array does it: the union takes the size of its largest member
+ * and the alignment of its strictest one, so 4096-aligned + 4096 bytes means the
+ * object IS the page.
+ *
+ * The assertions below are the part that keeps it true -- they fail the BUILD,
+ * with a number, rather than leaving a page-sharing condition for a machine to
+ * find. Same discipline as 9.347/9.358: the earlier occurrences of this mistake
+ * were each paid for with a crash or a hang.
+ */
+typedef union {
+    yghv_bp_t entries[YGHV_BP_MAX];
+    uint8_t   page[4096];
+} yghv_bp_pageregion_t;
+
+DECLSPEC_ALIGN(4096) static yghv_bp_pageregion_t g_bp_region;
+DECLSPEC_ALIGN(4096) static yghv_bp_pageregion_t g_bp_region_pad;   /* separation */
+
+#define g_bp  (g_bp_region.entries)
+
+YGHV_STATIC_ASSERT_BP(sizeof(g_bp) <= 4096, g_bp_fits_one_page);
+YGHV_STATIC_ASSERT_BP(sizeof(g_bp_region) == 4096, g_bp_is_exactly_one_page);
 /*
  * ============================================================================
  * 9.359: HOT / COLD SEPARATION.
@@ -109,16 +154,91 @@ DECLSPEC_ALIGN(4096) static yghv_bp_t g_bp[YGHV_BP_MAX];
 /* ---- HOT: read from inside the NPF / #DB / #BP handlers ---- */
 /* Hit ring: 6 qwords per entry (single-producer: island appends, PASSIVE drains). */
 #define YGHV_BP_RING 128
-DECLSPEC_ALIGN(4096) static uint64_t g_ring[YGHV_BP_RING * 6];
-DECLSPEC_ALIGN(4096) static volatile LONG g_head;
-DECLSPEC_ALIGN(4096) static volatile LONG g_tail;
-DECLSPEC_ALIGN(4096) static volatile LONG g_bp_count;
-DECLSPEC_ALIGN(4096) static volatile LONG64 g_bp_hits;
-DECLSPEC_ALIGN(4096) static volatile LONG64 g_bp_refusals;
-DECLSPEC_ALIGN(4096) static volatile LONG64 g_bp_recorded;
-DECLSPEC_ALIGN(4096) static volatile LONG64 g_bp_missed;
-DECLSPEC_ALIGN(4096) static volatile LONG64 g_bp_seq;
 
+/*
+ * 9.360: the hot scalars are ONE page-exact region, not nine aligned scalars.
+ *
+ * Declaring each as DECLSPEC_ALIGN(4096) aligns it but does not pad it: a 4-byte
+ * counter still leaves 4092 bytes for the linker to fill, and measured, it filled
+ * them with COLD state. page 0x38000 held g_bp_refusals (HOT, read by the NPF
+ * handler on every breakpoint hit) together with g_bp_fail_split, g_bp_fail_table,
+ * g_bp_fail_perm, g_bp_fail_va, g_bp_fail_patch, g_bp_fail_drslot and g_dr_used.
+ *
+ * Grouping them into one union member set makes the region exactly one page, so
+ * hot and cold cannot be interleaved by the linker at all. The assertion below
+ * fails the BUILD if the struct ever outgrows a page, because the failure that
+ * follows (hiding a hot page removes cold state the same fault path needs) has
+ * already cost this project a hang.
+ */
+typedef struct {
+    volatile LONG   head;
+    volatile LONG   tail;
+    volatile LONG   bp_count;
+    volatile LONG64 bp_hits;
+    volatile LONG64 bp_refusals;
+    volatile LONG64 bp_recorded;
+    volatile LONG64 bp_missed;
+    volatile LONG64 bp_seq;
+} yghv_bp_hot_t;
+
+typedef union {
+    yghv_bp_hot_t s;
+    uint8_t       page[4096];
+} yghv_bp_hot_region_t;
+
+/* ring stride stays 6 qwords per entry; the array is padded to whole pages */
+#define YGHV_BP_RING_QWORDS (YGHV_BP_RING * 8)
+
+typedef union {
+    uint64_t ring[YGHV_BP_RING_QWORDS];
+    uint8_t  page[sizeof(uint64_t) * YGHV_BP_RING_QWORDS];
+} yghv_bp_ring_region_t;
+
+/*
+ * 9.360: THE HOT REGION IS TWO PAGES, and the assertion is what found that out.
+ *
+ * The first attempt put the scalars AND the hit ring in one struct with a single
+ * page assertion. It failed the BUILD:
+ *
+ *     error: 'yghv_assert_bp_hot_fits_one_page' declared as an array with a
+ *            negative size
+ *
+ * The ring is YGHV_BP_RING * 6 qwords = 128 * 6 * 8 = 6144 bytes, one and a half
+ * pages before the scalars are counted. So "hot state" cannot be one page, and
+ * pretending otherwise would have left the ring's second half sharing a page with
+ * whatever the linker put there — the exact condition this separation exists to
+ * prevent. The assertion caught a design error in the code that was supposed to
+ * fix design errors, which is the most useful thing a new assertion can do.
+ *
+ * The split that matches reality:
+ *
+ *   PAGE A  the scalars the handlers read on every fault: head, tail, bp_count,
+ *           the hit/refusal/recorded/missed counters, the sequence number.
+ *   PAGE B  the hit ring, rounded UP to whole pages so its tail leaves no spare
+ *           bytes: 128 * 8 qwords = 1024 * 8 = 8192 = exactly two pages.
+ *
+ * yghv_bp_record still writes e[0..5] per entry; the extra two qwords per entry
+ * are padding that exists so the region ends on a page boundary.
+ */
+DECLSPEC_ALIGN(4096) static yghv_bp_hot_region_t  g_hot;
+DECLSPEC_ALIGN(4096) static yghv_bp_ring_region_t g_ring_region;
+DECLSPEC_ALIGN(4096) static yghv_bp_hot_region_t  g_hot_pad;   /* separation */
+DECLSPEC_ALIGN(4096) static yghv_bp_ring_region_t g_ring_pad;  /* separation */
+
+#define g_head         (g_hot.s.head)
+#define g_tail         (g_hot.s.tail)
+#define g_bp_count     (g_hot.s.bp_count)
+#define g_bp_hits      (g_hot.s.bp_hits)
+#define g_bp_refusals  (g_hot.s.bp_refusals)
+#define g_bp_recorded  (g_hot.s.bp_recorded)
+#define g_bp_missed    (g_hot.s.bp_missed)
+#define g_bp_seq       (g_hot.s.bp_seq)
+#define g_ring         (g_ring_region.ring)
+
+YGHV_STATIC_ASSERT_BP(sizeof(yghv_bp_hot_t) <= 4096, bp_hot_fits_one_page);
+YGHV_STATIC_ASSERT_BP(sizeof(yghv_bp_hot_region_t) == 4096, bp_hot_is_exactly_one_page);
+YGHV_STATIC_ASSERT_BP((sizeof(uint64_t) * YGHV_BP_RING_QWORDS) % 4096 == 0, bp_ring_whole_pages);
+YGHV_STATIC_ASSERT_BP(sizeof(yghv_bp_ring_region_t) == sizeof(uint64_t) * YGHV_BP_RING_QWORDS, bp_ring_region_exact);
 /* ---- COLD: read only from IOCTL context ---- */
 static volatile LONG64 g_bp_fail_irql;
 static volatile LONG64 g_bp_fail_engine;

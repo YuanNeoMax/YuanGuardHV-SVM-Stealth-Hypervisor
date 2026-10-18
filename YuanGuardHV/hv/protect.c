@@ -2903,3 +2903,52 @@ int yghv_protect_npt_unmap_page(uint64_t gpa) {
     return NT_SUCCESS(npt_exclude_pa(&g_npt, gpa & ~(uint64_t)0xFFFULL))
            ? 1 : 0;
 }
+/*
+ * 9.361, corrected in 9.364: does this page hold one of the NPT managers?
+ *
+ * g_npt and g_npt_alt are static in this file, so yghv_guard.c cannot name them —
+ * and naming them from there failed to link (LNK2019, measured). Exposing the
+ * QUESTION instead of the objects keeps ownership where it belongs: the guard
+ * asks "is this page one of your managers?", and this file answers from
+ * definitions only it can see, so the answer cannot drift from the object.
+ *
+ * 9.364 FIX — this was the THIRD instance of the same VA-vs-PA confusion, so it is
+ * worth naming as such rather than as a one-line typo:
+ *
+ *     p = page & ~0xFFF        <- caller passes a PHYSICAL page
+ *     &g_npt & ~0xFFF          <- that is a VIRTUAL address
+ *
+ * The comparison was false for every input, so neither manager page was ever
+ * recognised. yghv_guard_state_page() relies on this call for two of its
+ * refusals, so those two refusals silently did nothing. Measured consequence: G29
+ * reported "hid 1 page(s)" with hide_fail=3 — two of the three tables were skipped
+ * as guard state while the third was hidden, i.e. the refusal fired on the WRONG
+ * page and missed the two it was written for.
+ *
+ * THE PATTERN WORTH REMEMBERING: all three occurrences were the same shape —
+ * comparing an address the caller computed from MmGetPhysicalAddress against one
+ * taken with `&` on a variable. The two look identical in source and cannot be
+ * told apart by the type system, because both are uint64_t. So the rule is a
+ * NAMING rule, not a type rule: if a value comes from MmGetPhysicalAddress it is
+ * physical, and `&something` is never physical. Every site below spells that out.
+ */
+int yghv_protect_page_is_npt(uint64_t phys_page) {
+    extern PHYSICAL_ADDRESS MmGetPhysicalAddress(void *BaseAddress);
+    uint64_t p = phys_page & ~(uint64_t)0xFFFULL;
+    uint64_t mgr_pa;
+    static uint64_t npt_pa, npt_alt_pa;
+
+    /* resolve each manager's PHYSICAL page once, then compare PA to PA */
+    if (!npt_pa)
+        npt_pa = (uint64_t)MmGetPhysicalAddress((PVOID)&g_npt).QuadPart & ~(uint64_t)0xFFFULL;
+    if (!npt_alt_pa)
+        npt_alt_pa = (uint64_t)MmGetPhysicalAddress((PVOID)&g_npt_alt).QuadPart & ~(uint64_t)0xFFFULL;
+
+    mgr_pa = npt_pa;
+    if (p == mgr_pa)
+        return 1;
+    mgr_pa = npt_alt_pa;
+    if (p == mgr_pa)
+        return 1;
+    return 0;
+}

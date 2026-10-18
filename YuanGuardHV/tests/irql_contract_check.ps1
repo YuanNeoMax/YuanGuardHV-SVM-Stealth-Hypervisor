@@ -253,6 +253,7 @@ if ($wrongMode.Count -gt 0) {
 
 # --- collect pointer tables: name -> list of member function names ---
 $ptrTables = @{}
+$tableTypes = @{}   # table name -> struct type name (9.362, member mapping)
 foreach ($f in $sources) {
     $code = Strip-Comments ([IO.File]::ReadAllText($f.FullName))
     foreach ($m in [regex]::Matches($code, '(?m)^\s*(?:const\s+)?[\w_]+\s+(g_\w+)\s*=\s*\{([^}]*)\}')) {
@@ -263,9 +264,50 @@ foreach ($f in $sources) {
             if ($n -match '^\d') { continue }
             if ($definedIn.ContainsKey($n)) { $members += $n }
         }
-        if ($members.Count -gt 0) { $ptrTables[$tname] = $members }
+        if ($members.Count -gt 0) {
+            $ptrTables[$tname] = $members
+            # the declared type, so member order can be resolved later
+            $tm = [regex]::Match($m.Value, '(?m)^\s*(?:const\s+)?([\w_]+)\s+g_\w+\s*=')
+            if ($tm.Success) { $tableTypes[$tname] = $tm.Groups[1].Value }
+        }
     }
 }
+
+# 9.362: MEMBER-LEVEL PRECISION, so a call site is checked against the member it
+# actually names instead of every member in the table.
+#
+# The conservative version checked every target in the table and reported all of
+# them. That is safe but it is not useful: measured on the negative test, a call
+# to t->read() reported t->write's gating as a violation of the read call, so the
+# reader had to work out which of two named targets their code could even reach.
+#
+# The layout makes the mapping available: the initialiser lists members in
+# declaration order, and the struct declaration states that order:
+#
+#     typedef struct {
+#         const char *name;      position 0
+#         NTSTATUS (*read)(...); position 1
+#         NTSTATUS (*write)(...);position 2
+#     } yghv_mem_engine_ops_t;
+#     const ... g_yghv_engine_pte = { "pte", pte_read, pte_write };
+#
+# So position i of the initialiser is the member declared i-th. This map is built
+# from the struct declaration rather than hardcoded, so a field reorder or a rename
+# moves the map with it.
+$memberPos = @{}   # table -> @{ memberName = position }
+foreach ($f in $sources) {
+    $code = Strip-Comments ([IO.File]::ReadAllText($f.FullName))
+    # a struct whose fields include function pointers, and the table typed by it
+    foreach ($d in [regex]::Matches($code, '(?m)typedef\s+struct\s*\{([^}]*)\}\s*(\w+)\s*;')) {
+        $typeName = $d.Groups[2].Value
+        $fields = @()
+        foreach ($fm in [regex]::Matches($d.Groups[1].Value, '(?m)^\s*(?:const\s+)?[\w\s\*]*?\(\s*\*\s*(\w+)\s*\)\s*\([^)]*\)\s*;')) {
+            $fields += $fm.Groups[1].Value
+        }
+        if ($fields.Count -gt 0) { $memberPos[$typeName] = $fields }
+    }
+}
+Write-Host ("[irql] pointer-table layouts: " + $(if($memberPos.Count){($memberPos.Keys -join ", ")}else{"none"}))
 
 Write-Host ("[irql] pointer tables: {0}" -f $ptrTables.Count)
 foreach ($t in $ptrTables.Keys) {
@@ -290,20 +332,38 @@ foreach ($n in $islandNames) {
             continue
         }
         $checkedIndirect++
-        # CONSERVATIVE ON PURPOSE: every member of the table is checked, not only
-        # the one named at the call site.
+        $checkedIndirect++
+        # 9.362: MEMBER-LEVEL PRECISION.
         #
-        # The initialiser is an ordered list ({"pte", pte_read, pte_write}), so the
-        # member name COULD be mapped to a position. It is not, for two reasons:
-        # the position depends on struct layout, which this scan does not parse; and
-        # a false negative here (miss a gated target actually reached) is far worse
-        # than a false positive (check a sibling that is not reached). A violation
-        # therefore names every gated member and states which member the call site
-        # used, so the reader can tell whether it is the one they care about.
-        foreach ($target in $ptrTables[$tname]) {
+        # The conservative version checked every target in the table and reported
+        # all of them. Safe, but not useful: measured on the negative test, a call
+        # to t->read() reported that t->write() gates as a violation of the read
+        # call, so the reader had to work out which named target their code could
+        # even reach.
+        #
+        # The layout makes the mapping available: the initialiser lists members in
+        # declaration order, so position i is the i-th declared member. The map is
+        # built from the struct DECLARATION (see $memberPos), not hardcoded, so a
+        # field reorder moves the map with it.
+        #
+        # FALLBACK IS STILL CONSERVATIVE: if the table type cannot be resolved, or
+        # the member name is not among the declared fields, every target is checked.
+        # A false negative (miss a gated target actually reached) is far worse than
+        # a false positive, so an unresolvable name falls back to checking all.
+        $targets = $ptrTables[$tname]
+        $tableType = $tableTypes[$tname]
+        if ($tableType -and $memberPos.ContainsKey($tableType)) {
+            $fields = $memberPos[$tableType]
+            $pos = [array]::IndexOf($fields, $member)
+            if ($pos -ge 0) {
+                $indexed = @($ptrTables[$tname] | Where-Object { $true })
+                if ($pos -lt $indexed.Count) { $targets = @($indexed[$pos]) }
+            }
+        }
+        foreach ($target in $targets) {
             if ($bodies[$target] -match 'KeAreAllApcsDisabled\(\)') {
-                $badIndirect += ("{0} (island) dispatches to {1} (PASSIVE-gated) via {2}->{3}() ({4})" -f `
-                                 $n, $target, $tname, $member, $definedIn[$n])
+                $badIndirect += ("{0} (island) calls {1}->{2}(), which dispatches to {3} (PASSIVE-gated) [{4}]" -f `
+                                 $n, $tname, $member, $target, $definedIn[$n])
             }
         }
     }

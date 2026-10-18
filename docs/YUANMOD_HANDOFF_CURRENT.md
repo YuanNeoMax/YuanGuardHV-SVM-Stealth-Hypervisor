@@ -9064,3 +9064,158 @@ T12 在 T3/T4（隐藏）之后跑，而 `g_bp` 现在被隐藏 → `bp add` 正
 3. **soak 未重跑**：`g28_hidesoak` 指向 z3 但本轮没跑（用户指定跳过 soak）。
 4. **两处 benign NOTE 仍在**（`g_npt` 74 个邻居、`g_npt_alt` 15 个）——
    它们是无关全局，且那些页不是隐藏目标。
+
+
+### 9.364 2026-10-18 **三项剩余 + 三处 VA/PA 混淆缺陷（同一根因，三个位置）**
+
+#### 9.364.1 最终验证（镜像 `206z8_vafull` / CEF35E62）
+
+```
+G25  Tier 7 全功能        13/13 ALL PASS
+G26  bp-after-hide         3/3  PASS
+G29  arm→hide→trigger      PASS   hid 3 page(s), hide_fail=0
+机器 uptime 740 min 未重启，本轮零崩溃零挂起
+```
+
+#### 9.364.2 点1 收口：hot/cold 编译期断言（含区域页精确）
+
+**断言先抓出了我自己的设计错误。** 第一版把热标量与命中环放进同一个 struct +
+一条页断言，构建直接失败：
+
+```
+error: 'yghv_assert_bp_hot_fits_one_page' declared as an array with a negative size
+```
+
+环是 `128 * 6 qwords = 6144` 字节 —— **一页半**。若要假装它是一页，环的后半截
+必然与链接器塞进来的东西共页，正是这套分离要防的事。**断言在"用来修设计错误的
+代码"里抓出一个设计错误，这是新断言最有用的形态。**
+
+**实测布局**（`.map` 验证）：
+
+```
+g_bp_region    @0x37000  syms_on_page=1   ← 注册表独占
+g_hot          @0x36000  syms_on_page=1   ← 热标量独占
+g_ring_region  @0x39000  syms_on_page=1   ← 命中环独占（2 页对齐）
+page 0x38000   全部是 COLD（无 HOT）
+```
+
+`DECLSPEC_ALIGN(4096)` **只对齐起点，不规定尺寸** —— 一个 4 字节计数器仍留 4092
+字节空隙给链接器填。union + 页大小字节数组让区域**恰好是一页**，`YGHV_STATIC_ASSERT_BP`
+保证它不会长大。
+
+#### 9.364.3 点2 收口：规则 7 成员级精度
+
+指针表布局是可解析的（初始化列表按声明顺序列出成员），所以检查从"查全表"改为
+"查调用点命名的那个成员"。
+
+**双向负向验证**：
+```
+岛内调 .read()，read 带门槛、write 不带  -> FAIL，精确指名 read
+岛内调 .write()，write 不带门槛          -> PASS，不再误报 read
+```
+
+**回退仍保守**：表类型无法解析、或成员名不在声明字段中时，退回查全表 ——
+**漏报一个真到达的 gated 目标**远比多查一个兄弟糟糕。
+
+#### 9.364.4 点3 收口：6 处 benign NOTE 全部转为可验证 OK
+
+Rule 2 原来对每个邻居都报 WARN（"benign while that page is not a hide target"）——
+**这是给人看的指令，而人读到第六条就不读了**。修法：让它们变成**可计算的**。
+
+**关键：检查从源码读拒绝列表**，所以检查与实现不可能不一致：
+
+```
+state_page refuses: g_npt, g_npt_alt, g_code_start, g_code_size,
+                    g_decoy_pa, g_decoy_va, g_protect
+OK: g_guard / g_guard_count / g_decoy_va / g_npt / g_npt_alt / g_protect
+```
+
+第一版检查硬编码了一个跨度，而代码拒绝更长的列表 —— **检查一直在给代码已经拒绝的
+页打 NOTE**，读者无法分辨"未保护"与"检查过时"。**与被检查代码不一致的检查，比
+两者中任何一个都糟。**
+
+`g_npt_alt` 是 `static` 在 protect.c，`extern` 引用失败（LNK2019 实测）。
+**暴露问题而不是对象**：`yghv_protect_page_is_npt()`。
+
+#### 9.364.5 ★★ 三处 VA/PA 混淆 —— 同一根因，三个位置
+
+**这是本轮最重要的发现，也是三处一直藏在"能跑通"后面的缺陷。**
+
+**第一处：`yghv_guard_target_page()`**（已提交于 9.359）
+```c
+va   = yghv_bp_table_va(&bytes);   // 内核 VA
+page = gpa & ~0xFFF;               // 物理
+if (page >= ((uint64_t)va & ~0xFFF) && ...)   // 拿 GPA 比 VA —— 永远为假
+```
+
+**第二处：`yghv_guard_state_page()`**（这就是真正弄坏 hidecore 的那个）
+```c
+if (page == ((uint64_t)&g_code_start & ~0xFFF))   // 同样 GPA 比 VA
+```
+跨度用的是 VA 侧常量，**而物理页号可能巧合落在那个数值范围内** —— 于是
+state_page() 对**与 guard 状态无关的页返回 1**。
+
+**第三处：`yghv_protect_page_is_npt()`**（我 9.361 新写的，同样形状）
+```c
+p = page & ~0xFFF;                       // PA
+if (p == (&g_npt & ~0xFFF))              // VA
+```
+
+**为什么一直没暴露**：`hidecore` 的 `state_page` 跳过与 `mode_for` 的 UNMAP 判定，
+**都由同一个过宽的 state_page 提供了正确答案**。9.361 把跨度收紧（本身正确的改动）
+撤掉了这层意外覆盖，两处 target_page/state_page 的 bug 才露出来。
+
+> **教训：一个正确的修复可能暴露出第二个缺陷 —— 它一直寄生在"被修的那个缺陷"上。
+> 当某个改动让东西不再工作，先问是改动弄坏了它，还是改动只是揭开了它。**
+> 这里是后者；回退那个正确的改动只会把遮蔽重新装上。
+
+**第三处的实测症状**：G29 报 `hid 1 page(s)` + `hide_fail=3` —— 三张表里两张被
+当 guard 状态跳过，第三张被隐藏。**拒绝在错误的页上触发，漏掉它本该保护的两页。**
+
+**修法**：全部改为**显式翻译一次、并命名哪一侧是哪一侧**：
+```c
+lo = (uint64_t)MmGetPhysicalAddress(va).QuadPart & ~0xFFF;
+hi = ((uint64_t)MmGetPhysicalAddress(va).QuadPart + bytes - 1) & ~0xFFF;
+if (page >= lo && page <= hi) return 1;
+```
+`state_page` 的 VA 侧常量**解析一次并缓存**（在 per-VMEXIT 路径上，每次调用多走三趟
+页表遍历不可接受）。
+
+**全库扫描**：`page == ((uint64_t)&sym & ~0xFFF)` 模式已清零。
+
+#### 9.364.6 ★ 让"hid 0"自己说出原因
+
+三处修复的全过程里，最难的不是修 —— 是**知道该修哪一个**。`hid 0 page(s)` 有三种
+完全不同的成因，第一版把它们报成一样：
+
+```
+0x10  早退：ALLOW 循环未武装（g_code_size 或 g_decoy_pa 为零）—— 正确的拒绝
+1 / 2 NPT 步骤失败（split / 清 present）—— unmap_bare 分阶段
+3 / 4 / 5  逐页跳过：是 guard 状态 / 无 guard 条目 / 已隐藏
+0x20  循环未跑
+```
+
+**实测代价**：hidecore 说 `hid 0`、NPT 项逐字节未变、`hide_fail=0` —— 三可能无法
+区分，排查两次奔向 NPT，才想到早退。**一个能说出"走了哪扇门"的计数器，价值高于
+三次重建加载。**
+
+#### 9.364.7 本轮我自己的操作错误（诚实）
+
+**PowerShell `@()` 是固定大小数组**，`.Add()` 会失败 —— 两次用它重写文件，把
+`yghv_guard.c` **截断为 0 行**。第二次之后改用 **edit 工具**，不再用 PowerShell 做
+数组手术。**曾把测试自己的错当成实现缺陷三次**（本轮第四次：T12 无条件要求 `add OK`
+而正确行为是 `REFUSED`）。
+
+#### 9.364.8 状态
+- 静态检查：**6 个**（source 级 4 + map 级 1 + 拆分 runner）；IRQL 规则 **7** 条
+- 镜像：`206z8_vafull`（md5 `CEF35E62`）
+- **未推送**（本地领先 27 个提交）
+
+#### 9.364.9 剩余（诚实）
+1. **规则 7 的成员映射依赖结构体声明顺序** —— 字段重排会让映射移动（已设计为随之
+   移动），但若有人用位置初始化器以外的方式填表，映射会失准（回退查全表，安全）。
+2. **hot/cold 断言只覆盖 mem_bp.c 的两个区域** —— 其它模块若有同类"小对象留大空隙"
+   的布局，没有断言。页归属检查（Rule 1/2）能从 `.map` 发现，但不是编译期。
+3. **soak 未在本镜像重跑**（本轮聚焦缺陷修复）。
+4. **两处 benign NOTE 仍存在**（`g_npt` 74 邻居、`g_npt_alt` 15 邻居）——
+   两者已在 state_page 拒绝列表内，检查报 OK。

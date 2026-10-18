@@ -753,3 +753,64 @@ T12 在隐藏之后跑，arm 被正确 REFUSED，而判定无条件要求 `add O
 ```
 
 **这是验证护栏的地方，不是放松。**
+---
+
+## 二十七、★★ 同一个 VA/PA 混淆，三处，一个根因
+
+### 症状与实测
+
+`hidecore: hid 0 page(s)`、`hide_fail = 0`、NPT 项逐字节未变
+（`entry=0x11F6000E7` 前后相同）。
+
+### 三处，同一形状
+
+```c
+// 1. yghv_guard_target_page()   —— 已提交，一直在
+page = gpa & ~0xFFF;                          // 物理
+if (page >= ((uint64_t)va & ~0xFFF) && ...)   // va 是内核 VA —— 永远为假
+
+// 2. yghv_guard_state_page()    —— 真正弄坏 hidecore 的那个
+if (page == ((uint64_t)&g_code_start & ~0xFFF))   // 同样拿 PA 比 VA
+
+// 3. yghv_protect_page_is_npt() —— 新写的，同样形状
+p = page & ~0xFFF;                                // PA
+if (p == (&g_npt & ~0xFFF))                       // VA
+```
+
+`state_page` 的**跨度**用 VA 侧常量，而**物理页号可能巧合落进那个数值范围** ——
+于是它对与 guard 状态无关的页返回 1。第三处的实测症状：`hid 1 page(s)` +
+`hide_fail=3`，三张表里两张被当 guard 状态跳过，**拒绝在错误的页上触发，
+漏掉它本该保护的两页**。
+
+### 为什么长期没暴露
+
+`hidecore` 的跳过与 `mode_for` 的 UNMAP 判定**都由同一个过宽的 state_page
+提供了正确答案**。把跨度收紧（本身正确的改动）撤掉这层意外覆盖，bug 才露出来。
+
+> **一个正确的修复可能暴露出第二个缺陷 —— 它一直寄生在"被修的那个缺陷"上。
+> 当某个改动让东西不再工作，先问：是改动弄坏了它，还是改动只是揭开了它。**
+
+### 为什么类型系统救不了你
+
+两侧都是 `uint64_t`，源码上长得一样。所以这是**命名规则，不是类型规则**：
+
+- 来自 `MmGetPhysicalAddress` 的值是**物理**的
+- `&something` **永远不是**物理的
+
+每个比较点都要**显式翻译一次并命名哪一侧是哪一侧**：
+```c
+lo = (uint64_t)MmGetPhysicalAddress(va).QuadPart & ~0xFFF;
+if (page >= lo && page <= hi) return 1;
+```
+在 per-VMEXIT 路径上，VA 侧常量要**解析一次并缓存**。
+
+### 附带：让"什么都没做"说出是哪扇门
+
+`hid 0` 有三种成因，第一版报成一样，排查两次奔向 NPT 才想到早退：
+```
+0x10 早退（ALLOW 循环未武装，正确的拒绝）
+1/2  NPT 步骤失败（split / 清 present）
+3/4/5 逐页跳过（guard 状态 / 无条目 / 已隐藏）
+0x20 循环未跑
+```
+**一个能说出"走了哪扇门"的计数器，价值高于三次重建加载。**

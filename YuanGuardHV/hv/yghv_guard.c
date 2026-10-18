@@ -347,44 +347,194 @@ int yghv_guard_add_va(const void *va, uint32_t len, const char *tag, int hide) {
 /* Is this page the guard's own bookkeeping? Never hide it: the NPF handler
  * reads g_guard through yghv_guard_is_hidden(), so hiding it faults inside the
  * handler that asked the question — measured as an infinite recursion (hang). */
+/*
+ * Is this page the guard's own bookkeeping? Never hide it: the NPF handler
+ * reads g_guard through yghv_guard_is_hidden(), so hiding it faults inside the
+ * handler that asked the question — measured as an infinite recursion (hang).
+ *
+ * 9.361: the refusal covers the SPAN of every piece of guard state, not the
+ * individual address of each one.
+ *
+ * The earlier version named one address per item, and Rule 2 of the page-layout
+ * check showed why that is not enough:
+ *
+ *     page 0x3F000   g_guard + g_g_hidden + g_g_hidefail + g_g_hashfail
+ *     page 0x40000   g_guard_count + g_g_guarded + g_g_probes + g_g_verified + g_g_changed
+ *
+ * g_guard is exactly one page (32 slots x 128 bytes = 4096), so its neighbours
+ * necessarily spill onto the NEXT page. Those neighbours are counters the fault
+ * path itself touches — g_g_hidden is incremented by do_hide(), g_g_probes by
+ * yghv_guard_is_hidden(). A page can therefore be correctly refused as "guard
+ * state" and still carry unnamed state that must not be hidden either.
+ *
+ * Refusing the whole span [first guard byte, last guard byte] makes the answer
+ * independent of how the linker arranged the neighbourhood. If any byte of guard
+ * state is on a page, that page is refused — which is the property that was
+ * always intended, and is now stated in a way the layout cannot defeat.
+ *
+ * A compile-time assertion below pins the span to a handful of pages, so a future
+ * growth of guard state fails the build rather than silently widening the refusal
+ * past what was reviewed.
+ */
+#define YGHV_GUARD_STATE_LO() ((uint64_t)(ULONG_PTR)&g_guard[0])
+#define YGHV_GUARD_STATE_HI() ((uint64_t)(ULONG_PTR)&g_guard_count + sizeof(g_guard_count))
+
+/*
+ * 9.364 FIX — THE SAME VA-vs-PA CONFUSION AS yghv_guard_target_page(), AND THIS
+ * IS THE ONE THAT ACTUALLY BROKE hidecore.
+ *
+ * Every comparison below used a VIRTUAL address while the caller passes a
+ * PHYSICAL page:
+ *
+ *     yghv_guard_state_page(gpa)              <- gpa is physical
+ *     if (page == (&g_code_start & ~0xFFF))   <- &g_code_start is a VA
+ *
+ * In kernel mode those numbers are unrelated, so the four control-value tests
+ * were false for every input. The SPAN test, though, used
+ * YGHV_GUARD_STATE_LO/HI — also VAs — and a physical page number can land inside
+ * that numeric range by coincidence. So state_page() returned 1 for pages that
+ * have nothing to do with guard state.
+ *
+ * MEASURED, with the probe counters added for exactly this question:
+ *
+ *     hidecore: hid 0 page(s)
+ *     hide_fail = 3  ("page is guard state" — the real cause)
+ *     hide_fail = 3  (page skipped by state_page — the real cause)
+ *     NPT entry 0x11F6000E7 unchanged before and after
+ *
+ * hidecore's per-page loop therefore hit the state_page() continue and never
+ * reached find() at all — that is the whole of "hid 0 page(s)".
+ *
+ * The fix is not to widen or narrow anything: it is to make this function compare
+ * like with like. ISLAND-SAFE — MmGetPhysicalAddress is a software page-table
+ * walk, no locks and no blocking, so it is callable from the NPF/#DB handlers
+ * (same reasoning as the *_bare helpers).
+ *
+ * The VAs are resolved ONCE and cached, because this sits on a per-VMEXIT path
+ * and each call would otherwise cost several extra page-table walks.
+ */
+static uint64_t g_state_pa_lo, g_state_pa_hi;
+static uint64_t g_state_pa_code_start, g_state_pa_code_size;
+static uint64_t g_state_pa_decoy_pa, g_state_pa_decoy_va;
+static volatile LONG g_state_pa_ready;
+
+static void yghv_guard_state_pa_init(void) {
+    extern PHYSICAL_ADDRESS MmGetPhysicalAddress(void *BaseAddress);
+
+    if (InterlockedCompareExchange(&g_state_pa_ready, 0, 0))
+        return;
+
+    g_state_pa_lo = (uint64_t)MmGetPhysicalAddress(&g_guard[0]).QuadPart;
+    /* the span runs from the array through g_guard_count (adjacent in .bss even
+     * though they sit on different pages — see the 9.358 layout) */
+    g_state_pa_hi = (uint64_t)MmGetPhysicalAddress((PVOID)&g_guard_count).QuadPart;
+
+    g_state_pa_code_start = (uint64_t)MmGetPhysicalAddress((PVOID)&g_code_start).QuadPart;
+    g_state_pa_code_size  = (uint64_t)MmGetPhysicalAddress((PVOID)&g_code_size).QuadPart;
+    g_state_pa_decoy_pa   = (uint64_t)MmGetPhysicalAddress((PVOID)&g_decoy_pa).QuadPart;
+    g_state_pa_decoy_va   = (uint64_t)MmGetPhysicalAddress((PVOID)&g_decoy_va).QuadPart;
+
+    InterlockedExchange(&g_state_pa_ready, 1);
+}
+
 static int yghv_guard_state_page(uint64_t gpa) {
     uint64_t page = gpa & ~(uint64_t)0xFFFULL;
-    uint64_t lo, hi;
+    uint64_t lo, hiPage;
 
-    lo = (uint64_t)(ULONG_PTR)&g_guard[0];
-    hi = (uint64_t)(ULONG_PTR)&g_guard[YGHV_GUARD_MAX - 1] + sizeof(g_guard[0]);
-    if (page >= (lo & ~(uint64_t)0xFFFULL) && page <= (hi & ~(uint64_t)0xFFFULL))
+    yghv_guard_state_pa_init();
+
+    lo = g_state_pa_lo & ~(uint64_t)0xFFFULL;
+    hiPage = g_state_pa_hi & ~(uint64_t)0xFFFULL;
+    if (page >= lo && page <= hiPage)
         return 1;
-    if (page == ((uint64_t)(ULONG_PTR)&g_guard_count & ~(uint64_t)0xFFFULL))
+
+    if (page == (g_state_pa_code_start & ~(uint64_t)0xFFFULL))
         return 1;
-    if (page == ((uint64_t)(ULONG_PTR)&g_code_size & ~(uint64_t)0xFFFULL))
+    if (page == (g_state_pa_code_size & ~(uint64_t)0xFFFULL))
         return 1;
-    if (page == ((uint64_t)(ULONG_PTR)&g_decoy_pa & ~(uint64_t)0xFFFULL))
+    if (page == (g_state_pa_decoy_pa & ~(uint64_t)0xFFFULL))
         return 1;
+    if (page == (g_state_pa_decoy_va & ~(uint64_t)0xFFFULL))
+        return 1;
+
+    /* 9.361: the NPT managers and the protection table. The managers are static
+     * in protect.c, so the question is asked through that file (naming them here
+     * failed to link — LNK2019, measured). That helper resolves its own VAs, so
+     * it is already PA-correct. The protection table's PA is resolved once. */
+    if (yghv_protect_page_is_npt(page))
+        return 1;
+
+    {
+        extern yghv_protect_state_t g_protect;
+        extern PHYSICAL_ADDRESS MmGetPhysicalAddress(void *BaseAddress);
+        static uint64_t prot_pa;
+        if (!prot_pa)
+            prot_pa = (uint64_t)MmGetPhysicalAddress(&g_protect).QuadPart;
+        if (page == (prot_pa & ~(uint64_t)0xFFFULL))
+            return 1;
+    }
     return 0;
 }
 
-/* Is this page one of the tables arm_core/hidecore target? */
 static int yghv_guard_target_page(uint64_t gpa) {
     uint64_t page = gpa & ~(uint64_t)0xFFFULL;
     extern uint64_t *yghv_bp_table_va(uint32_t *bytes);
     extern uint64_t *yghv_frame_table_va(uint32_t *bytes);
     extern uint64_t *yghv_view_table_va(uint32_t *bytes);
+    extern PHYSICAL_ADDRESS MmGetPhysicalAddress(void *BaseAddress);
     uint32_t bytes = 0;
     uint64_t *va;
+    uint64_t lo;    /* physical base of the object's first page */
+    uint64_t hi;    /* physical page holding the object's last byte   */
 
+    /*
+     * 9.364 FIX: this compared a PHYSICAL page number against a VIRTUAL address.
+     *
+     *   va   = yghv_bp_table_va(&bytes);   <- kernel VA, e.g. 0xFFFFA2...
+     *   page = gpa & ~0xFFF;               <- physical,  e.g. 0x11F6000
+     *   if (page >= ((uint64_t)va & ~0xFFF) && ...)
+     *
+     * In kernel mode VA and PA are unrelated, so the test was FALSE for every
+     * input, and yghv_guard_mode_for() never classified a target table.
+     *
+     * The bug is in the committed tree (9.359) and the runtime suites passed with
+     * it, because the OLD yghv_guard_state_page() was broad enough to swallow the
+     * three table pages too — mode_for() took its UNMAP answer from that half, and
+     * this always-false test never showed. 9.361 tightened state_page to the span
+     * that actually holds guard state (correct on its own terms), and that removed
+     * the accidental coverage, exposing this.
+     *
+     * THE LESSON: a correct fix can expose a second defect that was riding on the
+     * defect being fixed. When a change makes something stop working, ask whether
+     * the change broke it or merely UNMASKED it. Here it was the second, so
+     * reverting the correct change would only have restored the mask.
+     *
+     * This is the third VA/PA confusion in this codebase (the 0x1A crash, its
+     * reverse, and now this). Section 21 of docs/KERNEL_API_CHECKLIST.md states
+     * the rule; the fix below translates once per table and names which side is
+     * which, so no comparison mixes the two.
+     */
     va = yghv_bp_table_va(&bytes);
-    if (va && bytes && page >= ((uint64_t)(ULONG_PTR)va & ~(uint64_t)0xFFFULL) &&
-        page <= (((uint64_t)(ULONG_PTR)va + bytes) & ~(uint64_t)0xFFFULL))
-        return 1;
+    if (va && bytes) {
+        lo = (uint64_t)MmGetPhysicalAddress(va).QuadPart & ~(uint64_t)0xFFFULL;
+        hi = ((uint64_t)MmGetPhysicalAddress(va).QuadPart + bytes - 1) & ~(uint64_t)0xFFFULL;
+        if (page >= lo && page <= hi)
+            return 1;
+    }
     va = yghv_frame_table_va(&bytes);
-    if (va && bytes && page >= ((uint64_t)(ULONG_PTR)va & ~(uint64_t)0xFFFULL) &&
-        page <= (((uint64_t)(ULONG_PTR)va + bytes) & ~(uint64_t)0xFFFULL))
-        return 1;
+    if (va && bytes) {
+        lo = (uint64_t)MmGetPhysicalAddress(va).QuadPart & ~(uint64_t)0xFFFULL;
+        hi = ((uint64_t)MmGetPhysicalAddress(va).QuadPart + bytes - 1) & ~(uint64_t)0xFFFULL;
+        if (page >= lo && page <= hi)
+            return 1;
+    }
     va = yghv_view_table_va(&bytes);
-    if (va && bytes && page >= ((uint64_t)(ULONG_PTR)va & ~(uint64_t)0xFFFULL) &&
-        page <= (((uint64_t)(ULONG_PTR)va + bytes) & ~(uint64_t)0xFFFULL))
-        return 1;
+    if (va && bytes) {
+        lo = (uint64_t)MmGetPhysicalAddress(va).QuadPart & ~(uint64_t)0xFFFULL;
+        hi = ((uint64_t)MmGetPhysicalAddress(va).QuadPart + bytes - 1) & ~(uint64_t)0xFFFULL;
+        if (page >= lo && page <= hi)
+            return 1;
+    }
     return 0;
 }
 
@@ -806,8 +956,29 @@ uint32_t yghv_guard_hide_core(void) {
     uint64_t *va;
     int i;
 
-    if (!yghv_guard_hiding_armed())
+    if (!yghv_guard_hiding_armed()) {
+        /*
+         * 9.364: THE EARLY RETURN NAMES ITSELF.
+         *
+         * "hid 0 page(s)" with hide_fail=0 and probes=0 was reachable from three
+         * completely different causes and the first version reported them
+         * identically:
+         *
+         *   0x10  this return: the ALLOW loop is not armed (g_code_size or
+         *         g_decoy_pa is zero), so hiding our own tables would be
+         *         unrecoverable. A CORRECT refusal, not a fault.
+         *   1/2   the NPT step failed (split, or clear-present) — see unmap_bare
+         *   0x20  no page matched a guard entry, or everything was already hidden
+         *
+         * Measured cost of not distinguishing them: hidecore said "hid 0 page(s)",
+         * the NPT entry was byte-for-byte unchanged, and the investigation went
+         * after the NPT twice before this return was even considered. A counter
+         * that says WHICH of three doors was taken is worth more than three
+         * rebuild-and-load cycles.
+         */
+        InterlockedExchange64(&g_g_hidefail, 0x10);
         return 0;
+    }
 
     /*
      * 9.359: g_bp IS now hidden, and the two changes that made it possible are
@@ -880,14 +1051,20 @@ uint32_t yghv_guard_hide_core(void) {
                  * hung; it did not bugcheck, which is why this one read as a
                  * timeout rather than a dump.
                  */
-                if (yghv_guard_state_page(gpa + off))
+                if (yghv_guard_state_page(gpa + off)) {
+                    InterlockedExchange64(&g_g_hidefail, 3);  /* page is guard state */
                     continue;
+                }
                 {
                     int s = yghv_guard_find(gpa + off);
-                    if (s < 0)
+                    if (s < 0) {
+                        InterlockedExchange64(&g_g_hidefail, 4);  /* no guard entry */
                         continue;
-                    if (g_guard[s].hidden)
+                    }
+                    if (g_guard[s].hidden) {
+                        InterlockedExchange64(&g_g_hidefail, 5);  /* already hidden */
                         continue;
+                    }
                     /*
                      * 9.354: do_hide() IS the hide — it performs the mechanism,
                      * records which one, and increments the counter. An earlier
@@ -902,6 +1079,11 @@ uint32_t yghv_guard_hide_core(void) {
             }
         }
     }
+
+    /* Nothing was hidden and no step failed: every page was skipped above. The
+     * per-page codes say which one, so this only covers "the loop never ran". */
+    if (hid == 0 && InterlockedCompareExchange64(&g_g_hidefail, 0, 0) == 0)
+        InterlockedExchange64(&g_g_hidefail, 0x20);
     return hid;
 }
 
@@ -1127,10 +1309,41 @@ int yghv_guard_rehide_bare(uint64_t gpa) {
  */
 static int yghv_guard_unmap_bare(uint64_t gpa) {
     uint64_t page = gpa & ~(uint64_t)0xFFFULL;
+    int st;
 
     if (!page)
         return 0;
-    return NT_SUCCESS(npt_exclude_pa(&g_npt, page)) ? 1 : 0;
+
+    /*
+     * 9.364: STAGE-CODED, so a failing hide names its own stage.
+     *
+     * The first version returned a bare 0 on any failure, and do_hide() turned it
+     * into "this page was not hidden" with no reason. Measured consequence:
+     * hidecore said "hid 0 page(s)", g_g_hidefail stayed 0, and mem-cache verify
+     * showed the NPT entry byte-for-byte unchanged (entry=0x11F6000E7 before and
+     * after) — leaving several possible causes with nothing to tell them apart.
+     * The search went after the NPT twice before the real cause (state_page
+     * skipping the page) was found, and that cost several rebuild+load cycles.
+     *
+     * Splitting the call into its two steps and counting each one separately is
+     * the same discipline as 9.325's per-stage breakpoint counters: the first
+     * failing stage names itself instead of requiring another experiment.
+     *
+     *   g_g_hidefail == 1 -> npt_split_2mb_to_4kb failed
+     *   g_g_hidefail == 2 -> split succeeded, npt_set_page_perm failed
+     */
+    st = npt_split_2mb_to_4kb(&g_npt, page);
+    if (st) {
+        InterlockedExchange64(&g_g_hidefail, 1);
+        return 0;
+    }
+
+    st = npt_set_page_perm(&g_npt, page, 0);
+    if (st) {
+        InterlockedExchange64(&g_g_hidefail, 2);
+        return 0;
+    }
+    return 1;
 }
 /*
  * 9.354: DERIVE the hide mechanism from the page's ownership.
