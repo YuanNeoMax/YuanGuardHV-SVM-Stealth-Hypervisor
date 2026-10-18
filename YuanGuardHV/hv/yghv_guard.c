@@ -62,12 +62,37 @@ static volatile LONG64 g_g_probes;
 static volatile LONG64 g_g_hidefail;
 static volatile LONG64 g_g_hashfail;
 
-/* 9.343: our own code range (RIP whitelist) and the decoy frame. Declared
- * here because the guard/decoy checks run in add paths defined below. */
-static uint64_t g_code_start;
-static uint64_t g_code_size;
-static uint64_t g_decoy_pa;
-static void *g_decoy_va;
+/*
+ * 9.343: our own code range (RIP whitelist) and the decoy frame.
+ *
+ * 9.358: EACH GETS ITS OWN PAGE, and there are two reasons worth stating
+ * because this looked like cosmetic alignment and is not.
+ *
+ * FIRST, a duplicate: these four were declared TWICE (once here, once again
+ * near the functions that use them). Two declarations of one static is one
+ * definition plus a shadow the linker places wherever it likes, which is how
+ * .bss came to pack them with unrelated globals.
+ *
+ * SECOND, the page-layout check's Rule 2 was reporting sharing for EVERY
+ * neighbour. Once it started CLASSIFYING instead, these four showed up as
+ * sharing with EACH OTHER:
+ *
+ *     g_code_size + g_decoy_pa                    page 0x3C000
+ *     g_code_start + g_guard_count + g_decoy_va   page 0x3E000
+ *
+ * That is the 15th hang's condition. These four are the guard's control
+ * state: the RIP whitelist that decides whether a fault is ours, and the
+ * frame the decoy points at. If one of those pages ever became a hide target,
+ * hiding it would remove the very values the fault handler needs in order to
+ * decide what to do about the fault — the recursion that hung the machine.
+ *
+ * Alignment is cheap and the failure mode is a hung machine, so the separation
+ * is bought structurally rather than left to "nobody will hide this page".
+ */
+DECLSPEC_ALIGN(4096) static uint64_t g_code_start;
+DECLSPEC_ALIGN(4096) static uint64_t g_code_size;
+DECLSPEC_ALIGN(4096) static uint64_t g_decoy_pa;
+DECLSPEC_ALIGN(4096) static void *g_decoy_va;
 /* 9.346: forward declarations — the add paths below use these. */
 static int yghv_guard_owns_page(uint64_t gpa);
 static int yghv_guard_state_page(uint64_t gpa);
@@ -691,8 +716,6 @@ void yghv_guard_stats_reset(void) {
 
 /* ---- #1 hide our OWN tables: RIP-whitelist ALLOW loop ---- */
 
-static uint64_t g_code_start;
-static uint64_t g_code_size;
 
 void yghv_guard_set_code_range(uint64_t start, uint64_t size) {
     g_code_start = start;
@@ -718,8 +741,6 @@ int yghv_guard_fault_is_ours(uint64_t rip, uint32_t cpl) {
 
 /* ---- #2 decoy frame for address-space continuity ---- */
 
-static uint64_t g_decoy_pa;
-static void *g_decoy_va;
 
 int yghv_guard_decoy_init(void) {
     if (g_decoy_va)
@@ -789,49 +810,55 @@ uint32_t yghv_guard_hide_core(void) {
         return 0;
 
     /*
-     * 9.355: g_bp is deliberately NOT hidden.
+     * 9.359: g_bp IS now hidden, and the two changes that made it possible are
+     * worth recording because the earlier state was "excluded by design".
      *
-     * MEASURED, by isolating one variable — hidecore with i=0..2 (includes g_bp)
-     * versus i=1..2 (excludes it):
+     * WHAT THE MEASUREMENTS SAID, IN ORDER.
      *
-     *     excludes g_bp  ->  breakpoint cycle after hiding PASSES
-     *     includes g_bp  ->  the bp trigger HANGS (15s, no return)
+     * 1. Isolation settled which variable mattered:
+     *        hidecore excludes g_bp  ->  breakpoint cycle after hiding PASSES
+     *        hidecore includes g_bp  ->  the bp trigger HANGS (driver answering)
      *
-     * With the driver still answering sys-guard/sys-health while the trigger is
-     * wedged, so this is a guest-side stall, not a driver deadlock.
+     * 2. The first explanation I wrote for that — "the hot path pays a nested
+     *    VMEXIT round trip to read its own registry" — was DISPROVED by the
+     *    counters: probes stayed at 0 throughout, so the guard branch is never
+     *    entered and those reads never fault at all. A comment asserting a
+     *    mechanism the counters contradict is worse than no comment.
      *
-     * WHAT THE COUNTERS SAY, AND WHAT THEY RULE OUT.
+     * 3. The mechanism that DOES fit: mem-bp add runs from IOCTL (guest mode),
+     *    its writes to g_bp[] go into the decoy and are discarded — but the arm
+     *    step came BEFORE the registration step and runs at PASSIVE, so the arm
+     *    succeeded. An armed page with no registered breakpoint. Every guest
+     *    write faults, yghv_bp_on_npf finds nothing to match, the fault falls
+     *    through to "reflect as PF", and the guest retries forever.
      *
-     * probes stayed at 0 throughout — and that is the informative part, because
-     * it disproves the first explanation I wrote here. The theory was "the bp hot
-     * path takes a nested VMEXIT round trip to read its own registry". If that
-     * were true, every such access would enter the guard branch and probes would
-     * climb. It did not move, so the guard path is NOT being taken: the accesses
-     * that would prove it never raise a fault at all.
+     * WHAT FIXED IT.
      *
-     * The two mechanisms differ exactly in the way that would produce this:
+     *   a) 9.355 added the -11 refusal: arming is refused when the registry page
+     *      is hidden. That is a safety net over a bad state.
      *
-     *     DECOY (leaf repointed)   — an ADDRESS change, which the NPT TLB
-     *                                observes  -> faults  -> probes moved (=1)
-     *     UNMAP (PRESENT cleared)  — a PERMISSION flip, which on Zen3 does NOT
-     *                                respond to TlbControl/nCR3/INVLPGA
-     *                                -> the stale translation survives
-     *                                -> no fault -> probes stays 0
+     *   b) 9.359 removed the bad state instead of guarding it: bp_add_ex now
+     *      REGISTERS FIRST and verifies the write landed (a readback, because a
+     *      discarded write leaves no trace), and only THEN arms the page. If the
+     *      arm fails, the slot is released. There is no window in which the page
+     *      is armed and the registry is not there.
      *
-     * So the working hypothesis is a TLB-visibility problem, not a hot-path
-     * cost problem: an unmap-hide of this page is not reliably observable to
-     * guest-mode code, and the breakpoint feature's state then diverges between
-     * what the entry claims and what the CPU is actually translating.
+     *   c) hot/cold separation in mem_bp.c moves everything the island reads onto
+     *      pages that are never hide targets, so the registry and the counters
+     *      deciding what to do about a fault cannot be split by visibility.
      *
-     * That hypothesis is NOT yet confirmed, and this comment says so rather than
-     * asserting it. What IS confirmed is the observation above, and it is enough
-     * to decide the design: hiding g_bp is excluded until the divergence is
-     * understood.
+     * MEASURED AFTER, in this order — arm first, hide second, trigger third:
      *
-     * g_frame and g_view_pages ARE hidden (i=1,2): both are read from IOCTL
-     * context, they are cold, and hiding them costs nothing observable.
+     *     arm first        = True     bp add OK with the registry visible
+     *     hide after arm   = True     hid 3 pages
+     *     trigger landed   = True     mmf-write LANDED
+     *     drain saw NPF    = True     #1 NPF W cpl=3 rip=0x7FF87E866DD2
+     *     trigger hung     = False
+     *
+     * So g_bp can be hidden: the hot path survives the ALLOW loop. The refusal
+     * stays as a safety net for the case where arming is attempted while hidden.
      */
-    for (i = 1; i < 3; i++) {
+    for (i = 0; i < 3; i++) {
         va = (i == 0) ? yghv_bp_table_va(&bytes)
                       : (i == 1) ? yghv_frame_table_va(&bytes)
                                  : yghv_view_table_va(&bytes);

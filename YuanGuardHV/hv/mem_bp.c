@@ -42,37 +42,84 @@ extern int yghv_guard_is_hidden(uint64_t gpa);
  * plus the padding forces the layout.
  */
 DECLSPEC_ALIGN(4096) static yghv_bp_t g_bp[YGHV_BP_MAX];
-/* padding: extend to a multiple of 4K so no neighbour shares the page */
-DECLSPEC_ALIGN(4096) static uint8_t g_bp_pad[4096];
 /*
- * 9.347: this table must fit inside ONE page, or the guard layer's assumption
- * ("hide this object" == "hide this page") is false and hiding it removes
- * whatever the linker packed alongside. The build fails here with a number
- * rather than the machine failing with a bugcheck — or hanging, which is what
- * the 15th failure did and is far worse to diagnose.
+ * ============================================================================
+ * 9.359: HOT / COLD SEPARATION.
+ *
+ * WHY THIS EXISTS, AND WHY IT IS NOT COSMETIC.
+ *
+ * The guard layer can hide a page of ours by clearing PRESENT in the NPT. Our
+ * own next access then faults, the NPF handler recognises the RIP as ours, serves
+ * the real frame for one instruction, and the #DB handler re-hides. That works —
+ * measured — for pages read from IOCTL context.
+ *
+ * It does NOT work for a page read from inside the NPF handler itself, and the
+ * measurement that settled it was isolating one variable:
+ *
+ *     hidecore excludes g_bp  ->  breakpoint cycle after hiding PASSES
+ *     hidecore includes g_bp  ->  the bp trigger HANGS (driver still answering)
+ *
+ * The earlier explanation I wrote for this ("the hot path takes a nested VMEXIT
+ * round trip") was DISPROVED by the counters: probes stayed at 0, so the guard
+ * branch is never entered, so those reads never fault at all. The mechanism that
+ * does fit the measurement:
+ *
+ *     mem-bp add runs from IOCTL (guest mode) and writes g_bp[]; when the page is
+ *     hidden those writes land in the decoy and are discarded. The LAST step of
+ *     the add clears WRITABLE on the target page, and THAT call runs at PASSIVE,
+ *     so it succeeds. The page is then armed with no registered breakpoint. Every
+ *     guest write faults, yghv_bp_on_npf finds nothing to match (its g_bp reads
+ *     see the same discarded decoy), returns 0, and the fault falls through to
+ *     "reflect as PF" — so the guest retries forever.
+ *
+ *     9.355 added a refusal for exactly that state (-11). This is the other half:
+ *     make the state impossible by not letting the two halves of a breakpoint live
+ *     on the same page.
+ *
+ * THE SPLIT.
+ *
+ * Everything the island reads goes on ONE page, aligned so nothing else shares it:
+ *
+ *     g_bp        the registry        yghv_bp_find, yghv_bp_on_npf/int3/dr
+ *     g_bp_count  slot count          same
+ *     g_head      ring write index    yghv_bp_record
+ *     g_tail      ring read index     same
+ *     g_bp_hits       hit counters    same
+ *     g_bp_refusals
+ *     g_bp_recorded
+ *     g_bp_missed
+ *     g_bp_seq
+ *     g_ring      the hit records     same
+ *
+ * Everything only IOCTL context reads stays elsewhere (unaligned, packed):
+ * the per-stage failure counters, the DR shadow bank, g_dbg_args.
+ *
+ * WHY THIS MAKES HIDING g_bp POSSIBLE: the registry and the counters that decide
+ * what to do about a fault now move together. There is no cold state on that page
+ * whose arming could disagree with the registry's visibility — which is what
+ * produced the "armed page with no breakpoint" state above.
+ *
+ * NOTE ON WHAT IS STILL NOT SOLVED: the NPF handler reading a hidden page is
+ * still a fault the handler must serve, and whether THAT is safe for g_bp is
+ * exactly what the soak must decide. The split removes the arming/registration
+ * divergence; it does not by itself prove the hot read path survives hiding.
+ * ============================================================================
  */
-typedef char yghv_assert_g_bp_fits_page[(sizeof(g_bp) <= 4096) ? 1 : -1];
-static volatile LONG g_bp_count;
 
-/* Virtual DR bank (9.327). The guest's DR0-DR3 accesses are intercepted, so
- * these values are what the target sees; the real DRs are ours. */
-static uint64_t g_dr_shadow[YGHV_BP_DR_SLOTS];
-static volatile LONG g_dr_used;
-
-/* Hit ring (single-producer discipline: island appends, PASSIVE drains).
- * 6 qwords per entry. */
+/* ---- HOT: read from inside the NPF / #DB / #BP handlers ---- */
+/* Hit ring: 6 qwords per entry (single-producer: island appends, PASSIVE drains). */
 #define YGHV_BP_RING 128
-static uint64_t g_ring[YGHV_BP_RING * 6];
-static volatile LONG g_head;
-static volatile LONG g_tail;
+DECLSPEC_ALIGN(4096) static uint64_t g_ring[YGHV_BP_RING * 6];
+DECLSPEC_ALIGN(4096) static volatile LONG g_head;
+DECLSPEC_ALIGN(4096) static volatile LONG g_tail;
+DECLSPEC_ALIGN(4096) static volatile LONG g_bp_count;
+DECLSPEC_ALIGN(4096) static volatile LONG64 g_bp_hits;
+DECLSPEC_ALIGN(4096) static volatile LONG64 g_bp_refusals;
+DECLSPEC_ALIGN(4096) static volatile LONG64 g_bp_recorded;
+DECLSPEC_ALIGN(4096) static volatile LONG64 g_bp_missed;
+DECLSPEC_ALIGN(4096) static volatile LONG64 g_bp_seq;
 
-static volatile LONG64 g_bp_hits;
-static volatile LONG64 g_bp_recorded;
-static volatile LONG64 g_bp_missed;
-static volatile LONG64 g_bp_refusals;
-
-/* 9.325: one counter per guard, so a single run names the failing stage
- * instead of requiring another crash to narrow it down. */
+/* ---- COLD: read only from IOCTL context ---- */
 static volatile LONG64 g_bp_fail_irql;
 static volatile LONG64 g_bp_fail_engine;
 static volatile LONG64 g_bp_fail_split;
@@ -83,7 +130,12 @@ static volatile LONG64 g_bp_fail_va;
 static volatile LONG64 g_bp_fail_drslot;
 static volatile LONG64 g_bp_fail_patch;
 
-static volatile LONG64 g_bp_seq;
+/* Virtual DR bank (9.327). The guest's DR0-DR3 accesses are intercepted, so
+ * these values are what the target sees; the real DRs are ours. COLD: only the
+ * DR0-DR3 intercept handlers and IOCTL read these. */
+static uint64_t g_dr_shadow[YGHV_BP_DR_SLOTS];
+static volatile LONG g_dr_used;
+
 uint64_t g_dbg_args[8];   /* 9.327: last bp_add_ex arguments, for diagnosis */
 
 /* ---------- lookup ---------- */
@@ -279,38 +331,80 @@ int yghv_bp_add_ex(uint64_t gpa, uint64_t va, uint64_t rip,
             return -11;     /* registry hidden: cannot register, so must not arm */
         }
 
-        if (!yghv_protect_npt_set_perm(page, NPT_PERM_PRESENT)) {
-            InterlockedIncrement64(&g_bp_fail_perm);
-            return -4;
-        }
+        /*
+         * 9.359: REGISTER FIRST, ARM SECOND -- and verify the registration
+         * actually landed before arming.
+         *
+         * The order here was the other way round: yghv_protect_npt_set_perm()
+         * revoked the page's write permission at L332, and only then did the loop
+         * below claim a registry slot. That is the precise origin of the "armed
+         * page with no breakpoint" state that hung the machine:
+         *
+         *   if the registry write cannot land (its page is hidden, so the write
+         *   goes into the decoy and is discarded), the arm has ALREADY happened.
+         *   The page faults on every guest write, yghv_bp_on_npf finds nothing to
+         *   match, returns 0, and the fault falls through to "reflect as PF" -
+         *   so the guest retries forever, with the driver still answering every
+         *   other IOCTL. Measured exactly that: trigger hung 15s, probes stayed 0,
+         *   bp drain returned 0 entries, and "add OK" was reported for a
+         *   breakpoint that never existed.
+         *
+         * The -11 refusal above catches that case, but a refusal is a patch over
+         * an ordering fault. Doing the work in the order that cannot produce the
+         * bad state is the fix: claim and VERIFY the slot first, and only then
+         * touch the target page's permissions. If the registration did not land,
+         * nothing was armed and there is nothing to undo.
+         *
+         * The verification is a readback, not a trust in the write: a discarded
+         * write leaves no trace, and the whole failure mode here is a write that
+         * reported success while changing nothing (9.350's lesson).
+         */
+        {
+            int claimed = -1;
+            for (i = 0; i < YGHV_BP_MAX; i++) {
+                if (InterlockedCompareExchange(&g_bp[i].active, 0, 0))
+                    continue;
+                g_bp[i].gpa = page;
+                g_bp[i].va = 0;
+                g_bp[i].rip = rip;
+                g_bp[i].kinds = kinds;
+                g_bp[i].mode = mode;
+                g_bp[i].orig_byte = 0;
+                g_bp[i].dr_slot = YGHV_BP_NO_SLOT;
+                g_bp[i].hits = 0;
+                InterlockedExchange(&g_bp[i].active, 1);
+                claimed = i;
+                break;
+            }
 
-        /* 9.327 FIX: claim the table slot HERE. The first version left this
-         * to the shared tail, which does not exist — the permission went in
-         * and the function then fell through to the final `return -6`
-         * ("bad mode"), so a perfectly valid NPF add reported failure while
-         * having already revoked the page's write permission. That is the
-         * worst of both: reported as broken, actually half-applied. */
-        for (i = 0; i < YGHV_BP_MAX; i++) {
-            if (InterlockedCompareExchange(&g_bp[i].active, 0, 0))
-                continue;
-            g_bp[i].gpa = page;
-            g_bp[i].va = 0;
-            g_bp[i].rip = rip;
-            g_bp[i].kinds = kinds;
-            g_bp[i].mode = mode;
-            g_bp[i].orig_byte = 0;
-            g_bp[i].dr_slot = YGHV_BP_NO_SLOT;
-            g_bp[i].hits = 0;
-            InterlockedExchange(&g_bp[i].active, 1);
+            if (claimed < 0) {
+                InterlockedIncrement64(&g_bp_fail_table);
+                return -5;      /* table full: nothing was armed, nothing to undo */
+            }
+
+            /*
+             * Read the slot back through the SAME path the island will use. If
+             * this disagrees with what was just written, the registry is not
+             * visible to us and arming would produce an unattended fault.
+             */
+            if (InterlockedCompareExchange(&g_bp[claimed].active, 0, 0) != 1 ||
+                g_bp[claimed].gpa != page) {
+                InterlockedExchange(&g_bp[claimed].active, 0);
+                InterlockedIncrement64(&g_bp_fail_table);
+                return -11;     /* registration did not land: refuse to arm */
+            }
+
+            if (!yghv_protect_npt_set_perm(page, NPT_PERM_PRESENT)) {
+                /* Arm failed: release the slot so the table does not fill with
+                 * registrations that were never enforced. */
+                InterlockedExchange(&g_bp[claimed].active, 0);
+                InterlockedIncrement64(&g_bp_fail_perm);
+                return -4;
+            }
+
             InterlockedIncrement(&g_bp_count);
             return 1;
         }
-        /* Table full: undo the permission change so the page is not left
-         * faulting with nobody listening. */
-        InterlockedIncrement64(&g_bp_fail_table);
-        (void)yghv_protect_npt_set_perm(page,
-                                        NPT_PERM_PRESENT | NPT_PERM_WRITABLE);
-        return -5;
     }
 
     /* ---- INT3 mode: overwrite the instruction's first byte ---- */

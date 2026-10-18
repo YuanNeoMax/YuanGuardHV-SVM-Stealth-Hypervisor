@@ -8937,3 +8937,130 @@ VERDICT: STABLE
 4. **两处 WARN 仍在**（`g_guard` 与三个计数器同页、`g_npt_alt` 与 14 个符号同页）
    —— 页归属检查报告为 WARN 而非 FAIL，因为它们是**已知且有意**的布局
    （`g_guard` 的页从不被隐藏；`g_npt_alt` 不参与隐藏）。
+
+
+### 9.359 2026-10-18 **三项收口 + 热/冷分离：g_bp 可以隐藏了**
+
+#### 9.359.1 最终验证（同一镜像 `206z3_bphidden` / 8424FB4D）
+
+```
+G25  Tier 7 全功能        13/13 ALL PASS   （g_bp 现在在隐藏集内）
+G26  bp-after-hide         3/3  PASS
+G29  arm→hide→trigger      PASS   （决定性：热路径在隐藏下存活）
+机器 uptime 600 min 未重启，本轮零崩溃零挂起
+```
+
+#### 9.359.2 点1 收口：规则 7 从"提示"升级为"判定"
+
+**指针表的目标是可解析的** —— 初始化列表里写着函数名：
+
+```c
+const yghv_mem_engine_ops_t g_yghv_engine_pte = { "pte", pte_read, pte_write };
+```
+
+所以检查现在**读出目标集合**，像对待直接调用者一样逐个检查：
+
+```
+[irql] pointer tables: 2
+[irql]   g_yghv_engine_pte -> pte_read, pte_write
+[irql]   g_yghv_engine_api -> api_read, api_write
+```
+
+**负向验证**：让表的一个成员指向带门槛函数 + 岛内经表调用：
+
+```
+[irql] FAIL: yghv_guard_do_hide (island) dispatches to yghv_injected_gated_read
+              (PASSIVE-gated) via g_yghv_engine_pte->read()
+```
+
+**保守性说明**（写进检查）：**表的所有成员都被检查，不只调用点那个** —— 因为成员位置取决于结构体布局（本扫描不解析），而**漏报一个真正到达的 gated 目标**远比**多查一个兄弟成员**糟糕。
+
+#### 9.359.3 点2 收口：分类取代笼统警告
+
+Rule 2 原来对**每个**邻居都报 WARN，把两种情况混为一谈：
+
+```
+A. guard 状态与【我方其他状态】共页 -> 15 次 hang 的条件 -> 必须 FAIL
+B. guard 状态与【无关全局】共页     -> 只要那页不被隐藏就无害 -> NOTE + 理由
+```
+
+**分类立刻暴露 5 个真实共页**（A 类），修完之后清零。
+
+#### 9.359.4 ★ 修掉一个重要的结构性缺陷：检查读了陈旧的产物
+
+`build.bat` 把静态检查放在**编译之前**，而 `page_layout_check` 读 `.map` ——
+它一直在验证**上一次构建**的布局。
+
+**实测症状**：给四个 guard 状态加了页对齐，检查却毫无变化，仍在报旧的布局并让
+"尚未产出的构建"失败。
+
+**修法**：拆成两个 runner，按依赖排序
+
+```
+run_source_checks.ps1   编译前（只读源码：ioctl/command/safety/irql）
+run_map_checks.ps1      链接后（读 .map：page layout）
+```
+
+**顺带修一个批处理陷阱**：`build.bat` 里我写的注释含 **em dash (U+2014)**，在 CJK 代码页下吞掉了后续字符，导致 `%WDK_ROOT%` 变空、报 "WDK not found at "。
+**批处理文件必须纯 ASCII。**
+
+**结果**：四个 guard 状态各占独立页，A 类 FAIL 全清。
+
+#### 9.359.5 ★★ 热/冷分离 + 重排序 —— `g_bp` 可以隐藏了
+
+**先纠正我自己写错的机制。** 9.355 注释断言"热路径付嵌套 VMEXIT"，但 **`probes=0` 推翻了它**（真走 guard 分支则 probes 必增）。已改为实测事实。
+
+**实测确立的真实机制**：
+```
+mem-bp add 从 IOCTL（guest 模式）运行，写 g_bp[] 落在诱饵被丢弃
+但【武装步骤在注册步骤之前】，且武装在 PASSIVE 成功
+  -> 页被武装却无已登记断点
+  -> guest 写永远 fault，bp_on_npf 匹配不到 -> 反射 #PF -> 无限重试
+```
+
+**结构性修法**（三件事一起）：
+1. **重排序**（核心）：`bp_add_ex` 改为**先注册并回读校验，后武装**。注册不落地则拒绝；
+   武装失败则释放槽位。**不存在"已武装但注册表不在"的窗口。**
+2. **热/冷分离**：`mem_bp.c` 把岛内读的东西（`g_bp`/`g_head`/`g_tail`/`g_bp_count`/
+   计数/`g_ring`）与仅 IOCTL 读的东西（各阶段失败计数、DR 影子、`g_dbg_args`）分开。
+3. **护栏保留**：`-11` 拒绝仍在，作为"隐藏状态下尝试武装"的安全网。
+
+**决定性验证（G29，顺序必须是 arm→hide→trigger）**：
+```
+arm first        = True     bp add OK（注册表可见时武装）
+hide after arm   = True     hid 3 pages
+trigger landed   = True     mmf-write LANDED
+drain saw NPF    = True     #1 NPF W cpl=3 rip=0x7FF87E847E72 gpa=0x19A2F0000
+trigger hung     = False
+VERDICT: g_bp CAN be hidden — the hot path survives the ALLOW loop.
+```
+
+**`g_bp` 已永久纳入隐藏集。**
+
+#### 9.359.6 ★ 第三次"测试自己的错当成实现缺陷"
+
+T12 在 T3/T4（隐藏）之后跑，而 `g_bp` 现在被隐藏 → `bp add` 正确返回 `REFUSED`。
+判定逻辑无条件要求 `add OK`，于是**正确行为看起来是缺陷**。
+
+**修法**：T12 接受**两种合法结果**并拒绝其他：
+```
+'add OK'   -> 注册表可见，断点已登记 -> 走完整周期并断言 drain 看到 NPF
+'REFUSED'  -> 注册表隐藏，武装被正确拒绝 -> 断言后续 trigger 仍然 LANDED
+其他       -> UNEXPECTED -> FAIL
+```
+**这才是验证护栏的地方，不是放松。**
+
+同类错误本轮第三次出现（soak 偏移越界、负向测试注入错位置、这条）。
+
+#### 9.359.7 状态
+- 静态检查：**6 个**（新增 run_map_checks 拆分）；IRQL 规则 7 条；岛内集合零手工维护
+- 镜像：`206z3_bphidden`（md5 `8424FB4D`）
+- **未推送**（本地领先 31 个提交）
+
+#### 9.359.8 剩余（诚实）
+1. **规则 7 的保守性**：表的所有成员都被查，可能多报；成员位置映射未做（需解析结构体布局）。
+2. **hot/cold 分离未加编译期断言**：分离靠手写顺序维持，没有断言"这些符号必须同页/不同页"。
+   这是下一步的自然补强。
+3. **soak 未重跑**：`g28_hidesoak` 指向 z3 但本轮没跑（用户指定跳过 soak）。
+4. **两处 benign NOTE 仍在**（`g_npt` 74 个邻居、`g_npt_alt` 15 个）——
+   它们是无关全局，且那些页不是隐藏目标。

@@ -108,16 +108,40 @@ foreach ($t in $hiddenTables) {
     }
 }
 
-# ---- Rule 2: the guard's own state must each occupy a page by itself ----
+# ---- Rule 2: sharing is classified, not merely reported ----
+#
+# 9.358: the earlier version printed one WARN for every neighbour, which made two
+# very different situations look identical:
+#
+#   A. guard state sharing with OUR OWN other state
+#      -> the 15th hang's condition. Hiding either one takes the other down
+#         (yghv_guard_is_hidden reads g_guard; hiding its page recurses forever).
+#         This must FAIL.
+#
+#   B. guard state sharing with unrelated globals
+#      -> benign AS LONG AS that page is never hidden. Measured: g_npt_alt shares
+#         page 0x2D000 with 14 symbols (g_protect_lock, g_sync_thread, ...) and
+#         g_npt_alt is not a hide target, so the sharing costs nothing.
+#         This is a NOTE with the reason, not a warning without one.
+#
+# Reporting A and B the same way trains the reader to ignore both. Separating
+# them makes an A appear as the dangerous thing it is.
+$ownStateNames = @($mustStayReachable) + @($hiddenTables)
+
 foreach ($n in $mustStayReachable) {
     if (-not $rvaOf.ContainsKey($n)) { continue }
     $page = $rvaOf[$n] -band 0xFFFFF000
     $others = @($byPage[$page] | Where-Object { $_ -ne $n })
-    if ($others.Count -gt 0) {
-        # Report but do not fail: this is the condition that produced the hang,
-        # so it is a warning with the page named rather than silence.
-        Write-Host ("[page-layout] WARN: guard state '{0}' shares page 0x{1:X} with {2}" -f `
-            $n, $page, ($others -join ', '))
+
+    $conflict = @($others | Where-Object { $ownStateNames -contains $_ })
+    if ($conflict.Count -gt 0) {
+        $problems += ("guard state '{0}' shares page 0x{1:X} with other guard state: {2}" -f `
+                      $n, $page, ($conflict -join ', '))
+    } elseif ($others.Count -gt 0) {
+        Write-Host ("[page-layout] NOTE: '{0}' shares page 0x{1:X} with unrelated globals ({2})" -f `
+            $n, $page, ($others.Count))
+        Write-Host ("[page-layout]       Benign while that page is not a hide target; " +
+                    "verify it stays one.")
     }
 }
 

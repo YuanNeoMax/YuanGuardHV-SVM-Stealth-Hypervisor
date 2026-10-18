@@ -6,8 +6,14 @@ set "HV_DIR=%PROJECT_DIR%hv"
 set "BIN_DIR=%PROJECT_DIR%bin"
 set "WDK_ROOT=C:\Program Files (x86)\Windows Kits\10"
 
-echo [YuanGuardHV] Running static checks...
-powershell -NoProfile -ExecutionPolicy Bypass -File "%PROJECT_DIR%tests\run_static_checks.ps1"
+rem 9.358: source-level checks run BEFORE compiling (they read sources only).
+rem The map-dependent checks (page layout) are deferred to AFTER the link, because
+rem they read bin\yuanguard_hv.map - and running them here read the PREVIOUS
+rem build's map. Measured: aligning four guard globals to their own pages changed
+rem nothing that the check could see, so it kept reporting the old layout and
+rem failing the build it had not yet produced.
+echo [YuanGuardHV] Running source-level checks...
+powershell -NoProfile -ExecutionPolicy Bypass -File "%PROJECT_DIR%tests\run_source_checks.ps1"
 if errorlevel 1 (
     echo [ERROR] Static checks failed
     exit /b 1
@@ -166,6 +172,14 @@ set "LIB=%SS_LIB%"
     !SVP206_OBJS! ^
     ntoskrnl.lib
 if errorlevel 1 goto :error
+
+rem 9.358: map-dependent checks run HERE, after the linker has written the map.
+echo [YuanGuardHV] Running map-level checks...
+powershell -NoProfile -ExecutionPolicy Bypass -File "%PROJECT_DIR%tests\run_map_checks.ps1"
+if errorlevel 1 (
+    echo [ERROR] Map-level checks failed
+    exit /b 1
+)
 
 echo [YuanGuardHV] Build SUCCESS: %BIN_DIR%\yuanguard_hv.sys
 echo   signing...

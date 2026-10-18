@@ -222,50 +222,104 @@ if ($wrongMode.Count -gt 0) {
 
 
 # ---------------------------------------------------------------------------
-# 7. Rule: indirect (function-pointer) calls must not silently escape this check.
+# ---------------------------------------------------------------------------
+# 7. Rule: an indirect call on an island path must be RESOLVABLE, and its
+#    targets must themselves be island-safe.
 #
-# The reachability walk in this script follows DIRECT call edges. A call through
-# a function pointer is invisible to it, so the island set could be complete and
-# still miss a path that reaches a PASSIVE-gated function.
-#
-# That blind spot is real in this codebase: mem_engine.h declares
+# The reachability walk follows DIRECT call edges, so a call through a function
+# pointer is invisible to it. That blind spot is real here: mem_engine.h declares
 #
 #     typedef struct {
-#         NTSTATUS (*read)(...);
-#         NTSTATUS (*write)(...);
+#         NTSTATUS (*read)(PEPROCESS, uint64_t, void*, SIZE_T, SIZE_T*);
+#         NTSTATUS (*write)(PEPROCESS, uint64_t, const void*, SIZE_T, SIZE_T*);
 #     } yghv_mem_engine_ops_t;
 #
-# and yghv_mem_engine.c dispatches through it (g_yghv_engine_pte.read(...)).
+# and yghv_mem_engine.c dispatches through it.
 #
-# CHECKED, NOT ASSUMED: the VMEXIT code (svm_simplevm206.cpp) contains no call to
-# yghv_mem_read / yghv_mem_write, so no island path currently reaches those
-# pointers. That is a MEASURED property of today's code, and a property of today's
-# code is exactly what changes without anyone noticing.
+# 9.358: THE TARGETS ARE PARSEABLE, so this is no longer a hint.
 #
-# So this rule states the invariant instead of trusting it: the island set must
-# not contain any function that dispatches through a pointer table. If a future
-# change puts such a call on an island path, this fails and names it.
+# A pointer table is initialised with the function names written out:
 #
-# It cannot tell what a pointer POINTS AT — that is the honest limit. It can tell
-# that an indirect call appeared where there was none, which is the part that
-# would otherwise pass unnoticed.
-$indirect = @()
-foreach ($n in $islandNames) {
-    if (-not $bodies.ContainsKey($n)) { continue }
-    $body = $bodies[$n]
-    # a call through a struct member: ident->member(  or  ident.member(
-    foreach ($m in [regex]::Matches($body, '\b\w+\s*(?:->|\.)\s*(read|write|fn|cb|handler|dispatch|ops)\s*\(')) {
-        $indirect += ("{0} reaches an indirect call ({1}{2}) — verify its target is not island-hostile" -f `
-                      $n, $m.Groups[1].Value, '(...)')
+#     const yghv_mem_engine_ops_t g_yghv_engine_pte = { "pte", pte_read, pte_write };
+#
+# So for any island function that calls through a table, the set of possible
+# targets can be READ OFF and each one checked like a direct callee. The earlier
+# version only printed a NOTE asking a human to look — which is exactly the kind
+# of "someone will review it" that this whole file exists to replace.
+#
+# Reported as a FAIL when a resolvable target gates on KeAreAllApcsDisabled():
+# that is the 15th crash's mechanism reached through a pointer, and the reason it
+# was worth following is that no human reviewer would have seen it either.
+
+# --- collect pointer tables: name -> list of member function names ---
+$ptrTables = @{}
+foreach ($f in $sources) {
+    $code = Strip-Comments ([IO.File]::ReadAllText($f.FullName))
+    foreach ($m in [regex]::Matches($code, '(?m)^\s*(?:const\s+)?[\w_]+\s+(g_\w+)\s*=\s*\{([^}]*)\}')) {
+        $tname = $m.Groups[1].Value
+        $members = @()
+        foreach ($id in [regex]::Matches($m.Groups[2].Value, '\b(\w+)\b')) {
+            $n = $id.Groups[1].Value
+            if ($n -match '^\d') { continue }
+            if ($definedIn.ContainsKey($n)) { $members += $n }
+        }
+        if ($members.Count -gt 0) { $ptrTables[$tname] = $members }
     }
 }
 
-if ($indirect.Count -gt 0) {
-    foreach ($i in $indirect) { Write-Host ("[irql] NOTE: $i") }
-    Write-Host ("[irql] NOTE: {0} indirect call site(s) on island paths. The reachability " -f $indirect.Count)
-    Write-Host '[irql]       walk cannot see through these, so they are reported rather than'
-    Write-Host '[irql]       silently assumed safe.'
-} else {
+Write-Host ("[irql] pointer tables: {0}" -f $ptrTables.Count)
+foreach ($t in $ptrTables.Keys) {
+    Write-Host ("[irql]   {0} -> {1}" -f $t, ($ptrTables[$t] -join ', '))
+}
+
+# --- map the identifier used at an island call site back to its table ---
+# A call reads "g_xxx->read(...)" or "g_xxx.read(...)"; the table is g_xxx.
+$badIndirect = @()
+$checkedIndirect = 0
+
+foreach ($n in $islandNames) {
+    if (-not $bodies.ContainsKey($n)) { continue }
+    $body = $bodies[$n]
+    foreach ($m in [regex]::Matches($body, '\b(g_\w+)\s*(?:->|\.)\s*(\w+)\s*\(')) {
+        $tname = $m.Groups[1].Value
+        $member = $m.Groups[2].Value
+        if (-not $ptrTables.ContainsKey($tname)) {
+            # points at something this scan cannot resolve: report, do not ignore
+            $badIndirect += ("{0} calls through '{1}->{2}()' which is not a recognised table ({3})" -f `
+                             $n, $tname, $member, $definedIn[$n])
+            continue
+        }
+        $checkedIndirect++
+        # CONSERVATIVE ON PURPOSE: every member of the table is checked, not only
+        # the one named at the call site.
+        #
+        # The initialiser is an ordered list ({"pte", pte_read, pte_write}), so the
+        # member name COULD be mapped to a position. It is not, for two reasons:
+        # the position depends on struct layout, which this scan does not parse; and
+        # a false negative here (miss a gated target actually reached) is far worse
+        # than a false positive (check a sibling that is not reached). A violation
+        # therefore names every gated member and states which member the call site
+        # used, so the reader can tell whether it is the one they care about.
+        foreach ($target in $ptrTables[$tname]) {
+            if ($bodies[$target] -match 'KeAreAllApcsDisabled\(\)') {
+                $badIndirect += ("{0} (island) dispatches to {1} (PASSIVE-gated) via {2}->{3}() ({4})" -f `
+                                 $n, $target, $tname, $member, $definedIn[$n])
+            }
+        }
+    }
+}
+
+Write-Host ("[irql] indirect call sites resolved: {0}" -f $checkedIndirect)
+
+if ($badIndirect.Count -gt 0) {
+    foreach ($b in $badIndirect) { Write-Host ("[irql] FAIL: $b") }
+    throw ("IRQL contract FAIL ({0} indirect violation(s)). A pointer call hides its " -f $badIndirect.Count) +
+          'target from the direct-call walk, so it is checked by reading the table' +
+          'initialiser. These targets gate on KeAreAllApcsDisabled() or could not ' +
+          'be resolved at all.'
+}
+
+if ($checkedIndirect -eq 0) {
     Write-Host '[irql] indirect calls on island paths: none (checked, not assumed)'
 }
 
