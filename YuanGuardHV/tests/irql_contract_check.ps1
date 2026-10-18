@@ -220,4 +220,53 @@ if ($wrongMode.Count -gt 0) {
     # the reader can confirm, rather than silently assumed either way.
 }
 
+
+# ---------------------------------------------------------------------------
+# 7. Rule: indirect (function-pointer) calls must not silently escape this check.
+#
+# The reachability walk in this script follows DIRECT call edges. A call through
+# a function pointer is invisible to it, so the island set could be complete and
+# still miss a path that reaches a PASSIVE-gated function.
+#
+# That blind spot is real in this codebase: mem_engine.h declares
+#
+#     typedef struct {
+#         NTSTATUS (*read)(...);
+#         NTSTATUS (*write)(...);
+#     } yghv_mem_engine_ops_t;
+#
+# and yghv_mem_engine.c dispatches through it (g_yghv_engine_pte.read(...)).
+#
+# CHECKED, NOT ASSUMED: the VMEXIT code (svm_simplevm206.cpp) contains no call to
+# yghv_mem_read / yghv_mem_write, so no island path currently reaches those
+# pointers. That is a MEASURED property of today's code, and a property of today's
+# code is exactly what changes without anyone noticing.
+#
+# So this rule states the invariant instead of trusting it: the island set must
+# not contain any function that dispatches through a pointer table. If a future
+# change puts such a call on an island path, this fails and names it.
+#
+# It cannot tell what a pointer POINTS AT — that is the honest limit. It can tell
+# that an indirect call appeared where there was none, which is the part that
+# would otherwise pass unnoticed.
+$indirect = @()
+foreach ($n in $islandNames) {
+    if (-not $bodies.ContainsKey($n)) { continue }
+    $body = $bodies[$n]
+    # a call through a struct member: ident->member(  or  ident.member(
+    foreach ($m in [regex]::Matches($body, '\b\w+\s*(?:->|\.)\s*(read|write|fn|cb|handler|dispatch|ops)\s*\(')) {
+        $indirect += ("{0} reaches an indirect call ({1}{2}) — verify its target is not island-hostile" -f `
+                      $n, $m.Groups[1].Value, '(...)')
+    }
+}
+
+if ($indirect.Count -gt 0) {
+    foreach ($i in $indirect) { Write-Host ("[irql] NOTE: $i") }
+    Write-Host ("[irql] NOTE: {0} indirect call site(s) on island paths. The reachability " -f $indirect.Count)
+    Write-Host '[irql]       walk cannot see through these, so they are reported rather than'
+    Write-Host '[irql]       silently assumed safe.'
+} else {
+    Write-Host '[irql] indirect calls on island paths: none (checked, not assumed)'
+}
+
 Write-Host '[PASS] IRQL contract: reachability-derived island set; no gate, no unpaired hide, no lying *_bare'

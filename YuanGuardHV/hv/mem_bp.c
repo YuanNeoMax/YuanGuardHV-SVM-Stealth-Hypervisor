@@ -9,6 +9,12 @@
 #include "common/mem_engine.h"
 #include "mem_pa.h"
 
+/* 9.355: mem_bp.c has its own include scheme, so this is declared directly
+ * rather than by including common/yghv_guard.h (which pulls <ntddk.h> in the
+ * wrong order and redefines PEPROCESS — measured when wiring svm_simplevm206).
+ * Used to refuse arming a page when the breakpoint registry itself is hidden. */
+extern int yghv_guard_is_hidden(uint64_t gpa);
+
 /*
  * 9.344: put this table on a page of its OWN.
  *
@@ -235,6 +241,44 @@ int yghv_bp_add_ex(uint64_t gpa, uint64_t va, uint64_t rip,
             InterlockedIncrement64(&g_bp_fail_split);
             return -3;
         }
+        /*
+         * 9.355: REFUSE to arm a page whose registry we cannot write.
+         *
+         * MEASURED mechanism (probes=0 ruled out the TLB and hot-path theories):
+         *
+         *   hidecore UNMAPs the page holding g_bp. This function runs from IOCTL
+         *   context — guest mode — so its writes to g_bp[] land in the DECOY and
+         *   are discarded. Then the LAST step here clears WRITABLE on the target
+         *   page, and that call runs at PASSIVE so it SUCCEEDS.
+         *
+         *   The page is now armed with NO registered breakpoint: every guest write
+         *   faults, yghv_bp_on_npf() finds nothing to match (its g_bp reads see
+         *   the same discarded decoy), returns 0, and the fault falls through to
+         *   "reflect as #PF". The guest retries forever.
+         *
+         *   Measured: trigger hung 15s with the driver still answering every other
+         *   IOCTL; probes stayed 0; bp drain returned 0 entries; "add OK" was
+         *   reported on a breakpoint that never existed.
+         *
+         * So arming a page and recording the breakpoint are not allowed to
+         * disagree. If g_bp's own page is hidden, the registration half cannot
+         * complete and the arm must not happen at all.
+         */
+        if (yghv_guard_is_hidden(MmGetPhysicalAddress(&g_bp[0]).QuadPart)) {
+            /*
+             * 9.355: a code of its OWN (-11).
+             *
+             * The first version returned -7 here, which already means "INT3 needs
+             * a VA" at the INT3 branch below — so the PS-side message said
+             * "FAILED (stage -7: INT3 needs a VA)" for a failure that had nothing
+             * to do with INT3. Measured on the y8 verification run. Reusing a
+             * stage code makes a diagnosis worse than no diagnosis: it names the
+             * wrong cause with full confidence.
+             */
+            InterlockedIncrement64(&g_bp_fail_table);
+            return -11;     /* registry hidden: cannot register, so must not arm */
+        }
+
         if (!yghv_protect_npt_set_perm(page, NPT_PERM_PRESENT)) {
             InterlockedIncrement64(&g_bp_fail_perm);
             return -4;

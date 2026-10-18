@@ -2030,6 +2030,7 @@ try {
                 -5 { 'FAILED (stage -5: breakpoint table full)' }
                 -6 { 'FAILED (stage -6: bad mode or arguments)' }
                 -7 { 'FAILED (stage -7: INT3 needs a VA)' }
+            -11 { 'REFUSED (stage -11: the breakpoint registry page is hidden, so registration cannot complete; arming is refused rather than leaving an armed page with no handler)' }
                 -8 { 'FAILED (stage -8: no DR slot free)' }
                 -9 { 'FAILED (stage -9: could not patch the instruction byte)' }
                 -10 { 'FAILED (stage -10: kinds is 0)' }

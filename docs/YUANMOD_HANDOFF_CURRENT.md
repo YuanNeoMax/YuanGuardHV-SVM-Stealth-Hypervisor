@@ -8824,3 +8824,116 @@ if (yghv_protect_npt_unmap_page(gpa + off)) {   ← 第1次隐藏
    若将来要隐藏它，需要先把 `yghv_bp_on_npf` 的读取改成"经缓存的热路径副本"，
    而不是让它直接触 `g_bp`。
 3. **10 分钟 soak 仍未做。**
+
+
+### 9.357 2026-10-18 **三个剩余点全部收口 —— 双套件 + soak 全通过**
+
+#### 9.357.1 最终验证矩阵（同一镜像 `206z1_final` / F93496F2）
+
+```
+G25  Tier 7 全功能        13/13 ALL PASS
+G26  bp-after-hide         3/3  PASS   (E: bp works after hidecore)
+G28  隐藏路径 10 分钟 soak STABLE      64 轮 / 0 hang / 0 失败
+静态检查                    5 个 PASS    (IRQL 规则 7 条)
+```
+
+机器 uptime 521 min 未重启，**本轮零崩溃零挂起**。
+
+#### 9.357.2 点1 收口：函数指针盲区 —— 从"沉默存在"到"显式报告"
+
+**盲区是真实的**：`mem_engine.h` 声明了函数指针表，`yghv_mem_engine.c` 经它派发
+（`g_yghv_engine_pte.read(...)`）。可达性分析跟随**直接调用边**，看不到它。
+
+**核查后的事实**（不是假设）：`svm_simplevm206.cpp` 里**没有任何** `yghv_mem_read/write`
+调用，所以当前岛内不经函数指针到达任何代码。
+
+**新增规则 7**：岛内函数中若出现经指针的调用（`x->read(` / `x.fn(` / `x.handler(` …），
+**报 NOTE 并指名**，要求人工确认目标。它是**降低**而非消除盲区 —— 诚实标注：
+
+> 规则能指出"这里有个间接调用需要看"，但**不能替人判断它指向什么**。
+> 但"出现了一个原本没有的间接调用"这件事，恰恰是会静默溜过去的那部分。
+
+**负向验证**：在岛内函数 `do_hide` 内注入 `g_inj_engine->read(gpa)`：
+
+```
+[irql] NOTE: yghv_guard_do_hide reaches an indirect call (read(...)) — verify its target is not island-hostile
+```
+
+**恢复后**：`indirect calls on island paths: none (checked, not assumed)`
+
+**第一个负向测试的教训**：我把注入放进了 `hide_core`，而 `hide_core` **不在岛内**
+（从 IOCTL 调用）—— 检查没报，而这是**正确**的（规则 3 也允许它在 PASSIVE 用带门槛
+的 unmap）。**测试写错位置会让正确的检查看起来失灵**，与 soak 那个 `0xC000000D`
+是同一类错误。
+
+#### 9.357.3 点2 收口：机制纠正 + 拒绝护栏
+
+**先纠正我自己写错的机制。** 9.355 注释里断言"热路径付嵌套 VMEXIT"，但 `probes=0`
+**推翻了它**（真走 guard 分支则 probes 必增）。已把注释改为**实测事实 + 未确认假设**
+—— 写错的机制比不写更糟。
+
+**实测机制**：
+```
+hidecore UNMAP g_bp 页
+  → mem-bp add 从 IOCTL（guest 模式）运行，其写 g_bp[] 落在诱饵被丢弃
+  → 但最后一步 clear WRITABLE 在 PASSIVE 成功
+  → 页被武装，却无任何已登记断点
+  → guest 写永远 fault，bp_on_npf 匹配不到（它的 g_bp 读看到同一诱饵）
+  → 落到"反射为 #PF"，guest 无限重试
+```
+
+**护栏**：`bp_add_ex` 武装前检查 g_bp 页是否被隐藏，为真则**拒绝**：
+
+```c
+if (yghv_guard_is_hidden(MmGetPhysicalAddress(&g_bp[0]).QuadPart)) {
+    InterlockedIncrement64(&g_bp_fail_table);
+    return -11;     /* registry hidden: cannot register, so must not arm */
+}
+```
+
+**验证**（临时把 g_bp 放回隐藏集）：`bp add: REFUSED (stage -11)` + `trigger LANDED`，
+**不再 hang**。
+
+**顺带修诊断错误**：第一版用 `-7`，而 `-7` 在 INT3 分支已有含义，于是 PS 把一次
+与 INT3 无关的失败报成 "INT3 needs a VA"。**复用 stage 码让诊断比没有诊断更糟 ——
+它自信地指出错误原因。**
+
+#### 9.357.4 点3 收口：10 分钟隐藏路径 soak —— STABLE
+
+新建 `tests/g28_hidesoak.ps1`。**不复用 `g21_soak` 的理由**：它循环读/写/cache/bp，
+**从不碰隐藏路径**；而隐藏是唯一"每次访问都要过 ALLOW 循环"的机制，稳定性只能靠
+持续访问证明。
+
+**设计目标：抓静默失能**（机制还在跑但不再做它该做的事）
+- 每轮：`sys-guard`（冷路径）+ `mem-read/write`（过 Engine A）
+- 每 8 轮：完整 bp 周期，**并断言 drain 确实看到 NPF**（只看"调用没报错"抓不到失能）
+- 每 40 轮：SHA-256 自检（hash 坏了则一切结论都是谎）
+- **每个调用都有超时**，超时记为 hang 而非静默跳过
+- 全程检查 `hidden` 计数**不回退**
+
+```
+rounds              = 64
+hangs               = 0
+failures            = 0
+hidden  start/final = 2 / 2
+crypto              = PASS      health = fatal=0
+VERDICT: STABLE
+```
+
+**soak 自身的 bug 也修了**：第一版做 `(round % 16)*0x1000` 偏移，远超 8KB 映射，
+`mem-write` 收到 `STATUS_INVALID_PARAMETER`。**把测试自己的错当成驱动缺陷，
+会让一份稳的 soak 看起来像失败的 soak。**
+
+#### 9.357.5 状态
+- 静态检查：5 个 PASS；IRQL 规则 **7** 条；岛内集合零手工维护
+- 镜像：`206z1_final`（md5 `F93496F2`）
+- **未推送**（本地领先 30 个提交）
+
+#### 9.357.6 剩余（诚实）
+1. **规则 7 只提示不判定** —— 无法知道指针指向什么，需人工确认。
+2. **`g_bp` 仍不可隐藏** —— 护栏让它安全失败，但"隐藏它"未实现。真正解法是热/冷分离
+   （把 `yghv_bp_on_npf` 读的东西做成每核缓存的热副本）。**独立工作量，本次未做。**
+3. **soak 10 分钟、单核重心** —— 未覆盖多核并发隐藏访问，未覆盖 30 分钟以上。
+4. **两处 WARN 仍在**（`g_guard` 与三个计数器同页、`g_npt_alt` 与 14 个符号同页）
+   —— 页归属检查报告为 WARN 而非 FAIL，因为它们是**已知且有意**的布局
+   （`g_guard` 的页从不被隐藏；`g_npt_alt` 不参与隐藏）。

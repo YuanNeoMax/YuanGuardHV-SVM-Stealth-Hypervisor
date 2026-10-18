@@ -789,32 +789,47 @@ uint32_t yghv_guard_hide_core(void) {
         return 0;
 
     /*
-     * 9.355: g_bp is deliberately NOT hidden, and this is a design decision
-     * rather than a gap.
+     * 9.355: g_bp is deliberately NOT hidden.
      *
-     * Measured by isolation: with g_bp excluded from hidecore, the breakpoint
-     * cycle after hiding PASSES. With it included, the trigger HANGS. So hiding
-     * g_bp is what breaks the breakpoint feature.
+     * MEASURED, by isolating one variable — hidecore with i=0..2 (includes g_bp)
+     * versus i=1..2 (excludes it):
      *
-     * The mechanism is a conflict between two things this project wants:
+     *     excludes g_bp  ->  breakpoint cycle after hiding PASSES
+     *     includes g_bp  ->  the bp trigger HANGS (15s, no return)
      *
-     *   UNMAP-hiding a page means every access to it must go through the ALLOW
-     *   loop: #NPF -> RIP check -> restore -> TF single-step -> #DB re-hide. That
-     *   is a full VMEXIT round trip PER ACCESS.
+     * With the driver still answering sys-guard/sys-health while the trigger is
+     * wedged, so this is a guest-side stall, not a driver deadlock.
      *
-     *   yghv_bp_on_npf() reads g_bp on EVERY target-page #NPF — it is the hot
-     *   path of the breakpoint feature, not a cold IOCTL path. Hiding it means
-     *   the hot path pays a nested VMEXIT round trip to read its own registry,
-     *   and the guest store that triggered the outer fault never gets an answer.
-     *   Measured: mmf-write did not return in 15s while the driver kept
-     *   answering other IOCTLs — a guest-side spin, not a deadlock.
+     * WHAT THE COUNTERS SAY, AND WHAT THEY RULE OUT.
      *
-     * g_frame and g_view_pages ARE hidden: they are read from IOCTL context,
-     * where the round trip is affordable.
+     * probes stayed at 0 throughout — and that is the informative part, because
+     * it disproves the first explanation I wrote here. The theory was "the bp hot
+     * path takes a nested VMEXIT round trip to read its own registry". If that
+     * were true, every such access would enter the guard branch and probes would
+     * climb. It did not move, so the guard path is NOT being taken: the accesses
+     * that would prove it never raise a fault at all.
      *
-     * This is the honest boundary: "hide our own tables" is workable for cold
-     * tables and self-defeating for the hot one. Hiding g_bp would be hiding a
-     * table from the very feature that reads it on every fault.
+     * The two mechanisms differ exactly in the way that would produce this:
+     *
+     *     DECOY (leaf repointed)   — an ADDRESS change, which the NPT TLB
+     *                                observes  -> faults  -> probes moved (=1)
+     *     UNMAP (PRESENT cleared)  — a PERMISSION flip, which on Zen3 does NOT
+     *                                respond to TlbControl/nCR3/INVLPGA
+     *                                -> the stale translation survives
+     *                                -> no fault -> probes stays 0
+     *
+     * So the working hypothesis is a TLB-visibility problem, not a hot-path
+     * cost problem: an unmap-hide of this page is not reliably observable to
+     * guest-mode code, and the breakpoint feature's state then diverges between
+     * what the entry claims and what the CPU is actually translating.
+     *
+     * That hypothesis is NOT yet confirmed, and this comment says so rather than
+     * asserting it. What IS confirmed is the observation above, and it is enough
+     * to decide the design: hiding g_bp is excluded until the divergence is
+     * understood.
+     *
+     * g_frame and g_view_pages ARE hidden (i=1,2): both are read from IOCTL
+     * context, they are cold, and hiding them costs nothing observable.
      */
     for (i = 1; i < 3; i++) {
         va = (i == 0) ? yghv_bp_table_va(&bytes)
