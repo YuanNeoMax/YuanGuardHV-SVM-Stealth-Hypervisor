@@ -323,36 +323,59 @@ typedef char assert_exact[(sizeof(region_t) == 4096) ? 1 : -1];
 
 ## 8. 剩余未做项（诚实清单）
 
-> 9.366 收口了 §8 原来的第 1/2/3/4/5 项。以下是**当前**的清单。
+> 9.366 收口了原来的 1-5 项。9.367 又更正了三份 Tier 规划的事实前提，见下。
 
-1. **没有多核 UNMAP soak** —— `g32` 用按归属分类后的 DECOY 路径（外来页永远走 DECOY），
-   所以它证明的是"4 进程并发写诱饵页不挂"，**不是**"ALLOW 循环在 4 核下存活"。
-   后者仍只有 G29/G26 的单次决定性验证，缺 30 分钟尺度的多核 soak。
-2. **`g_protect` 只做了页对齐，没做页精确** —— 它 ~6 KB 自然跨两页。对象清单已按
-   `sizeof` 覆盖整个跨度，但 union 化会改变 `extern` 声明形状，本轮未动。
-3. **`surface_arm_intercepts` 的清单是手写的** —— 9 个名字与掩码设置处同文件但不同语句。
-   从 VMCB 掩码反推要 `yghv_sentry.c` 知道 VMCB 形状，所以这个耦合是有意保留的；
-   代价是新增一个拦截要手工加名字。
-4. **位置式的宏构造形式绕得过检查** —— `#define TABLE(x) { ... }` 不是字面量
-   初始化器，检查器看不见。回退解析仍在（仍能精确指名），但"防止出现"这半对宏无效。
-5. **`escapes` 只在真正拒绝时才非零** —— 一次正常测试跑完仍是 0。要看它动，
-   必须真的触发一次拒绝（G30 里 `probes/escapes` 都为 0 是 DECOY 的正确结果）。
-   判断接线是否活着要看 `sys-sentry surface` 的条目，不是 escapes。
-6. **Tier 5（9 项）、Tier 6（5 项）、Tier 8-9** —— 已规划，未开始。
-7. **本地提交未推送** —— 用 `git rev-list --count @{u}..HEAD` 查当前领先数；
-   最后一次推送是 `535f74d`。
+**★ 规划文件的前提错误（9.367 已更正并加注）**
+
+`MEM_ENGINE_PLAN_TIER5/6/8_9.md` 开篇都写「现成 VMEXIT 已实现 35 种，扩展即可」。
+实测：拦截位只开了 5 组（CPUID / MSR / CR3+CR4 / #DB / SHUTDOWN / VMRUN / NPF），
+`SvHandleVmExit` 只有 **9 个 case**。35 是 AMD 的退出码数量，不是本实现的数量。
+三份文件顶部已加 `9.367 CORRECTION` 注记 —— **按风险排序前先读 9.367.1**。
+
+**★ 结构限制**：本项目的 VMCB 结构体在 `0x014` 处直接是
+`Reserved1[0x03c-0x014]`，**没有 `InterceptMisc3`**。所以位 41/42/43/45
+（WBINVD / MONITOR / MWAIT / XSETBV）做不了，除非先加字段。
+位 14（RDTSC）/ 23-25（PAUSE/HLT/INVLPG）在 Misc1，位 32/33/39 在 Misc2，都可以。
+
+**★ INT3 模式没有热路径证据**：`InterceptException` 只设了 bit 1（#DB），
+#BP 是 bit 3 **没设**。`case VMEXIT_EXCEPTION_BP` 那条链
+（#BP → 恢复原字节 → TF → #DB → 重写 0xCC）只会在 guest 自己执行 INT3 时到达，
+那时 find 返回 0、走反射。g18 的 B1-B3 验证的是**写字节/恢复字节**，
+靶页注释自己写着「never executed」—— 0xCC 从未触发。**热路径至今零证据。**
+（这是第七次「断言测的是 A，被读成 B」。）
+
+1. **没有多核 UNMAP soak** —— `g32` 只覆盖 DECOY。ALLOW 循环的并发行为仍只有
+   G29/G26 的单次决定性验证，缺 30 分钟尺度。
+2. **INT3 热路径未验证** —— 见上。补证需要开 `InterceptException bit 3`，
+   并先确认 #BP 反射路径不误伤 guest 自己的 INT3（历史：#GP 拦截曾导致 0xE2）。
+3. **`g_protect` 只做了页对齐，没做页精确** —— union 化会改变 `extern` 声明形状。
+4. **`surface_arm_intercepts` 的清单是手写的** —— 9 个名字需手工同步；
+   从掩码反推要 sentry 认识 VMCB 形状，这个耦合是有意保留的。
+5. **位置式的宏构造形式绕得过检查** —— `#define TABLE(x) { ... }` 检查器看不见。
+6. **`escapes` 只在真正拒绝时才非零** —— 判断接线是否活着看 `sys-sentry surface`
+   的条目，不是 escapes。
+7. **Tier 5（9 项）/ Tier 6（5 项）/ Tier 8（5 项）/ Tier 9（5 项）** —— 全部未开始；
+   但 Tier 5.1 的 TSC 平移部分**零拦截成本可做**（`VMCB.TscOffset` 字段已在）。
+8. **本地提交未推送** —— 9.366 = `3d6a784`；用 `git rev-list --count @{u}..HEAD` 查领先数。
 
 ---
 
 ## 9. 下一步建议（按价值排序）
 
-| 优先级 | 任务 | 理由 |
-|---|---|---|
-| **高** | 多核 UNMAP soak（30 分钟）| 唯一还缺的**尺度**验证；现在的 g32 只覆盖 DECOY，判词已如实写明 |
-| 中 | 把 `g_protect` 也 union 化 | 对象清单已按 sizeof 覆盖跨度，但"对象**就是**那两页"比"跨度算对了"更强 |
-| 中 | 拦截清单从 VMCB 掩码派生 | 消掉 `surface_arm_intercepts` 的手写清单；需要一层薄适配，不让 sentry 认识 VMCB |
-| 低 | Tier 5（9 项）/ Tier 6（5 项）/ Tier 8-9 | 已规划，未开始 |
-| 低 | 推送 | 按铁律 6，需用户明确指示 |
+> 排序原则：**先纠正前提 → 再补验证尺度 → 再补"已被误认为做过"的 → 最后才是新能力**。
+> 一个错了的验证会在后续每一项上重复付代价；新能力建在错的前提上会连着错。
+
+| 优先级 | 任务 | 理由 | 风险 |
+|---|---|---|---|
+| **已完成** | 更正三份 Tier 规划的前提 | 9.367；纯文档 | 无 |
+| **高** | 多核 UNMAP soak（30 分钟）| 唯一还缺的**尺度** | 低 |
+| **高** | INT3 热路径补证（开 #BP 位 + 可执行靶页）| 现在的验证只覆盖写字节 | **中** |
+| 中 | Tier 5.1 TSC 平移（`TscOffset`）| 零拦截成本、字段已在 | 低 |
+| 中 | Tier 5.1 非线性伪造（RDTSC + RDTSCP 拦截）| 两个拦截位都在已声明字段里 | 中 |
+| 中 | Tier 5.4 硬件视图伪造（CPUID 扩展）| CPUID 已拦截且在用 | 低 |
+| 中 | Tier 5.6 执行轨迹导出 | 记录侧已有，缺导出与容量 | 低中 |
+| 低 | Tier 6.5 反-反虚拟化闭环 | 依赖 TSC + CPUID 的结果，必须在其后 | 中 |
+| 低 | 技术债（`g_protect` union / 清单派生 / 推送）| 可随时插队；推送需明确指示 | 低 |
 
 ---
 
@@ -360,20 +383,19 @@ typedef char assert_exact[(sizeof(region_t) == 4096) ? 1 : -1];
 
 ```powershell
 cd D:\yuanguard
-git log --oneline -3            # 最新两条应含 docs: 恢复提示词
+git log --oneline -3            # HEAD 应含 9.366 的 feat 提交
 git status --porcelain          # 应为空
 cd D:\yuanguard\YuanGuardHV
 $env:YGHV_BAREMETAL_STEP=206; $env:YGHV_206B_COEXIST=1; $env:YGHV_206B_GNPT=1
-.\build.bat                      # 应 6 个 PASS + Build SUCCESS
+.\build.bat                      # 应 7 个 PASS + Build SUCCESS
 ```
-确认构建成功（6 个 PASS + Build SUCCESS）。
+确认构建成功（**7 个** PASS + Build SUCCESS）。
 **不要用 md5 校验** —— 每次构建都会因重新签名而变（见第 2 节的说明）。
-若要确认代码未变，比 `.map` 或比代码段 0x400..0x24E54。
 
 然后读：
-1. `docs/KERNEL_API_CHECKLIST.md` §27（VA/PA 三处）与 §28（页精确/具名）—— **最易重犯**
-2. `docs/YUANMOD_HANDOFF_CURRENT.md` 9.364 / 9.365（最近两章）
-3. 本文件第 4 节（架构约束）
+1. `docs/YUANMOD_HANDOFF_CURRENT.md` **9.366**（上一轮四项收口）与 **9.367**（下一步规划 + 三处事实更正）
+2. `docs/KERNEL_API_CHECKLIST.md` §27（VA/PA）、§28（页精确/具名）—— **最易重犯**
+3. 本文件第 4 节（架构约束，4.6-4.8 是 9.366 新增的）
 
 **动手前先问用户要做什么。不要自动开始剩余项。**
 
@@ -387,39 +409,27 @@ Phase 2-5 W1-W8        10/10
 Phase 7  C1-C6          7/7
 Phase 4b D1-D6          6/6
 Phase 6  E1-E6          6/6
-Tier 4.1                9/9
-Tier 4.3                9/9
-Tier 4.2                8/8
-Tier 4.4                7/7    （三机制：NPF/INT3/DR）
-Tier 4.5                7/7    （见 9.2xx）
-Tier 4.6                4/4    （见 9.2xx）
-Tier 4 合计            24/24   （4.4 三机制 + 4.5 + 4.6）
-Tier 7.2 / 7.7          8/8    （故障隔离 + 优雅降级）
-Tier 7.1 / 7.3          9/9    （自隐藏 + 完整性自检）
+Tier 4.1 / 4.3          9/9 / 9/9
+Tier 4.2 / 4.4 / 4.5    8/8 / 7/7 / 7/7
+Tier 4.6                4/4
+Tier 7.2 / 7.7          8/8
+Tier 7.1 / 7.3          9/9
 Tier 7 全功能          13/13   ★ 9.366 复跑仍全绿
-SOAK(旧)               10.2 min STABLE
 G30 诱饵语义 + 接线     ALL PASS  ★ 9.366
 G32 多核隐藏 soak 1min  STABLE    ★ 9.366（DECOY 路径，判词已限定）
 ```
 
-**近期镜像归档**（`D:\aaaaaavm\`，按时间）：
+> **INT3 热路径不在这份清单里** —— B1-B3 验的是写/恢复字节，不是命中（9.367.3）。
+
+**近期镜像归档**（`D:\aaaaaavm\`）：
 
 | 镜像 | 说明 |
 |---|---|
-| `206y6_nohot` | Tier 7 13/13 首通（g_bp 排除） |
-| `206y9_guarded` | g_bp 护栏 + 断言 |
-| `206z1_final` | 三项收口 |
-| `206z3_bphidden` | g_bp 可隐藏 |
-| `206z4_assert` | hot/cold 页精确 |
-| `206z6_vafix` | VA/PA 首次修复 |
-| `206z8_vafull` | 三处 VA/PA 全修 |
 | `206z9_pageexact` | frame/view 页精确 |
 | `206zA_why` | 含 state_why 诊断 |
 | **`206zB_pageexact`** | **当前**：7.4/7.5/7.6 接线 + 诱饵重写 + 10 处页精确 + 位置式强制具名 |
 
-> md5 不再是镜像身份（每次构建重新签名都会变）。**比 `.map` 或代码段 0x400..0x24E54**。
-
-共 130+ 个历史镜像可回溯（`206a` … `206zB`）。
+> md5 不再是镜像身份。**比 `.map` 或代码段 0x400..0x24E54**。
 
 ---
 

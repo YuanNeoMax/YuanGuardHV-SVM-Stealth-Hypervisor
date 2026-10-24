@@ -9565,3 +9565,106 @@ G25 的 T3/T4 覆盖。判词与脚本头部都按这个措辞改过了。
 4. **Tier 5（9 项）、Tier 6（5 项）、Tier 8-9** 仍未开始。
 5. **位置式表的宏构造形式**（`#define TABLE(x) { ... }`）绕得过检查 —— 回退解析仍在，
    但"防止出现"这一半对宏无效。
+
+---
+
+### 9.367 2026-10-18 **规划下一步 —— 先更正三份 Tier 规划的事实前提**
+
+用户指令：先本地提交（9.366 已提交 `3d6a784`），然后规划下一步；方向「挨个来」。
+
+规划前核对了代码，发现**三份 Tier 规划（5 / 6 / 8-9）的开篇前提是错的**。
+不先更正它，后面每一批都会按错的风险排序走。
+
+#### 9.367.1 ★ 更正一：「现成 VMEXIT 已实现 35 种」是定义数，不是实现数
+
+`MEM_ENGINE_PLAN_TIER5.md` 第 13-24 行断言：
+
+> 技术前提已核实：现有 VMEXIT 已实现 **35 种**，覆盖 Tier 5 全部所需基础
+
+**实测（`svm_simplevm206.cpp`）**：
+
+```
+实际设置的拦截位：
+  InterceptMisc1  |= CPUID(18) | MSR_PROT(28) | SHUTDOWN(31)
+  InterceptMisc2  |= VMRUN(32)
+  InterceptCrWrite |= CR3(3) | CR4(4)
+  InterceptException |= #DB(1)                      ← 只有 bit 1
+  NP_ENABLE（NPT 本身）
+
+SvHandleVmExit 里真正有 case 的退出码：9 个
+  CPUID / MSR / VMRUN / NPF / CR3_WRITE / CR4_WRITE / #BP / #DB / SHUTDOWN
+```
+
+**35 是 AMD SVM 规范定义的退出码数量**（`svm_defs.h` 里确实声明了 40+ 个
+`SVM_EXIT_*` 常量），**不是本实现启用或处理的数量**。规划把「规范里有」当成了
+「我们已经做了」。
+
+#### 9.367.2 ★ 更正二：VMCB 结构体缺 `InterceptMisc3`，一部分拦截做不了
+
+拦截位编号与 VMCB 字段的对应（`svm_simplevm206.hpp`）：
+
+```
+0x00c InterceptMisc1  位 0-31    RDTSC(14) PAUSE(23) HLT(24) INVLPG(25) INVLPGA(26) ...
+0x010 InterceptMisc2  位 32-63   VMRUN(32) RDTSCP(39) VMMCALL(33) SKINIT(38) ...
+0x014 Reserved1[0x03c-0x014]     ← **InterceptMisc3 本应在这里，但结构体里没有声明**
+```
+
+所以：
+
+| 能力 | 可做？ | 依据 |
+|---|---|---|
+| RDTSC 拦截（Tier 5.1）| **可** | `InterceptMisc1 |= (1u<<14)` |
+| RDTSCP 拦截（Tier 5.1）| **可** | `InterceptMisc2 |= (1u<<(39-32))` |
+| TSC 平移（Tier 5.1 基础）| **可，且不需要拦截** | `VMCB.TscOffset` 字段已存在（+0x050）|
+| WBINVD / MONITOR / MWAIT / XSETBV | **不能，除非加字段** | 位 41/42/43/45 在 Misc3，结构体未声明 |
+| PAUSE / HLT / INVLPG / INVD | 可（Misc1）| 位 22-25 |
+
+**结论**：Tier 5.1 的**平移路径**（TscOffset）零风险、零拦截成本；**非线性伪造**
+（冻结/变速/回退对 RDTSC 单独生效）需要加 RDTSC+RDTSCP 拦截，两条都可行。
+Tier 5.7 的一部分（WBINVD/MWAIT）需要先补 `InterceptMisc3` 字段。
+
+#### 9.367.3 ★ 更正三：`case VMEXIT_EXCEPTION_BP` 是**从未被执行过的代码**
+
+`InterceptException` 只设了 `bit 1`（#DB）。**#BP 是 vector 3 → bit 3，没有设。**
+
+于是 `VMEXIT_EXCEPTION_BP` 分支（`svm_simplevm206.cpp:1925`，含
+「记录 → 恢复原字节 → TF 单步 → #DB 重写 0xCC」整条链）**只会在 guest 自己执行
+INT3 时到达**，而那时 `yghv_bp_on_int3()` 返回 0，代码走的是「反射为真 #BP」那条。
+
+**INT3 模式究竟验证了什么**（g18 B1-B3）：
+```
+byte before: 0x00
+mem-bp int3 OK
+byte after : 0xCC        ← 字节真的被改了
+mem-bp del OK
+byte after del: 0x00     ← 字节真的恢复了
+```
+这三条断言的是**写字节/恢复字节**，不是**命中**。测试注释自己写着
+「Target is a data page (never executed)」—— 那页从来没被执行，0xCC 从未触发过
+#BP。所以 INT3 的**热路径**（#BP → 恢复 → TF → #DB → 重写）至今零证据。
+
+> **这是本项目第七次同一形状**：断言测的是「写进去了」，被读成「机制通了」。
+> 与 9.366 的 T7（`value:` 字符串）、T10（`0 entry(s)`）同源。
+
+#### 9.367.4 下一步计划（按"必须先/最缺/风险递增"排序）
+
+| # | 任务 | 为什么排这个位置 | 风险 |
+|---|---|---|---|
+| 1 | **更正三份 Tier 规划的 35 种前提** | 编号错误的前提会让后面每批的风险排序都偏；纯文档，零代码风险 | 无 |
+| 2 | **多核 UNMAP soak（30 分钟）** | 唯一还缺的**验证尺度**。g32 只覆盖 DECOY，ALLOW 循环的并发行为至今只有单次决定性验证（G29/G26）| 低（只跑测试）|
+| 3 | **INT3 热路径补证**：加 `InterceptException bit 3`，用**可执行**页做靶，验证 #BP→恢复→TF→#DB 整条链 | 9.367.3：现在的 INT3 验证只覆盖写字节。开启 bit3 之前要先确认 #BP 反射路径不误伤 guest 自己的 INT3 | **中**（碰异常拦截位，历史上 #GP 拦截曾导致 0xE2）|
+| 4 | **Tier 5.1 TSC 平移**（`VMCB.TscOffset`）| 零拦截成本、字段已存在；这是 Tier 5 里**唯一不需要新拦截就能做**的项 | 低 |
+| 5 | **Tier 5.1 非线性伪造**（RDTSC+RDTSCP 拦截）| 在上面基础上加；两个拦截位都在已声明的字段里 | 中 |
+| 6 | **Tier 5.4 硬件视图伪造**（CPUID 扩展）| CPUID 已拦截且已在用，扩展即可 | 低 |
+| 7 | **Tier 5.6 执行轨迹**（NPF 已带 RIP）| 记录侧已有（watch ring），缺的是导出与容量 | 低中 |
+| 8 | **Tier 6.5 反-反虚拟化闭环**（规划称 11/13 可做）| 依赖 4/5 的 TSC 与 6 的 CPUID 结果，必须在其后 | 中 |
+| 9 | 技术债：`g_protect` union 化 / 拦截清单从掩码派生 / 推送 | 小项，随时可插队；推送按铁律 6 需明确指示 | 低 |
+
+**执行顺序原则**：先纠正前提（1），再补验证尺度（2），再补**已被误认为做过**的
+（3），然后才是新能力（4-8）。理由：一个错了的验证会在后续每一项上重复付代价，
+而新能力建在错的前提上会连着错。
+
+#### 9.367.5 状态
+- 9.366 已本地提交 `3d6a784`（18 文件，+1345/-161），工作树干净
+- 本地领先 `origin/main` 33 个提交，**未推送**
+- 本节只更正事实与排序，**未改代码**

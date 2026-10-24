@@ -1,3 +1,8 @@
+<!-- 9.367 CORRECTION: the paragraph below said "35 VMEXITs already implemented". -->
+<!-- Measured (svm_simplevm206.cpp, 2026-10-18): 5 intercept groups are armed and  -->
+<!-- SvHandleVmExit has 9 cases. 35 is AMD's exit-code count, not this build's.     -->
+<!-- See docs/YUANMOD_HANDOFF_CURRENT.md 9.367.1 before using this file to order    -->
+<!-- work by risk.                                                                 -->
 # 无痕内存引擎 —— Tier 5：guest 可观测世界的完全控制
 
 > 补充日期：2026-10-11
