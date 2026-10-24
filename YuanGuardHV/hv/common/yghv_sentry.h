@@ -81,22 +81,24 @@ int yghv_sentry_surface_remove(const char *name);
 int yghv_sentry_surface_add_ioctl(uint32_t code);
 
 /*
- * 9.366: populate the inventory from the place that ARMS the intercepts.
+ * 9.366: fill the inventory from the mask.
  *
- * Before this, nothing ever called surface_add, so `sys-sentry surface` reported
- * "0 entry(s)" and `escapes=0` was true for a reason that had nothing to do with
- * the guest being quiet: the counters were never reachable. An inventory nobody
- * fills is worse than no inventory, because it reads as "we checked".
+ * 9.368 (A2) REMOVED the "arm_intercepts" entry point that did this from a
+ * hand-written list of nine names: the list and the mask were two statements in
+ * two files, so adding an intercept meant remembering to add a name, and
+ * forgetting produced an inventory that under-reported the surface while still
+ * looking complete. The mask is the truth, so the module that owns the VMCB
+ * scans it and calls surface_add() once per armed bit.
  *
- * Called once from SvPrepareForVirtualization (PASSIVE at prepare time), which
- * is where the intercept mask is actually set — so the list describes what this
- * core armed rather than what someone remembered to declare.
- * Idempotent: a second call is a no-op, not a second registration.
+ * What remains here is storage plus the "has anything filled it yet" flag, so
+ * this file keeps no opinion about what a VMCB is.
  */
-void yghv_sentry_surface_arm_intercepts(void);
-
-/* Has the intercept inventory been populated? (0 before the first VMRUN.) */
 int yghv_sentry_surface_armed(void);
+
+/* The filler sets this when it finishes, so a second core does not re-register
+ * the same names (each add() would otherwise bump the hit count as if the
+ * intercept had been exercised). */
+void yghv_sentry_surface_mark_armed(void);
 
 typedef struct {
     uint64_t escapes[YGHV_ESC_MAX];   /* attempts per kind */

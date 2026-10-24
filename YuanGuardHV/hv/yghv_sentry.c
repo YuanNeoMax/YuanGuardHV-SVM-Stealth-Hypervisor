@@ -313,52 +313,26 @@ void yghv_sentry_reset(void) {
     InterlockedExchange64(&g_exit_total, 0);
 }
 
-/* ============================================================================
- * 9.366 (Tier 7.6): THE INVENTORY FILLS ITSELF FROM THE INTERCEPT MASK.
- * ==========================================================================*/
-
 /*
- * One name per intercept that can actually reject a guest input, listed in the
- * order the code sets them so a reader can check the list against
- * SvPrepareForVirtualization line by line.
+ * 9.368 (A2): the flag the caller sets/inspects, and the ONLY entry point left
+ * for the inventory besides add/add_ioctl/list.
  *
- * The list is DELIBERATELY short: only intercepts whose handler has a rejection
- * branch appear, because an interrupt we merely observe cannot be "attacked".
- * (The full mask is already readable in the VMCB; this answers "which of them
- * treat the guest as untrusted".)
+ * The "arm from a hand-written list" function that used to live here is gone:
+ * the module that owns the VMCB now scans its own mask (SvArmSurfaceFromMask in
+ * svm_simplevm206.cpp) and calls add() once per armed bit. Keeping the list here
+ * would have made this file the second place that must know what a control area
+ * arms — the exact two-places-must-agree shape that produced 9.366.5.
+ *
+ * `armed` is set by the CALLER when it finishes filling, so this module only
+ * answers "has anyone filled it", which is what the prepare path needs to avoid
+ * registering the same names once per core.
  */
-static const char *const g_intercept_names[] = {
-    "cpuid",        /* SvHandleCpuid: the unload handshake */
-    "msr",          /* SvHandleMsrAccess: EFER_SVME protection */
-    "cr3",          /* SvHandleCr: CR value emulation, source-GPR decode */
-    "cr4",          /* same emulator, PCIDE dance */
-    "vmrun",        /* nested VMRUN is refused outright */
-    "npf",          /* nested page faults: protection + hiding verdicts */
-    "exception-db", /* the ALLOW loop's single-step re-hide */
-    "exception-bp", /* INT3 mode */
-    "shutdown"      /* guest triple fault becomes observable */
-};
-#define YGHV_SENTRY_INTERCEPT_COUNT \
-    (sizeof(g_intercept_names) / sizeof(g_intercept_names[0]))
-
-void yghv_sentry_surface_arm_intercepts(void) {
-    uint32_t i;
-
-    /*
-     * Because this is called from SvPrepareForVirtualization on EVERY processor,
-     * the count in each entry is the number of cores that armed it — not a
-     * repeated registration. yghv_sentry_surface_add() already increments the
-     * count on a name it finds, so a second core's call is exactly one more
-     * "this core has it".
-     */
-    for (i = 0; i < (uint32_t)YGHV_SENTRY_INTERCEPT_COUNT; i++)
-        (void)yghv_sentry_surface_add(g_intercept_names[i]);
-
-    InterlockedExchange(&g_surface_armed, 1);
-}
-
 int yghv_sentry_surface_armed(void) {
     return (int)InterlockedCompareExchange(&g_surface_armed, 0, 0);
+}
+
+void yghv_sentry_surface_mark_armed(void) {
+    InterlockedExchange(&g_surface_armed, 1);
 }
 
 const char *yghv_sentry_esc_name(uint64_t kind) {

@@ -9830,3 +9830,59 @@ G31:  hidecore: hid 3 page(s)
 与 9.366 收口时的 3/3 一致 —— 换判定所有者没有改变结果，这正是要证明的。
 
 **静态检查**：7/7 PASS。
+
+#### 9.368.6 A2 完成：拦截清单从掩码派生 —— 并且当场抓到一个真缺陷
+
+**做了什么**
+
+9.366 在 `yghv_sentry.c` 里手写了九个名字，并在注释里断言"这就是掩码武装的那些"。
+**那天是对的。** 但清单和掩码是**两个文件里的两条语句**：新增一个拦截需要记得加一个
+名字，忘了就会产出一份"看起来完整、实际少报"的清单。
+
+改成：清单从掩码**扫描**出来。`SvArmSurfaceFromMask()` 放在 `svm_simplevm206.cpp`
+（拥有 VMCB 的文件），逐行查表、按位置读掩码位、`armed` 才登记。`yghv_sentry.c`
+只剩存储，**不再对"VMCB 是什么"有任何意见**。
+
+表格每行同时写着「哪个字段/位武装它」和「哪个 case 处理它」：
+```c
+{ 18, "cpuid",  0 },  /* Misc1 bit18 CPUID    -> case VMEXIT_CPUID */
+{  3, "exception-bp", 3 },  /* Exception bit3 #BP -> case VMEXIT_EXCEPTION_BP
+                             *   9.367.3: NOT SET TODAY. 这一行存在的意义就是让缺口
+                             *   可见：case 在、位不在，所以不产出条目。 */
+```
+这是有意的：**位开了但没有 case = 首个 exit 就 bugcheck，不是攻击面**；
+**case 在但没有位 = 死代码（9.367.3 的形态）**。两者都不该出现在清单里，
+表格把它们并排写出来，读者一眼能对照。
+
+**★ 派生的第一次运行就抓到一个真缺陷**
+
+```
+第一次派生（填充位置在 NpEnable 之前）：
+  surface: 10 entry(s)
+  intercept cpuid / msr / shutdown / vmrun / exception-db / cr3 / cr4
+  ← 没有 npf
+```
+
+原因：`SvArmSurfaceFromMask` 当时在 `NpEnable` 设置**之前**运行，扫描时 NPT 看起来
+没武装。手写清单里有 `npf`，**所以手写版本永远发现不了这个问题** —— 它照抄了自己
+以为的事实。
+
+把填充移到 `NpEnable |=` 之后：**11 项，npf 回来了**。
+
+> 这就是 A2 的全部价值：手写清单是"某人以为的"，派生清单是"实际读到的"。
+> 前者不会错，因为它从不核对；后者会错，因为它核对，而错了就能修。
+
+**机制修复**：`yghv_sentry_surface_mark_armed()` 由**填充方**调用，不是存储模块。
+否则第二个核心会重新登记所有名字、把 hits 刷成核数而不是"这个拦截被用了多少次"。
+
+**实机验证（镜像 `206zD_a2`）**
+
+```
+G30: surface: 11 entry(s)   intercept×8 (含 npf) + ioctl×3
+     DECOY VERDICT: DECOY (zero)      guest 读隐藏页得 0x0
+     probes/escapes 按机制解释（DECOY 不产生 #NPF）
+     OVERALL: ALL PASS
+G31: hidecore hid 3/3, hide_fail=0, hash_fail=0
+```
+
+**静态检查**：7/7 PASS。

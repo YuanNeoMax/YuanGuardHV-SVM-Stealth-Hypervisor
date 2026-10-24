@@ -81,10 +81,20 @@ extern void yghv_sentry_escape(UINT32 kind, UINT64 detail, UINT64 a, UINT64 b);
 #define YGHV_ESC_GPA_GUARD   5
 /*
  * 9.366 (Tier 7.6): the intercept inventory, filled from where it is armed.
- * Both entry points are PASSIVE-only and are called from
- * SvPrepareForVirtualization, which is where the mask is actually set.
+ * PASSIVE-only; called from SvPrepareForVirtualization, which is where the mask
+ * is actually set.
+ *
+ * 9.368 (A2): the FUNCTION that filled it (yghv_sentry_surface_arm_intercepts)
+ * is gone — it carried a hand-written list of nine names, which is exactly the
+ * two-places-must-agree shape this project keeps finding. The inventory is now
+ * derived from the mask on the spot (SvArmSurfaceFromMask below), so this file
+ * still needs the two sentry entry points but no longer needs the one that
+ * guessed.
  */
-extern void yghv_sentry_surface_arm_intercepts(void);
+extern int  yghv_sentry_surface_armed(void);
+extern int  yghv_sentry_surface_add(const char *name);
+extern void yghv_sentry_surface_mark_armed(void);
+
 extern int  yghv_sentry_surface_armed(void);
 extern int yghv_guard_remap_bare(UINT64 gpa);
 extern int yghv_guard_reopen_bare(UINT64 gpa);
@@ -403,6 +413,96 @@ typedef struct _VIRTUAL_PROCESSOR_DATA
 } VIRTUAL_PROCESSOR_DATA, *PVIRTUAL_PROCESSOR_DATA;
 static_assert(sizeof(VIRTUAL_PROCESSOR_DATA) == KERNEL_STACK_SIZE + PAGE_SIZE * 3,
               "VIRTUAL_PROCESSOR_DATA Size Mismatch");
+
+/*
+ * 9.368 (A2): THE INTERCEPT INVENTORY IS DERIVED FROM THE MASK.
+ *
+ * 9.366 listed nine intercept names by hand, right here, in a comment that said
+ * "this is what the mask arms". The two facts were in two statements separated
+ * by 70 lines: adding an intercept to the mask left the list unchanged, and the
+ * inventory then under-reported what an attacker could reach while still looking
+ * complete. An inventory that can silently under-report is worse than none,
+ * because it reads as "we checked".
+ *
+ * So the mask is scanned. Each bit that is SET and that this handler actually
+ * HAS A CASE FOR becomes an entry. Two properties fall out of that:
+ *
+ *   - a bit armed without a case cannot appear (it is not a surface, it is a
+ *     bug that would bugcheck on the first exit), and
+ *   - a case without its bit cannot appear either (dead code, 9.367.3's shape),
+ *
+ * because the table below lists BOTH facts side by side and the code asks the
+ * mask about one while the reader can see the other.
+ *
+ * This lives in the file that owns the VMCB, on purpose: yghv_sentry.c stores
+ * names and must not learn what a control area is.
+ */
+typedef struct {
+    UINT32 bit;         /* position inside the field below */
+    const char *name;   /* what sys-sentry prints */
+    UINT8  field;       /* 0=Misc1 1=Misc2 2=Misc3 3=Exception 4=CrWrite */
+} S206_INTERCEPT_ENTRY;
+
+/*
+ * Every intercept this hypervisor can name, with the field and bit that arms it
+ * and the exit code its case handles. The two comments on each row are the point:
+ * if `bit` is not set, no entry appears; if the case is missing, the row should
+ * not be here at all.
+ */
+static const S206_INTERCEPT_ENTRY g_S206Intercepts[] = {
+    { 18, "cpuid",        0 },   /* Misc1 bit18 CPUID        -> case VMEXIT_CPUID    */
+    { 28, "msr",          0 },   /* Misc1 bit28 MSR_PROT     -> case VMEXIT_MSR      */
+    { 31, "shutdown",     0 },   /* Misc1 bit31 SHUTDOWN     -> case VMEXIT_SHUTDOWN */
+    {  0, "vmrun",        1 },   /* Misc2 bit0  VMRUN        -> case VMEXIT_VMRUN    */
+    {  1, "exception-db", 3 },   /* Exception bit1 #DB       -> case VMEXIT_EXCEPTION_DB */
+    {  3, "exception-bp", 3 },   /* Exception bit3 #BP       -> case VMEXIT_EXCEPTION_BP
+                                  *    9.367.3: NOT SET TODAY. This row exists so the
+                                  *    gap is visible: the case is present, the bit is
+                                  *    not, so no entry is emitted — which is the honest
+                                  *    description of an INT3 path with no hot evidence. */
+    {  3, "cr3",          4 },   /* CrWrite bit3 CR3         -> case VMEXIT_CR3_WRITE */
+    {  4, "cr4",          4 },   /* CrWrite bit4 CR4         -> case VMEXIT_CR4_WRITE */
+    {  0, "npf",          5 }    /* NpEnable bit0 NPT        -> case VMEXIT_NPF
+                                  *    NPT is not a "bit 0 of Misc1" fact; it is its own
+                                  *    field, which is why it gets field 5 rather than a
+                                  *    fake bit position. */
+};
+#define S206_INTERCEPT_ROWS \
+    ((UINT32)(sizeof(g_S206Intercepts) / sizeof(g_S206Intercepts[0])))
+
+_IRQL_requires_same_
+static
+VOID
+SvArmSurfaceFromMask (
+    _In_ PVIRTUAL_PROCESSOR_DATA VpData
+    )
+{
+    UINT32 i;
+    UINT32 misc1 = VpData->GuestVmcb.ControlArea.InterceptMisc1;
+    UINT32 misc2 = VpData->GuestVmcb.ControlArea.InterceptMisc2;
+    UINT32 exc   = VpData->GuestVmcb.ControlArea.InterceptException;
+    UINT16 crw   = VpData->GuestVmcb.ControlArea.InterceptCrWrite;
+    int    np    = (VpData->GuestVmcb.ControlArea.NpEnable & SVM_NP_ENABLE_NP_ENABLE) ? 1 : 0;
+
+    for (i = 0; i < S206_INTERCEPT_ROWS; i++) {
+        int armed = 0;
+        switch (g_S206Intercepts[i].field) {
+        case 0: armed = (misc1 >> g_S206Intercepts[i].bit) & 1; break;
+        case 1: armed = (misc2 >> g_S206Intercepts[i].bit) & 1; break;
+        case 3: armed = (exc   >> g_S206Intercepts[i].bit) & 1; break;
+        case 4: armed = (crw   >> g_S206Intercepts[i].bit) & 1; break;
+        case 5: armed = np; break;
+        default: armed = 0; break;
+        }
+        if (armed)
+            (void)yghv_sentry_surface_add(g_S206Intercepts[i].name);
+    }
+
+    /* 9.368 (A2): the FILLER marks it, not the storage module — otherwise a
+     * second core would re-register every name and inflate the hit counts. */
+    yghv_sentry_surface_mark_armed();
+}
+
 
 typedef struct _GUEST_REGISTERS
 {
@@ -2403,9 +2503,19 @@ SvPrepareForVirtualization (
      * PASSIVE at prepare time, so the plain (non-interlocked-only) surface
      * helpers are legal here; on the island the counters are what must stay
      * island-safe, and they are.
+     *
+     * 9.368 (A2): AND IT IS DERIVED FROM THE MASK, NOT FROM A HAND-WRITTEN LIST.
+     *
+     * 9.366 added nine names in yghv_sentry.c and asserted they matched what the
+     * mask arms. They did — that day. But the list and the mask were two
+     * statements in two files, so adding an intercept meant remembering to add a
+     * name, and forgetting produced an inventory that silently under-reported
+     * the surface. That is the same "two places must agree" shape as 9.366.5.
+     *
+     * The mask is the truth, so the mask is what gets read. This file is the one
+     * that owns the VMCB, so this file knows the bit layout; yghv_sentry.c keeps
+     * only storage and no longer has any opinion about what a VMCB is.
      */
-    if (!yghv_sentry_surface_armed())
-        yghv_sentry_surface_arm_intercepts();
 
     //
     // Specify guest's address space ID (ASID). TLB is maintained by the ID for
@@ -2431,6 +2541,22 @@ SvPrepareForVirtualization (
     //
     VpData->GuestVmcb.ControlArea.NpEnable |= SVM_NP_ENABLE_NP_ENABLE;
     VpData->GuestVmcb.ControlArea.NCr3 = pml4BasePa.QuadPart;
+
+    /*
+     * 9.368 (A2): THE INVENTORY IS FILLED **AFTER** THE LAST MASK WRITE.
+     *
+     * Measured on the first derived run: the list came back with 7 entries and
+     * no "npf" — because the scan ran before NpEnable was set, so NPT looked
+     * unarmed. The hand-written list it replaced had "npf" in it, which is
+     * exactly the difference between a list that is true because someone typed
+     * it and one that is true because it was read.
+     *
+     * Keeping the call here, after the last field that can arm an intercept, is
+     * therefore not cosmetic: moving it up silently drops entries again.
+     */
+    if (!yghv_sentry_surface_armed()) {
+        SvArmSurfaceFromMask(VpData);
+    }
 
     //
     // Set up the initial guest state based on the current system state. Those
