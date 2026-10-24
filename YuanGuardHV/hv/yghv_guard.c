@@ -476,6 +476,46 @@ static int yghv_guard_state_page(uint64_t gpa) {
     return 0;
 }
 
+/*
+ * 9.365: WHICH refusal matched — as a bitmask, so one counter carries the answer.
+ *
+ * "hide_fail = 3 (page is guard state)" does not say whether the span, a control
+ * value, or an NPT manager was responsible, and those are three different fixes.
+ * Measured cost: after making g_frame/g_view page-exact, hidecore reported hid 0
+ * with hide_fail=3 and the answer had to be re-derived from .map arithmetic.
+ *
+ * Integer return rather than a string: this runs inside the hide loop, and the
+ * caller only needs the bit that fired.
+ */
+uint32_t yghv_guard_state_why(uint64_t gpa) {
+    uint64_t page = gpa & ~(uint64_t)0xFFFULL;
+    uint64_t lo, hiPage;
+
+    yghv_guard_state_pa_init();
+
+    lo = g_state_pa_lo & ~(uint64_t)0xFFFULL;
+    hiPage = g_state_pa_hi & ~(uint64_t)0xFFFULL;
+    if (page >= lo && page <= hiPage)
+        return 0x01;                                    /* span g_guard..count   */
+
+    if (page == (g_state_pa_code_start & ~(uint64_t)0xFFFULL)) return 0x02;
+    if (page == (g_state_pa_code_size  & ~(uint64_t)0xFFFULL)) return 0x04;
+    if (page == (g_state_pa_decoy_pa   & ~(uint64_t)0xFFFULL)) return 0x08;
+    if (page == (g_state_pa_decoy_va   & ~(uint64_t)0xFFFULL)) return 0x10;
+
+    if (yghv_protect_page_is_npt(page)) return 0x20;    /* g_npt / g_npt_alt     */
+
+    {
+        extern yghv_protect_state_t g_protect;
+        extern PHYSICAL_ADDRESS MmGetPhysicalAddress(void *BaseAddress);
+        static uint64_t prot_pa;
+        if (!prot_pa)
+            prot_pa = (uint64_t)MmGetPhysicalAddress(&g_protect).QuadPart;
+        if (page == (prot_pa & ~(uint64_t)0xFFFULL)) return 0x40;
+    }
+    return 0;
+}
+
 static int yghv_guard_target_page(uint64_t gpa) {
     uint64_t page = gpa & ~(uint64_t)0xFFFULL;
     extern uint64_t *yghv_bp_table_va(uint32_t *bytes);
@@ -1052,6 +1092,22 @@ uint32_t yghv_guard_hide_core(void) {
                  * timeout rather than a dump.
                  */
                 if (yghv_guard_state_page(gpa + off)) {
+                    /*
+                     * 9.365: record WHICH refusal fired, into a counter slot.
+                     *
+                     * hide_fail=3 says "this page is guard state" but not WHICH
+                     * refusal matched. Measured cost of not saying: after making
+                     * g_frame/g_view page-exact, hidecore reported hid 0 with
+                     * hide_fail=3, and the page numbers alone could not tell
+                     * whether the span, a control value, or the NPT manager was
+                     * responsible — three very different fixes.
+                     *
+                     * The bits are packed so one counter carries the answer:
+                     *   bit0 span, bit1 code_start, bit2 code_size,
+                     *   bit3 decoy_pa, bit4 decoy_va, bit5 npt, bit6 protect
+                     */
+                    InterlockedExchange64(&g_g_hashfail,
+                                          (LONG64)yghv_guard_state_why(gpa + off));
                     InterlockedExchange64(&g_g_hidefail, 3);  /* page is guard state */
                     continue;
                 }

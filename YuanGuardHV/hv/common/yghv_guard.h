@@ -140,6 +140,14 @@ int yghv_guard_verify(uint64_t gpa);
  * invisible.
  */
 int yghv_guard_is_hidden(uint64_t gpa);
+/*
+ * 9.365: which guard-state refusal matched this page, as a bitmask:
+ *   0x01 span  0x02 code_start  0x04 code_size  0x08 decoy_pa
+ *   0x10 decoy_va  0x20 npt managers  0x40 protect table   (0 = none)
+ * Exists so "page is guard state" can say WHICH, instead of requiring .map
+ * arithmetic to work it out again.
+ */
+uint32_t yghv_guard_state_why(uint64_t gpa);
 
 /* Probe counter: how many times the guest reached for a hidden page. */
 uint64_t yghv_guard_probes(void);

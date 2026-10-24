@@ -41,7 +41,7 @@ if (-not (Test-Path $mapPath)) {
 # The page-exactness itself is asserted at COMPILE time (YGHV_STATIC_ASSERT_BP in
 # mem_bp.c); what this script adds is the cross-check that the region is really
 # alone on its page in the produced binary.
-$hiddenTables = @('g_bp_region', 'g_frame', 'g_view_pages')
+$hiddenTables = @('g_bp_region', 'g_frame_region', 'g_view_region')
 
 # State the guard layer itself needs while a page is hidden. Anything of ours on
 # the same page as a hidden table means the NPF handler will fault while asking
@@ -113,20 +113,34 @@ if (Test-Path $guardSrc) {
             if ($gs[$k] -eq '{') { $depth++ } elseif ($gs[$k] -eq '}') { $depth--; if ($depth -eq 0) { $end = $k; break } }
         }
         $body = $gs.Substring($si, $end - $si)
-        foreach ($m in [regex]::Matches($body, '&(\w+)\s*&')) {
-        # Two forms appear in state_page():  `&symbol &`  for an address it can name
-        # directly, and  yghv_protect_page_is_npt(page)  for the NPT managers, which
-        # are static in protect.c and therefore cannot be named from the guard
-        # (naming them failed to link — LNK2019, measured). Both forms must be read,
-        # or the check silently stops covering the pages that moved behind the
-        # query — which is what happened on the first attempt: g_npt and g_npt_alt
-        # came back as NOTEs while the code already refused them.
+
+        # 9.365: THREE forms now appear in state_page(), and all three must be read.
+        #
+        #   g_state_pa_xxx            the cached physical addresses of the guard's
+        #                             own control values (they are resolved once,
+        #                             because this runs per VMEXIT)
+        #   &symbol                   any address named directly
+        #   yghv_protect_page_is_npt  the NPT managers, static in protect.c
+        #
+        # A checker that understands only one form silently stops covering the
+        # others — measured: after the VA/PA fix introduced g_state_pa_*, this
+        # reported "none parsed" while the code was refusing seven pages.
+        foreach ($m in [regex]::Matches($body, 'g_state_pa_(\w+)')) {
+            $suffix = $m.Groups[1].Value
+            if ($suffix -eq 'lo' -or $suffix -eq 'hi' -or $suffix -eq 'ready') { continue }
+            $sym = 'g_' + $suffix
+            if ($stateRefusedSymbols -notcontains $sym) { $stateRefusedSymbols += $sym }
+        }
+        foreach ($m in [regex]::Matches($body, '&(\w+)\b')) {
+            $sym = $m.Groups[1].Value
+            if ($sym -match '^g_') {
+                if ($stateRefusedSymbols -notcontains $sym) { $stateRefusedSymbols += $sym }
+            }
+        }
         if ($body -match 'yghv_protect_page_is_npt') {
             foreach ($n2 in @('g_npt', 'g_npt_alt')) {
                 if ($stateRefusedSymbols -notcontains $n2) { $stateRefusedSymbols += $n2 }
             }
-        }
-            if ($stateRefusedSymbols -notcontains $m.Groups[1].Value) { $stateRefusedSymbols += $m.Groups[1].Value }
         }
     }
 }

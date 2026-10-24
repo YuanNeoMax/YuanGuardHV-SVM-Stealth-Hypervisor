@@ -41,17 +41,42 @@ typedef struct {
  * extern declarations elsewhere keep compiling unchanged, and DECLSPEC_ALIGN
  * plus the padding forces the layout.
  */
-DECLSPEC_ALIGN(4096) static yghv_frame_t g_frame[YGHV_FRAME_MAX];
-/* padding: extend to a multiple of 4K so no neighbour shares the page */
-DECLSPEC_ALIGN(4096) static uint8_t g_frame_pad[4096];
 /*
- * 9.347: this table must fit inside ONE page, or the guard layer's assumption
- * ("hide this object" == "hide this page") is false and hiding it removes
- * whatever the linker packed alongside. The build fails here with a number
- * rather than the machine failing with a bugcheck — or hanging, which is what
- * the 15th failure did and is far worse to diagnose.
+ * 9.365: PAGE-EXACT, not merely page-aligned.
+ *
+ * DECLSPEC_ALIGN(4096) aligns the START but says nothing about the SIZE, so a
+ * table smaller than 4K leaves the remainder for the linker to fill. Measured on
+ * the .map before this change — 15 symbols on g_frame's page:
+ *
+ *     g_frame, g_frm_seq, g_frame_count, g_frm_reserved, g_frm_bytes,
+ *     g_frm_released, g_total, g_by, g_last_reason, g_last_a, g_last_b,
+ *     g_last_c, g_degraded, g_ring_head, g_fatal
+ *
+ * hidecore hides g_frame's page. With those neighbours on it, hiding the TABLE
+ * also removes the guard layer's own failure bookkeeping — g_total, g_by,
+ * g_degraded, g_fatal — which the fault path reads to decide what to do. That is
+ * the 15th hang's shape again: hiding a page removes state the handler needs.
+ *
+ * The union makes the object EXACTLY one page, so there is no remainder to fill
+ * and the question cannot arise. The assertion keeps it that way: growing the
+ * table fails the BUILD with a number instead of putting a shared page on a
+ * machine to find.
+ *
+ * Found by widening the page-layout scrutiny, not by a crash — which is the whole
+ * point of having the check.
  */
+typedef union {
+    yghv_frame_t entries[YGHV_FRAME_MAX];
+    uint8_t      page[4096];
+} yghv_frame_region_t;
+
+DECLSPEC_ALIGN(4096) static yghv_frame_region_t g_frame_region;
+DECLSPEC_ALIGN(4096) static yghv_frame_region_t g_frame_region_pad;  /* separation */
+
+#define g_frame (g_frame_region.entries)
+
 typedef char yghv_assert_g_frame_fits_page[(sizeof(g_frame) <= 4096) ? 1 : -1];
+typedef char yghv_assert_g_frame_is_one_page[(sizeof(yghv_frame_region_t) == 4096) ? 1 : -1];
 static volatile LONG g_frame_count;
 
 static volatile LONG64 g_frm_reserved;

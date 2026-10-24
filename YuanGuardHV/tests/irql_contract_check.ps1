@@ -309,6 +309,44 @@ foreach ($f in $sources) {
 }
 Write-Host ("[irql] pointer-table layouts: " + $(if($memberPos.Count){($memberPos.Keys -join ", ")}else{"none"}))
 
+# --- 9.365: NAMED initialisers give the mapping directly; no order is inferred ---
+#
+# The positional form {"pte", pte_read, pte_write} says nothing about WHICH member
+# each function is for — only its position does, so inferring the mapping depends
+# on the struct declaration order staying put. The named form states it:
+#
+#     .name = "pte", .read = pte_read, .write = pte_write
+#
+# So read the mapping from the initialiser when it is named, and only fall back to
+# positional inference when it is not. BOTH paths are kept on purpose: a table
+# written positionally must still be checked, and a silent fallback to "check every
+# member" is the kind of quiet degradation that hides a real change.
+$namedMember = @{}   # table -> @{ memberName = targetFunction }
+$positionalTable = @()
+
+foreach ($f in $sources) {
+    $code = Strip-Comments ([IO.File]::ReadAllText($f.FullName))
+    foreach ($m in [regex]::Matches($code, '(?m)^\s*(?:const\s+)?[\w_]+\s+(g_\w+)\s*=\s*\{([^}]*)\}')) {
+        $tname = $m.Groups[1].Value
+        $body  = $m.Groups[2].Value
+        $map = @{}
+        foreach ($nm in [regex]::Matches($body, '\.(\w+)\s*=\s*(\w+)')) {
+            $member = $nm.Groups[1].Value
+            $target = $nm.Groups[2].Value
+            if ($definedIn.ContainsKey($target)) { $map[$member] = $target }
+        }
+        if ($map.Count -gt 0) { $namedMember[$tname] = $map }
+        else { $positionalTable += $tname }
+    }
+}
+
+Write-Host ("[irql] named-initialiser tables: " + $(if($namedMember.Count){($namedMember.Keys -join ", ")}else{"none"}))
+if ($positionalTable.Count -gt 0) {
+    Write-Host ("[irql] POSITIONAL tables (mapping inferred from declaration order): " + ($positionalTable -join ", "))
+    Write-Host "[irql]   A positional table's member meanings move if the struct is reordered."
+    Write-Host '[irql]   Convert it to named initialisers (.read = fn) to remove that coupling.'
+}
+
 Write-Host ("[irql] pointer tables: {0}" -f $ptrTables.Count)
 foreach ($t in $ptrTables.Keys) {
     Write-Host ("[irql]   {0} -> {1}" -f $t, ($ptrTables[$t] -join ', '))
@@ -327,11 +365,9 @@ foreach ($n in $islandNames) {
         $member = $m.Groups[2].Value
         if (-not $ptrTables.ContainsKey($tname)) {
             # points at something this scan cannot resolve: report, do not ignore
-            $badIndirect += ("{0} calls through '{1}->{2}()' which is not a recognised table ({3})" -f `
-                             $n, $tname, $member, $definedIn[$n])
+            $badIndirect += ("$n calls through $tname.$member() which is not a recognised table (" + $definedIn[$n] + ")")
             continue
         }
-        $checkedIndirect++
         $checkedIndirect++
         # 9.362: MEMBER-LEVEL PRECISION.
         #
@@ -351,19 +387,33 @@ foreach ($n in $islandNames) {
         # A false negative (miss a gated target actually reached) is far worse than
         # a false positive, so an unresolvable name falls back to checking all.
         $targets = $ptrTables[$tname]
-        $tableType = $tableTypes[$tname]
-        if ($tableType -and $memberPos.ContainsKey($tableType)) {
-            $fields = $memberPos[$tableType]
-            $pos = [array]::IndexOf($fields, $member)
-            if ($pos -ge 0) {
-                $indexed = @($ptrTables[$tname] | Where-Object { $true })
-                if ($pos -lt $indexed.Count) { $targets = @($indexed[$pos]) }
+        $resolvedByName = $false
+
+        # 9.365: PREFER the named initialiser. It states the mapping, so no
+        # declaration-order inference is involved at all.
+        if ($namedMember.ContainsKey($tname) -and $namedMember[$tname].ContainsKey($member)) {
+            $targets = @($namedMember[$tname][$member])
+            $resolvedByName = $true
+        }
+
+        # Positional fallback: the table is written positionally, so the mapping
+        # must be inferred from the struct declaration order. Only used when the
+        # initialiser itself did not name the member.
+        if (-not $resolvedByName) {
+            $tableType = $tableTypes[$tname]
+            if ($tableType -and $memberPos.ContainsKey($tableType)) {
+                $fields = $memberPos[$tableType]
+                $pos = [array]::IndexOf($fields, $member)
+                if ($pos -ge 0) {
+                    $indexed = @($ptrTables[$tname] | Where-Object { $true })
+                    if ($pos -lt $indexed.Count) { $targets = @($indexed[$pos]) }
+                }
             }
         }
         foreach ($target in $targets) {
-            if ($bodies[$target] -match 'KeAreAllApcsDisabled\(\)') {
-                $badIndirect += ("{0} (island) calls {1}->{2}(), which dispatches to {3} (PASSIVE-gated) [{4}]" -f `
-                                 $n, $tname, $member, $target, $definedIn[$n])
+            if ($bodies[$target] -match 'KeAreAllApcsDisabled[(]') {
+                $msg = "$n (island) calls " + $tname + "." + $member + "(), which dispatches to " + $target + " (PASSIVE-gated) [" + $definedIn[$n] + "]"
+                $badIndirect += $msg
             }
         }
     }
@@ -373,10 +423,10 @@ Write-Host ("[irql] indirect call sites resolved: {0}" -f $checkedIndirect)
 
 if ($badIndirect.Count -gt 0) {
     foreach ($b in $badIndirect) { Write-Host ("[irql] FAIL: $b") }
-    throw ("IRQL contract FAIL ({0} indirect violation(s)). A pointer call hides its " -f $badIndirect.Count) +
-          'target from the direct-call walk, so it is checked by reading the table' +
-          'initialiser. These targets gate on KeAreAllApcsDisabled() or could not ' +
-          'be resolved at all.'
+    $badMsg = "IRQL contract FAIL ($($badIndirect.Count) indirect violation(s)). A pointer call hides its " +
+              "target from the direct-call walk, so it is checked by reading the table " +
+              "initialiser. These targets gate on KeAreAllApcsDisabled() or could not " +
+              "be resolved at all."
 }
 
 if ($checkedIndirect -eq 0) {

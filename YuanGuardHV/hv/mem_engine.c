@@ -71,8 +71,25 @@ static NTSTATUS api_write(PEPROCESS proc, uint64_t va, const void *buf, SIZE_T l
     return STATUS_SUCCESS;
 }
 
+/*
+ * 9.365: NAMED INITIALIZERS, so the member mapping cannot drift.
+ *
+ * The positional form — { "api", api_read, api_write } — ties the meaning of each
+ * function to its POSITION in the struct declaration. Reorder the struct and the
+ * table silently swaps read and write; nothing in the language catches it, and the
+ * static check that resolves pointer-table targets had to re-derive the order from
+ * the declaration to compensate (and fell back to "check every member" when it
+ * could not).
+ *
+ * Naming each member removes the coupling at the source: the initialiser states
+ * which function is which, a reorder changes nothing, and the checker can read the
+ * mapping directly instead of inferring it. Belt and braces is not the point —
+ * the point is that the wrong answer is no longer expressible.
+ */
 const yghv_mem_engine_ops_t g_yghv_engine_api = {
-    "api", api_read, api_write
+    .name  = "api",
+    .read  = api_read,
+    .write = api_write
 };
 
 /* ===================== Engine B: page-table + physical ================= */
@@ -240,8 +257,11 @@ static NTSTATUS pte_write(PEPROCESS proc, uint64_t va, const void *buf, SIZE_T l
     return STATUS_SUCCESS;
 }
 
+/* 9.365: named for the same reason as g_yghv_engine_api above. */
 const yghv_mem_engine_ops_t g_yghv_engine_pte = {
-    "pte", pte_read, pte_write
+    .name  = "pte",
+    .read  = pte_read,
+    .write = pte_write
 };
 
 /* ===================== selection ====================================== */

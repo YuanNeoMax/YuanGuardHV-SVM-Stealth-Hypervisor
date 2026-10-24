@@ -17,16 +17,39 @@
  * g_engine_sel shares 0x2F000 with g_view_pages (62 symbols on that one page),
  * so hiding the view table removed a counter yghv_mem_read touches every call.
  */
-DECLSPEC_ALIGN(4096) static yghv_view_page_t g_view_pages[YGHV_VIEW_MAX_PAGES];
-DECLSPEC_ALIGN(4096) static uint8_t g_view_pages_pad[4096];
 /*
- * 9.347: this table must fit inside ONE page, or the guard layer's assumption
- * ("hide this object" == "hide this page") is false and hiding it removes
- * whatever the linker packed alongside. The build fails here with a number
- * rather than the machine failing with a bugcheck — or hanging, which is what
- * the 15th failure did and is far worse to diagnose.
+ * 9.365: PAGE-EXACT, not merely page-aligned.
+ *
+ * DECLSPEC_ALIGN(4096) aligns the START without saying anything about the SIZE.
+ * Measured on the .map before this change — 13 symbols on g_view_pages' page:
+ *
+ *     g_view_pages, g_view_page_count, g_view_obs_count, g_view_observers,
+ *     g_view_installs, g_view_to_alt, g_view_to_main, g_watch_dropped,
+ *     g_watch, g_watch_count, g_ring_head, g_ring_tail, g_ring
+ *
+ * hidecore hides g_view_pages' page. With those neighbours on it, hiding the
+ * TABLE also removes the bookkeeping that says whether the side view is installed
+ * (g_view_installs) and how many switches happened (g_view_to_alt/_to_main) —
+ * state the fault path and the IOCTL reporting both read.
+ *
+ * This is the SAME fault the comment above already describes for the 15th crash,
+ * one layer up: the crash was per-PAGE hiding when the object is smaller than the
+ * page, and this is the same confusion surviving inside the very table that crash
+ * was about. Making the object EXACTLY one page removes the remainder the linker
+ * was filling.
  */
+typedef union {
+    yghv_view_page_t entries[YGHV_VIEW_MAX_PAGES];
+    uint8_t          page[4096];
+} yghv_view_region_t;
+
+DECLSPEC_ALIGN(4096) static yghv_view_region_t g_view_region;
+DECLSPEC_ALIGN(4096) static yghv_view_region_t g_view_region_pad;  /* separation */
+
+#define g_view_pages (g_view_region.entries)
+
 typedef char yghv_assert_g_view_pages_fits_page[(sizeof(g_view_pages) <= 4096) ? 1 : -1];
+typedef char yghv_assert_g_view_pages_is_one_page[(sizeof(yghv_view_region_t) == 4096) ? 1 : -1];
 static uint64_t              g_view_observers[YGHV_VIEW_MAX_OBSERVERS];
 static volatile LONG         g_view_page_count;
 static volatile LONG         g_view_obs_count;

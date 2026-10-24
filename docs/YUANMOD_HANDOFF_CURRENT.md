@@ -9219,3 +9219,119 @@ if (page >= lo && page <= hi) return 1;
 3. **soak 未在本镜像重跑**（本轮聚焦缺陷修复）。
 4. **两处 benign NOTE 仍存在**（`g_npt` 74 邻居、`g_npt_alt` 15 邻居）——
    两者已在 state_page 拒绝列表内，检查报 OK。
+
+
+### 9.365 2026-10-18 **三项剩余全部收口 —— 顺序解耦 + 页精确推广 + soak STABLE**
+
+#### 9.365.1 最终验证（镜像 `206zA_why` / 86DF8BBE）
+
+```
+G25  Tier 7 全功能        13/13 ALL PASS   (hid 3, hide_fail=0)
+G26  bp-after-hide         3/3  PASS
+G29  arm→hide→trigger      PASS            (hid 3, drain saw NPF)
+G28  隐藏路径 10 分钟 soak STABLE          78 轮 / 0 hang / 0 失败
+                          hidden 3/3 全程保持，probes 0→9
+静态检查                    6 个 PASS（source 4 + map 1 + 拆分）
+机器本轮零崩溃零挂起
+```
+
+#### 9.365.2 点1：规则 7 成员映射不再依赖声明顺序
+
+**根因**：位置式初始化器把成员语义和位置绑死。
+
+```c
+const yghv_mem_engine_ops_t g_yghv_engine_pte = { "pte", pte_read, pte_write };
+```
+
+重排 struct 字段 → 表静默交换 read/write 含义，语言不报错。
+
+**结构性修法：改用具名初始化器**
+
+```c
+const yghv_mem_engine_ops_t g_yghv_engine_pte = {
+    .name  = "pte",
+    .read  = pte_read,
+    .write = pte_write
+};
+```
+
+**检查同步改为优先读具名映射**，位置推断仅作回退。
+
+**顺序无关的实测证明**：
+```
+1. 具名 + read 带门槛        -> FAIL 精确指名 read
+2. 把 struct 字段【对调】后   -> 仍 PASS，映射正确（位置式会静默错）
+3. 字段对调 + read 带门槛     -> 仍精确指名 read，不误指 write
+```
+
+**回退仍保守**：位置式表被显式报告（`POSITIONAL tables ...`），不会被静默降级。
+
+#### 9.365.3 ★ 点2：页精确断言推广 —— 发现两处真实隐患
+
+把"页精确"从 `mem_bp.c` 推广到另外两张**被隐藏的表**。`.map` 实测暴露出问题：
+
+```
+g_frame      页上有 15 个符号：g_frm_seq, g_frame_count, g_total,
+             g_by, g_last_reason, g_last_a/b/c, g_degraded, g_ring_head, g_fatal ...
+g_view_pages 页上有 13 个符号：g_view_installs, g_view_to_alt, g_view_to_main,
+             g_watch, g_watch_count, g_ring_head/tail, g_ring ...
+```
+
+**hidecore 会隐藏这两页**。所以隐藏表的同时，也会连带隐藏守卫自己的失败簿记
+（`g_total`/`g_by`/`g_degraded`/`g_fatal`）和分裂视图的安装状态 —— **正是 15 次
+hang 的形态：隐藏一页连带隐藏了处理器需要的状态。**
+
+**这是检查发现的，不是崩溃发现的** —— 这正是有检查的意义。
+
+修法与 `g_bp` 一致：union + 页大小字节数组 + 编译期断言。
+
+```
+g_bp_region    @0x38000  syms_on_page=1
+g_frame_region @0x3D000  syms_on_page=1   ← 之前 15 个
+g_view_region  @0x33000  syms_on_page=1   ← 之前 13 个
+```
+
+#### 9.365.4 ★ 点3 前置：让"哪个拒绝触发了"自己说出来
+
+`hide_fail=3`（页是 guard 状态）不说是**哪一个**拒绝匹配 —— 而跨度/控制值/NPT 管理器
+是三种完全不同的修法。
+
+新增 `yghv_guard_state_why()` 返回位掩码，hidecore 把它写进 `hash_fail`：
+```
+0x01 跨度  0x02 code_start  0x04 code_size  0x08 decoy_pa
+0x10 decoy_va  0x20 npt  0x40 protect   (0 = 无)
+```
+
+**同时修正检查的提取逻辑**：`state_page` 现在用 `g_state_pa_*` 缓存形式，旧正则
+只认 `&sym &`，于是报 `none parsed` —— **代码在拒绝七页，检查却说没解析到任何一页**。
+已支持三种形式（`g_state_pa_xxx` / `&sym` / `yghv_protect_page_is_npt`）。
+
+#### 9.365.5 ★ 点3：10 分钟隐藏路径 soak —— STABLE
+
+```
+rounds = 78   hangs = 0   failures = 0
+hidden  start/final = 3 / 3      全程保持，无泄漏无丢失
+probes  start/final = 0 / 9      ← 决定性：隐藏页每次访问都走了 ALLOW 循环并被服务
+crypto = PASS    health = fatal=0    mem-view failures=0
+VERDICT: STABLE
+```
+
+**第一次 soak 报 FAILED（14 failures），但那是测试自己的错**：它无条件要求
+`bp add OK`，而 soak 先进入隐藏状态、`g_bp` 已隐藏，于是 `-11` 护栏**正确拒绝**武装。
+
+> **这是本项目第四次"测试断言了自己的假设而不是实际契约"。**
+> 修法与 G25 的 T12 相同：接受两种合法结果，各自要求正确的后续 ——
+>   已武装 → 触发必须落地 **且** drain 必须看到 NPF
+>   被拒绝 → 触发仍必须落地（没武装就没东西会空转）
+
+#### 9.365.6 状态
+- 静态检查：**6 个**；IRQL 规则 7 条；`state_page refuses: 7 个符号`（从源码读）
+- 镜像：`206zA_why`（md5 `86DF8BBE`）
+- **未推送**（本地领先 28 个提交）
+
+#### 9.365.7 剩余（诚实）
+1. **页精确仍未覆盖所有模块** —— 只有 3 张被隐藏的表 + `mem_bp` 的两个热区域。
+   其余"小对象留大空隙"的全局靠 `page_layout_check` 事后从 `.map` 发现，不是编译期。
+2. **规则 7 的位置式回退路径仍存在** —— 若有人写位置式表，映射靠声明顺序推断。
+   已被显式报告，但没有强制改具名。
+3. **soak 单核重心** —— 未覆盖多核并发隐藏访问。
