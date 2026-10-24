@@ -11,7 +11,7 @@
 AMD-V SVM/NPT 隐形 Hypervisor 已完成 **Tier 7 全功能（13/13 PASS）**，
 `g_bp`/`g_frame`/`g_view_pages` 三张表**可以隐藏**（含热路径在隐藏下存活），
 隐藏路径 10 分钟 soak **STABLE**（78 轮 / 0 hang / 0 失败 / probes 0→9）。
-当前镜像 `206zA_why`（md5 `86DF8BBE`）。**30 个提交未推送。**
+当前镜像 `206zA_why`（md5 `86DF8BBE`）。**本地领先远程一批提交（用 `git rev-list --count @{u}..HEAD` 查，别写死数字——文档本身也在提交）。**
 
 ---
 
@@ -255,7 +255,7 @@ typedef char assert_exact[(sizeof(region_t) == 4096) ? 1 : -1];
 5. **T7 decoy 测试弱** —— 只有 `(t7 -match 'value:')`，非守卫路径也通过。
    需要一个真正验证"guest 读隐藏的外来页返回零"的测试。
 6. **Tier 5（9 项）、Tier 6（5 项）、Tier 8-9** —— 已规划，未开始。
-7. **30 个提交未推送**（最后一次推送是 `535f74d`）。
+7. **本地提交未推送** —— 最后一次推送是 `535f74d`；用 `git rev-list --count @{u}..HEAD` 查当前领先数。
 8. **未做长时 soak**（30 分钟以上、多核并发）。
 
 ---
