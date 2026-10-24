@@ -9668,3 +9668,165 @@ byte after del: 0x00     ← 字节真的恢复了
 - 9.366 已本地提交 `3d6a784`（18 文件，+1345/-161），工作树干净
 - 本地领先 `origin/main` 33 个提交，**未推送**
 - 本节只更正事实与排序，**未改代码**
+
+---
+
+### 9.368 2026-10-18 **执行排序 —— 按蓝屏/重启风险递增，压测与重启项归末**
+
+用户指令（追加）：
+> 需要重启机器的放到最后，压力测试每个节点放到最后，优先完成蓝屏风险小的，
+> 逐步升级至蓝屏/重启风险大的，先和我确认。
+
+#### 9.368.1 三条排序规则
+
+```
+规则 A  风险递增：零风险 -> 低 -> 中 -> 高 -> 极高
+规则 B  压力测试放最后：纯压测项整体排末尾；每项收口时也是"先单次决定性验证，
+        再压测"，压测不进项中间
+规则 C  需重启的（Tier 6.1 启动期控制）排最末，且动手前单独确认
+```
+
+已确认的边界（9.367 之后）：**全程不推送**；**Tier 6.4 / 9.4 跳过并在文档写明原因**；
+**蓝屏自动取证→定位→修复→重跑，不中断**。
+
+#### 9.368.2 风险分级的**代码依据**（不是凭感觉）
+
+| 项 | 风险 | 依据（实测代码）|
+|---|---|---|
+| 技术债：`g_protect` union + 清单派生 | **零** | 纯结构/检查器改动；union 有编译期断言把守，对象清单只影响"哪些页不许藏"，不碰运行路径 |
+| Tier 5.6 执行轨迹导出 | **低** | `g_watch` 环形缓冲已在 NPF 里记录；缺的只是 IOCTL 导出与容量。不新增任何拦截 |
+| Tier 5.4 CPUID 视图伪造 | **低** | `SvHandleCpuid` 已拦截、已有 4 个 case（含 `ExitVm`）；只加 case |
+| Tier 5.1 TSC 平移（`TscOffset`）| **中低** | 字段已在 VMCB `+0x050`，写一个值即可、**不加拦截**。但 offset 算错会让 guest 计时错乱→定时器/超时误判 |
+| Tier 5.1 RDTSC+RDTSCP 拦截 | **中低** | 两个拦截位都在已声明字段（Misc1 位14 / Misc2 位39）。RDTSC 是热指令，性能影响大于崩溃风险 |
+| Tier 5.5 PMC/MSR 伪造 | **中** | `SvBuildMsrPermissionsMap` 只开了 EFER 一位；要自己填位图。位图错=每次 MSR 访问都 exit |
+| INT3 热路径补证（开 `#BP` 位）| **中** | 碰 `InterceptException`。历史：#GP 拦截曾导致 0xE2。但 #BP 只是 bit3，且反射分支已在 |
+| Tier 5.3 syscall/中断虚拟化 | **中高** | 碰异常注入与指令流 |
+| Tier 5.7 I/O 控制 | **高** | **`IOPM` 已分配但从未初始化**（`svm_simplevm_port.c:126` 只有声明，无 `RtlFillMemory`），IOIO 拦截位也没开。填错立刻崩 |
+| Tier 5.2 指令流重定向 | **高** | 改执行流本身 |
+| Tier 5.8 多核一致性 | **高** | 碰 TLB/缓存语义 |
+| Tier 5.9 观测面完全控制 | **极高** | 组合项，规划本身就排在 5.x 最后 |
+| Tier 6.2 全状态快照 | **高** | 碰全部 VMCB 字段 |
+| Tier 6.3 确定性重放 | **高** | 高 |
+| Tier 6.5 反-反虚拟化闭环 | **中高** | 依赖 TSC + CPUID 的结果，必须在其后 |
+| Tier 8.1 进程诞生前控制 | **中** | 进程回调已可用 |
+| Tier 8.5 多进程编排 | **中** | 编排层，不碰岛内 |
+| Tier 8.2 挂起/恢复/时间冻结 | **中高** | 规划中高 |
+| Tier 8.3 终止后控制 | **中高** | 与 Tier 4.5 相关 |
+| Tier 8.4 确定性重生 | **高** | 规划标"最复杂" |
+| Tier 9.1 无设备控制通道 | **中** | SSV1 CPUID 已有基础 |
+| Tier 9.2 通道认证 | **低中** | 纯计算（SHA-256 已在 yghv_crypto.c）|
+| Tier 9.3 通道冗余 | **中** | 多路径 |
+| Tier 9.5 通道隐蔽 | **中** | |
+| **Tier 6.1 启动期控制** | **极高 + 需重启** | 改启动链，**排最末且先确认** |
+| 多核 UNMAP soak 30 分钟 | **低，但是压测** | 纯测试；按规则 B 整体放末尾 |
+
+#### 9.368.3 最终执行顺序（27 项可做 + 2 项跳过）
+
+```
+【阶段 A  零风险，纯代码/检查器，不加载驱动也能验编译】
+ A1  技术债：g_protect union 化
+ A2  技术债：拦截清单从 VMCB 掩码派生
+ A3  Tier 5.6 执行轨迹导出
+ A4  Tier 5.4 CPUID 视图伪造
+
+【阶段 B  低/中低，加 case 或字段，不新增高风险拦截】
+ B1  Tier 5.1 TSC 平移（TscOffset）
+ B2  Tier 5.1 RDTSC + RDTSCP 拦截
+ B3  Tier 9.2 控制通道认证
+
+【阶段 C  中风险，碰拦截位/位图】
+ C1  INT3 热路径补证（InterceptException bit3 + 可执行靶页）
+ C2  Tier 5.5 PMC/MSR 伪造（自填 MSRPM 位图）
+ C3  Tier 9.1 无设备控制通道
+ C4  Tier 8.1 进程诞生前控制
+
+【阶段 D  中高，碰异常注入/编排】
+ D1  Tier 5.3 syscall / 中断虚拟化
+ D2  Tier 6.5 反-反虚拟化闭环（依赖 B1/B2/A4）
+ D3  Tier 8.5 多进程编排
+ D4  Tier 9.3 控制通道冗余
+ D5  Tier 9.5 控制通道隐蔽
+
+【阶段 E  高，改执行流/碰 TLB/全 VMCB】
+ E1  Tier 5.7 I/O 控制（先补 IOPM 初始化 + InterceptMisc3）
+ E2  Tier 5.2 指令流重定向
+ E3  Tier 5.8 多核一致性操纵
+ E4  Tier 8.2 挂起 / 恢复 / 时间冻结
+ E5  Tier 8.3 进程终止后控制
+ E6  Tier 6.2 全状态快照
+ E7  Tier 6.3 确定性重放
+
+【阶段 F  极高 / 组合】
+ F1  Tier 8.4 确定性重生
+ F2  Tier 5.9 观测面完全控制（5.x 的组合项）
+
+【阶段 G  跳过项，只写原因】
+ G1  Tier 6.4 跨 VM 操纵 —— 本机 IOMMU 未暴露、且我们是唯一 hypervisor
+ G2  Tier 9.4 远程控制 —— 与 Tier 7.6 攻击面最小化直接冲突
+
+【阶段 H  压力测试 / 需重启，全部归末】
+ H1  多核 UNMAP soak 30 分钟（纯压测）
+ H2  Tier 5/6/8/9 各批的 soak 类验收（合并跑）
+ H3  Tier 6.1 启动期控制 —— 改启动链 + 需重启，**动手前单独确认**
+```
+
+**阶段内顺序不再变**；若某项崩溃两次修不好，按已定规则自动取证继续，但会在文档
+记录"该项未通过"而不是硬推。
+
+#### 9.368.4 与 9.367.4 的差异说明
+
+9.367.4 把"多核 UNMAP soak"排在第二（因为它是**唯一缺的验证尺度**）。按新指令
+（压测放最后）它移到 H1。这不改变它的重要性，只改变执行时机 —— 在它之前完成的
+每一项都会**先做单次决定性验证**，soak 是最后的尺度确认，而不是前置门禁。
+
+#### 9.368.5 A1 完成：`g_protect` 的跨度交给它自己的所有者
+
+**做了什么**
+
+`yghv_guard_state_page()` 与 `yghv_guard_state_why()` 各有一份
+`&g_protect` + `sizeof(g_protect)` + 自己的 static 缓存。两个地方算同一个对象的跨度 ——
+和 9.366.5（两个地方判定同一页是不是 guard 状态，结果不一致、把 frame table 的页拒了）
+**是同一形状**。
+
+新增 `int yghv_protect_state_page(uint64_t gpa)` 在 protect.c 里，紧挨对象定义，
+用它自己的名字和 sizeof。guard.c 的两处改成调用它。protect.c 和 yghv_guard.c
+各少一份重复算术。
+
+顺带加编译期断言：
+```c
+#define YGHV_PROTECT_STATE_PAGES ((sizeof(yghv_protect_state_t) + 4095) / 4096)
+_Static_assert(YGHV_PROTECT_STATE_PAGES == 2, "g_protect is 2 pages: ...");
+```
+跨度现在是**算出来并断言住**的，不是注释里写着"约 6 KB"。
+
+**检查器跟随所有者（这是本轮真正的要点）**
+
+`page_layout_check` 原来靠 `&(\w+)` 从 guard.c 里匹配到 `&g_protect`。改完之后
+那个 extern 没了，符号会**因巧合而继续出现在列表里**（protect.c 里还有
+`&g_protect.targets[0]` 之类），下一次清理就会静默消失 —— 覆盖率悄悄退化。
+
+所以检查器现在：识别到 `yghv_protect_state_page` 调用时，**去 protect.c 里定位
+该函数的函数体**，从中解析它 `&` 了哪些 `g_*`；**找不到函数直接 throw**。
+
+**负向验证（已做）**
+
+把 `yghv_protect_state_page` 改名：
+```
+page layout check: yghv_protect_state_page() referenced by the guard but not
+found in protect.c — the owner moved and this check can no longer resolve what
+it refuses
+```
+恢复后 PASS。这条比"符号还在列表里"重要：它保证**所有者搬家时检查器不会静默失联**。
+
+**实机验证（镜像 `206zC_a1`）**
+
+```
+G31:  hidecore: hid 3 page(s)
+      state: guarded=3 hidden=3 | probes=0 hide_fail=0 hash_fail=0
+      [0] bp-table    hidden=1
+      [1] frame-table hidden=1
+      [2] view-table  hidden=1
+```
+与 9.366 收口时的 3/3 一致 —— 换判定所有者没有改变结果，这正是要证明的。
+
+**静态检查**：7/7 PASS。

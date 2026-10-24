@@ -529,19 +529,18 @@ static int yghv_guard_state_page(uint64_t gpa) {
     if (yghv_protect_page_is_npt(page))
         return 1;
 
-    /* The protection table's own span. */
-    {
-        extern yghv_protect_state_t g_protect;
-        extern PHYSICAL_ADDRESS MmGetPhysicalAddress(void *BaseAddress);
-        static uint64_t prot_pa, prot_hi;
-        if (!prot_pa) {
-            prot_pa = (uint64_t)MmGetPhysicalAddress(&g_protect).QuadPart;
-            prot_hi = prot_pa + sizeof(g_protect) - 1;
-        }
-        if (page >= (prot_pa & ~(uint64_t)0xFFFULL) &&
-            page <= (prot_hi & ~(uint64_t)0xFFFULL))
-            return 1;
-    }
+    /*
+     * 9.368 (A1): the protection table's span is asked of its OWNER.
+     *
+     * 9.366 computed it here — `&g_protect` and `sizeof(g_protect)`, cached in a
+     * static in this file. That is a second place that must know another
+     * module's address and size, and it has to stay in step with that module.
+     * Two computations of one object's span is the same shape as 9.366.5 (two
+     * places deciding whether a page is guard state, which disagreed and refused
+     * the frame table). yghv_protect_state_page() is that owner now.
+     */
+    if (yghv_protect_state_page(page))
+        return 1;
     return 0;
 }
 
@@ -585,22 +584,15 @@ uint32_t yghv_guard_state_why(uint64_t gpa) {
     if (yghv_protect_page_is_npt(page)) return 0x20;    /* g_npt / g_npt_alt     */
 
     /*
-     * 9.366: the protection table's SPAN (see yghv_guard_state_page for why the
-     * start-only comparison was not enough). Same bit as before — the bit names
-     * "the protection table", and it now covers every page the object occupies.
+     * 9.368 (A1): asked of the owner, same as yghv_guard_state_page() above.
+     *
+     * The bit is unchanged (0x40 = "the protection table") and it still covers
+     * every page the object occupies — the difference is that the module that
+     * OWNS the object now decides where it ends, so this file no longer carries
+     * a cached copy of another module's address and size.
      */
-    {
-        extern yghv_protect_state_t g_protect;
-        extern PHYSICAL_ADDRESS MmGetPhysicalAddress(void *BaseAddress);
-        static uint64_t prot_pa, prot_hi;
-        if (!prot_pa) {
-            prot_pa = (uint64_t)MmGetPhysicalAddress(&g_protect).QuadPart;
-            prot_hi = prot_pa + sizeof(g_protect) - 1;
-        }
-        if (page >= (prot_pa & ~(uint64_t)0xFFFULL) &&
-            page <= (prot_hi & ~(uint64_t)0xFFFULL))
-            return 0x40;
-    }
+    if (yghv_protect_state_page(page))
+        return 0x40;
     return 0;
 }
 

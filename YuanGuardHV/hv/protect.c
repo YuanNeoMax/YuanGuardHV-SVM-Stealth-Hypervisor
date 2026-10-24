@@ -102,6 +102,65 @@ yghv_protect_hook_t g_protect_hooks[YGHV_PROTECT_MAX_HOOKS];
 uint64_t g_protect_cr3_list[YGHV_PROTECT_MAX_TARGETS];
 static FAST_MUTEX g_protect_lock;
 
+/*
+ * 9.368 (A1): THE OBJECT'S OWN SPAN, ANSWERED HERE.
+ *
+ * 9.366 made this page-aligned and made yghv_guard_state_page() compare against
+ * `[&g_protect, &g_protect + sizeof(g_protect))`. That was correct, but it put
+ * the arithmetic in the GUARD module — a second place that has to know this
+ * object's address and size, kept in step with a `static` cache of its own.
+ *
+ * Two places computing one object's span is the same shape as two places
+ * deciding whether a page is guard state (9.366.5, where they disagreed and the
+ * frame table's page was refused). The fix is the same: one owner.
+ *
+ * This function is the owner. It lives next to the object, uses the object's own
+ * name and sizeof, and answers the only question a caller has: "does this
+ * physical page carry any byte of the protection state?"
+ *
+ * ISLAND-SAFE: MmGetPhysicalAddress is a software page-table walk — no locks, no
+ * blocking — so the NPF handler may call it. The physical address is resolved
+ * once and cached, because this is on a per-VMEXIT path.
+ */
+int yghv_protect_state_page(uint64_t gpa) {
+    extern PHYSICAL_ADDRESS MmGetPhysicalAddress(void *BaseAddress);
+    static uint64_t pa = 0, hi = 0;
+    uint64_t page = gpa & ~(uint64_t)0xFFFULL;
+
+    if (!pa) {
+        pa = (uint64_t)MmGetPhysicalAddress(&g_protect).QuadPart;
+        hi = pa + sizeof(g_protect) - 1;
+        if (!pa) {
+            /* Resolution failed: report NOT-covered rather than caching a lie.
+             * A zero here is answered again on the next call. */
+            hi = 0;
+            return 0;
+        }
+    }
+    if (!pa)
+        return 0;
+    return (page >= (pa & ~(uint64_t)0xFFFULL) &&
+            page <= (hi & ~(uint64_t)0xFFFULL)) ? 1 : 0;
+}
+
+/* The object's page count, for the compile-time assertion below and for callers
+ * that need to know how many pages a hide decision is talking about. */
+#define YGHV_PROTECT_STATE_PAGES \
+    ((sizeof(yghv_protect_state_t) + 4095) / 4096)
+
+/*
+ * 9.368: the span is asserted, not discovered.
+ *
+ * g_protect is 4 targets (64 pages each) + config + count, which lands just over
+ * 6 KB — two pages. If a future field pushes it to three, the refusal above
+ * widens automatically, but the DOC that says "two pages" would be wrong. The
+ * assertion fails the build instead, so the number in the comment and the number
+ * in the object cannot drift.
+ */
+_Static_assert(YGHV_PROTECT_STATE_PAGES == 2,
+               "g_protect is 2 pages: update YGHV_PROTECT_STATE_PAGES notes "
+               "and the guard-state description in docs if this changes");
+
 static BOOLEAN yghv_protect_is_target_cr3_locked(uint64_t cr3) {
     uint32_t i;
     /* 9.249 (run_c10 evidence): with CR4.PCIDE=1 the CR3 in the VMCB carries

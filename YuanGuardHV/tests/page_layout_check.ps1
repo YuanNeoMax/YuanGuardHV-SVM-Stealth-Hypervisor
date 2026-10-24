@@ -187,14 +187,19 @@ if (Test-Path $guardSrc) {
     $body = ($bodies -join "`n")
 
     # Forms that can appear, and all of them must be read — a checker that
-    # understands one silently stops covering the others (measured twice: after
-    # the VA/PA fix introduced g_state_pa_*, and again when the interval became a
-    # list).
+    # understands one silently stops covering the others (measured three times:
+    # after the VA/PA fix introduced g_state_pa_*, again when the interval became
+    # a list, and again now when the protection table's span moved into protect.c).
     #
     #   yghv_guard_state_add(&X, sizeof(X))   the object list (9.366)
     #   g_state_pa_xxx                        cached PAs of the control values
     #   &symbol                               any address named directly
     #   yghv_protect_page_is_npt              the NPT managers, static in protect.c
+    #   yghv_protect_state_page(...)          the protection table's span, now
+    #                                         answered by its OWNER in protect.c
+    #                                         (9.368/A1) — so its globals must be
+    #                                         resolved from THAT function's body,
+    #                                         not from this file's extern
         foreach ($m in [regex]::Matches($body, 'yghv_guard_state_add\(\s*\(?\s*void\s*\*?\s*\)?\s*&(\w+)')) {
             $sym = $m.Groups[1].Value
             if ($stateRefusedSymbols -notcontains $sym) { $stateRefusedSymbols += $sym }
@@ -214,6 +219,34 @@ if (Test-Path $guardSrc) {
         if ($body -match 'yghv_protect_page_is_npt') {
             foreach ($n2 in @('g_npt', 'g_npt_alt')) {
                 if ($stateRefusedSymbols -notcontains $n2) { $stateRefusedSymbols += $n2 }
+            }
+        }
+        # 9.368 (A1): the protection table's span is answered inside protect.c now,
+        # so its object is resolved from THAT function rather than from a `&g_protect`
+        # that this checker happened to still find in yghv_guard.c. Without this, the
+        # symbol would keep appearing by luck and stop appearing the moment the last
+        # extern is cleaned up — a silent loss of coverage.
+        if ($body -match 'yghv_protect_state_page') {
+            $protSrc = Join-Path (Split-Path -Parent $PSScriptRoot) 'hv\protect.c'
+            if (Test-Path $protSrc) {
+                $ps2 = [IO.File]::ReadAllText($protSrc)
+                $pi = $ps2.IndexOf('int yghv_protect_state_page(uint64_t gpa) {')
+                if ($pi -ge 0) {
+                    $pd = 0; $pe = $pi
+                    for ($k = $pi; $k -lt $ps2.Length; $k++) {
+                        if ($ps2[$k] -eq '{') { $pd++ } elseif ($ps2[$k] -eq '}') { $pd--; if ($pd -eq 0) { $pe = $k; break } }
+                    }
+                    foreach ($m in [regex]::Matches($ps2.Substring($pi, $pe - $pi), '&(\w+)\b')) {
+                        $sym = $m.Groups[1].Value
+                        if ($sym -match '^g_' -and $stateRefusedSymbols -notcontains $sym) {
+                            $stateRefusedSymbols += $sym
+                        }
+                    }
+                } else {
+                    throw ('page layout check: yghv_protect_state_page() referenced by the ' +
+                           'guard but not found in protect.c — the owner moved and this ' +
+                           'check can no longer resolve what it refuses')
+                }
             }
         }
 }

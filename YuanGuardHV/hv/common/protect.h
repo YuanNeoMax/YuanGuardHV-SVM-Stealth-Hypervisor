@@ -219,6 +219,15 @@ BOOLEAN yghv_protect_check_target_exited(void);
 BOOLEAN yghv_protect_on_target_exit(ULONG pid);
 int yghv_protect_validate_hook_target(uint64_t func_va);
 
+/*
+ * 9.368: does this PHYSICAL page carry any byte of the protection state?
+ *
+ * The owner of g_protect answers this, so no other module has to hold its own
+ * copy of the address-and-size arithmetic. ISLAND-SAFE (software page-table walk
+ * only), so the NPF handler may call it.
+ */
+int yghv_protect_state_page(uint64_t gpa);
+
 extern yghv_protect_state_t g_protect;
 extern yghv_protect_hook_t g_protect_hooks[YGHV_PROTECT_MAX_HOOKS];
 
