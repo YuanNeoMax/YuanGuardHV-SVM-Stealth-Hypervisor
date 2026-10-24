@@ -11,7 +11,7 @@
 AMD-V SVM/NPT 隐形 Hypervisor 已完成 **Tier 7 全功能（13/13 PASS）**，
 `g_bp`/`g_frame`/`g_view_pages` 三张表**可以隐藏**（含热路径在隐藏下存活），
 隐藏路径 10 分钟 soak **STABLE**（78 轮 / 0 hang / 0 失败 / probes 0→9）。
-当前镜像 `206zA_why`（md5 `86DF8BBE`）。**28 个提交未推送。**
+当前镜像 `206zA_why`（md5 `86DF8BBE`）。**30 个提交未推送。**
 
 ---
 
@@ -54,6 +54,7 @@ cd /d D:\yuanguard\YuanGuardHV && build.bat
 > 实测：同一份代码两次构建，**代码段 0x400..0x24E54 差异字节 = 0**。
 > 比对是否同一份代码要**比 .map** 或**比代码段**，不要比文件 md5。
 > `206zA_why` 归档的 `86DF8BBE` 是那一次签名的产物，重建会得到不同的值。
+
 编译器 `clang-cl`，`CFLAGS=/nologo /O2 /kernel /GR- /EHs-c- /Zl /GS-`
 另有 `-Werror=return-type -Werror=implicit-function-declaration`（**不是全部警告**，内核内建产生 208 个）。
 
@@ -202,17 +203,23 @@ typedef char assert_exact[(sizeof(region_t) == 4096) ? 1 : -1];
 位置式初始化器把成员语义和位置绑死，重排字段静默交换 `read`/`write`。
 **改具名，验证方式是"字段对调后仍精确指名"。**
 
-### 6.6 ★ 测试断言了自己的假设（**五次**）
-1. soak 偏移越界 → `STATUS_INVALID_PARAMETER`
-2. 负向测试注入到 `hide_core`（不在岛内）
-3. T12 无条件要求 `add OK` 而正确行为是 `REFUSED`
-4. soak 无条件要求 `bp add OK`（同上）
+### 6.6 ★ 测试断言了自己的假设（**四次记录在案**）
+1. soak 偏移越界 → `STATUS_INVALID_PARAMETER`（把测试的错当成驱动缺陷）
+2. 负向测试注入到 `hide_core` —— 但它**不在岛内**，正确的检查看起来失灵
+3. T12 无条件要求 `add OK`，而正确行为是 `REFUSED`（注册表已隐藏）
+4. soak 无条件要求 `bp add OK`，同上 —— 报 14 failures / FAILED，
+   而实际 hidden 3/3、probes 前进、零 hang
+
+**共同点**：断言写的是"我以为会发生的"，而不是"契约允许的"。
 
 **修法模板**：接受两种合法结果，各自要求正确的后续。
 ```
 已武装   → 触发必须落地 且 drain 必须看到 NPF
 被拒绝   → 触发仍必须落地（没武装就没东西会空转）
 ```
+
+> 写负向测试前先确认：**注入点确实在检查的作用域内**。
+> 写正向断言前先问：**这个操作在当前状态下有几种合法结局**。
 
 ### 6.7 让"什么都没做"说出是哪扇门
 `hid 0` 有三种成因，第一版报成一样，排查两次奔向 NPT 才想到早退。
@@ -248,7 +255,7 @@ typedef char assert_exact[(sizeof(region_t) == 4096) ? 1 : -1];
 5. **T7 decoy 测试弱** —— 只有 `(t7 -match 'value:')`，非守卫路径也通过。
    需要一个真正验证"guest 读隐藏的外来页返回零"的测试。
 6. **Tier 5（9 项）、Tier 6（5 项）、Tier 8-9** —— 已规划，未开始。
-7. **28 个提交未推送**（最后一次推送是 `535f74d`）。
+7. **30 个提交未推送**（最后一次推送是 `535f74d`）。
 8. **未做长时 soak**（30 分钟以上、多核并发）。
 
 ---
