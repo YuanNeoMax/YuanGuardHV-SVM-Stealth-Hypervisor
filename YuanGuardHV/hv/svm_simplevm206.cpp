@@ -566,6 +566,90 @@ typedef struct _GUEST_CONTEXT
 #define CPUID_HV_MAX                CPUID_HV_INTERFACE
 
 /*!
+    @brief      Tier 5.4 (9.368/A4): what the guest is ALLOWED to see about us.
+
+    @details    Every CPUID answer below is a claim about the hardware the guest
+                thinks it is running on. Until this existed the hypervisor bit
+                was written unconditionally:
+
+                    registers[2] |= CPUID_FN0000_0001_ECX_HYPERVISOR_PRESENT;
+
+                which is an honest answer ("a hypervisor is present") and the
+                single easiest thing for a detector to check. The bit cannot be
+                hidden by the guest itself — CPUID leaves 0x40000000+ are how it
+                is discovered — so the decision has to live here, on our side.
+
+                5.4 calls this "hardware view faking"; the whole capability is a
+                POLICY about what to admit, and the policy has to be reachable
+                from the control plane rather than recompiled. Three levels:
+
+                  HONEST (default)  hypervisor bit set, vendor string says
+                                    "SimpleSvm". This is what the code always
+                                    did, kept as the default so nothing about
+                                    existing tests changes silently.
+                  NO_VENDOR_BIT     hypervisor bit CLEARED, but leaves
+                                    0x40000000+ still answer a vendor string.
+                                    A guest reading 0x40000000 sees us anyway —
+                                    this level is for measuring which detectors
+                                    look at bit 31 versus which probe the leaves.
+                  OFF               hypervisor bit cleared AND leaves
+                                    0x40000000+ answer zero (leaf 0 as if
+                                    unsupported). The guest is told there is no
+                                    hypervisor at all.
+
+                HONEST LIMIT, stated where it is load-bearing: OFF is a lie the
+                guest can still catch — TSC latency and the leaf-0 max-standard
+                answer are not adjusted here (that is Tier 5.1 / 6.5 territory),
+                so a timing or a max-leaf comparison still sees something. This
+                level changes what CPUID *says*, not what the CPU *does*.
+
+                Island-safe: three volatile LONGs, read once per CPUID exit.
+*/
+typedef enum {
+    YGHV_CPUID_VIEW_HONEST = 0,
+    YGHV_CPUID_VIEW_NO_VENDOR_BIT = 1,
+    YGHV_CPUID_VIEW_OFF = 2,
+    YGHV_CPUID_VIEW_MAX = 3
+} YGHV_CPUID_VIEW;
+
+static volatile LONG g_CpuidView = YGHV_CPUID_VIEW_HONEST;
+static volatile LONG64 g_CpuidViewSets = 0;      /* how many times it was changed */
+static volatile LONG64 g_CpuidViewSuppressed = 0; /* answers actually altered */
+
+/*!
+    @brief      Set the view. PASSIVE (control plane only, never the island).
+    @result     1 on success, 0 for an out-of-range level (nothing is changed).
+*/
+extern "C" int yghv_s206_cpuid_view_set(UINT32 level)
+{
+    if (level >= YGHV_CPUID_VIEW_MAX)
+        return 0;
+    InterlockedExchange(&g_CpuidView, (LONG)level);
+    InterlockedIncrement64(&g_CpuidViewSets);
+    return 1;
+}
+
+extern "C" UINT32 yghv_s206_cpuid_view_get(VOID)
+{
+    return (UINT32)InterlockedCompareExchange(&g_CpuidView, 0, 0);
+}
+
+/*! Read-only counters, so a test can prove the policy actually fired rather than
+    assuming it did. out[0]=level out[1]=sets out[2]=suppressed */
+extern "C" void yghv_s206_cpuid_view_stats(UINT64 *out)
+{
+    if (!out)
+        return;
+    out[0] = (UINT64)yghv_s206_cpuid_view_get();
+    out[1] = (UINT64)InterlockedCompareExchange64(&g_CpuidViewSets, 0, 0);
+    out[2] = (UINT64)InterlockedCompareExchange64(&g_CpuidViewSuppressed, 0, 0);
+}
+
+/*
+ * SimpleSVM specific constants.
+ */
+
+/*!
     @brief      Breaks into a kernel debugger when it is present.
 
     @details    This macro is emits software breakpoint that only hits when a
@@ -804,14 +888,44 @@ SvHandleCpuid (
     switch (leaf)
     {
     case CPUID_PROCESSOR_AND_PROCESSOR_FEATURE_IDENTIFIERS:
-        //
-        // Indicate presence of a hypervisor by setting the bit that are
-        // reserved for use by hypervisor to indicate guest status. See "CPUID
-        // Fn0000_0001_ECX Feature Identifiers".
-        //
-        registers[2] |= CPUID_FN0000_0001_ECX_HYPERVISOR_PRESENT;
+        /*
+         * 9.368 (A4, Tier 5.4): THE HYPERVISOR BIT IS A POLICY, NOT A FACT.
+         *
+         * This used to OR the bit in unconditionally. "Indicate presence of a
+         * hypervisor" is the honest answer, and it is also the one line a
+         * detector checks first. Whether to admit it is a decision about what
+         * the guest is allowed to know, so it belongs to the control plane.
+         *
+         * The count is incremented only when the answer actually DIFFERS from
+         * the hardware's — a test that sets the level and sees `suppressed`
+         * stay 0 would otherwise pass on a policy that never ran.
+         */
+        if (yghv_s206_cpuid_view_get() == YGHV_CPUID_VIEW_HONEST)
+        {
+            registers[2] |= CPUID_FN0000_0001_ECX_HYPERVISOR_PRESENT;
+        }
+        else
+        {
+            registers[2] &= ~((int)CPUID_FN0000_0001_ECX_HYPERVISOR_PRESENT);
+            InterlockedIncrement64(&g_CpuidViewSuppressed);
+        }
         break;
     case CPUID_HV_VENDOR_AND_MAX_FUNCTIONS:
+        /*
+         * 9.368/A4: level OFF says there is no hypervisor at all, so leaves
+         * 0x40000000+ must answer as unsupported hardware does: all zero.
+         *
+         * NO_VENDOR_BIT deliberately still ANSWERS here. That is the level's
+         * whole point — it clears bit 31 while leaving the vendor string
+         * readable, which separates "detectors that check bit 31" from
+         * "detectors that probe the leaves".
+         */
+        if (yghv_s206_cpuid_view_get() == YGHV_CPUID_VIEW_OFF)
+        {
+            registers[0] = registers[1] = registers[2] = registers[3] = 0;
+            InterlockedIncrement64(&g_CpuidViewSuppressed);
+            break;
+        }
         //
         // Return a maximum supported hypervisor CPUID leaf range and a vendor
         // ID signature as required by the spec.
@@ -822,6 +936,17 @@ SvHandleCpuid (
         registers[3] = '   m';
         break;
     case CPUID_HV_INTERFACE:
+        /*
+         * 9.368/A4: same rule as above. If the guest is being told there is no
+         * hypervisor, the interface leaf cannot answer "Hv#0" — that alone
+         * would confirm one is present.
+         */
+        if (yghv_s206_cpuid_view_get() == YGHV_CPUID_VIEW_OFF)
+        {
+            registers[0] = registers[1] = registers[2] = registers[3] = 0;
+            InterlockedIncrement64(&g_CpuidViewSuppressed);
+            break;
+        }
         //
         // Return non Hv#1 value. This indicate that the SimpleSvm does NOT
         // conform to the Microsoft hypervisor interface.

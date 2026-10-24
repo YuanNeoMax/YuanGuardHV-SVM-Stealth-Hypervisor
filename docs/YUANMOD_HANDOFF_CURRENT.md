@@ -9946,3 +9946,73 @@ OVERALL: ALL PASS
 是两个相反的结果同时成立。
 
 **静态检查**：7/7 PASS。
+
+#### 9.368.8 A4 完成：Tier 5.4 CPUID 视图伪造 —— 三档策略，guest 侧实测
+
+**问题**
+
+hypervisor 位是**无条件置位**的：
+
+```c
+VpData->GuestVmcb.ControlArea.InterceptMisc1 |= ...;  /* 与本项无关 */
+registers[2] |= CPUID_FN0000_0001_ECX_HYPERVISOR_PRESENT;
+```
+
+这是诚实答案，也是检测器最先查的那一行。guest 自己藏不掉它（CPUID 0x40000000+
+正是发现它的方式），所以决定必须在我们这侧，而且必须是**可达的策略**而非重编译。
+
+**做了什么**
+
+`svm_simplevm206.cpp` 新增三档视图（`yghv_s206_cpuid_view_set/get/stats`）：
+
+| 档 | 名字 | leaf1 ECX.31 | leaf 0x40000000 |
+|---|---|---|---|
+| 0 | honest（默认）| **1** | `max=0x40000001`, vendor `SimpleSvm` |
+| 1 | no-vendor-bit | **0** | **仍然回答** vendor |
+| 2 | off | **0** | **全零** |
+
+档 1 是这一项真正的价值：它把「检测器查 bit 31」与「检测器探 0x40000000+」
+分开。只有档 0 和档 2 的话，一个「不 honest 就把所有 leaf 清零」的粗实现也能
+全过。
+
+**控制面**：`sys-sentry cpuid-view [0|1|2]`（IOCTL `0x828` op 3 读 / op 4 写）。
+读数里带 **`altered`** —— 策略实际改变了多少次 CPUID 答案。**这个字段无法被
+"返回常量"伪造**：策略设了但从不生效，`altered` 会停在 0 而档位读数仍然正确。
+
+**★ 决定性测试必须在 GUEST 侧读**
+
+驱动里调 `__cpuidex` 走的是 **host 侧**、不越过 VMRUN 边界，**永远不会到
+`SvHandleCpuid`**。用驱动侧读做断言，在任何档位下都会通过而什么也没证明。
+
+新增 `guest-cpuid [leaf]`：在普通用户态进程里执行 CPUID（内嵌一段 RWX stub，
+`push rbx / mov eax,ecx / mov ecx,edx / cpuid / ... / pop rbx / ret`）。CPUID 对整个
+guest 拦截，不分 CPL —— 这正是检测器会做的事。
+
+**实测（G34，镜像 `206zF_a4`）**
+
+```
+L0 honest        leaf1  ecx=0x7EF8320B  ECX.31=1
+                 leaf4  vendor='SimpleSvm   ' max=0x40000001
+L1 no-vendor-bit leaf1  ecx=0x7EF8320B  ECX.31=0
+                 leaf4  vendor='SimpleSvm   ' max=0x40000001   ← 仍回答
+L2 off           leaf1  ecx=0x7EF8320B  ECX.31=0
+                 leaf4  eax=0 ebx=0 ecx=0 edx=0  vendor=''      ← 全零
+回 L0            ECX.31=1, vendor 恢复                            ← 可还原
+altered=1616     ← 策略真的改变了答案，不是只被设置
+
+OVERALL: ALL PASS
+```
+
+**回归**（改完跑全量）：G25 13/13、G29 PASS、G31 hid 3/3、G33 ALL PASS。
+
+**过程中的两个自己踩的坑（诚实）**
+
+1. **PowerShell 5.1 把负 int32 转 uint32 会抛 InvalidCast**：stub 返回的是有符号
+   int32，ECX 带 bit31 时为负，`[uint32]$r[2]` 直接失败。改用
+   `[BitConverter]::ToUInt32([BitConverter]::GetBytes($v),0)` 重解释位。
+2. **单引号字符串里的 em dash 破坏了引号配对**：`throw` 那行加上一行含 `—` 的
+   `Write-Host` 之后，5.1 解析器在**几十行之外**报"缺少 `{`"。这就是 §7 记过的
+   同类陷阱（无 BOM 的 .ps1 按 GBK 解码），症状离真因很远。已把该文件所有
+   em dash 替换成 ASCII `-`。
+
+**静态检查**：7/7 PASS；命令数 56→57。

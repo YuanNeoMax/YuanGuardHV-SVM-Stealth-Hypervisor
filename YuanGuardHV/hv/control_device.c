@@ -20,6 +20,14 @@
 #include "yghv_sentry.h"   /* Tier 7.4/7.5/7.6: timing/escape/surface */
 #include "debug.h"
 
+/*
+ * 9.368 (A4, Tier 5.4): the CPUID view policy lives in svm_simplevm206.cpp —
+ * the module that owns the CPUID handler. PASSIVE setters, island-safe getters.
+ */
+extern int    yghv_s206_cpuid_view_set(UINT32 level);
+extern UINT32 yghv_s206_cpuid_view_get(void);
+extern void   yghv_s206_cpuid_view_stats(UINT64 *out);
+
 NTKERNELAPI PEPROCESS IoGetRequestorProcess(PIRP Irp);
 NTKERNELAPI HANDLE PsGetProcessId(PEPROCESS Process);
 /* Phase 1: the WDK km headers here do not declare this, so declare it
@@ -896,6 +904,36 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
         if (op == 2) {
             yghv_sentry_reset();
             out[0] = 1;
+            info = 8;
+            status = STATUS_SUCCESS;
+            break;
+        }
+        /*
+         * 9.368 (A4, Tier 5.4): the CPUID view lives here because it is the same
+         * subject 7.6 already owns — "what does the guest get to observe". It is
+         * a policy over the attack surface, not a new mechanism.
+         *
+         *   op 3  read  -> out[0]=level out[1]=how many times it was set
+         *                        out[2]=how many CPUID answers it actually ALTERED
+         *   op 4  write <- in[1]=level (0 honest / 1 no-vendor-bit / 2 off)
+         *
+         * `altered` is the one field that cannot be faked by returning a constant:
+         * a policy that never fires leaves it at 0 while the level reads back as
+         * whatever was set.
+         */
+        if (op == 3 && out_len >= 3 * sizeof(UINT64)) {
+            UINT64 st[3];
+            yghv_s206_cpuid_view_stats(st);
+            out[0] = st[0];
+            out[1] = st[1];
+            out[2] = st[2];
+            info = 3 * sizeof(UINT64);
+            status = STATUS_SUCCESS;
+            break;
+        }
+        if (op == 4 && in_len >= 32) {
+            UINT64 lvl = ((UINT64 *)buf)[1];
+            out[0] = (UINT64)(INT64)yghv_s206_cpuid_view_set((UINT32)lvl);
             info = 8;
             status = STATUS_SUCCESS;
             break;

@@ -241,7 +241,7 @@ public static class YghvMmf
         v.View = v.Map = v.File = IntPtr.Zero;
     }
 
-    /* 9.286: the AVE must be caught INSIDE this C# frame — PowerShell's
+    /* 9.286: the AVE must be caught INSIDE this C# frame - PowerShell's
      * dynamic call site cannot catch cross-boundary AVEs even with the CSE
      * attributes (the mmf-write child died unhandled in run_c18). */
     [System.Runtime.ExceptionServices.HandleProcessCorruptedStateExceptions]
@@ -260,7 +260,7 @@ public static class YghvMmf
         }
     }
 
-    /* 9.284: CSE-protected — a read right after a DENY-injected #PF can
+    /* 9.284: CSE-protected - a read right after a DENY-injected #PF can
      * still catch an in-flight AV; without the attribute the mmf-write
      * child dies unhandled before printing BLOCKED (run_c18 gate2). */
     [System.Runtime.ExceptionServices.HandleProcessCorruptedStateExceptions]
@@ -277,7 +277,7 @@ public static class YghvMmf
 
     /* One machine store, then report. The DENY verdict arrives as an injected
      * #PF (present, write, user) on this store; .NET raises it as an
-     * AccessViolationException, which is a corrupted-state exception — only
+     * AccessViolationException, which is a corrupted-state exception - only
      * catchable from a method marked HandleProcessCorruptedStateExceptions.
      * Windows PowerShell 5.1 (.NET Framework) honours the attribute; pwsh 7
      * fail-fasts instead, so this must run under powershell.exe. */
@@ -298,10 +298,88 @@ public static class YghvMmf
 }
 '@
 
-# 206-C5: cross-process memory inspection helpers for the real-process pilot
-# (scan-pid / wpm-write). Kernel-mediated reads/writes never hit the NPT write
-# protection as cpl=3 user stores — wpm-write deliberately demonstrates that
-# trust gap.
+# 9.368 (A4, Tier 5.4): GUEST-SIDE CPUID.
+#
+# The whole point of the CPUID view is what the GUEST sees, and the driver cannot
+# answer that: __cpuidex executed inside the driver runs on the host side of the
+# VMRUN boundary, so it returns the REAL hardware and never reaches
+# SvHandleCpuid. A test built on a driver-side read would pass at every policy
+# level while proving nothing.
+#
+# This runs CPUID from a normal user-mode process instead. CPUID is intercepted
+# for the whole guest regardless of CPL, so this is the path that exercises the
+# policy - and it is also exactly what a detector would do.
+Add-Type -TypeDefinition @'
+public static class YghvCpuid
+{
+    [System.Runtime.InteropServices.UnmanagedFunctionPointer(
+        System.Runtime.InteropServices.CallingConvention.Cdecl)]
+    private delegate void CpuidFn(int leaf, int sub, out int a, out int b, out int c, out int d);
+
+    /* Marshal the four output registers as int[4] so the caller does not need
+       four out-parameters. CPUID itself cannot be called from C# directly, so
+       the stub below is emitted as machine code into a private RWX region. */
+    public static int[] Query(int leaf, int sub)
+    {
+        int a, b, c, d;
+        Native(leaf, sub, out a, out b, out c, out d);
+        return new int[] { a, b, c, d };
+    }
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+    private static extern System.IntPtr VirtualAlloc(System.IntPtr addr, System.UIntPtr size,
+        uint allocType, uint protect);
+
+    /*  x86-64 stub (Win64 ABI): args are leaf->ecx? no: (leaf, sub, &a, &b, &c, &d)
+     *  rcx=leaf rdx=sub r8=&a r9=&b  [rsp+0x28]=&c [rsp+0x30]=&d
+     *
+     *      push rbx
+     *      mov  eax, ecx          ; leaf
+     *      mov  ecx, edx          ; subleaf
+     *      cpuid
+     *      mov  [r8], eax
+     *      mov  [r9], ebx
+     *      mov  r10, [rsp+0x30]   ; &c  (0x28 after push +0x08 for ret addr)
+     *      mov  [r10], ecx
+     *      mov  r11, [rsp+0x38]   ; &d
+     *      mov  [r11], edx
+     *      pop  rbx
+     *      ret
+     */
+    private static readonly byte[] Stub = new byte[]
+    {
+        0x53,                                            /* push rbx                */
+        0x89, 0xC8,                                      /* mov eax, ecx            */
+        0x89, 0xD1,                                      /* mov ecx, edx            */
+        0x0F, 0xA2,                                      /* cpuid                   */
+        0x41, 0x89, 0x00,                                /* mov [r8], eax           */
+        0x41, 0x89, 0x19,                                /* mov [r9], ebx           */
+        0x4C, 0x8B, 0x54, 0x24, 0x30,                    /* mov r10, [rsp+0x30]     */
+        0x41, 0x89, 0x0A,                                /* mov [r10], ecx          */
+        0x4C, 0x8B, 0x5C, 0x24, 0x38,                    /* mov r11, [rsp+0x38]     */
+        0x41, 0x89, 0x13,                                /* mov [r11], edx          */
+        0x5B,                                            /* pop rbx                 */
+        0xC3                                             /* ret                     */
+    };
+
+    private static CpuidFn _fn;
+
+    private static void Native(int leaf, int sub, out int a, out int b, out int c, out int d)
+    {
+        if (_fn == null)
+        {
+            System.IntPtr mem = VirtualAlloc(System.IntPtr.Zero, (System.UIntPtr)Stub.Length,
+                0x3000 /*COMMIT|RESERVE*/, 0x40 /*PAGE_EXECUTE_READWRITE*/);
+            if (mem == System.IntPtr.Zero)
+                throw new System.InvalidOperationException("VirtualAlloc for CPUID stub failed");
+            System.Runtime.InteropServices.Marshal.Copy(Stub, 0, mem, Stub.Length);
+            _fn = (CpuidFn)System.Runtime.InteropServices.Marshal.GetDelegateForFunctionPointer(
+                mem, typeof(CpuidFn));
+        }
+        _fn(leaf, sub, out a, out b, out c, out d);
+    }
+}
+'@
 Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
@@ -877,7 +955,7 @@ try {
             }
         }
         'selftest-abort' {
-            # 9.258 (206-C3): watchdog test — arm a page then die WITHOUT any
+            # 9.258 (206-C3): watchdog test - arm a page then die WITHOUT any
             # cleanup (the deliberate c12 leak scenario). The driver's process
             # -exit watchdog must disarm + free the slot; a state probe right
             # after this process exits must show page_count=0 for this pid.
@@ -896,7 +974,7 @@ try {
                     -InBytes ([BitConverter]::GetBytes([uint64]$addr)) | Out-Null
                 Write-Host 'selftest-abort: add-page OK'
                 Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x803)) | Out-Null
-                Write-Host 'selftest-abort: start OK — dying WITHOUT cleanup'
+                Write-Host 'selftest-abort: start OK - dying WITHOUT cleanup'
             } finally {
                 $gc.Free()
             }
@@ -1025,7 +1103,7 @@ try {
             }
         }
         'config-sync' {
-            # 9.299 (C line): SYNC GUARD — snapshot + poll, no NPT permission
+            # 9.299 (C line): SYNC GUARD - snapshot + poll, no NPT permission
             # flip. The page stays writable so the hardware never needs to
             # invalidate a translation; a guard thread detects drift by
             # comparison and rolls the page back.
@@ -1102,7 +1180,7 @@ try {
             Write-Host 'mmf-loop: done'
         }
         'mmf-hold' {
-            # 9.302 (A phase): a PASSIVE target — maps the section, publishes
+            # 9.302 (A phase): a PASSIVE target - maps the section, publishes
             # pid + VA, then just sleeps. It never writes the page itself.
             # Needed because mmf-loop writes every 400ms, which makes it
             # impossible to tell "the guard rolled my write back" from "the
@@ -1115,7 +1193,7 @@ try {
             $secs = [int]$Arg2
             # 9.305: optional mapping size, so a multi-page test can arm several
             # CONTROLLED pages instead of scan-pid's arbitrary process pages.
-            # Arming those made the guard roll back live code/data — that is how
+            # Arming those made the guard roll back live code/data - that is how
             # the 0x7E crash was reached, and it was a test-design error.
             $mapSize = if ($null -ne $Arg4) { [uint32]::Parse($Arg4) } else { [uint32]4096 }
             $map = [YghvMmf]::MapFile($path, $mapSize)
@@ -1137,8 +1215,8 @@ try {
         'mem-pte' {
             # Phase 1 (2026-10-11): page-table walk probe (Engine B foundation).
             #
-            # Resolves a VA through the target's CR3 by hand —
-            # CR3 -> PML4 -> PDPT -> PD -> PT — reading only the table pages
+            # Resolves a VA through the target's CR3 by hand -
+            # CR3 -> PML4 -> PDPT -> PD -> PT - reading only the table pages
             # (system pages). It does NOT read the target's memory; it proves
             # the translation works, which is what everything else builds on.
             #
@@ -1240,12 +1318,12 @@ try {
             }
         }
         'mmf-read' {
-            # 9.366: THE GUEST'S OWN READ OF THE PAGE — the half `mmf-write`
+            # 9.366: THE GUEST'S OWN READ OF THE PAGE - the half `mmf-write`
             # never covered.
             #
             # Why a separate command: `mem-read` reads through the DRIVER
             # (Engine A/B, our image's RIP), so it cannot distinguish a page the
-            # guest can see from one it cannot — both return whatever our side
+            # guest can see from one it cannot - both return whatever our side
             # resolves. The decoy question is about the GUEST path: a CPL=3
             # store/load from a foreign process whose page we hid. That needs a
             # read issued by a process we are not, on the same section, so the
@@ -1465,7 +1543,7 @@ try {
             #   mem-selfmap init|stop|reset
             #
             # The window is one reserved VA whose leaf PTE is rewritten to
-            # alias a target frame, so a later access is a plain load/store —
+            # alias a target frame, so a later access is a plain load/store -
             # no MmCopyMemory, no per-page MDL. Requires PASSIVE_LEVEL, so it
             # is set up from here rather than from the island.
             if ($null -eq $Arg1) {
@@ -1499,7 +1577,7 @@ try {
             # guest sees them on every access through that entry. Modes:
             #   0 writeback (default)  1 write-through  2 uncached  3 uncacheable-strong
             #
-            # HONEST: this changes the GUEST's behaviour too — uncached memory
+            # HONEST: this changes the GUEST's behaviour too - uncached memory
             # is dramatically slower for the guest, and a target that measures
             # its own throughput can detect it. This is not a stealth feature.
             # "Per-observer" needs the split-view mechanism: set the mode in
@@ -1552,7 +1630,7 @@ try {
             #
             # WHY THIS EXISTS: mem-write takes a VIRTUAL address and walks the
             # page tables. A test that wanted to touch a physical frame had no
-            # entry point and handed a PHYSICAL address to mem-write instead —
+            # entry point and handed a PHYSICAL address to mem-write instead -
             # which crashed the machine twice:
             #     0x3B  Engine A faults, the "VA" is not mapped
             #     0x1A  the memory manager then tries to make it resident
@@ -1603,18 +1681,18 @@ try {
             # path), checked at runtime rather than trusted.
             $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x826)) -OutputLength 64
             $ok = [BitConverter]::ToUInt64($out, 56)
-            Write-Host ("sys-crypto: SHA-256 selftest " + $(if($ok -eq 1){'PASS (fips-180-4 vectors match)'}else{'FAIL — hashes are NOT trustworthy'}))
+            Write-Host ("sys-crypto: SHA-256 selftest " + $(if($ok -eq 1){'PASS (fips-180-4 vectors match)'}else{'FAIL - hashes are NOT trustworthy'}))
         }
         'sys-sentry' {
-            # Tier 7.4/7.5/7.6 (2026-10-18): three sides of one subject — how
+            # Tier 7.4/7.5/7.6 (2026-10-18): three sides of one subject - how
             # the hypervisor behaves when someone is looking at it or attacking.
             #
             # 7.4 WHAT A GUEST CAN MEASURE ABOUT US
             #   Time-based detection is the probe a guest can always run on
             #   itself: rdtsc around a hypervisor call, cpuidex leaf 1 /
             #   0x40000000. The cost of a VMEXIT is what leaks. This keeps a
-            #   running worst case so a regression that makes us slow — and
-            #   therefore loud — is visible here first.
+            #   running worst case so a regression that makes us slow - and
+            #   therefore loud - is visible here first.
             #   HONEST LIMIT: this measures and reports. Hiding the cost needs
             #   TSC scaling, which Tier 5 (5.1) owns and is a much larger change.
             #
@@ -1653,7 +1731,7 @@ try {
                     $exits, [BitConverter]::ToUInt64($out,96), `
                     $(if($exits -gt 0){[Math]::Round([BitConverter]::ToUInt64($out,104) / $exits, 0)}else{0}))
                 if ($exits -eq 0) {
-                    Write-Host "  (no exit measurements yet — the VMEXIT path records them)"
+                    Write-Host "  (no exit measurements yet - the VMEXIT path records them)"
                 }
                 return
             }
@@ -1671,7 +1749,7 @@ try {
                 # 9.366: the inventory is populated from the intercept mask (9
                 # entries) plus one per IOCTL code actually exercised (41). The
                 # old 256-byte request could only carry 10 entries, so a full
-                # inventory would have been TRUNCATED SILENTLY — the count would
+                # inventory would have been TRUNCATED SILENTLY - the count would
                 # have said 10 and the list would have looked complete.
                 # 64 entries * 24 bytes + 8 header = 1544.
                 $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x828)) -InBytes $req -OutputLength 1544
@@ -1689,7 +1767,107 @@ try {
                 }
                 return
             }
-            throw 'sys-sentry: use surface|reset'
+            if ($v -eq 'cpuid-view') {
+                # 9.368 (A4, Tier 5.4): what CPUID tells the guest about us.
+                #
+                # Levels:
+                #   0 honest          hypervisor bit SET, vendor string answers
+                #                     (this is what the code always did)
+                #   1 no-vendor-bit   bit 31 CLEARED, leaves 0x40000000+ still
+                #                     answer a vendor string
+                #   2 off             bit 31 cleared AND leaves answer zero,
+                #                     i.e. "no hypervisor here"
+                #
+                # The field that cannot be faked: `altered`. A policy that is
+                # set but never fires leaves it at 0 while the level still reads
+                # back correctly, so the readout distinguishes "configured" from
+                # "in effect".
+                if ($null -eq $Arg2) {
+                    $r0 = New-Object byte[] 32
+                    [BitConverter]::GetBytes([uint64]3).CopyTo($r0, 0)
+                    $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x828)) -InBytes $r0 -OutputLength 24
+                    $lvl = [BitConverter]::ToUInt64($out, 0)
+                    $sets = [BitConverter]::ToUInt64($out, 8)
+                    $alt = [BitConverter]::ToUInt64($out, 16)
+                    # A nested switch inside an expression is legal but the
+                    # default arm's string interpolation is where this tripped
+                    # the 5.1 parser. Build the name with if/elseif instead: no
+                    # nested pipeline assignment, no interpolation.
+                    $nm = 'unknown(' + $lvl + ')'
+                    if ($lvl -eq 0) { $nm = 'honest (bit31 set, vendor answers)' }
+                    elseif ($lvl -eq 1) { $nm = 'no-vendor-bit (bit31 cleared, vendor still answers)' }
+                    elseif ($lvl -eq 2) { $nm = 'off (bit31 cleared, leaves answer zero)' }
+                    Write-Host ("sys-sentry cpuid-view: {0}" -f $nm)
+                    Write-Host ("  set {0} time(s); CPUID answers actually altered: {1}" -f $sets, $alt)
+                    if ($sets -gt 0 -and $alt -eq 0 -and $lvl -ne 0) {
+                        Write-Host '  NOTE: the level is not honest but nothing was altered'
+                        Write-Host '        either no CPUID left 1/0x40000000+ has run since, or'
+                        Write-Host '        the policy is set on a core that never exits.'
+                    }
+                    return
+                }
+                $want = [int]$Arg2
+                if ($want -lt 0 -or $want -gt 2) { throw 'sys-sentry cpuid-view: level must be 0, 1 or 2' }
+                $r2 = New-Object byte[] 32
+                [BitConverter]::GetBytes([uint64]4).CopyTo($r2, 0)
+                [BitConverter]::GetBytes([uint64]$want).CopyTo($r2, 8)
+                $o2 = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x828)) -InBytes $r2 -OutputLength 8
+                $ok = [BitConverter]::ToUInt64($o2, 0)
+                Write-Host ("sys-sentry cpuid-view: set to {0} -> {1}" -f $want, $(if($ok){'OK'}else{'REJECTED (out of range)'}))
+                return
+            }
+            throw 'sys-sentry: use surface, reset, or cpuid-view 0/1/2'
+        }
+        'guest-cpuid' {
+            # 9.368 (A4, Tier 5.4): read CPUID the way a DETECTOR reads it.
+            #
+            # Driver-side __cpuidex answers from the host side of the boundary, so
+            # it can never show what the policy did. This stub executes CPUID in a
+            # plain user-mode process, which is intercepted for the whole guest.
+            #
+            # usage:
+            #   guest-cpuid [leaf]           default leaf 1
+            #   guest-cpuid 0x40000000       vendor + max leaf
+            #
+            # Reported: EAX EBX ECX EDX, plus the two bits that matter most:
+            #   leaf 1 ECX bit31 = "hypervisor present"
+            #   leaf 0x40000000  = vendor string, all zero when told there is none
+            $leaf = 1
+            if ($null -ne $Arg1) { $leaf = [int]([Convert]::ToUInt32(("$Arg1" -replace '^0[xX]',''), 16)) }
+            $r = [YghvCpuid]::Query($leaf, 0)
+            # The stub returns CPUID's registers as SIGNED int32, so ECX with
+            # bit 31 set comes back negative. `[uint32]$negativeInt` throws
+            # InvalidCast in PowerShell 5.1 -- the conversion has to go through
+            # [uint32]::Parse or a mask, not a cast. Reinterpret the bits:
+            #   ($r[n] -band 0xFFFFFFFFL) is wrong for a negative int32 (it stays
+            #   negative), so use the .NET BitConverter round trip instead.
+            function As-U32([int]$v) {
+                return [BitConverter]::ToUInt32([BitConverter]::GetBytes($v), 0)
+            }
+            $eax = As-U32 $r[0]; $ebx = As-U32 $r[1]
+            $ecx = As-U32 $r[2]; $edx = As-U32 $r[3]
+            Write-Host ("guest-cpuid: leaf=0x{0:X8}  eax=0x{1:X8} ebx=0x{2:X8} ecx=0x{3:X8} edx=0x{4:X8}" -f `
+                $leaf, $eax, $ebx, $ecx, $edx)
+            if ($leaf -eq 1) {
+                $hv = ($ecx -shr 31) -band 1
+                Write-Host ("  hypervisor-present bit (ECX.31) = {0}" -f $hv)
+            }
+            if ($leaf -eq 0x40000000) {
+                # Vendor string = EBX||ECX||EDX, 12 ASCII bytes (leaf 0x40000000).
+                # Built with an explicit loop: the pipeline form
+                #   -join ($vb | ForEach-Object { if ($_ -ne 0) { [char]$_ } })
+                # tripped the 5.1 parser inside this switch arm, and there is no
+                # reason to depend on a pipeline for twelve characters.
+                $sb = New-Object System.Text.StringBuilder
+                for ($bi = 0; $bi -lt 12; $bi++) {
+                    $src = As-U32 $r[1 + [Math]::Floor($bi / 4)]
+                    $byte = ($src -shr (8 * ($bi % 4))) -band 0xFF
+                    if ($byte -ne 0) { [void]$sb.Append([char]$byte) }
+                }
+                $vs = $sb.ToString()
+                Write-Host ("  max-leaf={0}  vendor='{1}'" -f $eax, $vs)
+                if ($vs.Length -eq 0) { Write-Host '  (all zero: the guest is told no hypervisor exists here)' }
+            }
         }
         'sys-guard' {
             # Tier 7.1/7.3 (2026-10-18): self-hiding + integrity self-check.
@@ -1697,7 +1875,7 @@ try {
             # THE EXPOSURE this answers: our tables are ordinary physical pages
             # below 4GB (MmAllocateContiguousMemory). The NPT identity-maps
             # physical memory for the guest, so a guest walking its own address
-            # space can read AND WRITE them — an NPT entry, a breakpoint slot, a
+            # space can read AND WRITE them - an NPT entry, a breakpoint slot, a
             # frame reservation. Nothing detected it and nothing stopped it.
             #
             # Two answers, and they are complementary:
@@ -1766,7 +1944,7 @@ try {
                 $a = [Convert]::ToUInt64(("$Arg2" -replace '^0[xX]',''),16)
                 $b = [uint64]::Parse($Arg3)
             } elseif ($op -eq 7) {
-                # 9.366: ask ONE page why a hide would be refused — without
+                # 9.366: ask ONE page why a hide would be refused - without
                 # performing one. See control_device.c case 7 for the answer's
                 # layout and yghv_guard.c for why a bitmask rather than a code.
                 if ($null -eq $Arg2) { throw 'sys-guard why: usage: sys-guard why <hex_pa>' }
@@ -1816,10 +1994,10 @@ try {
                     #   e[4]=hash_off|hash_len  e[5..8]=digest  e[9]=tag|armed
                     #
                     # The parser had $o = 8 + $i*48, i.e. 48-byte entries, so it read
-                    # checks from +32 and changes from +16 — both wrong, and the tag
+                    # checks from +32 and changes from +16 - both wrong, and the tag
                     # from +40..47, which is inside the digest. It looked plausible
                     # only because a stale value happened to sit where it read.
-                    # Measured: "pa=0x1F1952000 ... tag=lñµ}Yç" — one real entry
+                    # Measured: "pa=0x1F1952000 ... tag=lñµ}Yç" - one real entry
                     # followed by address-shaped garbage, printed with no error.
                     $o = 8 + $i*80
                     $tg = -join (0..7 | ForEach-Object {
@@ -1863,7 +2041,7 @@ try {
             # Tier 7.2/7.7 (2026-10-18): failure isolation / graceful degradation.
             #
             # Before this existed, every abnormal condition ended in
-            # KeBugCheckEx — a feature hitting an unexpected state and the
+            # KeBugCheckEx - a feature hitting an unexpected state and the
             # machine being broken looked identical, and the price was a reboot
             # each time (12 of them in one day).
             #
@@ -2132,7 +2310,7 @@ try {
             }
         }
         'mem-watch' {
-            # Tier 4.6 (2026-10-17): NPF watchpoints — the debug-register superset.
+            # Tier 4.6 (2026-10-17): NPF watchpoints - the debug-register superset.
             #
             # x86 gives a debugger FOUR hardware breakpoints (DR0-DR3), and
             # software breakpoints need int3 (a code byte the target can see).
@@ -2232,7 +2410,7 @@ try {
             Write-Host ("mem-watch: {0} {1}" -f $v, $(if([BitConverter]::ToUInt64($out2,0)){'OK'}else{'FAILED'}))
         }
         'mem-time' {
-            # Tier 4.2 (2026-10-17): time-dimension control — O(1) snapshot/rollback.
+            # Tier 4.2 (2026-10-17): time-dimension control - O(1) snapshot/rollback.
             #
             # Keep several physical copies of one page and switch between them
             # by rewriting ONE NPT entry. Rollback costs a store, not a 4KB
@@ -2290,7 +2468,7 @@ try {
             # Tier 4.1/4.3 (2026-10-11): split-view memory + cross-process aliasing.
             #
             # 4.1: the SAME guest-physical page shows different content
-            #      depending on who reads it — the target sees its real frame,
+            #      depending on who reads it - the target sees its real frame,
             #      a registered observer sees a decoy frame.
             # 4.3: process A's VA points at process B's frame, established
             #      unilaterally (no IPC, no handle, neither process told).
@@ -2298,7 +2476,7 @@ try {
             # Both reduce to one primitive, and 9.311 measured that it works
             # on this CPU: rewriting an NPT entry so a GPA resolves to a
             # different SPA IS observed. (9.297/9.298's "NPT ignores software
-            # flushes" was about PERMISSION flips — a different mechanism.)
+            # flushes" was about PERMISSION flips - a different mechanism.)
             #
             # Selection is per-CORE (VMCB is per-VCPU), not per-access.
             # usage:
@@ -2388,7 +2566,7 @@ try {
             # of the transfer primitives: MmCopyMemory is APC_LEVEL max,
             # MmMapLockedPagesSpecifyCache and MmMapIoSpace are PASSIVE, and
             # MmGetVirtualForPhysical only maps system pages. What is left is
-            # the kernel's direct map — reading a frame becomes a plain load
+            # the kernel's direct map - reading a frame becomes a plain load
             # at (base + pa), which works at any IRQL.
             #
             # The base is not exported, so it is derived from two (VA, PA)
@@ -2437,7 +2615,7 @@ try {
             throw 'mem-island: usage: mem-island [init ...|read <pa> [len]]'
         }
         'mem-scan-rev' {
-            # Phase 4b (2026-10-11): reverse scan — find the VAs mapping a frame.
+            # Phase 4b (2026-10-11): reverse scan - find the VAs mapping a frame.
             # Forward scan asks "what is at this VA"; this asks "who points at
             # this frame". Engine A cannot express the second question: it has
             # no physical-address interface to search with.
@@ -2499,7 +2677,7 @@ try {
         'scan-pid' {
             # 206-C5 pilot helper: enumerate a foreign process's committed
             # PRIVATE read-write pages (VirtualQueryEx; kernel-mediated read,
-            # never hits the NPT write protection). Pure userland — the ctl
+            # never hits the NPT write protection). Pure userland - the ctl
             # device handle is opened only because this tool always requires
             # the driver service to be present.
             if ($null -eq $Arg1) { throw 'scan-pid: usage: scan-pid <pid> [count]' }
@@ -2545,7 +2723,7 @@ try {
             # (WriteProcessMemory). Under the current verdict semantics this
             # is a cpl=0 write with the TARGET's CR3 attached (MmCopyVirtual
             # Memory), so it takes the cpl==0/own-CR3 ALLOW branch and LANDS
-            # by design — run_c17 documents this as the known kernel-mediated
+            # by design - run_c17 documents this as the known kernel-mediated
             # trust gap, not as a failure.
             if ($null -eq $Arg1 -or $null -eq $Arg2 -or $null -eq $Arg3) {
                 throw 'wpm-write: usage: wpm-write <pid> <hex_va> <hex_val>'
@@ -2586,7 +2764,7 @@ try {
             }
         }
         'wpm-read' {
-            # 9.299 (C line): pure read of a target's 8 bytes — NO write.
+            # 9.299 (C line): pure read of a target's 8 bytes - NO write.
             # Needed to verify the sync guard's rollback: a write-based probe
             # (wpm-write with value 0) perturbs the page it is trying to
             # measure, and reads back before the 50ms poll can act.
