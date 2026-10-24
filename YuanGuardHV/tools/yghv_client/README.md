@@ -78,7 +78,7 @@ yghv_ctl.ps1 mem-scan-rev <pid> <hex_pa> [max] [start] [end]
 yghv_ctl.ps1 mem-island [init <va_a> <pa_a> <va_b> <pa_b> | read <hex_pa> [len]]
 yghv_ctl.ps1 npt-remap <hex_gpa> <hex_spa> [alt]
 yghv_ctl.ps1 mem-view [init|stop|split <gpa> <real> <decoy>|unsplit <gpa>|observer <cr3>|unobserver <cr3>|pick <cr3>]
-yghv_ctl.ps1 mem-watch [add <gpa> <r|w|rw>|del <gpa>|drain [max]|reset]
+yghv_ctl.ps1 mem-watch [add <gpa> <r|w|rw>|del <gpa>|drain [max]|snapshot [max]|reset]
 yghv_ctl.ps1 mem-time [track|untrack|snapshot|goto|current] <gpa> [ver]
 yghv_ctl.ps1 mem-cache [set|setalt|reset] <gpa> [mode]
 yghv_ctl.ps1 mem-bp [add|int3|dr|del|clear|drain] ...

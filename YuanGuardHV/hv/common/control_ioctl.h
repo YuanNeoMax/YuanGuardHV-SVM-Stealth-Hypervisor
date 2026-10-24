@@ -132,6 +132,17 @@ typedef struct {
    Zero-length input = 6 qwords diagnostics.
    32-byte input {ULONG op, pad, ULONG_PTR a, b, c}:
      op 0 add(gpa,kinds) / 1 remove(gpa) / 2 drain(a=max) / 3 reset */
+/* Tier 4.6 (2026-10-17): NPF-based watchpoints.
+   32-byte input {ULONG op, pad, ULONG_PTR a, b, c}:
+     op 0 add(a=gpa, b=kinds) / 1 remove(a=gpa)
+     op 2 drain  -> out[0]=count, out[1]=0,        then 4 qwords per event
+     op 3 reset stats
+     op 4 snapshot (9.368/A3, Tier 5.6) -> SAME LAYOUT as op 2, but:
+           out[0]=copied, out[1]=depth-before-copy, then 4 qwords per event.
+           NON-DESTRUCTIVE: does not advance the ring tail, so the same window
+           can be read again. Truncation is visible as copied < depth. A caller
+           that only ever snapshots and never drains will see `dropped` climb —
+           draining is what frees slots. */
 #define IOCTL_YGHV_WATCH \
     YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x820, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
 #define YGHV_WATCH_OUT_HDR_QWORDS 2

@@ -9886,3 +9886,63 @@ G31: hidecore hid 3/3, hide_fail=0, hash_fail=0
 ```
 
 **静态检查**：7/7 PASS。
+
+#### 9.368.7 A3 完成：Tier 5.6 执行轨迹 —— 从「只能读一次」变成「可重读」
+
+**问题**
+
+四个 S206 遥测环（`npf`/`deny`/`vr`/`dbg`）都经 `yghv_trace_u64` 写到 `progress.log`，
+写完**清零索引**。而 watch 环只有 `drain` —— 它推进 tail，读过的就没了。
+
+于是"轨迹"实际上只是一次性副作用：想换个角度看同一段窗口，做不到；想先查深度再分配
+缓冲，做不到。**只能读一次的轨迹是一行日志，不是轨迹。**
+
+**做了什么**
+
+`mem_watch.c` 新增两个非破坏性原语：
+
+```c
+uint32_t yghv_watch_snapshot(out, max);  // 按环顺序（最旧在前）拷贝，不动 head/tail
+uint32_t yghv_watch_depth(void);         // 当前保留多少条，不动任何东西
+```
+
+IOCTL `0x820` 新增 **op 4 = snapshot**，输出布局与 op 2 **完全相同**（客户端一套解析
+两用），语义不同：
+
+| | op 2 drain | op 4 snapshot |
+|---|---|---|
+| 推进 tail | 是 | 否 |
+| 同一窗口再读 | 空（正确）| 相同（这才是轨迹）|
+| `out[1]` | 恒 0 | 拷贝**前**的环深度，所以 `copied < depth` 能指出截断 |
+| 长期只做它 | 环不会满 | 环会满，`dropped` 会涨 —— drain 才是释放槽位的 |
+
+**决定性测试（G33，镜像 `206zE_a3`）**
+
+两次快照**逐字相同**，drain 一次后清空，再 store 只出现新事件：
+
+```
+三个 g33 的 foreign store 后： recorded=3
+
+DECISIVE 1  快照 #1: 3 event(s) of 3 retained
+            快照 #2: 3 event(s) of 3 retained
+            [0][1][2] 三次 cr3/rip/gpa 完全一致   -> 非破坏性 ✔
+
+DECISIVE 2  drain #1: 3 event(s)
+            drain #2: 0 event(s)                  -> 真的消耗 ✔
+
+再次 store 后  snapshot: 1 event(s) of 1 retained
+            -> 旧窗口确实被清掉了 ✔
+
+OVERALL: ALL PASS
+```
+
+每条事件实测都带 `cpl=3`、`kind=W`、真实的 `cr3`/`rip`/`gpa` ——
+即它是 **guest 的写**，不是驱动自己 cpl=0 的访问。
+
+**为什么这条测试必须是"两次读同一窗口"**
+
+只断言「snapshot 返回了事件」的话，drain、一个返回常量的桩、一个永不推进的环
+**全部能通过**。唯一能把两者分开的性质就是「第二次读还在不在」，所以测试要求的
+是两个相反的结果同时成立。
+
+**静态检查**：7/7 PASS。

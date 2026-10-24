@@ -1399,9 +1399,68 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
                 break;
             }
             case 3: yghv_watch_stats_reset(); ok = 1; break;
+            case 4: {
+                /*
+                 * 9.368 (A3, Tier 5.6): op 4 = NON-DESTRUCTIVE trace snapshot.
+                 *
+                 * op 2 drains: it advances the ring tail, so the events are gone
+                 * afterwards. That is a queue read. A trace needs to be re-read:
+                 * look at a different slice of the same window, save it twice,
+                 * size a buffer from the real depth first.
+                 *
+                 * Same output layout as op 2 (so a client can parse either with
+                 * one function), different semantics:
+                 *   op 2  consumes; yghv_watch_dropped stops climbing while you drain
+                 *   op 4  copies;   yghv_watch_dropped keeps climbing if you only
+                 *                   ever snapshot, because the ring fills up
+                 *
+                 * out[0] = events copied, out[1] = depth BEFORE the copy (so a
+                 * truncation is visible: copied < depth means the output buffer
+                 * was too small, not that the ring was nearly empty).
+                 */
+                uint32_t maxev, got, depth;
+                yghv_watch_event_t *ev;
+
+                if (out_len <= YGHV_WATCH_OUT_HDR_QWORDS * sizeof(UINT64)) {
+                    ok = 0;
+                    break;
+                }
+                maxev = (uint32_t)((out_len - YGHV_WATCH_OUT_HDR_QWORDS * sizeof(UINT64)) /
+                                   (4 * sizeof(UINT64)));
+                if (a && a < maxev)
+                    maxev = (uint32_t)a;
+                depth = yghv_watch_depth();
+                ev = (yghv_watch_event_t *)ExAllocatePoolWithTag(
+                    NonPagedPoolNx, (SIZE_T)maxev * sizeof(*ev), 'WCHG');
+                if (!ev) {
+                    ok = 0;
+                    break;
+                }
+                got = yghv_watch_snapshot(ev, maxev);
+                out[0] = (UINT64)got;
+                out[1] = (UINT64)depth;
+                if (got) {
+                    UINT64 *dst = out + YGHV_WATCH_OUT_HDR_QWORDS;
+                    uint32_t i;
+                    for (i = 0; i < got; i++) {
+                        dst[i*4+0] = ev[i].cr3;
+                        dst[i*4+1] = ev[i].rip;
+                        dst[i*4+2] = ev[i].gpa;
+                        dst[i*4+3] = (UINT64)ev[i].kind |
+                                     ((UINT64)ev[i].cpl << 8);
+                    }
+                    info = (ULONG)(YGHV_WATCH_OUT_HDR_QWORDS * sizeof(UINT64) +
+                                   (SIZE_T)got * 4 * sizeof(UINT64));
+                } else {
+                    info = YGHV_WATCH_OUT_HDR_QWORDS * sizeof(UINT64);
+                }
+                ExFreePoolWithTag(ev, 'WCHG');
+                status = STATUS_SUCCESS;
+                break;
+            }
             default: ok = 0; break;
             }
-            if (op != 2) {
+            if (op != 2 && op != 4) {
                 out[0] = (UINT64)(ok ? 1 : 0);
                 info = 8;
             }

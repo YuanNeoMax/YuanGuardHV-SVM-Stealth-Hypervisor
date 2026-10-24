@@ -297,6 +297,74 @@ uint32_t yghv_watch_drain(yghv_watch_event_t *out, uint32_t max) {
     return n;
 }
 
+/* ============================================================================
+ * 9.368 (A3, Tier 5.6): NON-DESTRUCTIVE TRACE EXPORT.
+ * ==========================================================================*/
+
+/*
+ * The drain above is a QUEUE CONSUMER: it advances the tail, so an event read
+ * once is gone. That is the right shape for "give me what happened since I last
+ * asked", and the wrong shape for a trace, where the question is "show me the
+ * whole window again so I can look at a different part of it".
+ *
+ * Measured cost of not having both: the four S206 rings
+ * (npf/deny/vr/dbg) flush to progress.log through yghv_trace_u64 and then zero
+ * their indices, so a second look is impossible and the trace exists only as a
+ * one-shot side effect of unload. A trace you can only read once is a log line,
+ * not a trace.
+ *
+ * This copies up to `max` retained events IN RING ORDER (oldest first) without
+ * touching head or tail. The producer keeps writing while it runs, so the
+ * snapshot can gain events at the end — which is why the count is returned
+ * rather than assumed, and why the caller must treat it as "at least this many
+ * were present when I started reading".
+ *
+ * ISLAND-SAFE IN THE READ DIRECTION: plain loads of a single-producer ring. A
+ * torn event can only mean one event is old or repeated, never a crash — the
+ * same tolerance yghv_watch_match already relies on.
+ */
+uint32_t yghv_watch_snapshot(yghv_watch_event_t *out, uint32_t max) {
+    uint32_t n = 0;
+    LONG head, tail, count, i;
+
+    if (!out || !max)
+        return 0;
+
+    head  = InterlockedCompareExchange(&g_ring_head, 0, 0);
+    tail  = InterlockedCompareExchange(&g_ring_tail, 0, 0);
+
+    /* Ring order: the oldest retained event is at `tail`, the newest is at
+     * `head - 1`. `head - tail` is what is retained; the ring can only hold
+     * YGHV_WATCH_RING - 1 entries because one slot is the "full" sentinel. */
+    count = head - tail;
+    if (count <= 0)
+        return 0;
+    if (count > (LONG)(YGHV_WATCH_RING - 1))
+        count = (LONG)(YGHV_WATCH_RING - 1);
+
+    for (i = 0; i < count && n < max; i++) {
+        out[n++] = g_ring[(tail + i) & (YGHV_WATCH_RING - 1)];
+    }
+    return n;
+}
+
+/*
+ * How many events the ring is holding right now, without moving anything.
+ * Separate from stats_get because `recorded` is cumulative and a caller sizing a
+ * snapshot buffer needs the CURRENT depth.
+ */
+uint32_t yghv_watch_depth(void) {
+    LONG head = InterlockedCompareExchange(&g_ring_head, 0, 0);
+    LONG tail = InterlockedCompareExchange(&g_ring_tail, 0, 0);
+    LONG count = head - tail;
+
+    if (count <= 0)
+        return 0;
+    if (count > (LONG)(YGHV_WATCH_RING - 1))
+        count = (LONG)(YGHV_WATCH_RING - 1);
+    return (uint32_t)count;
+}
+
 void yghv_watch_stats_get(yghv_watch_stats_t *out) {
     if (!out)
         return;

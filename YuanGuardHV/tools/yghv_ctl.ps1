@@ -2147,7 +2147,8 @@ try {
             #   mem-watch                      diagnostics
             #   mem-watch add <hex_gpa> <r|w|rw>
             #   mem-watch del <hex_gpa>
-            #   mem-watch drain [max]
+            #   mem-watch drain [max]      consume: the events are gone after this
+            #   mem-watch snapshot [max]   non-destructive: read the same window again
             #   mem-watch reset
             if ($null -eq $Arg1) {
                 $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x820)) -OutputLength 48
@@ -2164,7 +2165,8 @@ try {
                 'del'   { $op = 1 }
                 'drain' { $op = 2 }
                 'reset' { $op = 3 }
-                default { throw 'mem-watch: use add|del|drain|reset' }
+                'snapshot' { $op = 4 }
+                default { throw 'mem-watch: use add|del|drain|snapshot|reset' }
             }
             if ($op -eq 0) {
                 if ($null -eq $Arg2 -or $null -eq $Arg3) { throw 'mem-watch add: usage: mem-watch add <hex_gpa> <r|w|rw>' }
@@ -2178,7 +2180,7 @@ try {
             } elseif ($op -eq 1) {
                 if ($null -eq $Arg2) { throw 'mem-watch del: usage: mem-watch del <hex_gpa>' }
                 $a = [Convert]::ToUInt64(("$Arg2" -replace '^0[xX]',''),16)
-            } elseif ($op -eq 2) {
+            } elseif ($op -eq 2 -or $op -eq 4) {
                 $a = 32
                 if ($null -ne $Arg2) { $a = [uint64]::Parse($Arg2) }
             }
@@ -2188,11 +2190,27 @@ try {
             [BitConverter]::GetBytes([uint64]$a).CopyTo($req, 8)
             [BitConverter]::GetBytes([uint64]$b).CopyTo($req, 16)
 
-            if ($op -eq 2) {
+            if ($op -eq 2 -or $op -eq 4) {
+                # 9.368 (A3, Tier 5.6): op 4 uses the SAME layout as op 2 and one
+                # parse path serves both. The difference is not in the bytes, it is
+                # in out[1]:
+                #   op 2 drain     -> out[1] is always 0 (a drain either got them or
+                #                     the ring was empty)
+                #   op 4 snapshot  -> out[1] = ring depth BEFORE the copy, so
+                #                     `copied < depth` names a truncated buffer
+                #                     instead of looking like an empty ring
                 $outLen = 16 + [int]$a * 32
                 $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x820)) -InBytes $req -OutputLength $outLen
                 $got = [BitConverter]::ToUInt64($out, 0)
-                Write-Host ("mem-watch drain: {0} event(s)" -f $got)
+                $depth = [BitConverter]::ToUInt64($out, 8)
+                if ($op -eq 4) {
+                    Write-Host ("mem-watch snapshot: {0} event(s) of {1} retained (non-destructive)" -f $got, $depth)
+                    if ($got -lt $depth) {
+                        Write-Host ("  TRUNCATED: pass a larger max (currently {0}) to read all {1}" -f $a, $depth)
+                    }
+                } else {
+                    Write-Host ("mem-watch drain: {0} event(s)" -f $got)
+                }
                 for ($i = 0; $i -lt $got; $i++) {
                     $o = 16 + $i*32
                     $cr3  = [BitConverter]::ToUInt64($out, $o)

@@ -87,6 +87,29 @@ void yghv_watch_record(uint64_t cr3, uint64_t rip, uint64_t gpa,
 /* Drain up to `max` events into `out`. PASSIVE. Returns the count. */
 uint32_t yghv_watch_drain(yghv_watch_event_t *out, uint32_t max);
 
+/*
+ * 9.368 (A3, Tier 5.6): NON-DESTRUCTIVE copy of the retained trace.
+ *
+ * drain() is a queue consumer — an event read once is gone. A trace needs the
+ * opposite: read the same window again, look at a different part of it, size a
+ * buffer before allocating. So:
+ *
+ *   yghv_watch_snapshot(out, max)  copies up to `max` events in ring order
+ *                                  (oldest first) and does NOT advance tail.
+ *                                  Returns how many were copied.
+ *   yghv_watch_depth(void)         how many events are retained right now,
+ *                                  without moving anything.
+ *
+ * The producer keeps writing while the copy runs, so a snapshot may gain events
+ * at its end; the returned count is "at least this many were present when the
+ * read started". A torn event can only mean one entry is old or repeated.
+ *
+ * NOT a substitute for drain(): draining is what frees slots. A caller that only
+ * ever snapshots will eventually see yghv_watch_dropped climb.
+ */
+uint32_t yghv_watch_snapshot(yghv_watch_event_t *out, uint32_t max);
+uint32_t yghv_watch_depth(void);
+
 /* Diagnostics */
 typedef struct {
     uint64_t pages;
