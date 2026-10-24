@@ -1,7 +1,7 @@
 # YuanGuardHV 新窗口恢复提示词
 
 > 生成时间: 2026-10-18 19:50
-> 仓库根: `D:\yuanguard` | 分支: `main` | HEAD: `fb32cbf`
+> 仓库根: `D:\yuanguard` | 分支: `main` | 代码 HEAD: `fb32cbf`（其上一条是本恢复提示词的 docs 提交）
 > 本文件用于在新会话中无缝接管。**先读完本文件再动手。**
 
 ---
@@ -47,6 +47,13 @@ set YGHV_206B_COEXIST=1
 set YGHV_206B_GNPT=1
 cd /d D:\yuanguard\YuanGuardHV && build.bat
 ```
+
+> **⚠ 每次构建 md5 都会变 —— 这不是回归。**
+> `build.bat` 每次重新签名，PE 头里的 `TimeDateStamp`（0xE8）、`CheckSum`（0x138）、
+> debug directory、证书表指针、PKCS#7 签名都会变，共约 323 字节，**全部在元数据区**。
+> 实测：同一份代码两次构建，**代码段 0x400..0x24E54 差异字节 = 0**。
+> 比对是否同一份代码要**比 .map** 或**比代码段**，不要比文件 md5。
+> `206zA_why` 归档的 `86DF8BBE` 是那一次签名的产物，重建会得到不同的值。
 编译器 `clang-cl`，`CFLAGS=/nologo /O2 /kernel /GR- /EHs-c- /Zl /GS-`
 另有 `-Werror=return-type -Werror=implicit-function-declaration`（**不是全部警告**，内核内建产生 208 个）。
 
@@ -262,13 +269,15 @@ typedef char assert_exact[(sizeof(region_t) == 4096) ? 1 : -1];
 
 ```powershell
 cd D:\yuanguard
-git log --oneline -3            # 应为 fb32cbf
+git log --oneline -3            # 最新两条应含 docs: 恢复提示词
 git status --porcelain          # 应为空
 cd D:\yuanguard\YuanGuardHV
 $env:YGHV_BAREMETAL_STEP=206; $env:YGHV_206B_COEXIST=1; $env:YGHV_206B_GNPT=1
 .\build.bat                      # 应 6 个 PASS + Build SUCCESS
 ```
-确认 `bin\yuanguard_hv.sys` md5 = `86DF8BBE`。
+确认构建成功（6 个 PASS + Build SUCCESS）。
+**不要用 md5 校验** —— 每次构建都会因重新签名而变（见第 2 节的说明）。
+若要确认代码未变，比 `.map` 或比代码段 0x400..0x24E54。
 
 然后读：
 1. `docs/KERNEL_API_CHECKLIST.md` §27（VA/PA 三处）与 §28（页精确/具名）—— **最易重犯**
@@ -276,3 +285,67 @@ $env:YGHV_BAREMETAL_STEP=206; $env:YGHV_206B_COEXIST=1; $env:YGHV_206B_GNPT=1
 3. 本文件第 4 节（架构约束）
 
 **动手前先问用户要做什么。不要自动开始剩余项。**
+
+---
+
+## 11. 累积已验证历史（全部在实机跑过，零崩溃）
+
+```
+Phase 1                 6/6
+Phase 2-5 W1-W8        10/10
+Phase 7  C1-C6          7/7
+Phase 4b D1-D6          6/6
+Phase 6  E1-E6          6/6
+Tier 4.1                9/9
+Tier 4.3                9/9
+Tier 4.2                8/8
+Tier 4.4                7/7    （三机制：NPF/INT3/DR）
+Tier 4.5                7/7    （见 9.2xx）
+Tier 4.6                4/4    （见 9.2xx）
+Tier 4 合计            24/24   （4.4 三机制 + 4.5 + 4.6）
+Tier 7.2 / 7.7          8/8    （故障隔离 + 优雅降级）
+Tier 7.1 / 7.3          9/9    （自隐藏 + 完整性自检）
+Tier 7 全功能          13/13   ★ 当前
+SOAK(旧)               10.2 min STABLE
+```
+
+**近期镜像归档**（`D:\aaaaaavm\`，按时间）：
+
+| 镜像 | md5 | 说明 |
+|---|---|---|
+| `206y6_nohot` | 585A71AE | Tier 7 13/13 首通（g_bp 排除） |
+| `206y9_guarded` | F797728B | g_bp 护栏 + 断言 |
+| `206z1_final` | F93496F2 | 三项收口 |
+| `206z3_bphidden` | 8424FB4D | g_bp 可隐藏 |
+| `206z4_assert` | 6C408DD2 | hot/cold 页精确 |
+| `206z6_vafix` | FB8DD42E | VA/PA 首次修复 |
+| `206z8_vafull` | CEF35E62 | 三处 VA/PA 全修 |
+| `206z9_pageexact` | AA3F774F | frame/view 页精确 |
+| **`206zA_why`** | **86DF8BBE** | **当前 HEAD，含 state_why 诊断** |
+
+共 130+ 个历史镜像可回溯（`206a` … `206zA`）。
+
+---
+
+## 12. 目录结构速查
+
+```
+D:\yuanguard\
+├─ docs\
+│  ├─ YUANMOD_HANDOFF_CURRENT.md   9337 行，章节到 9.365  ← 权威交接记录
+│  ├─ KERNEL_API_CHECKLIST.md       873 行，28 章         ← 内核 API 红线
+│  └─ RESUME_PROMPT.md                                    ← 本文件
+├─ YuanGuardHV\
+│  ├─ hv\           驱动源码（.c/.cpp/.h）
+│  ├─ hv\common\    共享头（control_ioctl.h / mem_bp.h / yghv_guard.h ...）
+│  ├─ tests\        6 个静态检查 .ps1
+│  ├─ tools\        yghv_ctl.ps1 (55 命令) + yghv_client (Java 18)
+│  ├─ bin\          构建产物 yuanguard_hv.sys + .map
+│  └─ build.bat     clang-cl + link
+└─
+
+D:\aaaaaavm\                       测试脚本与镜像归档
+├─ g20..g29_*.ps1                测试脚本（g25/g26/g28/g29 是当前主力）
+├─ yuanguard_hv_step206*.sys     130+ 历史镜像
+└─ doc_93xx.md                   章节草稿（已并入 HANDOFF）
+```
