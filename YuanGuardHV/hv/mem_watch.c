@@ -8,20 +8,95 @@
 #include "mem_bp.h"
 #include "npt.h"
 
-static yghv_watch_page_t  g_watch[YGHV_WATCH_MAX_PAGES];
-static volatile LONG      g_watch_count;
+/*
+ * 9.366: PAGE-EXACT. These three objects were interleaved on ONE page by the
+ * linker, together with mem_view's observer table, so the page carried the hot
+ * state of two independent mechanisms and nothing said so.
+ *
+ * Measured on the .map before this change (page 0x34000, 12 symbols):
+ *
+ *     g_watch, g_watch_count, g_ring, g_ring_head, g_ring_tail,
+ *     g_watch_dropped, g_view_page_count, g_view_obs_count, g_view_observers,
+ *     g_view_installs, g_view_to_alt, g_view_to_main
+ *
+ * Every one of those is read or written INSIDE SvHandleVmExit: the watch tables
+ * by yghv_watch_match/record, the view table by yghv_view_pick_ncr3, which runs
+ * on every VMEXIT to choose the NCR3. So a single page held the hit path of both
+ * mechanisms, and the same page would have been the hide target of either.
+ *
+ * The 15th crash is the general form of that: hiding a page removes it from the
+ * driver too, so an object smaller than its page takes its neighbours with it.
+ * DECLSPEC_ALIGN(4096) only aligns the START — the 384-byte watch table still
+ * left 3712 bytes for the linker to fill. Making each object EXACTLY its pages
+ * leaves nothing to fill (docs/KERNEL_API_CHECKLIST.md §28.1).
+ */
+typedef union {
+    yghv_watch_page_t entries[YGHV_WATCH_MAX_PAGES];
+    uint8_t           page[4096];
+} yghv_watch_region_t;
 
-/* Event ring. Single producer (the island) appends; a PASSIVE reader drains.
+/* The scalars the island touches on every fault, exactly one page. */
+typedef struct {
+    volatile LONG   count;
+    volatile LONG   ring_head;    /* next write slot */
+    volatile LONG   ring_tail;    /* next read slot  */
+    volatile LONG64 total;
+    volatile LONG64 recorded;
+    volatile LONG64 dropped;
+    volatile LONG64 seq;
+} yghv_watch_hot_t;
+
+typedef union {
+    yghv_watch_hot_t s;
+    uint8_t          page[4096];
+} yghv_watch_hot_region_t;
+
+/*
+ * Event ring. Single producer (the island) appends; a PASSIVE reader drains.
  * Both indices are volatile LONGs and the writes are ordered so a reader
- * never sees an entry before its fields are filled. */
-static yghv_watch_event_t g_ring[YGHV_WATCH_RING];
-static volatile LONG      g_ring_head;    /* next write slot */
-static volatile LONG      g_ring_tail;    /* next read slot  */
+ * never sees an entry before its fields are filled.
+ *
+ * 256 * 48 = 12288 = exactly three pages, asserted below, so its tail leaves no
+ * spare bytes for a cold scalar to land in.
+ */
+typedef union {
+    yghv_watch_event_t entries[YGHV_WATCH_RING];
+    uint8_t            page[sizeof(yghv_watch_event_t) * YGHV_WATCH_RING];
+} yghv_watch_ring_region_t;
 
-static volatile LONG64 g_watch_total;
-static volatile LONG64 g_watch_recorded;
-static volatile LONG64 g_watch_dropped;
-static volatile LONG64 g_watch_seq;
+DECLSPEC_ALIGN(4096) static yghv_watch_region_t      g_watch_region;
+DECLSPEC_ALIGN(4096) static yghv_watch_hot_region_t  g_watch_hot;
+DECLSPEC_ALIGN(4096) static yghv_watch_ring_region_t g_watch_ring;
+
+/* Separation so the linker has no neighbour to place flush against the region.
+ * The exact-size assertion already forbids a remainder; these make the layout
+ * independent of allocation order as well. */
+DECLSPEC_ALIGN(4096) static yghv_watch_region_t      g_watch_pad;
+DECLSPEC_ALIGN(4096) static yghv_watch_hot_region_t  g_watch_hot_pad;
+DECLSPEC_ALIGN(4096) static yghv_watch_ring_region_t g_watch_ring_pad;
+
+#define g_watch        (g_watch_region.entries)
+#define g_watch_count  (g_watch_hot.s.count)
+#define g_ring_head    (g_watch_hot.s.ring_head)
+#define g_ring_tail    (g_watch_hot.s.ring_tail)
+#define g_watch_total  (g_watch_hot.s.total)
+#define g_watch_recorded (g_watch_hot.s.recorded)
+#define g_watch_dropped  (g_watch_hot.s.dropped)
+#define g_watch_seq      (g_watch_hot.s.seq)
+#define g_ring         (g_watch_ring.entries)
+
+/* Page-exactness is a BUILD property, not something to re-derive from the map
+ * after a crash: an object that outgrows its page silently re-acquires
+ * neighbours, which is precisely the condition this separation exists to end. */
+_Static_assert(sizeof(yghv_watch_page_t) <= 4096, "watch page entry fits a page");
+_Static_assert(sizeof(yghv_watch_region_t) == 4096, "g_watch is exactly one page");
+_Static_assert(sizeof(yghv_watch_hot_t) <= 4096, "watch hot scalars fit a page");
+_Static_assert(sizeof(yghv_watch_hot_region_t) == 4096, "watch hot region is exactly one page");
+_Static_assert((sizeof(yghv_watch_event_t) * YGHV_WATCH_RING) % 4096 == 0,
+               "watch ring is whole pages");
+_Static_assert(sizeof(yghv_watch_ring_region_t) ==
+               sizeof(yghv_watch_event_t) * YGHV_WATCH_RING,
+               "watch ring region is exact");
 
 static int yghv_watch_find(uint64_t gpa) {
     int i;

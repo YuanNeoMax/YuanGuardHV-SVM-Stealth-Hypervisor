@@ -1,7 +1,8 @@
 # YuanGuardHV 新窗口恢复提示词
 
-> 生成时间: 2026-10-18 19:50
-> 仓库根: `D:\yuanguard` | 分支: `main` | 代码 HEAD: `fb32cbf`（其上一条是本恢复提示词的 docs 提交）
+> 更新时间: 2026-10-18 23:55（9.366 四项收口后）
+> 仓库根: `D:\yuanguard` | 分支: `main`
+> 用 `git rev-list --count @{u}..HEAD` 查当前领先提交数，`git log --oneline -3` 查 HEAD —— 不要写死。
 > 本文件用于在新会话中无缝接管。**先读完本文件再动手。**
 
 ---
@@ -10,8 +11,15 @@
 
 AMD-V SVM/NPT 隐形 Hypervisor 已完成 **Tier 7 全功能（13/13 PASS）**，
 `g_bp`/`g_frame`/`g_view_pages` 三张表**可以隐藏**（含热路径在隐藏下存活），
-隐藏路径 10 分钟 soak **STABLE**（78 轮 / 0 hang / 0 失败 / probes 0→9）。
-当前镜像 `206zA_why`（md5 `86DF8BBE`）。**本地领先远程一批提交（用 `git rev-list --count @{u}..HEAD` 查，别写死数字——文档本身也在提交）。**
+隐藏路径 10 分钟 soak **STABLE**。
+
+9.366 之后：**Tier 7.4/7.5/7.6 的 wiring 已接通**（escape 与 attack-surface 不再恒为 0）、
+**诱饵语义首次被真正验证**（`mmf-read`：guest cpl=3 读隐藏页得 `0x0`）、
+**10 个模块状态区页精确化**（新增 `page_layout_check` 规则 4）、
+**位置式指针表改为构建失败**。当前镜像 `206zB_pageexact`（md5 每次构建都变，**比 .map**）。
+
+> **所有者的 1 分钟多核 soak 是 DECOY 路径的**（`probes=0` 是机制正确，不是没跑）。
+> 详见 9.366.7 —— 不要把那条判词读成"ALLOW 循环在 4 核下存活"。
 
 ---
 
@@ -69,14 +77,17 @@ cd /d D:\yuanguard\YuanGuardHV && build.bat
 
 ---
 
-## 3. 当前验证矩阵（镜像 `206zA_why` / 86DF8BBE）
+## 3. 当前验证矩阵（镜像 `206zB_pageexact`）
 
 ```
-G25  Tier 7 全功能          13/13 ALL PASS
+G25  Tier 7 全功能          13/13 ALL PASS   ← T7/T9/T10 已重写
 G26  bp-after-hide           3/3  PASS
 G29  arm→hide→trigger        PASS (hid 3, hide_fail=0, drain saw NPF)
-G28  隐藏路径 10 分钟 soak   STABLE (78 轮, 0 hang, 0 失败, probes 0→9)
-静态检查                     6 个 PASS
+G30  诱饵语义 + 7.4/7.6 接线 ALL PASS        ← 新增，决定性
+G31  hidecore 归因           hid 3 / hide_fail=0    ← 新增，诊断
+G32  多核隐藏 soak 1 分钟    STABLE (4 worker, 1209 写, hidden 11/11)
+G28  隐藏路径 10 分钟 soak   STABLE（9.365 的结论，本轮未复跑）
+静态检查                     7 个 PASS
 ```
 
 | 测试 | 脚本 | 用途 |
@@ -138,16 +149,53 @@ Get-ChildItem 'C:\' -Filter 'yghv*' | ForEach-Object { Remove-Item $_.FullName -
 
 ### 4.5 返回 0 无法区分"拒绝"与"无事可做"
 
-必须用计数器交叉验证。`hide_fail` 位掩码（9.365）：
+必须用计数器交叉验证。`hide_fail` 位掩码：
 ```
 0x10 早退（ALLOW 循环未武装，正确的拒绝）  1 split 失败  2 perm 失败
 3 页是guard状态  4 无guard条目  5 已隐藏  0x20 循环未跑
 ```
-`hash_fail` 现在承载 `state_why` 位掩码：
+`hash_fail` 承载 `state_why` 位掩码：
 ```
-0x01 跨度  0x02 code_start  0x04 code_size  0x08 decoy_pa
+0x01 某个具名 guard 对象占这一页（9.366 起，不再是"在某两个地址之间"）
+0x02 code_start  0x04 code_size  0x08 decoy_pa
 0x10 decoy_va  0x20 npt  0x40 protect
 ```
+**要单页归因，不要重建加载**：`sys-guard why <hex_pa>`（IOCTL 0x826 op 7）一次问清
+三套判定，只读、不做隐藏。9.366 靠它一次定位"frame-table 页被拒"。
+
+### 4.6 ★ 页归属判定必须是**对象清单**，不能是数值区间
+
+`yghv_guard_state_page()` 曾经用 `[g_guard 的物理地址, g_guard_count 的物理地址]`
+这个**数值区间**表示"guard 自己的状态"。链接器排 RVA，内存管理器排物理页 ——
+`.map` 上只占两页的区间，运行时能覆盖一大片无关的活分配。
+
+实测（9.366）：frame-table 的物理页恰好排进区间 → hidecore 只隐藏 2/3，
+`hide_fail=3` + `hash_fail=1`，而 bp/view 两页在区间外、正常隐藏。
+
+**现在的形式**：每个对象 `yghv_guard_state_add(&X, sizeof(X))` 登记一次，
+判定是"有没有已登记的对象占这一页"。新增状态必须登记，否则它可被隐藏。
+
+### 4.7 ★ 岛内读取的状态区必须页精确，且不与他模块共页
+
+不是"隐藏目标"才需要页精确。VMEXIT 处理器每次故障**读**的那些模块状态
+（watch 环、view 选择、fail 计数、sentry 计数、protect 表）同样需要：
+一个页上有两套机制的热状态，隐藏它就会连带移除"决定怎么处理故障"的东西。
+
+`page_layout_check` **规则 4** 检查这条（按 `.map` 的 obj 文件判定跨模块）。
+
+### 4.8 ★ 两种隐藏机制产生**两种可观测结果**，测试必须按机制判定
+
+外来页由 `yghv_guard_mode_for()` 按**归属**分类，只有 guard 状态与三张表是
+"我们的"，其余一律 **DECOY**。
+
+```
+DECOY  叶子仍 present，指向零页  → guest 读 0x0，写入被丢弃，**不发 #NPF**
+                                  → probes / escapes 都不会动（正确行为）
+UNMAP  清 present                → 每次访问 #NPF → 处理器运行 → probes 增长
+```
+
+**把"必须增长"写成断言，等于断言本次走了 UNMAP。** 9.366 在这上面栽了两次
+（G30 的 probes、G25 的 T9）。修法：先判机制，再要求与该机制相符的后续。
 
 ---
 
@@ -155,16 +203,20 @@ Get-ChildItem 'C:\' -Filter 'yghv*' | ForEach-Object { Remove-Item $_.FullName -
 
 | 文件 | 说明 |
 |---|---|
-| `YuanGuardHV\hv\yghv_guard.c` (1477 行) | Tier 7.1/7.3；`state_page`/`target_page`/`do_hide`/`hide_core`/`arm_core` |
+| `YuanGuardHV\hv\yghv_guard.c` | Tier 7.1/7.3；`state_page`/`state_why`/`state_add`/`target_page`/`do_hide`/`hide_core`/`arm_core` |
 | `YuanGuardHV\hv\mem_bp.c` | 断点；**热/冷分离**（`g_bp_region`/`g_hot`/`g_ring_region`）|
 | `YuanGuardHV\hv\mem_frame.c` | **页精确** `g_frame_region` |
-| `YuanGuardHV\hv\mem_view.c` | **页精确** `g_view_region` |
+| `YuanGuardHV\hv\mem_view.c` | **页精确** `g_view_region` + `g_view_hot` |
+| `YuanGuardHV\hv\mem_watch.c` | **页精确** `g_watch_region`/`g_watch_hot`/`g_watch_ring` |
+| `YuanGuardHV\hv\yghv_sentry.c` | 7.4/7.5/7.6；**页精确** `g_sentry_hot`/`g_sentry_surface`；`surface_arm_intercepts` |
+| `YuanGuardHV\hv\yghv_fail.c` | 7.2/7.7；**页精确** `g_fail`（环索引是 struct 字段，不是旁边的变量）|
+| `YuanGuardHV\hv\mem_time.c` / `mem_cache.c` | **页精确** `g_time_region` / `g_cache_region` |
 | `YuanGuardHV\hv\mem_engine.c` | **具名初始化器**（`.read = ` / `.write = `）|
 | `YuanGuardHV\hv\npt_core.c` | `npt_split_2mb_to_4kb` / `npt_set_page_perm` / `npt_exclude_pa` |
 | `YuanGuardHV\hv\protect.c` | `yghv_protect_page_is_npt()` (PA-correct)；2MB→4KB 分裂 |
 | `YuanGuardHV\hv\svm_simplevm206.cpp` (3377 行) | **自有 include 方案**；guard 分支 L1389；#DB re-hide L1941/1945 |
 | `YuanGuardHV\hv\common\control_ioctl.h` | IOCTL 0x800–0x828 |
-| `YuanGuardHV\tools\yghv_ctl.ps1` | PS 命令 55 |
+| `YuanGuardHV\tools\yghv_ctl.ps1` | PS 命令 56（9.366 新增 `mmf-read`、`sys-guard why`）|
 | `YuanGuardHV\tools\yghv_client\YghvCtl.java` | Java FN_ 18 |
 
 **静态检查**（`YuanGuardHV\tests\`）：
@@ -172,8 +224,17 @@ Get-ChildItem 'C:\' -Filter 'yghv*' | ForEach-Object { Remove-Item $_.FullName -
 run_source_checks.ps1 → ioctl_parity / command_parity / safety_checks / irql_contract_check
 run_map_checks.ps1    → page_layout_check
 ```
+- `irql_contract_check`：岛内可达集 + 指针表目标 + **位置式表 = 构建失败**（9.366）
+- `page_layout_check`：隐藏表页独占 + 页对齐 + **规则 4：岛内读取区域页对齐且不跨模块共页**
+  —— 解析到 0 个拒绝符号时**直接 throw**，否则空清单会让每一页都显得合法
 
-**接口计数**（build 报告）：`C=41 PowerShell=41 Java=41`（IOCTL），`PowerShell=55 Java=18`（命令）
+**接口计数**（build 报告）：`C=41 PowerShell=41 Java=41`（IOCTL），`PowerShell=56 Java=18`（命令）
+
+**9.366 新增的两个原语**：
+- `sys-guard why <hex_pa>` —— 只读归因（IOCTL `0x826` op 7），一次问清 `state_why` /
+  `target_page` / guard slot / hidden / hide_mode。定位"哪个表的页被拒"靠它，不靠重建加载。
+- `mmf-read <path>` —— guest 侧读（`mmf-write` 的另一半）。判诱饵必须用它：`mem-read`
+  走驱动、由 ALLOW 循环服务，两种机制下都返回一个 value 字符串。
 
 ---
 
@@ -203,12 +264,16 @@ typedef char assert_exact[(sizeof(region_t) == 4096) ? 1 : -1];
 位置式初始化器把成员语义和位置绑死，重排字段静默交换 `read`/`write`。
 **改具名，验证方式是"字段对调后仍精确指名"。**
 
-### 6.6 ★ 测试断言了自己的假设（**四次记录在案**）
+### 6.6 ★ 测试断言了自己的假设（**七次记录在案**）
 1. soak 偏移越界 → `STATUS_INVALID_PARAMETER`（把测试的错当成驱动缺陷）
 2. 负向测试注入到 `hide_core` —— 但它**不在岛内**，正确的检查看起来失灵
 3. T12 无条件要求 `add OK`，而正确行为是 `REFUSED`（注册表已隐藏）
 4. soak 无条件要求 `bp add OK`，同上 —— 报 14 failures / FAILED，
    而实际 hidden 3/3、probes 前进、零 hang
+5. G30 的诱饵检查调 `hidecore`（隐藏我们自己的三张表）然后读 guest 的 section ——
+   **没有任何机制被要求隐藏那一页**，于是读到种子值、报 NOT HIDDEN（9.366）
+6. G30 无条件要求 `probes` 增长，而 DECOY 模式**不产生 fault** —— 不增长是机制正确
+7. G25 的 T9 无条件要求 `escapes>0`，而它在 T7 之前跑，那个位置的正确输出就是 0
 
 **共同点**：断言写的是"我以为会发生的"，而不是"契约允许的"。
 
@@ -220,6 +285,12 @@ typedef char assert_exact[(sizeof(region_t) == 4096) ? 1 : -1];
 
 > 写负向测试前先确认：**注入点确实在检查的作用域内**。
 > 写正向断言前先问：**这个操作在当前状态下有几种合法结局**。
+> **问机制前先确定本次走的是哪条机制** —— 一个只对 UNMAP 成立的断言，
+> 在 DECOY 下报的是测试的错。
+>
+> ★ **别把机制名和 PASS/FAIL 存在同一个槽里**。PowerShell 里
+> `$true -eq 'UNMAP (hole)'` 是 **TRUE**（字符串被转成布尔），
+> 于是判词说 DECOY、下游逻辑无条件走 UNMAP。9.366 实测。
 
 ### 6.7 让"什么都没做"说出是哪扇门
 `hid 0` 有三种成因，第一版报成一样，排查两次奔向 NPT 才想到早退。
@@ -240,23 +311,36 @@ typedef char assert_exact[(sizeof(region_t) == 4096) ? 1 : -1];
 - 批处理 `.bat` **必须纯 ASCII**（em dash 在 CJK 代码页下吞字符，曾让 `%WDK_ROOT%` 变空）
 - 每个 `powershell -File` 是**新进程** → 扫描+遍历必须在同一次调用内完成
 - `Start-Job` 子进程随父进程死；用**有界 `Start-Job` + `Wait-Job -Timeout`** 检测挂起
+- ★ **.ps1 必须带 UTF-8 BOM 或纯 ASCII**。PowerShell 5.1 对无 BOM 的 .ps1 按 GBK
+  解码，里面的 em dash 会让解析器在**完全无关的行**上报"缺少参数"。9.366 在这上面
+  浪费两轮，症状（报错行号离真因很远）极具误导性
+- ★ **每条命令都新开 powershell 进程的 soak 不是 soak**。g32 第一版 1 分钟只跑到
+  2 轮 —— 6 次进程创建。把写动作放进 worker 自己的进程里，故障才真的并发
+- 诊断脚本也要**卸载驱动**。g26/g29 跑完不卸载，调用方等一个永不退出的进程，
+  下一个测试对着一个没人停的驱动跑（正是 runbook 警告的旧驱动污染）
 
 ---
 
 ## 8. 剩余未做项（诚实清单）
 
-1. **页精确未覆盖所有模块** —— 只有 3 张被隐藏表 + `mem_bp` 两个热区域。
-   其余"小对象留大空隙"靠 `page_layout_check` 事后从 `.map` 发现，不是编译期。
-2. **规则 7 的位置式回退路径仍在** —— 位置式表被显式报告，但未强制改具名。
-3. **soak 是单核重心** —— 未覆盖多核并发隐藏访问，未覆盖 30 分钟以上。
-4. **Tier 7.4/7.5/7.6 wiring 仍 inert** —— `yghv_sentry_escape`/`yghv_sentry_surface_add`
-   从未被调用 ⇒ `escapes=0`、`surface: 0 entry(s)`。需在 MSR/IOIO/CR 拒绝路径、
-   `yghv_guard_is_hidden` 命中处、加载时与 IOCTL 分发器里加调用点。
-5. **T7 decoy 测试弱** —— 只有 `(t7 -match 'value:')`，非守卫路径也通过。
-   需要一个真正验证"guest 读隐藏的外来页返回零"的测试。
+> 9.366 收口了 §8 原来的第 1/2/3/4/5 项。以下是**当前**的清单。
+
+1. **没有多核 UNMAP soak** —— `g32` 用按归属分类后的 DECOY 路径（外来页永远走 DECOY），
+   所以它证明的是"4 进程并发写诱饵页不挂"，**不是**"ALLOW 循环在 4 核下存活"。
+   后者仍只有 G29/G26 的单次决定性验证，缺 30 分钟尺度的多核 soak。
+2. **`g_protect` 只做了页对齐，没做页精确** —— 它 ~6 KB 自然跨两页。对象清单已按
+   `sizeof` 覆盖整个跨度，但 union 化会改变 `extern` 声明形状，本轮未动。
+3. **`surface_arm_intercepts` 的清单是手写的** —— 9 个名字与掩码设置处同文件但不同语句。
+   从 VMCB 掩码反推要 `yghv_sentry.c` 知道 VMCB 形状，所以这个耦合是有意保留的；
+   代价是新增一个拦截要手工加名字。
+4. **位置式的宏构造形式绕得过检查** —— `#define TABLE(x) { ... }` 不是字面量
+   初始化器，检查器看不见。回退解析仍在（仍能精确指名），但"防止出现"这半对宏无效。
+5. **`escapes` 只在真正拒绝时才非零** —— 一次正常测试跑完仍是 0。要看它动，
+   必须真的触发一次拒绝（G30 里 `probes/escapes` 都为 0 是 DECOY 的正确结果）。
+   判断接线是否活着要看 `sys-sentry surface` 的条目，不是 escapes。
 6. **Tier 5（9 项）、Tier 6（5 项）、Tier 8-9** —— 已规划，未开始。
-7. **本地提交未推送** —— 最后一次推送是 `535f74d`；用 `git rev-list --count @{u}..HEAD` 查当前领先数。
-8. **未做长时 soak**（30 分钟以上、多核并发）。
+7. **本地提交未推送** —— 用 `git rev-list --count @{u}..HEAD` 查当前领先数；
+   最后一次推送是 `535f74d`。
 
 ---
 
@@ -264,11 +348,11 @@ typedef char assert_exact[(sizeof(region_t) == 4096) ? 1 : -1];
 
 | 优先级 | 任务 | 理由 |
 |---|---|---|
-| **高** | Tier 7.4/7.5/7.6 wiring | 功能存在但从不被调用，`escapes=0` 是**假指标** |
-| **高** | 强化 T7 decoy 测试 | 当前测试在非守卫路径也通过，无法证明功能 |
-| 中 | 页精确推广到其余热点模块 | 防止下一次"隐藏连带隐藏邻居" |
-| 中 | 多核并发隐藏 soak | 当前 soak 单核重心 |
-| 低 | 位置式表强制改具名 | 已有显式报告，风险可控 |
+| **高** | 多核 UNMAP soak（30 分钟）| 唯一还缺的**尺度**验证；现在的 g32 只覆盖 DECOY，判词已如实写明 |
+| 中 | 把 `g_protect` 也 union 化 | 对象清单已按 sizeof 覆盖跨度，但"对象**就是**那两页"比"跨度算对了"更强 |
+| 中 | 拦截清单从 VMCB 掩码派生 | 消掉 `surface_arm_intercepts` 的手写清单；需要一层薄适配，不让 sentry 认识 VMCB |
+| 低 | Tier 5（9 项）/ Tier 6（5 项）/ Tier 8-9 | 已规划，未开始 |
+| 低 | 推送 | 按铁律 6，需用户明确指示 |
 
 ---
 
@@ -312,25 +396,30 @@ Tier 4.6                4/4    （见 9.2xx）
 Tier 4 合计            24/24   （4.4 三机制 + 4.5 + 4.6）
 Tier 7.2 / 7.7          8/8    （故障隔离 + 优雅降级）
 Tier 7.1 / 7.3          9/9    （自隐藏 + 完整性自检）
-Tier 7 全功能          13/13   ★ 当前
+Tier 7 全功能          13/13   ★ 9.366 复跑仍全绿
 SOAK(旧)               10.2 min STABLE
+G30 诱饵语义 + 接线     ALL PASS  ★ 9.366
+G32 多核隐藏 soak 1min  STABLE    ★ 9.366（DECOY 路径，判词已限定）
 ```
 
 **近期镜像归档**（`D:\aaaaaavm\`，按时间）：
 
-| 镜像 | md5 | 说明 |
-|---|---|---|
-| `206y6_nohot` | 585A71AE | Tier 7 13/13 首通（g_bp 排除） |
-| `206y9_guarded` | F797728B | g_bp 护栏 + 断言 |
-| `206z1_final` | F93496F2 | 三项收口 |
-| `206z3_bphidden` | 8424FB4D | g_bp 可隐藏 |
-| `206z4_assert` | 6C408DD2 | hot/cold 页精确 |
-| `206z6_vafix` | FB8DD42E | VA/PA 首次修复 |
-| `206z8_vafull` | CEF35E62 | 三处 VA/PA 全修 |
-| `206z9_pageexact` | AA3F774F | frame/view 页精确 |
-| **`206zA_why`** | **86DF8BBE** | **当前 HEAD，含 state_why 诊断** |
+| 镜像 | 说明 |
+|---|---|
+| `206y6_nohot` | Tier 7 13/13 首通（g_bp 排除） |
+| `206y9_guarded` | g_bp 护栏 + 断言 |
+| `206z1_final` | 三项收口 |
+| `206z3_bphidden` | g_bp 可隐藏 |
+| `206z4_assert` | hot/cold 页精确 |
+| `206z6_vafix` | VA/PA 首次修复 |
+| `206z8_vafull` | 三处 VA/PA 全修 |
+| `206z9_pageexact` | frame/view 页精确 |
+| `206zA_why` | 含 state_why 诊断 |
+| **`206zB_pageexact`** | **当前**：7.4/7.5/7.6 接线 + 诱饵重写 + 10 处页精确 + 位置式强制具名 |
 
-共 130+ 个历史镜像可回溯（`206a` … `206zA`）。
+> md5 不再是镜像身份（每次构建重新签名都会变）。**比 `.map` 或代码段 0x400..0x24E54**。
+
+共 130+ 个历史镜像可回溯（`206a` … `206zB`）。
 
 ---
 

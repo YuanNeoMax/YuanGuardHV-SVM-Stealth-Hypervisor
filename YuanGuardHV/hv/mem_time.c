@@ -20,7 +20,34 @@ static uint64_t yghv_time_readcr3(void) {
     return v;
 }
 
-static yghv_time_page_t g_time[YGHV_TIME_MAX_PAGES];
+/*
+ * 9.366: PAGE-EXACT. Measured on the .map: g_time (8 slots x 84 B = 672) shared
+ * page 0x36000 with g_cache (32 slots) and eight counters belonging to BOTH
+ * modules — 14 symbols on one page:
+ *
+ *     g_time, g_cache, g_time_count, g_cache_count, g_time_snapshots,
+ *     g_time_switches, g_time_fail, g_time_seq, g_cache_sets, g_cache_resets,
+ *     g_cache_fail, g_watch_total, g_watch_recorded, g_watch_seq
+ *
+ * None of those is on the VMEXIT path today, so it is not the 15th crash's
+ * mechanism yet — it is that mechanism's PRE-CONDITION, one added island call
+ * away from becoming it. Separating them now costs two assertions and removes
+ * the possibility rather than documenting it (docs/KERNEL_API_CHECKLIST.md §28.1).
+ */
+typedef union {
+    yghv_time_page_t entries[YGHV_TIME_MAX_PAGES];
+    uint8_t          page[4096];
+} yghv_time_region_t;
+
+DECLSPEC_ALIGN(4096) static yghv_time_region_t g_time_region;
+DECLSPEC_ALIGN(4096) static yghv_time_region_t g_time_region_pad;  /* separation */
+
+#define g_time (g_time_region.entries)
+
+_Static_assert(sizeof(yghv_time_page_t) * YGHV_TIME_MAX_PAGES <= 4096,
+               "time table fits a page");
+_Static_assert(sizeof(yghv_time_region_t) == 4096, "time region is exactly one page");
+
 static volatile LONG    g_time_count;
 
 static volatile LONG64  g_time_snapshots;

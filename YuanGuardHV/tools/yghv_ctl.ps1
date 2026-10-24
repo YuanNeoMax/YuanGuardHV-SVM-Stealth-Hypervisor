@@ -1239,6 +1239,38 @@ try {
                 [YghvMmf]::UnmapFile($map)
             }
         }
+        'mmf-read' {
+            # 9.366: THE GUEST'S OWN READ OF THE PAGE — the half `mmf-write`
+            # never covered.
+            #
+            # Why a separate command: `mem-read` reads through the DRIVER
+            # (Engine A/B, our image's RIP), so it cannot distinguish a page the
+            # guest can see from one it cannot — both return whatever our side
+            # resolves. The decoy question is about the GUEST path: a CPL=3
+            # store/load from a foreign process whose page we hid. That needs a
+            # read issued by a process we are not, on the same section, so the
+            # fault reaches the NPF handler as a foreign access.
+            #
+            # Reported values, each of which means something different:
+            #   OK + the seeded value   page is visible (baseline, or after del)
+            #   OK + 0                  a hidden page served by the DECOY: present
+            #                           and zero, not a hole
+            #   AVE                     UNMAP mode: the read faulted, i.e. the
+            #                           address space has a hole in it
+            #
+            # usage: mmf-read <path>
+            if ($null -eq $Arg1) { throw 'mmf-read: usage: mmf-read <path>' }
+            $map = [YghvMmf]::MapFile($Arg1, [uint32]4096)
+            try {
+                $v = 0L
+                $st = [YghvMmf]::TryRead($map.View, [ref]$v)
+                Write-Host ("mmf-read: pid={0} va=0x{1:X} state={2} value=0x{3:X}" -f
+                    [YghvCtlNative]::GetCurrentProcessId(),
+                    $map.View.ToInt64(), $st, $v)
+            } finally {
+                [YghvMmf]::UnmapFile($map)
+            }
+        }
         'mem-read' {
             # Phase 3 (2026-10-11): typed cross-process read, dual engine.
             # usage: mem-read <pid> <hex_va> <type> [count]
@@ -1636,7 +1668,13 @@ try {
             if ($v -eq 'surface') {
                 $req = New-Object byte[] 32
                 [BitConverter]::GetBytes([uint64]1).CopyTo($req, 0)
-                $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x828)) -InBytes $req -OutputLength 256
+                # 9.366: the inventory is populated from the intercept mask (9
+                # entries) plus one per IOCTL code actually exercised (41). The
+                # old 256-byte request could only carry 10 entries, so a full
+                # inventory would have been TRUNCATED SILENTLY — the count would
+                # have said 10 and the list would have looked complete.
+                # 64 entries * 24 bytes + 8 header = 1544.
+                $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x828)) -InBytes $req -OutputLength 1544
                 $n = [BitConverter]::ToUInt64($out, 0)
                 Write-Host ("sys-sentry surface: {0} entry(s)" -f $n)
                 for ($i = 0; $i -lt $n; $i++) {
@@ -1645,6 +1683,9 @@ try {
                     $meta = [BitConverter]::ToUInt64($out, $o + 16)
                     $kind = if ($meta -band 1) { 'ioctl' } else { 'intercept' }
                     Write-Host ("  {0,-10} {1,-16} hits={2}" -f $kind, $nm.Trim(), ($meta -shr 8))
+                }
+                if ($n -eq 0) {
+                    Write-Host '  (empty: no VMRUN has run on this boot, so no core has armed an intercept yet)'
                 }
                 return
             }
@@ -1708,7 +1749,8 @@ try {
                 'arm'    { $op = 4 }
                 'uncovered' { $op = 5 }
                 'hidecore'  { $op = 6 }
-                default  { throw 'sys-guard: use arm|hidecore|add|del|verify|list|uncovered' }
+                'why'       { $op = 7 }
+                default  { throw 'sys-guard: use arm|hidecore|add|del|verify|list|uncovered|why' }
             }
             if ($op -eq 0) {
                 if ($null -eq $Arg2) { throw 'sys-guard add: usage: sys-guard add <hex_pa> [hide] [hash] [tag]' }
@@ -1723,6 +1765,34 @@ try {
                 if ($null -eq $Arg2 -or $null -eq $Arg3) { throw 'sys-guard uncovered: usage: sys-guard uncovered <hex_start> <len>' }
                 $a = [Convert]::ToUInt64(("$Arg2" -replace '^0[xX]',''),16)
                 $b = [uint64]::Parse($Arg3)
+            } elseif ($op -eq 7) {
+                # 9.366: ask ONE page why a hide would be refused — without
+                # performing one. See control_device.c case 7 for the answer's
+                # layout and yghv_guard.c for why a bitmask rather than a code.
+                if ($null -eq $Arg2) { throw 'sys-guard why: usage: sys-guard why <hex_pa>' }
+                $a = [Convert]::ToUInt64(("$Arg2" -replace '^0[xX]',''),16)
+                $req7 = New-Object byte[] 32
+                [BitConverter]::GetBytes([uint64]7).CopyTo($req7, 0)
+                [BitConverter]::GetBytes([uint64]$a).CopyTo($req7, 8)
+                $o7 = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x826)) -InBytes $req7 -OutputLength 40
+                $why    = [BitConverter]::ToUInt64($o7, 0)
+                $isTgt  = [BitConverter]::ToUInt64($o7, 8)
+                $slot   = [BitConverter]::ToInt64($o7, 16)
+                $hidF   = [BitConverter]::ToInt64($o7, 24)
+                $mode   = [BitConverter]::ToInt64($o7, 32)
+                $reasons = @()
+                if ($why -band 0x01) { $reasons += 'span(g_guard..g_guard_count)' }
+                if ($why -band 0x02) { $reasons += 'code_start' }
+                if ($why -band 0x04) { $reasons += 'code_size' }
+                if ($why -band 0x08) { $reasons += 'decoy_pa' }
+                if ($why -band 0x10) { $reasons += 'decoy_va' }
+                if ($why -band 0x20) { $reasons += 'npt manager' }
+                if ($why -band 0x40) { $reasons += 'protect table' }
+                Write-Host ("sys-guard why: pa=0x{0:X} page=0x{1:X}" -f $a, ($a -band 0xFFFFF000))
+                Write-Host ("  guard state   : {0} (0x{1:X})" -f $(if($why){($reasons -join ' + ')}else{'no'}), $why)
+                Write-Host ("  target table  : {0}" -f $(if($isTgt){'yes'}else{'no'}))
+                Write-Host ("  guard slot    : {0}  hidden={1}  hide_mode={2}" -f $slot, $hidF, $mode)
+                return
             }
             $req = New-Object byte[] 64
             [BitConverter]::GetBytes([uint32]$op).CopyTo($req, 0)

@@ -5,20 +5,73 @@
 
 #include "yghv_fail.h"
 
+/*
+ * 9.366: PAGE-EXACT. yghv_fail_degrade() is called from INSIDE SvHandleVmExit
+ * (an unknown exit code, a CR index we do not emulate), so everything below is
+ * island-written state. Measured on the .map, it shared page 0x49000 with
+ * mem_frame's bookkeeping — an IOCTL-only module, but that is a difference in
+ * PRIVILEGE and LIFETIME, not a difference that makes two objects safe to put
+ * on one page:
+ *
+ *     g_frm_seq, g_frame_count, g_frm_reserved, g_frm_bytes, g_frm_released,
+ *     g_total, g_by, g_last_reason, g_last_a, g_last_b, g_last_c, g_degraded,
+ *     g_ring_head, g_fatal
+ *
+ * g_frame's TABLE is a hide target (g_frame_region is page-exact), so the page
+ * carrying its scalars is the page a future "hide the frame module" change
+ * would reach for — and that page carries the counters this path increments.
+ * The 15th crash was exactly that, one object up.
+ */
+
 /* Hit ring so the LAST few conditions survive even if stats are printed late.
  * 4 qwords per entry: reason, a, b, c. */
 #define YGHV_FAIL_RING 32
-static uint64_t g_ring[YGHV_FAIL_RING * 4];
-static volatile LONG g_ring_head;
 
-static volatile LONG64 g_total;
-static volatile LONG64 g_by[YGHV_FAIL_MAX];
-static volatile LONG64 g_last_reason;
-static volatile LONG64 g_last_a;
-static volatile LONG64 g_last_b;
-static volatile LONG64 g_last_c;
-static volatile LONG64 g_degraded;
-static volatile LONG64 g_fatal;
+typedef struct {
+    volatile LONG64 total;
+    volatile LONG64 by[YGHV_FAIL_MAX];
+    volatile LONG64 last_reason;
+    volatile LONG64 last_a;
+    volatile LONG64 last_b;
+    volatile LONG64 last_c;
+    volatile LONG64 degraded;
+    volatile LONG64 fatal;
+    /*
+     * 9.366: THE RING INDEX IS A FIELD OF THIS STRUCT, not a variable beside it.
+     *
+     * It was declared next to the ring and left outside every page-exact region,
+     * which is how it ended up on a page belonging to another module. A counter
+     * that is not inside the object it indexes is a counter the linker places
+     * wherever it likes — and this one is written on the island path.
+     */
+    volatile LONG   ring_head;
+    uint32_t        _pad;
+    uint64_t        ring[YGHV_FAIL_RING * 4];
+} yghv_fail_state_t;
+
+typedef union {
+    yghv_fail_state_t s;
+    uint8_t           page[4096];
+} yghv_fail_region_t;
+
+DECLSPEC_ALIGN(4096) static yghv_fail_region_t g_fail;
+DECLSPEC_ALIGN(4096) static yghv_fail_region_t g_fail_pad;  /* separation */
+
+#define g_ring      (g_fail.s.ring)
+#define g_ring_head (g_fail.s.ring_head)
+#define g_total         (g_fail.s.total)
+#define g_by            (g_fail.s.by)
+#define g_last_reason   (g_fail.s.last_reason)
+#define g_last_a        (g_fail.s.last_a)
+#define g_last_b        (g_fail.s.last_b)
+#define g_last_c        (g_fail.s.last_c)
+#define g_degraded      (g_fail.s.degraded)
+#define g_fatal         (g_fail.s.fatal)
+
+_Static_assert(sizeof(yghv_fail_state_t) <= 4096,
+               "failure state fits one page (grow the ring only in whole pages)");
+_Static_assert(sizeof(yghv_fail_region_t) == 4096,
+               "failure region is exactly one page");
 
 /*
  * Which reasons can be survived by skipping the thing we could not handle.

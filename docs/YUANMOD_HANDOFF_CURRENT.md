@@ -9335,3 +9335,233 @@ VERDICT: STABLE
 2. **规则 7 的位置式回退路径仍存在** —— 若有人写位置式表，映射靠声明顺序推断。
    已被显式报告，但没有强制改具名。
 3. **soak 单核重心** —— 未覆盖多核并发隐藏访问。
+
+---
+
+### 9.366 2026-10-18 **四项剩余全部收口 —— 7.4/7.5/7.6 接线 + 诱饵测试重写 + 页精确推广 + 位置式强制具名**
+
+用户指令：四项挨个做，多核 soak 放最后、只跑 1 分钟。全部完成，实机跑过。
+
+#### 9.366.1 最终验证（镜像 `206zB_pageexact`）
+
+```
+G25  Tier 7 全功能          13/13 ALL PASS（含重写后的 T7/T9/T10）
+G26  bp-after-hide          3/3  PASS
+G29  arm→hide→trigger       PASS (hid 3, hide_fail=0, drain saw NPF)
+G30  诱饵语义 + 7.4/7.6 接线 ALL PASS（新增脚本）
+G31  hidecore 3/3 归因       hid 3, hide_fail=0, hash_fail=0（新增脚本）
+G32  多核隐藏 soak 1 分钟    STABLE (4 worker, 1252 次写, 0 hang, hidden 11/11)
+静态检查                     7 个 PASS（原 6 个 + page_layout 新增规则 4）
+```
+
+> md5 每次构建都变（重新签名），**不是回归**。比 `.map` 或代码段。
+
+#### 9.366.2 点1：Tier 7.4/7.5/7.6 wiring —— `escapes=0` 曾经是假指标
+
+**问题**：`yghv_sentry_escape()` 与 `yghv_sentry_surface_add()` 有定义、有 IOCTL、
+有计数器，但**从未被任何代码调用**。于是 `sys-sentry` 恒报 `escapes=0`、
+`sys-sentry surface` 恒报 `0 entry(s)` —— 一个"我们检查过了，什么也没有"的答案，
+而实际上根本没有人检查。
+
+**加了 6 个调用点，全部在真实拒绝路径上**：
+
+| 位置 | 类型 | 记录什么 |
+|---|---|---|
+| `SvHandleMsrAccess`，EFER_SVME 清除被拒 | `msr-index` | MSR 号 + 试图写入的值 |
+| `SvHandleVmrun`（嵌套 VMRUN 一律拒绝） | `vmcb-field` | 尝试嵌套的 guest RIP |
+| `SvHandleCr`，不认识的 CR 索引 | `cr-value` | CR 索引 + RIP + 写入值 |
+| NPF 隐藏页分支，**确认不是我们的 RIP 之后** | `guarded-page` | GPA + guest RIP + CPL |
+| `yghv_sentry_surface_arm_intercepts()` | — | 9 个拦截项，从掩码处填充 |
+| `yghv_control_dispatch_ioctl` 成功出口 | `ioctl:NNN` | 实际被服务的功能号 |
+
+**为什么隐藏页的 escape 记在"不是我们的 RIP"之后**：ALLOW 循环每服务一次我们
+自己对隐藏表的读，都会走到那个分支。把那些也算成"有人试图逃出我们"，这个数字
+就没有任何含义了。判据是 `yghv_guard_fault_is_ours()` 已经给出的那一个。
+
+**顺带修掉两个真实缺陷**：
+- `surface_add_ioctl` 只写**两位**十六进制，0x800..0x8FF 全部塌缩成 256 个名字，
+  0x800/0x810/0x820 无法区分 → 改三位。
+- `PS` 侧 `surface` 只申请 256 字节输出，最多放 10 条；条目上限从 24 提到 64 之后
+  会**静默截断**（count 说 10，列表看起来完整）→ 改 1544 字节，并加空列表说明。
+
+#### 9.366.3 点2：诱饵测试重写 —— 旧断言在任何路径上都成立
+
+`T7` 原来是 `($t7 -match 'value:')`，读的是 **`mem-read`（驱动侧 cpl=0，我们的 RIP）**。
+那种读在 UNMAP 模式下由 ALLOW 循环服务、在 DECOY 模式下落到诱饵 —— **两种都会返回
+一个 value 字符串**，包括"根本没隐藏"的那种。它断言的是"调用没崩"。
+
+**新原语 `mmf-read`**：另一个进程、cpl=3、外来 CR3，读同一个 section。这才是
+诱饵要回答的那个问题。三态各自都是结论：
+
+```
+value=0x0     → DECOY：present-but-zero，地址空间连续
+state=AVE     → UNMAP：叶子被清，guest 摸不到这个范围
+hold seed     → NOT HIDDEN  ← 唯一的 FAIL
+```
+
+**实测（G30，决定性）**：
+```
+[cpl=3 外来读]  mmf-read: state=OK value=0x0
+隐藏前基线（同一条命令）  state=OK value=0xC4C40000000000
+```
+隐藏前 guest 读到种子值，隐藏后读到 0 —— 机制被真正验证了。
+
+**同一形状的另外两处**（T9、T10）：
+- `T9` 收 `($t9 -match 'guarded-page') -or ($t9 -match 'escapes=0')` —— 把"什么都没记到"
+  当成了通过。而且它在 T7 之前跑，那个位置的正确输出**就是** 0。
+- `T10` 收 `($t10 -match 'entry\(s\)')` —— `0 entry(s)` 也满足它。清单**一直是空的**，
+  而测试一直在报 PASS。
+
+修法同 §6.6 的老模板：**先判机制，再要求与该机制相符的后续**。T9 移到 T7 之后，
+按 T7 得出的机制名决定要什么。
+
+#### 9.366.4 点3：页精确推广 —— 五个模块，五处"只是还没出事"
+
+`page_layout_check` 原来只验证**被隐藏的三张表**不与 guard 状态共页。它从未检查
+另一半：VMEXIT 处理器**每次故障都要读**的那些模块状态，它们不是表、不是隐藏目标，
+所以从来没人看。
+
+`.map` 实测（改前）：
+
+| 页 | 符号数 | 上面有谁的什么 |
+|---|---|---|
+| `0x34000` | 12 | `mem_watch` 热环（`g_watch`/`g_ring`/`g_ring_head`/`g_ring_tail`）+ `mem_view` 岛内状态（`g_view_up`/`g_view_page_count`/`g_view_observers`/`g_view_to_alt`/`g_view_to_main`）|
+| `0x36000` | 14 | 整个 `mem_time` + 整个 `mem_cache` + 三个 watch 计数器 |
+| `0x49000` | 14 | `mem_frame` 簿记 + `yghv_fail` 降级计数器（`SvHandleVmExit` 会调它）|
+| `0x4F000` | 22 | `yghv_sentry` 计数器（岛内写）+ guard 状态 |
+| `0x2C738` | — | `g_protect` **起始在半页中间**，尾部落进 guard 认为可隐藏的页 |
+
+没有一处已经崩溃。每一处都是**第 15 次崩溃的前置条件**：一个页上放着两套机制的
+热状态，那么隐藏它就会连带移除"决定怎么处理故障"的状态。
+
+**修法**：`g_watch`/`g_ring`、`g_view_hot`、`g_time`、`g_cache`、`g_fail`、
+`g_sentry_hot`/`g_sentry_surface` 全部改成 union + 页大小字节数组 + 编译期断言。
+环的每次条目从 40 字节补到 48 字节，使 `256 × 48 = 12288` 正好三页 —— 补的那 8 字节
+存在的唯一理由就是让尾巴不留缝。`g_protect` 加 `DECLSPEC_ALIGN(4096)`。
+
+**新增 `page_layout_check` 规则 4**：每个岛内读取区域必须页对齐，且页上不能有
+**另一个模块**的状态（按 `.map` 的 obj 文件判定，不是手写模块名单）。
+
+**负向验证**：故意去掉 `g_fail` 的 `DECLSPEC_ALIGN` →
+```
+FAIL: island region 'g_fail' is not page-aligned (offset 0x28)
+FAIL: island region 'g_fail' shares page 0x49000 with ANOTHER MODULE's state:
+      g_frm_reserved(mem_frame.obj), ... g_frm_seq(mem_frame.obj)
+page layout check FAIL (2 problem(s))
+```
+恢复后 PASS。
+
+#### 9.366.5 ★ 点3 的意外收获：`state_page` 的**跨度**用数值区间是错的
+
+改完页精确后，G29 报 `hid 1 page(s)`、`hide_fail=3`、`hash_fail=1`，而 G30 在
+另一种顺序下报 `hid 3 / hide_fail=0`。**同一个镜像，不同的结果** —— 先查是哪一页。
+
+为此加了只读诊断 `sys-guard why <hex_pa>`（IOCTL `0x826` op 7），直接对一页报出
+三套判定的结果，不做任何隐藏。G31 一跑就定位了：
+
+```
+[bp-table]   hidden=1
+[frame-table] hidden=0   ← 被拒
+[view-table]  hidden=1
+```
+
+**根因**：`yghv_guard_state_page()` 用**数值区间** `[g_guard 的物理地址,
+g_guard_count 的物理地址]` 判断"是不是 guard 自己的状态"。链接器排的是 RVA，
+内存管理器排的是物理页 —— 一个在 `.map` 上只占两页的区间，运行时可以覆盖一大片
+无关的活分配。frame-table 的物理页恰好排在区间里。
+
+**这不是新问题**：9.361 的注释里已经写过"物理页号可能巧合落进那个数值范围"。
+这一次，巧合真的发生了。
+
+**修法**：改成**显式对象清单**。每个对象用 `yghv_guard_state_add(&X, sizeof(X))`
+登记一次，判定是"有没有已登记的对象占这一页"。`state_why` 的 bit0 也随之改成
+"某个具名对象占这一页"，不再是"在某两个地址之间"。
+
+修完：`hid 3 page(s)`, `hide_fail=0`, `hash_fail=0`（G31 + G29 双证）。
+
+**检查器同步**：`page_layout_check` 原来只从 `state_page()` 里读拒绝符号，而清单
+搬到了 `state_pa_init()`，于是它只看到 4 个符号、漏掉 13 个登记对象 —— 对
+`g_decoy_va` 报了一条**假 NOTE**。改成两个函数都读，并且**解析到 0 个符号时直接
+throw**（拒绝清单为空会让每一页都显得合法，而这正是这个检查存在的原因）。
+
+#### 9.366.6 点4：位置式表从"报告"改成"构建失败"
+
+9.365 把两张引擎表改成具名初始化器，但检查器只把位置式表**打印出来**。一条 NOTE
+读一次就过去了，而它描述的耦合（成员语义绑在声明顺序上）会活过每一次 struct 重排，
+下一个人还会照那个写法写第三张。
+
+改成 FAIL，**同时保留位置式回退解析**：两者不冲突 —— 一个防止状态出现，一个在状态
+出现时仍能精确指名（否则报错信息会变成"整张表所有成员"，读者得自己排除）。
+
+**负向验证**：把 `g_yghv_engine_pte` 改回 `{ "pte", pte_read, pte_write }` →
+```
+[irql] POSITIONAL tables: g_yghv_engine_pte
+IRQL contract FAIL (1 positional pointer-table initialiser(s): g_yghv_engine_pte)
+```
+恢复后 PASS。
+
+#### 9.366.7 点5：多核隐藏 soak（1 分钟，按要求放最后）
+
+`g28` 的隐藏 soak 是**单进程**跑，每一次故障都由那个短命进程恰好落到的那个核心
+服务。ALLOW 循环的 re-hide 在同核 #DB 上跑，而 guard 注册表是**所有核心共享**的 ——
+"两个核心同时故障时 re-hide 还对不对"这个问题从未被问过。
+
+`g32_multicore_soak.ps1`：4 个 worker 各自映射自己的 section 并持续写入，
+控制器把它们的页隐藏掉，同时采样计数器。
+
+```
+rounds = 7 (5s each)     workers = 4
+writes per worker = 303, 302, 302, 302   （共 1209 次写）
+hangs = 0   failures = 0   fatal = 0
+hidden start/final = 11 / 11
+VERDICT: STABLE
+```
+
+**★ 但必须把这一点写下来，否则就是第七次"测试断言了自己的假设"**：
+`probes=0` 全程未动。原因是**机制**：外来页由 `yghv_guard_mode_for()` 按**归属**分类，
+只有 guard 自己的状态和三张表是"我们的"，其余一律 **DECOY**。DECOY 模式下叶子仍然
+present、指向零页，写入落进诱饵被丢弃，**不发 #NPF，处理器不运行**。
+
+所以这个 soak 证明的是"4 个进程并发写诱饵页、注册表被藏在下面，一分钟不挂"，
+**不是**"ALLOW 循环在 4 核并发下存活"。后者由 G29/G26（先武装→再隐藏→再触发）与
+G25 的 T3/T4 覆盖。判词与脚本头部都按这个措辞改过了。
+
+> 第一版 g32 用控制器进程逐次调用驱动，1 分钟只跑到 **2 轮** —— 6 次进程创建
+> 换来的不是 soak，是一个超时更长的冒烟测试。这就是把写动作放进 worker 自己的
+> 进程里的原因。
+
+#### 9.366.8 本轮我自己的操作错误（诚实，共 4 处）
+
+1. **g30 第一版测了错误的页** —— 调 `hidecore`（隐藏我们自己的三张表），然后读
+   guest 的 section。没有任何机制被要求隐藏那一页，于是读到种子值、报 NOT HIDDEN。
+   同一次运行里 `probes` 也是 0，因为驱动那次根本没碰过任何隐藏页。
+   **这是第五次同一形状的错误。**
+2. **g30 第一版无条件要求 `probes` 增长** —— 又一次断言了自己的假设（第六次）。
+   probes 是**机制的函数**：DECOY 不产生 fault，UNMAP 才产生。改成先判机制。
+3. **PowerShell 的 `$true -eq 'UNMAP (hole)'` 是 TRUE** —— 把机制名和 PASS/FAIL
+   布尔存在同一个 `$RES` 槽里，字符串被转成布尔，T9 因此无条件进 UNMAP 分支。
+   分成两个槽（`T7 decoy mechanism` 存布尔，`T7 mechanism name` 存字符串）。
+4. **g26 / g29 脚本跑完不卸载驱动** —— 调用方等一个永不退出的进程，下一个测试
+   就对着一个没人停的驱动跑（正是 runbook 警告的"旧驱动污染"）。诊断脚本也要收尾。
+
+> 这四处都不是驱动缺陷。四处都是**测试写错了位置或断言错了对象**，
+> 而其中三处会让人去改一个本来正确的实现。
+
+#### 9.366.9 状态
+- 静态检查：**7 个**（`page_layout_check` 新增规则 4 + `irql_contract_check` 位置式改 FAIL）
+- `state_page` 拒绝：**25 个符号**（从源码的 `yghv_guard_state_add` 清单读，不再用区间）
+- 环 / 区域：**10 个** union + 编译期断言（原 5 个）
+- 镜像：`206zB_pageexact`（md5 非代码身份，比 `.map`）
+- **未推送**（用 `git rev-list --count @{u}..HEAD` 查）
+
+#### 9.366.10 剩余（诚实）
+1. **没有 4 核并发的 UNMAP soak** —— g32 用按归属分类后的 DECOY 路径，ALLOW 循环的
+   多核行为仍未在 30 分钟尺度上测过（G29/G26 是单次决定性验证，不是 soak）。
+2. **`g_protect` 只做了页对齐，没做页精确** —— 它 ~6 KB 自然跨两页，对象清单已按
+   sizeof 覆盖整个跨度，但 union 化会改变 `extern` 声明形状，本轮未动。
+3. **`yghv_sentry_surface_arm_intercepts` 的清单是手写的** —— 9 个名字与掩码设置处
+   同文件但不同语句，新增一个拦截仍需手工加名字。可做的是从 VMCB 掩码反推，而
+   `yghv_sentry.c` 不该知道 VMCB 的形状，所以这个耦合是有意保留的。
+4. **Tier 5（9 项）、Tier 6（5 项）、Tier 8-9** 仍未开始。
+5. **位置式表的宏构造形式**（`#define TABLE(x) { ... }`）绕得过检查 —— 回退解析仍在，
+   但"防止出现"这一半对宏无效。

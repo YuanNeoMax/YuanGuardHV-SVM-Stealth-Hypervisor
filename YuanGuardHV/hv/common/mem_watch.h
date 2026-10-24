@@ -48,6 +48,19 @@ typedef struct {
     uint32_t kind;      /* YGHV_WATCH_* */
     uint32_t cpl;
     uint64_t seq;       /* monotonically increasing */
+    /*
+     * 9.366: padding that exists so the ring ends on a page boundary.
+     *
+     * The event is 40 bytes, and 40 * 256 = 10240 = two and a half pages — so
+     * the ring's tail left 2048 bytes for the linker to fill with whatever
+     * cold scalar it liked, on a page the island writes on every hit. Padding
+     * the entry to 48 makes 256 * 48 = 12288 exactly three pages, which the
+     * compile-time assertion in mem_watch.c enforces.
+     *
+     * The drain side copies four qwords per event and never reads this, so the
+     * wire format is unchanged.
+     */
+    uint64_t _pad;
 } yghv_watch_event_t;
 
 typedef struct {

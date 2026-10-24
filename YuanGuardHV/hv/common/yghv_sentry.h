@@ -80,6 +80,24 @@ int yghv_sentry_surface_remove(const char *name);
 /* Which IOCTL codes the device accepts right now. */
 int yghv_sentry_surface_add_ioctl(uint32_t code);
 
+/*
+ * 9.366: populate the inventory from the place that ARMS the intercepts.
+ *
+ * Before this, nothing ever called surface_add, so `sys-sentry surface` reported
+ * "0 entry(s)" and `escapes=0` was true for a reason that had nothing to do with
+ * the guest being quiet: the counters were never reachable. An inventory nobody
+ * fills is worse than no inventory, because it reads as "we checked".
+ *
+ * Called once from SvPrepareForVirtualization (PASSIVE at prepare time), which
+ * is where the intercept mask is actually set — so the list describes what this
+ * core armed rather than what someone remembered to declare.
+ * Idempotent: a second call is a no-op, not a second registration.
+ */
+void yghv_sentry_surface_arm_intercepts(void);
+
+/* Has the intercept inventory been populated? (0 before the first VMRUN.) */
+int yghv_sentry_surface_armed(void);
+
 typedef struct {
     uint64_t escapes[YGHV_ESC_MAX];   /* attempts per kind */
     uint64_t escapes_total;
@@ -95,7 +113,7 @@ typedef struct {
     uint64_t total_cycles;
 } yghv_sentry_timing_t;
 
-#define YGHV_SENTRY_MAX_SURFACE 24
+#define YGHV_SENTRY_MAX_SURFACE 64
 #define YGHV_SENTRY_NAME_LEN    16
 
 typedef struct {

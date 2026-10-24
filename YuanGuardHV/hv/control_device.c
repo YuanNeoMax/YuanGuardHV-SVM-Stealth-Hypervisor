@@ -1082,6 +1082,38 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
                 info = 8;
                 break;
             }
+            case 7: {
+                /*
+                 * 9.366: ASK THE REFUSAL WHY, FOR ONE PAGE.
+                 *
+                 * `hide_fail=3` + `hash_fail=1` says "a page was skipped as guard
+                 * state, and the SPAN test matched" — but not WHICH page, and not
+                 * whether the answer is even right. Measured cost of not saying:
+                 * the frame table's page was refused while the other two tables
+                 * hid, and the state counters alone could not distinguish "the
+                 * span genuinely covers it" from "the span comparison is wrong".
+                 *
+                 * This reports the three predicates a hide decision is built from,
+                 * for any page, without performing a hide. Read-only; PASSIVE.
+                 *   out[0] = state_why bitmask (0 = not guard state)
+                 *   out[1] = target_page (1 = it is one of the three tables)
+                 *   out[2] = guard slot for this page (-1 = none)
+                 *   out[3] = hidden flag for that slot
+                 *   out[4] = hide_mode for that slot
+                 */
+                extern uint32_t yghv_guard_state_why(uint64_t gpa);
+                extern int yghv_guard_target_page_probe(uint64_t gpa);
+                extern int yghv_guard_find_probe(uint64_t gpa);
+                extern int yghv_guard_hidden_probe(uint64_t gpa);
+                extern int yghv_guard_hide_mode(uint64_t gpa);
+                out[0] = (UINT64)yghv_guard_state_why((uint64_t)a);
+                out[1] = (UINT64)yghv_guard_target_page_probe((uint64_t)a);
+                out[2] = (UINT64)(INT64)yghv_guard_find_probe((uint64_t)a);
+                out[3] = (UINT64)(INT64)yghv_guard_hidden_probe((uint64_t)a);
+                out[4] = (UINT64)(INT64)yghv_guard_hide_mode((uint64_t)a);
+                info = 5 * sizeof(UINT64);
+                break;
+            }
             default:
                 out[0] = 0;
                 info = 8;
@@ -1651,6 +1683,27 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
         status = STATUS_INVALID_DEVICE_REQUEST;
         break;
     }
+
+    /*
+     * 9.366 (Tier 7.6, wiring): the IOCTL half of the attack-surface inventory.
+     *
+     * Recorded HERE rather than from a list, because a list drifts: the switch
+     * above is the only thing that decides which codes this device serves, so a
+     * name added to an inventory by hand would eventually describe a device that
+     * no longer exists. A code that reaches the end of the switch with success
+     * has just PROVED it is accepted, and that proof is the entry.
+     *
+     * Function number, not the raw CTL code: `0x5947`-elsewhere bits are the
+     * device type and access, identical for all of them, so carrying them would
+     * make every name unreadably long for no information. (code >> 2) & 0xFFF is
+     * CTL_CODE's Function field — 0x800..0x828 in this driver.
+     *
+     * Cost: one interlocked increment on a name lookup, on an IOCTL the caller
+     * already waited a synchronous trip for. The `hits` column it produces is
+     * what makes the list describe use as well as reach.
+     */
+    if (NT_SUCCESS(status))
+        (void)yghv_sentry_surface_add_ioctl((code >> 2) & 0xFFFu);
 
     if (!NT_SUCCESS(status)) {
         info = 0;

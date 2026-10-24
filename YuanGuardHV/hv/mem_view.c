@@ -50,13 +50,55 @@ DECLSPEC_ALIGN(4096) static yghv_view_region_t g_view_region_pad;  /* separation
 
 typedef char yghv_assert_g_view_pages_fits_page[(sizeof(g_view_pages) <= 4096) ? 1 : -1];
 typedef char yghv_assert_g_view_pages_is_one_page[(sizeof(yghv_view_region_t) == 4096) ? 1 : -1];
-static uint64_t              g_view_observers[YGHV_VIEW_MAX_OBSERVERS];
-static volatile LONG         g_view_page_count;
-static volatile LONG         g_view_obs_count;
-static volatile LONG         g_view_up;
 
-static volatile LONG64 g_view_to_alt;
-static volatile LONG64 g_view_to_main;
+/*
+ * 9.366: THE ISLAND-READ STATE, page-exact.
+ *
+ * yghv_view_pick_ncr3() runs on EVERY #VMEXIT to choose the NCR3, and it reads
+ * g_view_up, g_view_page_count, g_view_observers and writes g_view_to_alt /
+ * g_view_to_main. Before this change all of that shared page 0x34000 with
+ * mem_watch's hot state (g_watch, g_ring, g_ring_head, g_ring_tail,
+ * g_watch_dropped) — 12 symbols, two mechanisms, one page:
+ *
+ *     g_watch, g_watch_count, g_ring, g_ring_head, g_ring_tail,
+ *     g_watch_dropped, g_view_page_count, g_view_obs_count, g_view_observers,
+ *     g_view_installs, g_view_to_alt, g_view_to_main
+ *
+ * The table above (g_view_region) was already made page-exact in 9.365 and this
+ * is the same fix one layer down: page-exact for the REGION did not make the
+ * module's hot READ state page-exact, so the linker was free to interleave it
+ * with the watch module's. Hiding the view table's page would have taken the
+ * watch hit ring with it — the 15th crash's condition, relocated.
+ */
+typedef struct {
+    volatile LONG   page_count;
+    volatile LONG   obs_count;
+    volatile LONG   up;
+    volatile LONG   _pad;
+    volatile LONG64 to_alt;
+    volatile LONG64 to_main;
+    uint64_t        observers[YGHV_VIEW_MAX_OBSERVERS];
+} yghv_view_hot_t;
+
+typedef union {
+    yghv_view_hot_t s;
+    uint8_t         page[4096];
+} yghv_view_hot_region_t;
+
+DECLSPEC_ALIGN(4096) static yghv_view_hot_region_t g_view_hot;
+DECLSPEC_ALIGN(4096) static yghv_view_hot_region_t g_view_hot_pad;  /* separation */
+
+#define g_view_page_count (g_view_hot.s.page_count)
+#define g_view_obs_count  (g_view_hot.s.obs_count)
+#define g_view_up         (g_view_hot.s.up)
+#define g_view_to_alt     (g_view_hot.s.to_alt)
+#define g_view_to_main    (g_view_hot.s.to_main)
+#define g_view_observers  (g_view_hot.s.observers)
+
+_Static_assert(sizeof(yghv_view_hot_t) <= 4096, "view hot state fits a page");
+_Static_assert(sizeof(yghv_view_hot_region_t) == 4096, "view hot region is exactly one page");
+
+/* Cold: only the IOCTL reporting path reads these, never the island. */
 static volatile LONG64 g_view_installs;
 static volatile LONG64 g_view_fail;
 

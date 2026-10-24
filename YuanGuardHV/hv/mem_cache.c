@@ -16,7 +16,29 @@ typedef struct {
     volatile LONG active;
 } yghv_cache_slot_t;
 
-static yghv_cache_slot_t g_cache[YGHV_CACHE_MAX_PAGES];
+/*
+ * 9.366: PAGE-EXACT — same fix as mem_time.c, same measured page.
+ *
+ * The object here is a 32-slot table (24 B each = 768) and it shared page
+ * 0x36000 with the whole time module. `mem-cache verify` reads this table from
+ * an IOCTL, and the rollback path in mem_time.c addresses the same physical
+ * pages, so "which of the two is this page about" is a question a reader should
+ * never have to answer from the .map (docs/KERNEL_API_CHECKLIST.md §28.1).
+ */
+typedef union {
+    yghv_cache_slot_t entries[YGHV_CACHE_MAX_PAGES];
+    uint8_t           page[4096];
+} yghv_cache_region_t;
+
+DECLSPEC_ALIGN(4096) static yghv_cache_region_t g_cache_region;
+DECLSPEC_ALIGN(4096) static yghv_cache_region_t g_cache_region_pad;  /* separation */
+
+#define g_cache (g_cache_region.entries)
+
+_Static_assert(sizeof(yghv_cache_slot_t) * YGHV_CACHE_MAX_PAGES <= 4096,
+               "cache table fits a page");
+_Static_assert(sizeof(yghv_cache_region_t) == 4096, "cache region is exactly one page");
+
 static volatile LONG     g_cache_count;
 
 static volatile LONG64   g_cache_sets;

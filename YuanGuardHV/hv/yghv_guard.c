@@ -416,19 +416,91 @@ int yghv_guard_add_va(const void *va, uint32_t len, const char *tag, int hide) {
 static uint64_t g_state_pa_lo, g_state_pa_hi;
 static uint64_t g_state_pa_code_start, g_state_pa_code_size;
 static uint64_t g_state_pa_decoy_pa, g_state_pa_decoy_va;
+
+/*
+ * 9.366: THE GUARD'S OWN STATE IS A LIST OF PAGES, NOT AN INTERVAL.
+ *
+ * 9.361 refused the span [first guard byte, last guard byte] so the answer would
+ * not depend on the linker's neighbourhood. That reasoning was right about what
+ * must be refused and wrong about how to express it: a NUMERIC INTERVAL between
+ * two physical addresses contains every unrelated allocation that happens to
+ * land between them at runtime. Physical layout is chosen by the memory manager,
+ * not by the linker, so a span that is three pages in the .map can cover a
+ * megabyte of live allocations after boot.
+ *
+ * MEASURED (9.366, g31_whynot.ps1): hidecore hid 2 of 3 tables and reported
+ * hide_fail=3, hash_fail=1 — "page skipped as guard state, the span test
+ * matched". The skipped entry was the FRAME table, whose physical page was
+ * numerically inside the interval; the BP and VIEW tables were outside it and
+ * hid correctly. The same span had already been a correctness dependency in
+ * 9.361 ("the physical page number might coincidentally fall into that numeric
+ * range") — and this is that coincidence, arriving for real.
+ *
+ * So the state is enumerated: every object is named and its page(s) derived from
+ * its own address and size. One extra page-table walk per object, resolved once
+ * and cached, on a path that already ran several.
+ */
+typedef struct {
+    uint64_t pa;      /* physical address of the object's first byte */
+    uint64_t bytes;   /* its size, so the span is the OBJECT's, not a guess */
+} yghv_state_obj_t;
+
+static yghv_state_obj_t g_state_objs[8];
+static volatile LONG g_state_obj_count;
 static volatile LONG g_state_pa_ready;
 
-static void yghv_guard_state_pa_init(void) {
+/* Register one object: the ONLY way a piece of guard state becomes refused.
+ * Called once, from the initializer below, so the list cannot drift from the
+ * objects it describes. */
+static void yghv_guard_state_add(void *va, uint64_t bytes) {
     extern PHYSICAL_ADDRESS MmGetPhysicalAddress(void *BaseAddress);
+    LONG i = InterlockedIncrement(&g_state_obj_count) - 1;
 
+    if (i < 0 || i >= (LONG)(sizeof(g_state_objs) / sizeof(g_state_objs[0])))
+        return;
+    g_state_objs[i].pa = (uint64_t)MmGetPhysicalAddress(va).QuadPart;
+    g_state_objs[i].bytes = bytes ? bytes : 1;
+}
+
+static void yghv_guard_state_pa_init(void) {
     if (InterlockedCompareExchange(&g_state_pa_ready, 0, 0))
         return;
 
-    g_state_pa_lo = (uint64_t)MmGetPhysicalAddress(&g_guard[0]).QuadPart;
-    /* the span runs from the array through g_guard_count (adjacent in .bss even
-     * though they sit on different pages — see the 9.358 layout) */
-    g_state_pa_hi = (uint64_t)MmGetPhysicalAddress((PVOID)&g_guard_count).QuadPart;
+    /* The registry itself and every counter the fault path touches. Each is
+     * named with its own sizeof, so growing one widens the refusal by exactly
+     * the pages it grew into. */
+    yghv_guard_state_add(&g_guard[0], sizeof(g_guard));
+    yghv_guard_state_add((void *)&g_guard_count, sizeof(g_guard_count));
+    yghv_guard_state_add((void *)&g_g_guarded, sizeof(g_g_guarded));
+    yghv_guard_state_add((void *)&g_g_hidden, sizeof(g_g_hidden));
+    yghv_guard_state_add((void *)&g_g_verified, sizeof(g_g_verified));
+    yghv_guard_state_add((void *)&g_g_changed, sizeof(g_g_changed));
+    yghv_guard_state_add((void *)&g_g_probes, sizeof(g_g_probes));
+    yghv_guard_state_add((void *)&g_g_hidefail, sizeof(g_g_hidefail));
+    yghv_guard_state_add((void *)&g_g_hashfail, sizeof(g_g_hashfail));
 
+    /* The control values hiding depends on: the RIP whitelist, the decoy. */
+    yghv_guard_state_add((void *)&g_code_start, sizeof(g_code_start));
+    yghv_guard_state_add((void *)&g_code_size, sizeof(g_code_size));
+    yghv_guard_state_add((void *)&g_decoy_pa, sizeof(g_decoy_pa));
+    yghv_guard_state_add((void *)&g_decoy_va, sizeof(g_decoy_va));
+
+    /* The cached physical addresses of the above: reading them from a page we
+     * hid would fault this very function. (See the note in state_why about why
+     * these exist.) */
+    yghv_guard_state_add((void *)&g_state_pa_lo, sizeof(g_state_pa_lo));
+    yghv_guard_state_add((void *)&g_state_pa_hi, sizeof(g_state_pa_hi));
+    yghv_guard_state_add((void *)&g_state_pa_code_start, sizeof(g_state_pa_code_start));
+    yghv_guard_state_add((void *)&g_state_pa_code_size, sizeof(g_state_pa_code_size));
+    yghv_guard_state_add((void *)&g_state_pa_decoy_pa, sizeof(g_state_pa_decoy_pa));
+    yghv_guard_state_add((void *)&g_state_pa_decoy_va, sizeof(g_state_pa_decoy_va));
+    yghv_guard_state_add((void *)&g_state_objs[0], sizeof(g_state_objs));
+    yghv_guard_state_add((void *)&g_state_obj_count, sizeof(g_state_obj_count));
+    yghv_guard_state_add((void *)&g_state_pa_ready, sizeof(g_state_pa_ready));
+
+    /* Keep the cached scalars, so the hot path does not re-walk. */
+    g_state_pa_lo = g_state_objs[0].pa;
+    g_state_pa_hi = g_state_objs[1].pa;
     g_state_pa_code_start = (uint64_t)MmGetPhysicalAddress((PVOID)&g_code_start).QuadPart;
     g_state_pa_code_size  = (uint64_t)MmGetPhysicalAddress((PVOID)&g_code_size).QuadPart;
     g_state_pa_decoy_pa   = (uint64_t)MmGetPhysicalAddress((PVOID)&g_decoy_pa).QuadPart;
@@ -437,40 +509,37 @@ static void yghv_guard_state_pa_init(void) {
     InterlockedExchange(&g_state_pa_ready, 1);
 }
 
+/* Does any registered object occupy this page? */
 static int yghv_guard_state_page(uint64_t gpa) {
     uint64_t page = gpa & ~(uint64_t)0xFFFULL;
-    uint64_t lo, hiPage;
+    LONG i, n;
 
     yghv_guard_state_pa_init();
 
-    lo = g_state_pa_lo & ~(uint64_t)0xFFFULL;
-    hiPage = g_state_pa_hi & ~(uint64_t)0xFFFULL;
-    if (page >= lo && page <= hiPage)
-        return 1;
+    n = InterlockedCompareExchange(&g_state_obj_count, 0, 0);
+    for (i = 0; i < n && i < (LONG)(sizeof(g_state_objs) / sizeof(g_state_objs[0])); i++) {
+        uint64_t lo = g_state_objs[i].pa & ~(uint64_t)0xFFFULL;
+        uint64_t hi = (g_state_objs[i].pa + g_state_objs[i].bytes - 1) & ~(uint64_t)0xFFFULL;
+        if (g_state_objs[i].pa && page >= lo && page <= hi)
+            return 1;
+    }
 
-    if (page == (g_state_pa_code_start & ~(uint64_t)0xFFFULL))
-        return 1;
-    if (page == (g_state_pa_code_size & ~(uint64_t)0xFFFULL))
-        return 1;
-    if (page == (g_state_pa_decoy_pa & ~(uint64_t)0xFFFULL))
-        return 1;
-    if (page == (g_state_pa_decoy_va & ~(uint64_t)0xFFFULL))
-        return 1;
-
-    /* 9.361: the NPT managers and the protection table. The managers are static
-     * in protect.c, so the question is asked through that file (naming them here
-     * failed to link — LNK2019, measured). That helper resolves its own VAs, so
-     * it is already PA-correct. The protection table's PA is resolved once. */
+    /* The NPT managers live in protect.c and are static, so the question goes
+     * through that file (naming them here failed to link — LNK2019). */
     if (yghv_protect_page_is_npt(page))
         return 1;
 
+    /* The protection table's own span. */
     {
         extern yghv_protect_state_t g_protect;
         extern PHYSICAL_ADDRESS MmGetPhysicalAddress(void *BaseAddress);
-        static uint64_t prot_pa;
-        if (!prot_pa)
+        static uint64_t prot_pa, prot_hi;
+        if (!prot_pa) {
             prot_pa = (uint64_t)MmGetPhysicalAddress(&g_protect).QuadPart;
-        if (page == (prot_pa & ~(uint64_t)0xFFFULL))
+            prot_hi = prot_pa + sizeof(g_protect) - 1;
+        }
+        if (page >= (prot_pa & ~(uint64_t)0xFFFULL) &&
+            page <= (prot_hi & ~(uint64_t)0xFFFULL))
             return 1;
     }
     return 0;
@@ -489,14 +558,24 @@ static int yghv_guard_state_page(uint64_t gpa) {
  */
 uint32_t yghv_guard_state_why(uint64_t gpa) {
     uint64_t page = gpa & ~(uint64_t)0xFFFULL;
-    uint64_t lo, hiPage;
+    LONG i, n;
 
     yghv_guard_state_pa_init();
 
-    lo = g_state_pa_lo & ~(uint64_t)0xFFFULL;
-    hiPage = g_state_pa_hi & ~(uint64_t)0xFFFULL;
-    if (page >= lo && page <= hiPage)
-        return 0x01;                                    /* span g_guard..count   */
+    /*
+     * 9.366: PER-OBJECT, not an interval (see yghv_guard_state_page for the
+     * measurement that forced this). The bit now means "one of the guard's named
+     * objects occupies this page", which is what a reader needs: the OLD 0x01
+     * said "somewhere between two addresses" and was wrong about pages that
+     * merely happened to sort between them.
+     */
+    n = InterlockedCompareExchange(&g_state_obj_count, 0, 0);
+    for (i = 0; i < n && i < (LONG)(sizeof(g_state_objs) / sizeof(g_state_objs[0])); i++) {
+        uint64_t lo = g_state_objs[i].pa & ~(uint64_t)0xFFFULL;
+        uint64_t hi = (g_state_objs[i].pa + g_state_objs[i].bytes - 1) & ~(uint64_t)0xFFFULL;
+        if (g_state_objs[i].pa && page >= lo && page <= hi)
+            return 0x01;                                /* a named guard object */
+    }
 
     if (page == (g_state_pa_code_start & ~(uint64_t)0xFFFULL)) return 0x02;
     if (page == (g_state_pa_code_size  & ~(uint64_t)0xFFFULL)) return 0x04;
@@ -505,13 +584,22 @@ uint32_t yghv_guard_state_why(uint64_t gpa) {
 
     if (yghv_protect_page_is_npt(page)) return 0x20;    /* g_npt / g_npt_alt     */
 
+    /*
+     * 9.366: the protection table's SPAN (see yghv_guard_state_page for why the
+     * start-only comparison was not enough). Same bit as before — the bit names
+     * "the protection table", and it now covers every page the object occupies.
+     */
     {
         extern yghv_protect_state_t g_protect;
         extern PHYSICAL_ADDRESS MmGetPhysicalAddress(void *BaseAddress);
-        static uint64_t prot_pa;
-        if (!prot_pa)
+        static uint64_t prot_pa, prot_hi;
+        if (!prot_pa) {
             prot_pa = (uint64_t)MmGetPhysicalAddress(&g_protect).QuadPart;
-        if (page == (prot_pa & ~(uint64_t)0xFFFULL)) return 0x40;
+            prot_hi = prot_pa + sizeof(g_protect) - 1;
+        }
+        if (page >= (prot_pa & ~(uint64_t)0xFFFULL) &&
+            page <= (prot_hi & ~(uint64_t)0xFFFULL))
+            return 0x40;
     }
     return 0;
 }
@@ -1474,4 +1562,31 @@ int yghv_guard_hide_mode(uint64_t gpa) {
     if (s < 0)
         return -1;
     return (int)g_guard[s].hide_mode;
+}
+
+/*
+ * 9.366: READ-ONLY PROBES, so the three predicates a hide decision is built from
+ * can be asked about any page without performing one.
+ *
+ * `hide_fail=3` + `hash_fail=1` on the frame table's page could be either a
+ * correct refusal or a wrong span comparison, and the state counters cannot tell
+ * those apart — the difference is in WHICH predicate answered, on WHICH page.
+ * These turn that from a two-rebuild investigation into one IOCTL.
+ *
+ * None of them mutates anything, so all three are safe to expose.
+ */
+int yghv_guard_target_page_probe(uint64_t gpa) {
+    return yghv_guard_target_page(gpa);
+}
+
+int yghv_guard_find_probe(uint64_t gpa) {
+    return yghv_guard_find(gpa);
+}
+
+int yghv_guard_hidden_probe(uint64_t gpa) {
+    int s = yghv_guard_find(gpa);
+
+    if (s < 0)
+        return -1;
+    return (int)g_guard[s].hidden;
 }

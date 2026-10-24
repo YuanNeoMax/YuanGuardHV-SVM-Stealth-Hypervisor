@@ -66,6 +66,26 @@ extern int yghv_guard_fault_is_ours(UINT64 rip, UINT32 cpl);
 /* Tier 7.4 (9.343): exit-latency self-measurement. */
 extern void yghv_sentry_exit_begin(UINT64 tsc);
 extern void yghv_sentry_exit_end(UINT64 tsc);
+/*
+ * 9.366 (Tier 7.5): escape recording — every rejected guest input, with context.
+ * Island-safe by construction (counters only; see yghv_sentry.c).
+ */
+extern void yghv_sentry_escape(UINT32 kind, UINT64 detail, UINT64 a, UINT64 b);
+/* Kinds, mirroring common/yghv_sentry.h (the vendored file keeps its own
+ * include set, so re-state the ordinals here exactly as the enum declares them). */
+#define YGHV_ESC_MSR_INDEX   0
+#define YGHV_ESC_IO_PORT     1
+#define YGHV_ESC_CR_VALUE    2
+#define YGHV_ESC_VMCB_FIELD  3
+#define YGHV_ESC_IOCTL_ARG   4
+#define YGHV_ESC_GPA_GUARD   5
+/*
+ * 9.366 (Tier 7.6): the intercept inventory, filled from where it is armed.
+ * Both entry points are PASSIVE-only and are called from
+ * SvPrepareForVirtualization, which is where the mask is actually set.
+ */
+extern void yghv_sentry_surface_arm_intercepts(void);
+extern int  yghv_sentry_surface_armed(void);
 extern int yghv_guard_remap_bare(UINT64 gpa);
 extern int yghv_guard_reopen_bare(UINT64 gpa);
 /* 9.350: re-hide using the entry's recorded mechanism. */
@@ -821,6 +841,18 @@ SvHandleMsrAccess (
         value.HighPart = GuestContext->VpRegs->Rdx & MAXUINT32;
         if ((value.QuadPart & EFER_SVME) == 0)
         {
+            /*
+             * 9.366 (Tier 7.5, wiring): THIS is a rejected guest input — the
+             * guest tried to clear EFER_SVME and we are about to inject #GP and
+             * discard the write. Before this line the counter existed and was
+             * never incremented, so `sys-sentry` reported escapes=0 and that
+             * zero was indistinguishable from "nobody tried".
+             *
+             * detail = the offending value; a = 1 (write) b = CR/EFER marker.
+             * Island-safe: counters only.
+             */
+            yghv_sentry_escape(YGHV_ESC_MSR_INDEX, IA32_MSR_EFER,
+                               value.QuadPart, 1);
             //
             // Inject #GP if the guest attempts to clear the SVME bit. Protection of
             // this bit is required because clearing the bit while guest is running
@@ -909,6 +941,13 @@ SvHandleVmrun (
     )
 {
     UNREFERENCED_PARAMETER(GuestContext);
+
+    /*
+     * 9.366 (Tier 7.5): a nested VMRUN is a refusal, and refusals are recorded.
+     * detail = the guest's RIP that tried it (nested-VM attempt, not a fault).
+     */
+    yghv_sentry_escape(YGHV_ESC_VMCB_FIELD, VpData->GuestVmcb.StateSaveArea.Rip,
+                       0, 0);
 
     SvInjectGeneralProtectionException(VpData);
 }
@@ -1388,6 +1427,18 @@ SvHandleVmExit (
              */
             if (yghv_guard_is_hidden(gpa)) {
                 /*
+                 * 9.366 (Tier 7.5): a GUEST reaching for a page we hid is the
+                 * single most interesting escape attempt this hypervisor can
+                 * observe — it is either an inventory comparison looking for
+                 * holes or a detector that already suspects us.
+                 *
+                 * It is recorded on the guest branch only (not on our own
+                 * served access below): our own reads of a hidden table happen
+                 * on every fault the ALLOW loop serves, and counting those as
+                 * "someone tried to escape us" would make the number mean
+                 * nothing. `detail = GPA, a = guest RIP, b = CPL`.
+                 */
+                /*
                  * 9.344: OUR OWN access must be served.
                  *
                  * 9.320.1 established that hiding a page the driver reads with
@@ -1417,6 +1468,21 @@ SvHandleVmExit (
                         break;
                     }
                 }
+                /*
+                 * 9.366 (Tier 7.5): WE GOT HERE, SO THE ACCESS IS NOT OURS.
+                 *
+                 * This is the one escape that matters most: a guest reaching for
+                 * a page we hid is either an inventory comparison looking for
+                 * holes or a detector that already suspects us. Recorded before
+                 * the two guest-serving branches so a successful decoy read is
+                 * counted as the attempt it is — a decoy that answers cleanly is
+                 * exactly what makes the attempt worth knowing about.
+                 *
+                 * `detail = GPA, a = guest RIP, b = CPL`.
+                 */
+                yghv_sentry_escape(YGHV_ESC_GPA_GUARD, gpa,
+                                   VpData->GuestVmcb.StateSaveArea.Rip,
+                                   (UINT64)VpData->GuestVmcb.StateSaveArea.Cpl);
                 /*
                  * Not ours: serve the DECOY rather than a hole.
                  *
@@ -1828,6 +1894,14 @@ SvHandleVmExit (
                    flush semantics are replaced by TlbControl=1 below. */
                 VpData->GuestVmcb.StateSaveArea.Cr4 = newCr;
             } else {
+                /*
+                 * 9.366 (Tier 7.5): an unexpected CR index is a VMCB field the
+                 * guest reached that we do not emulate. Recorded BEFORE the
+                 * bugcheck decision, because the degradation path may choose to
+                 * survive rather than die and the attempt is evidence either
+                 * way. `detail = CR index, a = RIP, b = the value attempted`.
+                 */
+                yghv_sentry_escape(YGHV_ESC_CR_VALUE, (UINT64)crIdx, rip, newCr);
                 /* unexpected CR index (we only intercept 3 and 4) */
                 S206RecordFatal(VpData->GuestVmcb.ControlArea.ExitCode,
                                 rip, newCr);
@@ -2315,6 +2389,23 @@ SvPrepareForVirtualization (
     //
     VpData->GuestVmcb.ControlArea.InterceptMisc1 |= SVM_INTERCEPT_MISC1_MSR_PROT;
     VpData->GuestVmcb.ControlArea.MsrpmBasePa = msrpmPa.QuadPart;
+
+    /*
+     * 9.366 (Tier 7.6): fill the attack-surface inventory HERE, where the mask
+     * above is actually set.
+     *
+     * This is the whole point of 7.6: "what can be attacked" has to be read off
+     * the thing that arms it, not asserted in a comment. Before this call
+     * nothing ever populated the list, so `sys-sentry surface` said
+     * "0 entry(s)" — a true statement that read as "we checked and found
+     * nothing", when in fact nobody had looked.
+     *
+     * PASSIVE at prepare time, so the plain (non-interlocked-only) surface
+     * helpers are legal here; on the island the counters are what must stay
+     * island-safe, and they are.
+     */
+    if (!yghv_sentry_surface_armed())
+        yghv_sentry_surface_arm_intercepts();
 
     //
     // Specify guest's address space ID (ASID). TLB is maintained by the ID for

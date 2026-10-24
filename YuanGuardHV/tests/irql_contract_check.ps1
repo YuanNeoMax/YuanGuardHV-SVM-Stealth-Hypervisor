@@ -341,10 +341,29 @@ foreach ($f in $sources) {
 }
 
 Write-Host ("[irql] named-initialiser tables: " + $(if($namedMember.Count){($namedMember.Keys -join ", ")}else{"none"}))
+# --- 9.366: A POSITIONAL TABLE NOW FAILS THE BUILD ---
+#
+# 9.365 converted the two engine tables and made the checker READ named
+# initialisers, but left the positional form as a reported NOTE. A NOTE is read
+# once; the coupling it describes (member meaning tied to declaration order)
+# survives every refactor of the struct it points at, and the next table someone
+# writes will be written the same way because nothing objects.
+#
+# So this is now a FAILURE, and the fallback below stays as the DEFENSIVE path:
+# if the rule is ever bypassed (a table built by a macro, a generated header),
+# the mapping is still resolved precisely so the message names the real target
+# rather than every member of the table. Enforcing the rule and keeping the
+# fallback are not in tension — one prevents the state, the other survives it.
+$positionalProblem = $null
 if ($positionalTable.Count -gt 0) {
     Write-Host ("[irql] POSITIONAL tables (mapping inferred from declaration order): " + ($positionalTable -join ", "))
     Write-Host "[irql]   A positional table's member meanings move if the struct is reordered."
     Write-Host '[irql]   Convert it to named initialisers (.read = fn) to remove that coupling.'
+    $positionalProblem = ("IRQL contract FAIL ($($positionalTable.Count) positional pointer-table " +
+        "initialiser(s): $($positionalTable -join ', ')). A positional initialiser ties each " +
+        "function to its POSITION on the struct declaration, so reordering the struct silently " +
+        "swaps the members and nothing in the language catches it. Write the members by name " +
+        "(.read = ..., .write = ...) — see mem_engine.c for the two tables that already were.")
 }
 
 Write-Host ("[irql] pointer tables: {0}" -f $ptrTables.Count)
@@ -433,4 +452,13 @@ if ($checkedIndirect -eq 0) {
     Write-Host '[irql] indirect calls on island paths: none (checked, not assumed)'
 }
 
-Write-Host '[PASS] IRQL contract: reachability-derived island set; no gate, no unpaired hide, no lying *_bare'
+# --- 9.366: the positional-initialiser rule is a GATE, not a reminder ---
+#
+# Checked here so both failures are reported in one run: a reader fixing an
+# indirect-call violation should not have to rebuild to discover that a table
+# form is also refused.
+if ($positionalProblem) {
+    throw $positionalProblem
+}
+
+Write-Host '[PASS] IRQL contract: reachability-derived island set; no gate, no unpaired hide, no lying *_bare; no positional pointer tables'

@@ -61,19 +61,79 @@ $mustStayReachable = @(
     'g_protect'           # the ALLOW loop consults the protection table
 )
 
+# ---------------------------------------------------------------------------
+# 9.366: RULE 4 — THE ISLAND-READ REGIONS ARE PAGE-EXCLUSIVE.
+#
+# 9.365 made the three tier-4 TABLES page-exact and this check verified that no
+# guard state shared their pages. That left the OTHER half of the same hazard
+# unverified: the per-module state the VMEXIT handler READS on every fault, which
+# is not a table, is not a hide target, and was therefore never looked at.
+#
+# Measured when the list below was first written (page -> symbols on it):
+#
+#   0x34000  12 symbols: mem_watch's hot ring (g_watch, g_ring, g_ring_head,
+#            g_ring_tail, g_watch_dropped) AND mem_view's island state
+#            (g_view_up, g_view_page_count, g_view_observers, g_view_to_alt,
+#            g_view_to_main, ...) — two mechanisms' hit paths on one page
+#   0x36000  14 symbols: the whole time module AND the whole cache module AND
+#            three watch counters
+#   0x49000  14 symbols: mem_frame's bookkeeping AND the degradation counters
+#            that SvHandleVmExit increments on an unknown exit
+#   0x4F000  22 symbols: the sentry counters (written inside SvHandleVmExit by
+#            yghv_sentry_escape) AND guard state
+#   0x2C738  g_protect started MID-PAGE and spanned into a page the guard
+#            considered hidable (see yghv_guard_state_page)
+#
+# None of those had crashed yet. Every one of them is the 15th crash's
+# PRECONDITION: a page carrying two mechanisms' hot state is a page whose hiding
+# removes state that decides what to do about the fault. The condition is
+# checkable from the map, so it is checked rather than remembered.
+#
+# A region passes only if EVERY other symbol on each of its pages belongs to the
+# SAME object file. That is looser than "alone on the page" on purpose — a
+# module is allowed to put two of its own regions on one page, and forbidding
+# that would push the list into a per-symbol whitelist that drifts. What must not
+# happen is another MODULE's state arriving on the page, because that is state
+# whose lifetime and privilege the owner does not control.
+$islandRegions = @(
+    'g_guard',            # yghv_guard_is_hidden() — the recursion page
+    'g_hot',              # breakpoint scalars read on every hit
+    'g_ring_region',      # breakpoint hit ring
+    'g_bp_region',        # breakpoint registry
+    'g_frame_region',     # frame-ownership table
+    'g_view_region',      # split-view table
+    'g_view_hot',         # view state read by yghv_view_pick_ncr3 per VMEXIT
+    'g_watch_region',     # watch table (yghv_watch_match per NPF)
+    'g_watch_hot',        # watch ring indices + counters (per NPF)
+    'g_watch_ring',       # watch event ring (per NPF)
+    'g_time_region',      # snapshot table
+    'g_cache_region',     # cache-mode table
+    'g_fail',             # degradation counters (SvHandleVmExit calls this)
+    'g_sentry_hot',       # escape counters (SvHandleVmExit calls this)
+    'g_sentry_surface',   # attack-surface inventory
+    'g_protect'           # the ALLOW loop's protection table
+)
+
+
 $lines = [IO.File]::ReadAllLines($mapPath)
 $rvaOf = @{}
 $sectionOf = @{}
+$objOf = @{}
 
 foreach ($line in $lines) {
     # " 0003:00000110       yghv_trace  0000000140001000 f   main.obj"
-    $m = [regex]::Match($line, '^\s+000([0-9a-fA-F]):[0-9a-fA-F]{8}\s+(\S+)\s+([0-9a-fA-F]{16})\s')
+    $m = [regex]::Match($line, '^\s+000([0-9a-fA-F]):[0-9a-fA-F]{8}\s+(\S+)\s+([0-9a-fA-F]{16})\s+(.*)$')
     if ($m.Success) {
         $name = $m.Groups[2].Value
         $addr = [Convert]::ToUInt64($m.Groups[3].Value, 16) - 0x140000000
         if (-not $rvaOf.ContainsKey($name)) {
             $rvaOf[$name] = $addr
             $sectionOf[$name] = $m.Groups[1].Value
+            # 9.366: the OBJECT FILE each symbol came from, so "is this page
+            # shared with another MODULE" can be answered without a hand-written
+            # list of module names. Trailing token of the rest of the line.
+            $rest = @($m.Groups[4].Value.Trim() -split '\s+')
+            $objOf[$name] = if ($rest.Count -ge 1) { $rest[-1] } else { '?' }
         }
     }
 }
@@ -106,25 +166,39 @@ $stateRefusedSymbols = @()
 $guardSrc = Join-Path (Split-Path -Parent $PSScriptRoot) 'hv\yghv_guard.c'
 if (Test-Path $guardSrc) {
     $gs = [IO.File]::ReadAllText($guardSrc)
-    $si = $gs.IndexOf('static int yghv_guard_state_page(uint64_t gpa) {')
-    if ($si -ge 0) {
+    # 9.366: TWO functions now hold the answer, and the check must read BOTH.
+    # The object list moved into yghv_guard_state_pa_init() (where the PAs are
+    # resolved once), and state_page() only walks that list. Reading state_page()
+    # alone found g_state_obj_count and missed all thirteen registered objects —
+    # measured: it printed 4 refusal symbols while the code refused 8 pages, and
+    # the NOTE it then emitted for g_decoy_va was a false alarm.
+    $bodies = @()
+    foreach ($fn in @('static int yghv_guard_state_page(uint64_t gpa) {',
+                      'static void yghv_guard_state_pa_init(void) {')) {
+        $si = $gs.IndexOf($fn)
+        if ($si -lt 0) { continue }
         $depth = 0; $end = $si
         for ($k = $si; $k -lt $gs.Length; $k++) {
             if ($gs[$k] -eq '{') { $depth++ } elseif ($gs[$k] -eq '}') { $depth--; if ($depth -eq 0) { $end = $k; break } }
         }
-        $body = $gs.Substring($si, $end - $si)
+        $bodies += $gs.Substring($si, $end - $si)
+    }
+    if ($bodies.Count -eq 0) { throw 'page layout check: neither state_page() nor state_pa_init() found in yghv_guard.c' }
+    $body = ($bodies -join "`n")
 
-        # 9.365: THREE forms now appear in state_page(), and all three must be read.
-        #
-        #   g_state_pa_xxx            the cached physical addresses of the guard's
-        #                             own control values (they are resolved once,
-        #                             because this runs per VMEXIT)
-        #   &symbol                   any address named directly
-        #   yghv_protect_page_is_npt  the NPT managers, static in protect.c
-        #
-        # A checker that understands only one form silently stops covering the
-        # others — measured: after the VA/PA fix introduced g_state_pa_*, this
-        # reported "none parsed" while the code was refusing seven pages.
+    # Forms that can appear, and all of them must be read — a checker that
+    # understands one silently stops covering the others (measured twice: after
+    # the VA/PA fix introduced g_state_pa_*, and again when the interval became a
+    # list).
+    #
+    #   yghv_guard_state_add(&X, sizeof(X))   the object list (9.366)
+    #   g_state_pa_xxx                        cached PAs of the control values
+    #   &symbol                               any address named directly
+    #   yghv_protect_page_is_npt              the NPT managers, static in protect.c
+        foreach ($m in [regex]::Matches($body, 'yghv_guard_state_add\(\s*\(?\s*void\s*\*?\s*\)?\s*&(\w+)')) {
+            $sym = $m.Groups[1].Value
+            if ($stateRefusedSymbols -notcontains $sym) { $stateRefusedSymbols += $sym }
+        }
         foreach ($m in [regex]::Matches($body, 'g_state_pa_(\w+)')) {
             $suffix = $m.Groups[1].Value
             if ($suffix -eq 'lo' -or $suffix -eq 'hi' -or $suffix -eq 'ready') { continue }
@@ -142,16 +216,25 @@ if (Test-Path $guardSrc) {
                 if ($stateRefusedSymbols -notcontains $n2) { $stateRefusedSymbols += $n2 }
             }
         }
-    }
 }
 Write-Host ("[page-layout] state_page refuses: " + $(if($stateRefusedSymbols.Count){($stateRefusedSymbols -join ', ')}else{'none parsed'}))
+if ($stateRefusedSymbols.Count -eq 0) {
+    throw ('page layout check: could not parse ANY guard-state refusal from yghv_guard.c. ' +
+           'An empty refusal list makes every page below look legal, which is the ' +
+           'failure this check exists to catch — so it is an error, not a warning.')
+}
 
+# 9.366: the span calc below is kept ONLY for the NOTE wording of pages that
+# happen to sit between g_guard and g_guard_count. The DECISION is now per-object:
+# a page is refused when a named guard object occupies it. The span is still
+# printed because it is the historically dangerous neighbourhood, and a reader
+# looking at a map wants to know where it is.
 $statePageLo = 0; $statePageHi = 0
 if ($rvaOf.ContainsKey('g_guard') -and $rvaOf.ContainsKey('g_guard_count')) {
     $statePageLo = $rvaOf['g_guard'] -band 0xFFFFF000
     $statePageHi = $rvaOf['g_guard_count'] -band 0xFFFFF000
 }
-Write-Host ("[page-layout] guard-state span: pages 0x{0:X} .. 0x{1:X} are refused as hide targets" -f $statePageLo, $statePageHi)
+Write-Host ("[page-layout] g_guard..g_guard_count occupies pages 0x{0:X} .. 0x{1:X} (informational; the refusal is per-object)" -f $statePageLo, $statePageHi)
 
 
 # ---- Rule 1: a hidden table's page must not carry guard state ----
@@ -231,20 +314,30 @@ foreach ($n in $mustStayReachable) {
         # check that disagrees with the code it is checking is worse than either
         # one alone. Extracting the names from state_page() makes them agree by
         # construction: adding a refusal in C widens what the check accepts.
+        # 9.366: THE SPAN IS NO LONGER PART OF THE DECISION.
+        #
+        # The code stopped refusing a numeric interval between two addresses
+        # (g31_whynot.ps1 measured why: the frame table's page sorted inside it
+        # and was refused, while the two tables outside it hid). This check used
+        # to accept the same interval, so it agreed with a rule that was wrong —
+        # agreement with the implementation is only worth having when the
+        # implementation is right.
+        #
+        # The decision is now per-object: a page is refused when one of the
+        # registered objects occupies it. $stateRefusedSymbols holds exactly those
+        # objects (parsed from yghv_guard_state_add calls), so the membership test
+        # below IS the code's rule rather than an approximation of it.
         $stateRefuses = $false
         foreach ($sym in $stateRefusedSymbols) {
             if ($rvaOf.ContainsKey($sym)) {
                 if ($page -eq ($rvaOf[$sym] -band 0xFFFFF000)) { $stateRefuses = $true; break }
             }
         }
-        if (-not $stateRefuses -and $statePageHi -gt 0) {
-            if (($page -ge $statePageLo) -and ($page -le $statePageHi)) { $stateRefuses = $true }
-        }
         if ($stateRefuses) {
             Write-Host ("[page-layout] OK: '{0}' shares page 0x{1:X} with {2} unrelated global(s)," -f `
                 $n, $page, $others.Count)
-            Write-Host ("[page-layout]     and that page is inside the guard-state span" +
-                        " yghv_guard_state_page() refuses -> it can never be a hide target.")
+            Write-Host ("[page-layout]     and one of the guard's own objects occupies that page" +
+                        " (per yghv_guard_state_page) -> it can never be a hide target.")
         } else {
             Write-Host ("[page-layout] NOTE: '{0}' shares page 0x{1:X} with {2} unrelated global(s)," -f `
                 $n, $page, $others.Count)
@@ -262,9 +355,36 @@ foreach ($t in $hiddenTables) {
     }
 }
 
+# ---- Rule 4: an island-read region is not shared with another module ----
+foreach ($r in $islandRegions) {
+    if (-not $rvaOf.ContainsKey($r)) {
+        $problems += "island region '$r' not found in the map (renamed or optimised out?)"
+        continue
+    }
+    $rPage = $rvaOf[$r] -band 0xFFFFF000
+    $rObj  = $objOf[$r]
+    $foreign = @()
+    foreach ($s in $byPage[$rPage]) {
+        if ($s -eq $r) { continue }
+        if ($objOf[$s] -ne $rObj) { $foreign += ("{0}({1})" -f $s, $objOf[$s]) }
+    }
+    # The region must also START on a page boundary. g_protect is the case that
+    # taught this: it began at 0x2C738, so its first page was fine and its TAIL
+    # landed on a page the guard considered a legal hide target.
+    if (($rvaOf[$r] -band 0xFFF) -ne 0) {
+        $problems += ("island region '{0}' is not page-aligned (offset 0x{1:X}); its tail lands on a page this check does not examine" -f $r, ($rvaOf[$r] -band 0xFFF))
+    }
+    Write-Host ("[page-layout] island region {0} @ 0x{1:X}  page 0x{2:X}  from {3}" -f `
+        $r, $rvaOf[$r], $rPage, $rObj)
+    if ($foreign.Count -gt 0) {
+        $problems += ("island region '{0}' shares page 0x{1:X} with ANOTHER MODULE's state: {2}" -f `
+                      $r, $rPage, ($foreign -join ', '))
+    }
+}
+
 if ($problems.Count -gt 0) {
     foreach ($p in $problems) { Write-Host ("[page-layout] FAIL: $p") }
     throw ("page layout check FAIL ({0} problem(s)) — each one is a page-sharing condition that has already cost this project a crash or a hang" -f $problems.Count)
 }
 
-Write-Host '[PASS] Page layout: no hidden table shares a page with guard state'
+Write-Host '[PASS] Page layout: no hidden table shares a page with guard state; every island-read region is page-aligned and not co-tenanted with another module'

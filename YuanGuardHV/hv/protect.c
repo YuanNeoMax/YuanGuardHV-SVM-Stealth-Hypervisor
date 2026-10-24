@@ -75,7 +75,29 @@ static void yghv_hook_diag_flush(void) {
     }
 }
 
-yghv_protect_state_t g_protect;
+/*
+ * 9.366: PAGE-ALIGNED, and the alignment is load-bearing now.
+ *
+ * yghv_protect_find_page_bare() runs INSIDE the NPF handler (it is what tells a
+ * protected page from an unrelated fault), and it walks g_protect.targets[].pages
+ * with plain C. Before this change the object started at 0x2C738 — mid-page —
+ * and spanned into the NEXT page, so its bytes were split across two pages that
+ * each carried 16 unrelated globals:
+ *
+ *     0x2C000: g_protect, g_vcpus, g_npt_test_pa, g_fake_tlb_mode, ...
+ *     0x2D000: g_sync (64 slots), g_sync_mode
+ *
+ * yghv_guard_state_page() refuses the page holding g_protect's START, so the
+ * first page was protected by construction — but the object's TAIL lived on a
+ * page the guard considered hidable. Hiding it would fault the NPF handler while
+ * it was deciding whether to fault, which is the 15th hang's exact shape, one
+ * span-check away from being reachable.
+ *
+ * The address is now page-aligned and the guard's refusal covers the whole span
+ * (see yghv_guard_state_why), so "where does this object end" is answered by
+ * sizeof rather than by which page the linker happened to start it on.
+ */
+DECLSPEC_ALIGN(4096) yghv_protect_state_t g_protect;
 yghv_protect_hook_t g_protect_hooks[YGHV_PROTECT_MAX_HOOKS];
 uint64_t g_protect_cr3_list[YGHV_PROTECT_MAX_TARGETS];
 static FAST_MUTEX g_protect_lock;
