@@ -9,6 +9,10 @@
  */
 #define POOL_NX_OPTIN   1
 #include "common/npt.h"
+/* 9.375 (Tier 9.1): device-free control channel. Included here rather than via a
+ * common header because this file has its own include scheme (see the note in
+ * mem_bp.c: pulling <ntddk.h> in the wrong order redefines PEPROCESS). */
+#include "common/yghv_channel.h"
 #include "svm_simplevm206.hpp"
 
 #include <intrin.h>
@@ -1189,6 +1193,44 @@ SvHandleCpuid (
     subLeaf = static_cast<int>(GuestContext->VpRegs->Rcx);
     __cpuidex(registers, leaf, subLeaf);
 
+    /*
+     * 9.375 (Tier 9.1): the DEVICE-FREE control channel.
+     *
+     * Matched by MASK, not by an equality case, because the leaf carries the high
+     * 16 bits of the request VA - see YGHV_CH_BASE in yghv_channel.h for why the
+     * address has to be split across the only two registers CPUID reads.
+     *
+     * No object, no symbol link, no IOCTL: a caller with no handle at all puts a
+     * request in its own memory and rings this leaf; we resolve the VA it named and
+     * read the frame directly. That works only because the hypervisor can already
+     * translate any guest VA - the same function the INT3 path uses.
+     *
+     * Register contract:
+     *   in : EAX = YGHV_CH_BASE | va[47:32]   ECX = va[31:0]
+     *   out: EAX = status   EBX:EDX = value   ECX = ACK (ALWAYS)
+     *
+     * The ack is written on every exit path including refusals; omitting it is what
+     * made two callers dead code in 9.370.
+     */
+    if (((UINT32)leaf & YGHV_CH_BASE_MASK) == YGHV_CH_BASE)
+    {
+        uint64_t reqVa = ((uint64_t)((UINT32)leaf & 0xFFFFu) << 32)
+                       | (uint64_t)(UINT32)subLeaf;
+        uint32_t s_eax = 0, s_ebx = 0, s_ecx = 0, s_edx = 0;
+
+        yghv_channel_doorbell(VpData->GuestVmcb.StateSaveArea.Cr3, reqVa,
+                              0, 0, &s_eax, &s_ebx, &s_ecx, &s_edx);
+
+        registers[0] = (int)s_eax;
+        registers[1] = (int)s_ebx;
+        registers[2] = (int)s_ecx;
+        registers[3] = (int)s_edx;
+        /* The GPR write-back below is shared by every answer, so jump to it rather
+         * than duplicating it (and rather than a `break`, which has no target
+         * outside a switch - the build caught that). */
+        goto cpuid_writeback;
+    }
+
     switch (leaf)
     {
     case CPUID_PROCESSOR_AND_PROCESSOR_FEATURE_IDENTIFIERS:
@@ -1348,6 +1390,7 @@ SvHandleCpuid (
     //
     // Update guest's GPRs with results.
     //
+cpuid_writeback:
     GuestContext->VpRegs->Rax = registers[0];
     GuestContext->VpRegs->Rbx = registers[1];
     GuestContext->VpRegs->Rcx = registers[2];

@@ -92,6 +92,9 @@ if "%YGHV_SINGLECORE%"=="1" set "CFLAGS=%CFLAGS% /DYGHV_SINGLECORE=1"
 if "%YGHV_203Q%"=="1" set "CFLAGS=%CFLAGS% /DYGHV_203Q=1"
 if "%YGHV_206B_COEXIST%"=="1" set "CFLAGS=%CFLAGS% /DYGHV_206B_COEXIST=1"
 if "%YGHV_206B_GNPT%"=="1" set "CFLAGS=%CFLAGS% /DYGHV_206B_GNPT=1"
+rem 9.375 (Tier 9.1): build with NO control device, so the CPUID channel can be
+rem tested without the IOCTL path being available to explain the result.
+if "%YGHV_NO_DEVICE%"=="1" set "CFLAGS=%CFLAGS% /DYGHV_NO_DEVICE=1"
 if "%YGHV_CATCHALL%"=="1" set "CFLAGS=%CFLAGS% /DYGHV_CATCHALL=1"
 if "%YGHV_V101_4VEC%"=="1" set "CFLAGS=%CFLAGS% /DYGHV_V101_4VEC=1"
 
@@ -107,7 +110,7 @@ echo   WDK Version: %WDK_VER%
 echo   Compiling...
 
 rem 2026-10-11 Phase 1: mem_pte added (page-table walk, Engine B foundation).
-for %%f in (main svm_core npt_core vmexit vmmcall multi_core protect control_device loader_stealth svm_simplevm_port mem_pte mem_pa mem_engine mem_scan mem_selfmap mem_coop mem_island mem_view mem_watch mem_time mem_cache mem_bp mem_frame yghv_fail yghv_guard yghv_crypto yghv_auth yghv_sentry) do call :compile %%f || goto :error
+for %%f in (main svm_core npt_core vmexit vmmcall multi_core protect control_device loader_stealth svm_simplevm_port mem_pte mem_pa mem_engine mem_scan mem_selfmap mem_coop mem_island mem_view mem_watch mem_time mem_cache mem_bp mem_frame yghv_fail yghv_guard yghv_crypto yghv_auth yghv_channel yghv_sentry) do call :compile %%f || goto :error
 
 echo   svm_trampoline.S
 "%CLANG_CL%" %CFLAGS% %INCLUDES% /c /Fo"%BIN_DIR%\svm_trampoline.obj" "%HV_DIR%\svm_trampoline.S"
@@ -166,6 +169,7 @@ set "LIB=%SS_LIB%"
     "%BIN_DIR%\yghv_guard.obj" ^
     "%BIN_DIR%\yghv_crypto.obj" ^
     "%BIN_DIR%\yghv_auth.obj" ^
+    "%BIN_DIR%\yghv_channel.obj" ^
     "%BIN_DIR%\yghv_sentry.obj" ^
     "%BIN_DIR%\svm_simplevm_port.obj" ^
     "%BIN_DIR%\svm_simplevm_port_asm.obj" ^

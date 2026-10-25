@@ -2041,6 +2041,32 @@ NTSTATUS yghv_control_device_init(PDRIVER_OBJECT driver) {
     NTSTATUS status;
     ULONG i;
 
+#ifdef YGHV_NO_DEVICE
+    /*
+     * 9.375 (Tier 9.1): BUILD WITHOUT THE DEVICE, ON PURPOSE.
+     *
+     * Tier 9.1 claims the hypervisor can be commanded with no object at all - no
+     * \.\YuanGuardHV, no symbol link, no IOCTL. That claim cannot be tested on a
+     * build that still creates the device: every doorbell answer could have come
+     * from the IOCTL path, and the test would pass while testing nothing.
+     *
+     * So the device is compiled OUT under YGHV_NO_DEVICE. In that configuration
+     * the ONLY way to reach the driver is:
+     *   - the CPUID channel (Tier 9.1), and
+     *   - the loader, which installs it.
+     *
+     * The default build keeps the device: this tree has 42 IOCTL codes and a
+     * 13/13 regression suite that all go through it, so removing it by default
+     * would trade a working control plane for a claim. The point of the switch is
+     * that the claim becomes MEASURABLE, not that it becomes the default.
+     */
+    UNREFERENCED_PARAMETER(dev_name);
+    UNREFERENCED_PARAMETER(link_name);
+    UNREFERENCED_PARAMETER(dev);
+    UNREFERENCED_PARAMETER(i);
+    LOG_INFO("control device: NOT CREATED (YGHV_NO_DEVICE build) - channel only");
+    return STATUS_SUCCESS;
+#else
     RtlInitUnicodeString(&dev_name, YGHV_DEVICE_NAME_STRING);
     RtlInitUnicodeString(&link_name, YGHV_DOS_DEVICE_NAME_STRING);
 
@@ -2070,6 +2096,7 @@ NTSTATUS yghv_control_device_init(PDRIVER_OBJECT driver) {
 
     LOG_INFO("control device created");
     return STATUS_SUCCESS;
+#endif /* YGHV_NO_DEVICE */
 }
 
 void yghv_control_device_cleanup(PDRIVER_OBJECT driver) {

@@ -10616,3 +10616,82 @@ guest 正在碰这些位）从来没有被验证过。
 
 > 任何 `SvExecuteOnEachProcessor` 的新用途，必须先回答"遍历时另一侧在做什么"。
 > 若答案是"正在访问我要改的状态"，这条路不可用。
+
+---
+
+#### 9.376 第七次机器下线：不是蓝屏，而是硬挂 —— 根因是选错了页表遍历
+
+**事故性质（与前六次不同类）**
+
+```
+6008: 上一次系统在 11:50:18 的关闭是意外的
+dump: 无（最新仍是 11:14:01）
+bugcheck 事件: 无
+```
+
+**没有 dump、没有 bugcheck、只有 6008**。蓝屏一定会写 dump，所以这次不是蓝屏，
+而是硬挂或复位 —— 与本次会话第一次（"无响应，只能手动重启"）同类。
+
+发生在 `11:50:18`，即 G43 上一版跑完、我正在改 `goto` 的那段时间。
+
+**根因：CPUID 通道用了这个项目自己标记为不可靠的遍历**
+
+`yghv_channel.c` 第一版这样解析请求 VA：
+
+```c
+req_pa = yghv_protect_guest_va_to_pa(guest_cr3, req_va);
+```
+
+而 `protect.c` 的入口读取是：
+
+```c
+static uint64_t yghv_pt_read(uint64_t table_pa, uint64_t index) {
+    va = MmGetVirtualForPhysical(...);      /* ← 这里 */
+```
+
+`mem_pa.c` 的头部文件注释写着：
+
+> *MmGetVirtualForPhysical is not reliable for arbitrary physical pages*
+
+而 `mem_pte.c` 就是为了修这件事才写的（9.299 FIX-2），它用 `MmCopyMemory(PHYSICAL)`，
+注释明确：
+
+> *MmCopyMemory takes the physical address directly, needs no mapping, and reports
+> failure through its return status — so there is no bogus pointer to dereference.
+> **It is safe at DISPATCH_LEVEL and takes no locks.***
+
+**换句话说：这个项目早就把正确的遍历写好并验证过了，而我在新模块里用了老的那个。**
+
+在 CPUID 退出路径（DISPATCH + GIF=0）上跑那个不可靠的遍历，比在 PASSIVE 上跑更糟：
+查找失败在那里不是"答案错"，而可能是一个**在中断关闭时无法完成的映射调用**。
+这正是硬挂的形状 —— 没有 dump，因为系统根本没走到能写 dump 的状态。
+
+**修法**
+
+```c
+#include "mem_pte.h"
+req_pa = yghv_pte_va_to_pa(guest_cr3, req_va);   /* 已验证的遍历 */
+```
+
+**这次核查还确认了另外两件事**
+
+1. `yghv_channel.c` 里**没有**其它 island 不安全的调用：
+   `grep -nE "MmGetVirtualForPhysical|ExAllocate|KeWait|MmMapLocked|KeStackAttach"`
+   只命中注释。读物理内存走 `yghv_pa_read` → `MmCopyMemory`，正确。
+2. `YGHV_NO_DEVICE` 的卸载路径完整：`DriverUnload` 先 `Sv206CoopUnload()`
+   反虚拟化所有核，再 teardown，与有无设备无关。所以"无设备构建导致卸载不干净"
+   这个假设被排除。
+
+**顺带发现的一个语义冲突（未修，记录）**
+
+`ch_ack` 把 EDX 写成 0（value 低半的约定），而 FAULT 诊断又把 EDX 写成原因码
+（1..4）。同一寄存器两种语义，靠 EAX 的 status 区分。能工作但脆弱：测试第 2 步
+正是读 EDX 判原因，任何把 EDX 当 value 的调用方都会误读。**下一版应把诊断码移到
+EBX 的高 16 位**，与 value 分开。
+
+**教训（补进 §4）**
+
+> 新模块要用"遍历 guest 页表"这类能力时，先搜一遍树里是否已经有一个**被验证过**
+> 的实现，并且读它的头部注释说明为什么用那个 API。本项目同时存在正确的
+> (`mem_pte.c`, `MmCopyMemory`) 和错误的 (`protect.c`, `MmGetVirtualForPhysical`)
+> 两套遍历，选错的那一次代价是一台机器。
