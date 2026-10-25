@@ -10695,3 +10695,89 @@ EBX 的高 16 位**，与 value 分开。
 > 的实现，并且读它的头部注释说明为什么用那个 API。本项目同时存在正确的
 > (`mem_pte.c`, `MmCopyMemory`) 和错误的 (`protect.c`, `MmGetVirtualForPhysical`)
 > 两套遍历，选错的那一次代价是一台机器。
+
+---
+
+#### 9.377 第八次蓝屏：`0x1E` 特权指令 —— `wrmsr` 在一个仍在 guest 里的核上执行
+
+**事故（这次有 dump，且崩在我们自己的代码里）**
+
+```
+BUGCHECK_CODE:  1e   (KMODE_EXCEPTION_NOT_HANDLED)
+BUGCHECK_P1:    c0000096   (PRIVILEGED_INSTRUCTION)
+BUGCHECK_P2:    fffff807`46ec363f
+SYMBOL_NAME:    yghv_g43+363f
+MODULE_NAME:    yghv_g43
+PROCESS_NAME:   powershell.exe
+```
+
+`.map` 映射：`0x363f` → **`svm_core_ipi_cleanup + 0x5F`**。反汇编那一行：
+
+```
+yghv_g43+0x363a  and  eax, 0FFFFEFFFh     ; clear EFER.SVME
+yghv_g43+0x363f  0f30                     ; wrmsr          ← 崩溃就是这一条
+```
+
+**这不是 CPUID 通道的错**
+
+G43 日志停在 `2: ring the CPUID doorbell`，看起来像通道崩了。但崩溃点在**卸载路径**：
+
+```
+svm_core_cleanup()                      svm_core.c:574
+  -> KeIpiGenericCall(svm_core_ipi_cleanup)
+       -> yg_write_msr(MSR_EFER, efer & ~EFER_SVME)   ← wrmsr 在这里
+```
+
+**根因：在 GIF=0 的核上 `wrmsr` 会被拒绝，而不是被推迟**
+
+`KeIpiGenericCall` 保证 IPI **到达**（它等每个核都跑完回调），但**不保证回调运行在一个
+`wrmsr` 合法的上下文里**。一个仍在 SVM 客户模式的核，GIF 是清的，此时特权写会被
+直接拒绝 —— 而 `svm_core_ipi_cleanup` 恰恰要在那个核上关 SVME。
+
+卸载正是 guest 线程被拆掉的时刻，所以这个窗口是**结构性的**，不是巧合：
+八次卸载里有一次踩中。
+
+**我尝试的第一个修法，以及为什么它无效（重要）**
+
+我给 `yg_write_msr` 加了一个"先读 EFER 判断是否危险，再决定要不要写"的保护。
+**那是假保护**：两条分支里仍然执行 `wrmsr`，检测本身挡不住 fault。已 `git checkout`
+撤销，没有进入代码库。
+
+真正的修法只有一个方向：**在 IPI 之前确认该核已经不在 guest 里**。
+`Sv206CoopUnload()`（走 CPUID 后门反虚拟化）理论上已经做了这件事，而它排在
+`svm_core_cleanup()` 之前 —— 所以我目前**还不能解释**为什么有核没被它带走。
+
+三种可能，都还没验证：
+1. `SvDevirtualizeAllProcessors` 的 `SvExecuteOnEachProcessor` 遇到某个核时
+   `CPUID_UNLOAD_SIMPLE_SVM` 返回的不是 `SSVM`（该核的 VPD 已经不可达），
+   `SvDevirtualizeProcessor` 于是 `goto Exit` **不反虚拟化就返回**；
+2. `KeIpiGenericCall` 的 IPI 与 CPUID 后门两条路径对"该核是否虚拟化"的判断不一致；
+3. 无设备构建（`YGHV_NO_DEVICE`）下某条清理路径被跳过。
+
+**为什么停在这里**
+
+这一项已经付出 8 次重启（1 次 hang + 7 次蓝屏），其中 3 次有 dump 可查。
+上面三种可能各自需要一次"改了再加载"来区分，而那是一次机器。
+按既定规则（蓝屏风险大的先确认），在把这三条区分开之前不再加载无设备构建。
+
+**第八次与前面七次的归因（更新）**
+
+| # | 码 | 失效类别 |
+|---|---|---|
+| 1 | hang | 客体错误 |
+| 2 | 0x101 | 单向验证 |
+| 3 | 0x3B | 死代码掩盖 |
+| 4 | 0x139 | 单次≠重复 |
+| 5 | 0x139 | 跨代残留 |
+| 6 | 0x139 | 原语误用 |
+| 7 | 6008 hang | **选错已有的实现**（用老的页表遍历）|
+| 8 | 0x1E | **上下文合法性**：在 IPI 里做只允许在 PASSIVE 做的事 |
+
+第 8 类是新的一类：指令本身没错，位置错了。`wrmsr` 在 PASSIVE 完全合法，
+在 GIF=0 的 IPI 回调里不合法 —— 而代码没有区分这两者。
+
+**规则（补进 §4）**
+
+> `KeIpiGenericCall` 只保证回调到达，不保证回调的执行上下文允许它做想做的事。
+> 任何在 IPI 回调里执行特权指令（`wrmsr`/`rdmsr` 中的写方向、`mov crX`、
+> `invlpg` 之外的 TLB 操作）的代码，必须先证明目标核不在 guest 模式。
