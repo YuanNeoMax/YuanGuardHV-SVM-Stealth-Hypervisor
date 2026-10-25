@@ -250,6 +250,70 @@ fail:
 
 static void svm_free_vcpu(svm_vcpu_t *vcpu) {
     if (!vcpu) return;
+
+    /*
+     * 9.388: CANCEL AND DRAIN THE AVIC TIMER BEFORE FREEING THE VCPU.
+     *
+     * vmexit.c initialises a DPC and arms it with KeSetTimer:
+     *
+     *     KeInitializeDpc(&vcpu->avic_timer_dpc, yghv_avic_timer_dpc, vcpu);
+     *     KeSetTimer(&vcpu->avic_timer, due, &vcpu->avic_timer_dpc);
+     *
+     * The DPC's context parameter IS the vcpu. A timer DPC runs at
+     * DISPATCH_LEVEL, and the timer's expiry routine sits at CLOCK_LEVEL.
+     *
+     * This function freed the vcpu without cancelling that timer, so any armed
+     * timer fired afterwards with a pointer into freed pool. That is exactly the
+     * signature of five of this session's bugchecks:
+     *
+     *     DRIVER_IRQL_NOT_LESS_OR_EQUAL (0xD1)
+     *     Arg2 = 0xE   (CLOCK_LEVEL - a timer expiry context, not an arbitrary one)
+     *     Arg3 = 8     (an 8-byte field read)
+     *     faulting addresses two ADJACENT pages (0x…9000 / 0x…a000)
+     *
+     * KeCancelTimer is not enough on its own: a DPC may already be queued when the
+     * timer is cancelled, and it will still run. KeFlushQueuedDpcs waits for the
+     * DPC's queue entry to drain, so the vcpu cannot be freed while a callback is
+     * between "dequeued" and "returned". That ordering is the whole point: cancel,
+     * then drain, then free - any other order leaves the same window.
+     */
+    if (vcpu->avic_timer_initialized) {
+        /* Only touch a KTIMER/KDPC that was actually initialised: KeCancelTimer on
+         * a zeroed KTIMER dereferences a NULL timer list head.
+         *
+         * The DRAIN is NOT done here: KeFlushQueuedDpcs waits for every core's DPC
+         * queue, so calling it once per vcpu would cost 12 global drains on this
+         * machine. svm_core_cleanup cancels all timers first and drains ONCE after
+         * the loop - cancelling everywhere before draining anywhere is also the
+         * safer order, because a DPC queued by vcpu N cannot fire while vcpu N is
+         * still being freed. */
+        KeCancelTimer(&vcpu->avic_timer);
+        vcpu->avic_timer_initialized = FALSE;
+        InterlockedExchange((volatile LONG *)&vcpu->avic_timer_armed, 0);
+    }
+
+    /*
+     * 9.388b: THE AVIC STATE WAS NEVER RELEASED HERE AT ALL.
+     *
+     * main.c has yghv_avic_cleanup(vcpu), which frees avic_backing_page,
+     * avic_physical_id_table, avic_logical_id_table and unmaps avic_host_apic_va.
+     * That function is called from the thread-creation failure paths (3491, 3504)
+     * and from yghv_avic_init_self (2199) - but NOT from the teardown that actually
+     * runs on unload, which is this one.
+     *
+     * So on every unload those mappings and pages were simply leaked, and - more
+     * importantly - the timer that points INTO avic_backing_page was left armed
+     * while the page it reads (with vcpu as its DPC context) was going away.
+     *
+     * Declared here rather than included: yghv_avic_cleanup is static in main.c and
+     * this module is compiled separately. A forward declaration keeps the ownership
+     * in main.c, where the rest of the AVIC code lives.
+     */
+    {
+        extern void yghv_avic_cleanup_release(svm_vcpu_t *v);
+        yghv_avic_cleanup_release(vcpu);
+    }
+
     if (vcpu->iopm)  MmFreeContiguousMemory(vcpu->iopm);
     if (vcpu->msrpm) MmFreeContiguousMemory(vcpu->msrpm);
     if (vcpu->guest_tss) MmFreeContiguousMemory(vcpu->guest_tss);
@@ -608,6 +672,25 @@ int svm_core_cleanup(void) {
 
     /* Restore per-core MSR state while VMCB/hsave memory is still valid. */
     KeIpiGenericCall(svm_core_ipi_cleanup, 0);
+
+    /*
+     * 9.388c: CANCEL EVERY TIMER BEFORE FREEING ANY VCPU.
+     *
+     * A timer DPC carries the vcpu as its context. If freeing vcpu N is followed
+     * by a DPC for vcpu M that was still armed, the DPC reads freed pool. So the
+     * cancel pass runs over all of them first, then one drain, then the free pass.
+     * That is three passes instead of one, and it is the only order where no DPC
+     * can outlive the object it points at.
+     */
+    for (i = 0; i < SVM_MAX_CORES; i++) {
+        if (g_vcpus[i] && g_vcpus[i]->avic_timer_initialized) {
+            KeCancelTimer(&g_vcpus[i]->avic_timer);
+            g_vcpus[i]->avic_timer_initialized = FALSE;
+            InterlockedExchange((volatile LONG *)&g_vcpus[i]->avic_timer_armed, 0);
+        }
+    }
+    /* One global drain: a DPC already dequeued on any core has returned by now. */
+    KeFlushQueuedDpcs();
 
     for (i = 0; i < SVM_MAX_CORES; i++) {
         if (g_vcpus[i]) {

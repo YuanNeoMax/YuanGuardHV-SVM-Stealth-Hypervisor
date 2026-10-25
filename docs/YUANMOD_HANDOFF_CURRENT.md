@@ -11322,3 +11322,104 @@ B 类的修复需要**重排卸载顺序**，而每次尝试都是一次重启�
 > 因为验证需要卸载。此时必须先建立**不依赖被卸载者**的观测通道
 > （内核调试器、第二台机器、或写进一个不会被释放的页），
 > 再动被观测的代码。在没有观测通道的情况下改卸载代码，是在用重启次数赌。
+
+---
+
+#### 9.389 第十九次：崩溃点确定在 ASM 桩的 `vmrun` 附近 —— 两套卸载器互相覆盖
+
+**第十九次（第五次 B 类，签名完全一样）**
+
+```
+BUGCHECK_CODE: d1   IRQL 0xE   8-byte write
+faulting: 0x25601a000, 0x25601b000       (adjacent pages, 5th time)
+SYMBOL_NAME: yghv_load+2450d
+PROCESS:   System        <- 系统线程上下文，不是 powershell
+```
+
+**`.map` 这次给出了确定答案**
+
+```
+0x24500 gap=32   Sv206LaunchVm      <- 崩溃在 +0xD
+0x24110 ...      yghv_s206_tsc_apply_all
+```
+
+`Sv206LaunchVm` 的 map 条目**只有 32 字节**，而它实际是 188 字节的 ASM 桩 ——
+那 32 字节是 map 的 external-symbol 条目，不是函数长度。但这不重要，重要的是
+**偏移 `+0xD` 落在桩的开头几条指令**：
+
+```asm
+Sv206LaunchVm proc frame
+    mov  rsp, rcx        ; +0x00  RSP <= HostRsp
+SvLV10:
+    mov  rax, [rsp]      ; +0x03  RAX <= VpData->HostStackLayout.GuestVmcbPa
+    vmload rax           ; +0x07
+    vmrun rax            ; +0x08  <- 崩溃在 +0xD 附近，即 vmrun/vmsave 之间
+    vmsave rax
+```
+
+**`mov rax,[rsp]` 读的是 `VpData` 里的 `HostStackLayout`。** 而每一次崩溃的故障地址
+都是**两个相邻页** —— 那不是 NPT 表，是**内核栈加上 `VpData` 内的 HostStackLayout**。
+
+所以 B 类不是「NPT 被提前释放」，而是：
+
+> **`VpData` 被释放了，而 `Sv206LaunchVm` 的 VMRUN 循环还在用它。**
+
+**为什么循环还在跑：两套卸载器在互相覆盖**
+
+```
+main.c:4991   return Sv206Entry(d, r);          <- Sv206Entry 接管整个入口
+              （它内部安装了 upstream 自己的 DriverUnload）
+main.c:5259   /* upstream overwrote d->DriverUnload with its own half-teardown */
+main.c:5262   d->DriverUnload = DriverUnload;   <- 又覆盖回 yghv 的
+```
+
+**注释自己就写了这个问题**，但结论是"keep yghv's"，也就是选了 yghv 那个。
+
+而崩溃证明：**真正执行的那一个，没有等 `Sv206LaunchVm` 的 guest 循环停下来。**
+
+`svm_core_wait_all_stopped(g_vcpu_count)`（main.c:4920）等的是 **resident 线程**
+（`svm_core_stop_all_residents` 置位的那些）。而 206 主线每核的 guest 是
+`Sv206LaunchVm` 里的**无限 VMRUN 循环**，它由 `Sv206Entry` 启动、由
+**CPUID 心跳**（`CPUID_UNLOAD_SIMPLE_SVM` / 那个 stop flag）退出 —— **不在等的那批里。**
+
+这正是 9.387 记下的第 1 条可疑，现在有了确定的证据链。
+
+**我修过的四条为什么都不是它**
+
+| # | 修改 | 层面 | 对 B 类的影响 |
+|---|---|---|---|
+| 9.380 | 移除 IPI 里的 EFER 写 | 值/位置 | **修好了 A 类**（0x1E 消失，已证）|
+| 9.383 | ack 写进 `VpRegs->Rcx` | 值/位置 | 无 |
+| 9.386 | VPD 分配改为真页对齐 | 值/位置 | 无 |
+| 9.388 | AVIC timer cancel + DPC drain | **顺序** | 无（那个 timer 不是元凶）|
+
+B 类的根因是**"等谁停下来"这份名单不完整**，而四条修改没有一条动这份名单。
+
+**要修的是什么（下一步，需要重排）**
+
+`DriverUnload` 必须在 `svm_free_vcpu` / `npt_cleanup` **之前**，把
+`Sv206LaunchVm` 的每核 guest 循环**确认退出**。当前只有：
+- `g_os_guest_stop_requested`（只影响 OS-as-guest 那套线程）
+- `svm_core_stop_all_residents` + `wait_all_stopped`（只影响 resident 线程）
+
+缺的是 206 主线每核 VMRUN 循环的停止与确认。而它的退出机制是"下一次 VMEXIT 时
+看到 stop flag" —— 也就是**需要一个能让它必然 VMEXIT 的触发**（CPUID 心跳是现成的，
+`Sv206Entry` 里已有那套）。
+
+**为什么我不现在改**
+
+因为**没有观测通道**（9.387 的规则）。要验证"循环真的停了"，需要在崩溃前读到状态，
+而卸载路径在第一个文件写落盘前就把机器打死。十九次重启已经证明：
+**在没有观测通道的情况下改卸载代码，是在用重启次数赌。**
+
+这一次我至少拿到了**确定的崩溃点**（`Sv206LaunchVm+0xD`）和**确定的失效对象**
+（`VpData` 的 `HostStackLayout`），而不是又一次猜测。这比前四次有价值 ——
+它是"改哪里"的答案，只是还差"怎么验证"。
+
+**规则（补进 §4，与 9.387 那条并列）**
+
+> 一个"等待所有执行体停止"的函数，必须先枚举**全部**执行体来源。
+> 本树同时存在三套：OS-as-guest 线程、resident 线程、206 主线的每核 VMRUN 循环。
+> `svm_core_wait_all_stopped` 只覆盖前两套。判据：对每个
+> `PsCreateSystemThread` / `KeSetSystemAffinityThread` / `vmrun` 循环，
+> 都必须能在同一个等待函数里找到对应的"停止 + 确认"。

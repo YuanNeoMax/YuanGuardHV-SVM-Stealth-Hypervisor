@@ -2096,6 +2096,16 @@ static void yghv_avic_cleanup(svm_vcpu_t *vcpu) {
     }
 }
 
+/*
+ * 9.388b: a NON-STATIC alias for yghv_avic_cleanup, so svm_core.c can call it from
+ * the unload teardown. The function above is static and that file is a separate
+ * translation unit, so the release path had no way to reach it - which is exactly
+ * why the AVIC pages were leaked on every unload.
+ */
+void yghv_avic_cleanup_release(svm_vcpu_t *v) {
+    yghv_avic_cleanup(v);
+}
+
 static uint32_t yghv_avic_ffs_u32(uint32_t value) {
     uint32_t i;
     for (i = 0; i < 32; i++) {
