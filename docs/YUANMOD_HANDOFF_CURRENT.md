@@ -10461,3 +10461,83 @@ fast-fail dispatch，说明是栈检查在自己发现不对时主动 bugcheck�
 | 高频重放安全 | ✘ **未证，且已观察到 0x139** |
 
 前四项是 C1 真正要回答的问题，都回答了。第五项超出 C1 范围，单独记入剩余项。
+
+#### 9.373 第五次蓝屏：`#BP` 位跨驱动重载存活 —— 与 9.369h 同一个根因
+
+**事故**
+
+```
+BUGCHECK_CODE:  139 (KERNEL_SECURITY_CHECK_FAILURE)
+BUGCHECK_P1:    4   (FAST_FAIL_INCORRECT_STACK)
+FAILURE_BUCKET: 0x139_MISSING_GSFRAME_STACKPTR_ERROR_nt!KiFastFailDispatch
+```
+
+栈（决定性）：
+
+```
+nt!KeBugCheckEx
+nt!KiBugCheckDispatch
+nt!KiFastFailDispatch
+nt!KiRaiseSecurityCheckFailure
+nt!RtlpGetStackLimitsEx      <- 检查栈界限
+nt!RtlDispatchException      <- 正在派发一个异常
+nt!KiDispatchException
+```
+
+内核在**派发异常**时发现栈指针不在界限内。这不是我们的代码直接崩，而是异常派发
+路径先发现了栈不对。
+
+**★ 这次崩溃比上一次更早，而这是最有价值的线索**
+
+G42 的脚本顺序是 `baseline → holder → arm`。崩溃发生在 **holder 阶段**，也就是
+`sys-bp-int3 on` **还没执行**、策略旗标是 0、这一轮根本没有武装过任何断点。
+
+**所以它和 C1 的改动无关。** 它来自更早的一次运行留下的状态。
+
+**根因（与 9.369h 完全同形）**
+
+`InterceptException` 只在 prepare 里 `|= (1u << 1)`（#DB）。**bit 3（#BP）从未被
+清零**。而 VMCB 的内存**跨驱动重载存活**（9.369h 已经为 RDTSC 位记录过这一条）：
+
+> 上一轮 `sys-bp-int3 on` 把 bit 3 写进了 VMCB。驱动卸载、机器重启之后，那块内存
+> 还在，下一轮加载时位仍然开着 —— 于是 guest 的每一个 #BP 都变成我们的 VMEXIT，
+> 而这个 boot 里从来没有武装过任何断点。
+
+`prepare` 里"不设置"不等于"清除"：它必须先清。
+
+**修法**
+
+```c
+VpData->GuestVmcb.ControlArea.InterceptException &= ~((UINT32)(1u << 3));
+VpData->GuestVmcb.ControlArea.InterceptException |= (1u << 1);
+```
+
+同一段代码里，紧挨着 #DB 的设置，位置相邻是刻意的：下一次有人加第三个异常位时，
+会看见"这里有一个清零、一个设置"，而不是只看见设置。
+
+**验证（保守顺序，先不碰 #BP）**
+
+```
+g42a  safe：exec-page 跑通 ×2，intercept 0→1→0，health fatal=0，未崩
+G25   13/13 ALL PASS
+```
+
+`g42a` 是 C1 里那个**不起 holder、不放置 0xCC** 的安全子集。它能验证拦截位的
+开关与反射，而不触发任何 #BP —— 这正是判断"位是否残留"的正确工具。
+
+**这一项至此的五次崩溃，全部是同一个形状**
+
+| # | 码 | 我以为是 | 实际是 |
+|---|---|---|---|
+| 1 | hang | freeze 能控制时间 | 客体错了：冻的是宿主 OS |
+| 2 | 0x101 | 武装即可用 | 只验证了开启，没验证释放 |
+| 3 | 0x3B | handshake 可用 | ack 从未被写，两个调用方一直是死代码 |
+| 4 | 0x139 | 单次 #BP 通过就够了 | 单次通过 ≠ 重复通过 |
+| 5 | 0x139 | 是 4 的延续 | **位跨重载存活，与 4 无关** |
+
+第 5 次特别值得记：它在**没有执行任何新功能**的情况下发生，只因为上一轮留下的位
+还在。这类"上一轮的残留"是唯一无法靠"本轮代码看起来对"来预防的失效——只能靠
+**加载时把每个我们拥有解释权的位显式归位**。
+
+> **规则（写进 §4）**：任何我们可能设置过的 VMCB 位，prepare 必须显式清零，
+> 不能只保证"这次不设置"。VMCB 的生命周期长于驱动。

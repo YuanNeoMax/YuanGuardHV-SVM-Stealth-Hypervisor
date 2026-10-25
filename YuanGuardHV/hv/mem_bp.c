@@ -9,6 +9,10 @@
 #include "common/mem_engine.h"
 #include "mem_pa.h"
 
+/* 9.373: the NPT manager, defined in main.c. Declared here the way multi_core.c
+ * does it; there is no header that exports it. */
+extern npt_mgr_t g_npt;
+
 /*
  * 9.360: compile-time assert. A negatively-sized array fails the BUILD with a
  * line and a number, which is the form that reads clearly in a build log.
@@ -87,6 +91,62 @@ DECLSPEC_ALIGN(4096) static yghv_bp_pageregion_t g_bp_region_pad;   /* separatio
 
 YGHV_STATIC_ASSERT_BP(sizeof(g_bp) <= 4096, g_bp_fits_one_page);
 YGHV_STATIC_ASSERT_BP(sizeof(g_bp_region) == 4096, g_bp_is_exactly_one_page);
+
+/* ============================================================================
+ * 9.373: SHADOW FRAMES for INT3 mode - one page per slot, indexed by slot.
+ * ==========================================================================*/
+
+/*
+ * WHY THIS EXISTS
+ *
+ * The #BP handler has to make the ORIGINAL instruction execute. The old way was
+ * to write the original byte back into the guest frame with yghv_pa_write(), and
+ * then #DB wrote 0xCC again. Semantics were right and the mechanism was wrong:
+ * yghv_pa_write builds an MDL and calls MmMapLockedPagesSpecifyCache, which may
+ * BLOCK, from inside a #BP exit at DISPATCH with GIF=0.
+ *
+ * Measured: one breakpoint firing once was fine. The same 0xCC executed at 20 Hz
+ * produced 0x139 MISSING_GSFRAME_STACKPTR_ERROR and a reboot.
+ *
+ * The replacement writes no memory at all. Each INT3 slot gets a shadow frame
+ * that holds the page WITH the original byte already in place; the handler only
+ * flips the NPT leaf to the shadow (npt_map_page - pure arithmetic, the same
+ * primitive yghv_guard_decoy_bare already uses from the island), and #DB flips it
+ * back. The instruction executes against real bytes, so the breakpoint keeps
+ * firing: no semantic loss.
+ *
+ * WHY A SEPARATE TABLE: putting shadow_pa in yghv_bp_t made g_bp exceed its
+ * one-page assertion (64 slots x 8 bytes). The assertion fired at BUILD time,
+ * which is exactly its job - the alternative would have been a page that spills
+ * into a neighbour the guard later hides.
+ */
+typedef union {
+    uint64_t pa[YGHV_BP_MAX];        /* slot -> shadow frame physical address */
+    uint8_t  page[4096];
+} yghv_bp_shadow_region_t;
+
+DECLSPEC_ALIGN(4096) static yghv_bp_shadow_region_t g_bp_shadow;
+DECLSPEC_ALIGN(4096) static yghv_bp_shadow_region_t g_bp_shadow_pad;  /* separation */
+
+#define g_shadow_pa (g_bp_shadow.pa)
+
+/* The VAs of the same allocations, needed to free them. Kept in its own page for
+ * the same reason the PA table is: g_bp is asserted to be exactly one page. */
+typedef union {
+    void *va[YGHV_BP_MAX];
+    uint8_t page[4096];
+} yghv_bp_shadowva_region_t;
+
+DECLSPEC_ALIGN(4096) static yghv_bp_shadowva_region_t g_bp_shadow_va;
+DECLSPEC_ALIGN(4096) static yghv_bp_shadowva_region_t g_bp_shadow_va_pad;
+
+#define g_bp_shadow_va (g_bp_shadow_va.va)
+
+YGHV_STATIC_ASSERT_BP(sizeof(yghv_bp_shadowva_region_t) == 4096,
+                      bp_shadowva_is_exactly_one_page);
+
+YGHV_STATIC_ASSERT_BP(sizeof(yghv_bp_shadow_region_t) == 4096,
+                      bp_shadow_is_exactly_one_page);
 /*
  * ============================================================================
  * 9.359: HOT / COLD SEPARATION.
@@ -249,6 +309,7 @@ static volatile LONG64 g_bp_fail_mode;
 static volatile LONG64 g_bp_fail_va;
 static volatile LONG64 g_bp_fail_drslot;
 static volatile LONG64 g_bp_fail_patch;
+static volatile LONG64 g_bp_shadow_switches;   /* 9.373: leaf flips done */
 
 /* Virtual DR bank (9.327). The guest's DR0-DR3 accesses are intercepted, so
  * these values are what the target sees; the real DRs are ours. COLD: only the
@@ -561,6 +622,57 @@ int yghv_bp_add_ex(uint64_t gpa, uint64_t va, uint64_t rip,
             g_bp[i].hits = 0;
             InterlockedExchange(&g_bp[i].active, 1);
             InterlockedIncrement(&g_bp_count);
+
+            /*
+             * 9.373: BUILD THE SHADOW FRAME HERE, IN PASSIVE, BEFORE THE PATCH.
+             *
+             * The shadow is a copy of the whole page with the ORIGINAL byte at
+             * `off` - i.e. exactly what the page looked like before we put 0xCC
+             * there. #BP will point the NPT leaf at it so the real instruction
+             * executes, and #DB points the leaf back. Both are leaf writes; no
+             * MDL, no blocking, nothing that can be called only at PASSIVE.
+             *
+             * This is the only place that may block, and it is PASSIVE: the arm
+             * path. If the copy cannot be made the breakpoint is REFUSED rather
+             * than armed without a way back - an armed page whose restore path
+             * depends on an MDL inside the island is the exact defect that
+             * produced 0x139.
+             */
+            g_shadow_pa[i] = 0;
+            {
+                void *sh = ExAllocatePoolWithTag(NonPagedPool, 0x1000, 'BPSH');
+                if (!sh) {
+                    InterlockedIncrement64(&g_bp_fail_patch);
+                    InterlockedExchange(&g_bp[i].active, 0);
+                    InterlockedDecrement(&g_bp_count);
+                    return -10;
+                }
+                RtlZeroMemory(sh, 0x1000);
+                if (!yghv_pa_read(page, sh, 0x1000)) {
+                    ExFreePoolWithTag(sh, 'BPSH');
+                    InterlockedIncrement64(&g_bp_fail_patch);
+                    InterlockedExchange(&g_bp[i].active, 0);
+                    InterlockedDecrement(&g_bp_count);
+                    return -10;
+                }
+                /* The shadow must carry the ORIGINAL byte, which it already does
+                 * because it was copied before the patch. Assert that fact by
+                 * writing it explicitly, so a future reorder cannot silently
+                 * shadow the 0xCC instead. */
+                ((uint8_t *)sh)[off] = orig;
+                g_shadow_pa[i] = MmGetPhysicalAddress(sh).QuadPart;
+                if (!g_shadow_pa[i]) {
+                    ExFreePoolWithTag(sh, 'BPSH');
+                    InterlockedIncrement64(&g_bp_fail_patch);
+                    InterlockedExchange(&g_bp[i].active, 0);
+                    InterlockedDecrement(&g_bp_count);
+                    return -10;
+                }
+                /* Kept alive for the life of the breakpoint; released by
+                 * yghv_bp_remove_locked via the same slot index. */
+                g_bp_shadow_va[i] = sh;
+            }
+
             /* Publish the slot BEFORE patching, so the #BP handler can always
              * find it once the 0xCC is in place. */
             {
@@ -769,6 +881,71 @@ int yghv_bp_on_npf(uint64_t gpa, uint64_t rip, uint32_t kind, uint32_t cpl,
     InterlockedIncrement64(&g_bp_hits);
     yghv_bp_record(rip, page, 0, kind, cpl, YGHV_BP_MODE_NPF, cr3);
     return 1;
+}
+
+/* ============================================================================
+ * 9.373: ISLAND-SAFE shadow switch
+ * ==========================================================================*/
+
+/*
+ * Point the NPT leaf for `gpa` at the shadow frame (to_shadow=1) or back at the
+ * real frame (0). Nothing but leaf arithmetic:
+ *
+ *   npt_split_2mb_to_4kb   table walks in memory we already mapped
+ *   npt_map_page           writes one 8-byte entry
+ *   VmcbClean / TlbControl are set by the CALLER, which owns the VMCB
+ *
+ * No allocation, no MDL, no call that can block. That is the whole point: the
+ * previous implementation of this step was yghv_pa_write(), and calling it from
+ * here is what produced 0x139.
+ *
+ * Returns 1 when the leaf now points where asked, 0 when it could not (no
+ * shadow for this page, no NPT entry, split failed). A 0 means the caller must
+ * NOT pretend the instruction ran - it should reflect the #BP to the guest.
+ */
+int yghv_bp_find_int3_page(uint64_t page);   /* defined below */
+
+int yghv_bp_shadow_switch(uint64_t gpa, int to_shadow) {
+    uint64_t page = gpa & ~(uint64_t)0xFFFULL;
+    int slot;
+
+    if (!page)
+        return 0;
+
+    slot = yghv_bp_find_int3_page(page);
+    if (slot < 0)
+        return 0;
+    if (!g_shadow_pa[slot])
+        return 0;
+
+    if (npt_split_2mb_to_4kb(&g_npt, page))
+        return 0;
+
+    if (to_shadow) {
+        if (!NT_SUCCESS(npt_map_page(&g_npt, page,
+                                     g_shadow_pa[slot] & ~(uint64_t)0xFFFULL,
+                                     NPT_4K_PAGE_FLAGS)))
+            return 0;
+    } else {
+        if (!NT_SUCCESS(npt_map_page(&g_npt, page, page, NPT_4K_PAGE_FLAGS)))
+            return 0;
+    }
+    InterlockedIncrement64(&g_bp_shadow_switches);
+    return 1;
+}
+
+/* Which INT3 slot owns this PAGE? The shadow switch is page-granular, but slots
+ * are keyed by VA, so this walks for a matching gpa. */
+int yghv_bp_find_int3_page(uint64_t page) {
+    int i;
+    int n = (int)InterlockedCompareExchange(&g_bp_count, 0, 0);
+    for (i = 0; i < n && i < YGHV_BP_MAX; i++) {
+        if (InterlockedCompareExchange(&g_bp[i].active, 0, 0) &&
+            g_bp[i].mode == YGHV_BP_MODE_INT3 &&
+            g_bp[i].gpa == page)
+            return i;
+    }
+    return -1;
 }
 
 int yghv_bp_on_int3(uint64_t va, uint32_t cpl, uint64_t cr3) {

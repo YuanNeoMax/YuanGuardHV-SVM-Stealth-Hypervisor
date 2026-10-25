@@ -112,6 +112,8 @@ extern int yghv_protect_npt_set_perm(UINT64 gpa, UINT64 perm);
 /* Tier 4.4 (9.327, INT3 mode): #BP handling + the byte we displaced. */
 extern int yghv_bp_on_int3(UINT64 va, UINT32 cpl, UINT64 cr3);
 extern int yghv_bp_int3_orig(UINT64 va, UINT8 *out);
+/* 9.373: island-safe shadow switch (leaf write only). */
+extern int yghv_bp_shadow_switch(UINT64 gpa, int to_shadow);
 /* Tier 4.4 (9.327, DR mode): which breakpoint fired, per DR6. */
 extern int yghv_bp_on_dr(UINT64 dr6, UINT64 rip, UINT32 cpl, UINT64 cr3);
 /* Physical write, used to restore/patch the instruction byte. */
@@ -2634,12 +2636,35 @@ tsc_policy_done:;
                 yghv_bp_int3_orig(bpVa, &origByte)) {
                 UINT64 bpGpa = yghv_protect_guest_va_to_pa(
                                    VpData->HostStackLayout.Padding1, bpVa);
-                if (bpGpa)
-                    (void)yghv_pa_write(bpGpa, &origByte, 1);
-                VpData->GuestVmcb.StateSaveArea.Rflags |= 0x100ULL; /* TF */
-                VpData->GuestVmcb.ControlArea.GuestPaOfGhcb = bpVa | 2ULL;
-                VpData->GuestVmcb.ControlArea.TlbControl = 1;
-                break;
+                /*
+                 * 9.373: NO MEMORY WRITE HERE. THE LEAF IS FLIPPED INSTEAD.
+                 *
+                 * The old code called yghv_pa_write(bpGpa, &origByte, 1), which
+                 * builds an MDL and maps it - a call that may block, executed
+                 * inside a #BP exit at DISPATCH with GIF=0. One firing was
+                 * survivable; the same 0xCC at 20 Hz produced 0x139
+                 * MISSING_GSFRAME_STACKPTR and a reboot.
+                 *
+                 * Now the page's NPT leaf is pointed at the shadow frame, which
+                 * already carries the ORIGINAL byte at this offset. The
+                 * instruction fetches real bytes and executes, so the breakpoint
+                 * keeps its semantics; #DB points the leaf back. Both are 8-byte
+                 * table writes.
+                 *
+                 * If there is no shadow for this page (arm refused, or the copy
+                 * failed), the switch fails and the #BP is REFLECTED to the guest
+                 * rather than silently pretending the instruction ran.
+                 */
+                if (bpGpa && yghv_bp_shadow_switch(bpGpa, 1)) {
+                    VpData->GuestVmcb.StateSaveArea.Rflags |= 0x100ULL; /* TF */
+                    VpData->GuestVmcb.ControlArea.GuestPaOfGhcb = bpVa | 2ULL;
+                    VpData->GuestVmcb.ControlArea.VmcbClean = 0;
+                    VpData->GuestVmcb.ControlArea.TlbControl = 1;
+                    break;
+                }
+                /* No shadow: fall through to the reflect branch below, so the
+                 * guest still sees its own #BP semantics instead of a silently
+                 * skipped instruction. */
             }
 
             /* No INT3 breakpoint here: this #BP is the guest's own.
@@ -2717,10 +2742,24 @@ tsc_policy_done:;
                     UINT64 int3Gpa = yghv_protect_guest_va_to_pa(
                                          VpData->HostStackLayout.Padding1,
                                          int3Va);
+                    /*
+                     * 9.373: PUT THE LEAF BACK, DO NOT REWRITE THE BYTE.
+                     *
+                     * This is the second of the two MDL writes on the INT3 hot
+                     * path (the first is in the #BP branch). Both had to go: they
+                     * map a page to write one byte, and mapping may block, from
+                     * inside an exit at DISPATCH with GIF=0.
+                     *
+                     * Pointing the leaf back at the real frame restores the page
+                     * exactly - the 0xCC is still there, because the shadow copy
+                     * was the thing that had it removed, not the guest page. So
+                     * the breakpoint is armed again for the next visit with no
+                     * byte written anywhere.
+                     */
                     if (int3Gpa) {
-                        UINT8 cc = 0xCC;
-                        (void)yghv_pa_write(int3Gpa, &cc, 1);
+                        (void)yghv_bp_shadow_switch(int3Gpa, 0);
                     }
+                    VpData->GuestVmcb.ControlArea.VmcbClean = 0;
                     VpData->GuestVmcb.ControlArea.TlbControl = 1;
                 } else {
                     yghv_protect_arm_page_bare(slot);
@@ -3221,6 +3260,21 @@ SvPrepareForVirtualization (
     // crash (the c12/c13 fast dialog deaths; dbg ring empty proved zero #DB
     // VMEXITs). Only bit 1 is set: Windows' benign #GP/#PF probes stay native
     // (the 9.244 concern targets #GP, vector 13 — untouched).
+    /*
+     * 9.373: FORCE bit 3 (#BP) CLEAR AT PREPARE.
+     *
+     * Measured across two runs: the SAME 0x139 MISSING_GSFRAME_STACKPTR appeared
+     * even when the policy flag was 0 and no breakpoint had been armed in that
+     * boot at all. The cause is the one 9.369h already recorded for the RDTSC
+     * bits: a VMCB intercept bit lives in memory that OUTLIVES a driver reload,
+     * so a bit set by an earlier load stays armed for the next one. Refraining
+     * from setting it cannot clear it.
+     *
+     * So prepare owns bit 3 the same way it owns the TSC bits: cleared here, and
+     * re-armed only by yghv_s206_bp_int3_apply_all() when the policy asks.
+     */
+    VpData->GuestVmcb.ControlArea.InterceptException &= ~((UINT32)(1u << 3));
+
     VpData->GuestVmcb.ControlArea.InterceptException |= (1u << 1);
     /*
      * 9.372 (C1): INTERCEPT #BP -- OPT-IN, AND ONLY BECAUSE IT WAS NEVER ON.

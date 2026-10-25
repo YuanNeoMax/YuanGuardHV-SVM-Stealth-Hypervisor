@@ -61,6 +61,29 @@ typedef struct {
     uint32_t kinds;      /* bitmask of YGHV_BP_* */
     uint32_t mode;       /* YGHV_BP_MODE_* */
     uint8_t  orig_byte;  /* INT3 mode: the byte we replaced with 0xCC */
+    /*
+     * 9.373: THE SHADOW FRAME, allocated at arm time.
+     *
+     * The #BP handler used to restore the original byte with yghv_pa_write(),
+     * which builds an MDL and calls MmMapLockedPagesSpecifyCache - a call that
+     * may block. It ran inside the #BP exit at DISPATCH with GIF=0. Once per
+     * breakpoint that was survivable; measured under repeated execution of the
+     * same 0xCC (20 Hz) it produced 0x139 MISSING_GSFRAME_STACKPTR.
+     *
+     * The fix that keeps the SEMANTICS (the original instruction really does
+     * execute, so a breakpoint keeps firing) while writing no memory in the
+     * island: a shadow frame holding the page WITH the original byte already in
+     * place. The handler only flips an NPT leaf -
+     * npt_map_page(g_npt, page, shadow_pa, flags) - which is pure memory
+     * arithmetic, and the same primitive yghv_guard_decoy_bare() already uses
+     * from the island. #DB then flips the leaf back to the real frame.
+     *
+     * Allocated PASSIVE at arm time. It is NOT a field of this struct: the
+     * compile-time assertion pins g_bp to exactly one page (64 slots), and adding
+     * eight bytes per slot made it 64 bytes too large - the assertion caught that,
+     * which is what it is for (9.363). The shadow frames live in their own
+     * page-exact table indexed by the same slot number.
+     */
     uint32_t dr_slot;    /* DR mode: which of DR0-DR3, or YGHV_BP_NO_SLOT */
     uint64_t hits;       /* times this breakpoint matched */
     volatile LONG active;
