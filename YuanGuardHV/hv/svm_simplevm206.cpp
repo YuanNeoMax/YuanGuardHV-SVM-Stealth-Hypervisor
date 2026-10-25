@@ -3070,7 +3070,40 @@ tsc_policy_done:;
         //
         guestContext.VpRegs->Rax = reinterpret_cast<UINT64>(VpData) & MAXUINT32;
         guestContext.VpRegs->Rbx = VpData->GuestVmcb.ControlArea.NRip;
-        guestContext.VpRegs->Rcx = VpData->GuestVmcb.StateSaveArea.Rsp;
+        /*
+         * 9.383: THE ACK GOES HERE, AND THIS IS THE UNIFIED ROOT CAUSE.
+         *
+         * SvDevirtualizeProcessor does:
+         *     __cpuidex(registers, CPUID_UNLOAD_SIMPLE_SVM, ...);
+         *     if (registers[2] != 'SSVM') goto Exit;
+         * and registers[2] is ECX. The value it will actually see is THIS line -
+         * RCX is overwritten right here with the guest's RSP. So the check failed
+         * every single time and SvDevirtualizeAllProcessors de-virtualized NOTHING.
+         *
+         * THAT ONE FACT EXPLAINS BOTH CRASH FAMILIES:
+         *
+         *   0x1E PRIVILEGED_INSTRUCTION at svm_core_ipi_cleanup+0x5F
+         *     cores were still in guest mode, and the unload IPI cleared
+         *     EFER.SVME there - undefined per the AMD APM. Fixed by 9.380, which
+         *     removed that write because the ExitVm path below already clears
+         *     SVME in the one legal window.
+         *
+         *   0xD1 at IRQL 14 on the two adjacent NPT pages 0x194bfd000/0x194bfe000
+         *     with the cores STILL VIRTUALIZED, DriverUnload went on to
+         *     npt_cleanup() and freed the very tables those cores were running
+         *     with as NCr3. The next guest instruction caused an #NPF, the walk
+         *     read freed memory, and it faulted inside the exit handler.
+         *
+         * So the two fixes are one fix plus its precondition: 9.380 removed a write
+         * that should not happen; this one makes the de-virtualizer actually run so
+         * that npt_cleanup is no longer reached with live cores.
+         *
+         * RSP is not lost: SvDevirtualizeProcessor only reads EAX:EDX for the VPD
+         * address. The resume state that the ORIGINAL caller (the guest itself,
+         * continuing after CPUID) would need is kept in RBX (NRip) and is not read
+         * by the unloader.
+         */
+        guestContext.VpRegs->Rcx = 'SSVM';
         guestContext.VpRegs->Rdx = reinterpret_cast<UINT64>(VpData) >> 32;
 
         //

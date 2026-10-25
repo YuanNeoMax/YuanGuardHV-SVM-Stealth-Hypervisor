@@ -15,9 +15,67 @@ static volatile LONG64 g_npt_pt_miss;
  * on this build: 9.271-9.273). MmAllocateContiguousMemory keeps table PAs
  * under 4GB; the direct-map-free design makes the alt-NPT clone safe. */
 
+/*
+ * 9.384: RECORD EVERY NPT PAGE'S PHYSICAL ADDRESS, SO A CRASH ADDRESS CAN BE
+ * ANSWERED WITHOUT SYMBOLS.
+ *
+ * Fifteen restarts, and the last three ended with the same signature: a 0xD1
+ * whose faulting addresses were two ADJACENT pages (0x194bfd000/0x194bfe000, then
+ * 0x2187f6000/0x2187f7000). Those look like NPT tables, but "look like" is not a
+ * measurement, and the .map could not name the crashing instruction reliably
+ * (import thunk table around 0x24120 makes any offset in that range ambiguous).
+ *
+ * This table turns the question into arithmetic: is the faulting address inside
+ * the range this driver allocated? Recorded at the ONE place NPT pages are
+ * allocated, so it cannot miss a page.
+ */
+#define YGHV_NPT_PA_MAX 512
+static volatile LONG64 g_npt_pa_count;
+static DECLSPEC_ALIGN(8) uint64_t g_npt_pa[YGHV_NPT_PA_MAX];
+
+void yghv_npt_note_pa(uint64_t pa) {
+    LONG i = InterlockedIncrement64(&g_npt_pa_count) - 1;
+    if (i >= 0 && i < YGHV_NPT_PA_MAX)
+        g_npt_pa[i] = pa;
+}
+
+int yghv_npt_is_our_page(uint64_t pa) {
+    uint64_t page = pa & ~(uint64_t)0xFFFULL;
+    LONG n = (LONG)InterlockedCompareExchange64(&g_npt_pa_count, 0, 0);
+    LONG i;
+    if (n > YGHV_NPT_PA_MAX) n = YGHV_NPT_PA_MAX;
+    for (i = 0; i < n; i++)
+        if (g_npt_pa[i] == page) return 1;
+    return 0;
+}
+
+uint64_t yghv_npt_alloc_count(void) {
+    return (uint64_t)InterlockedCompareExchange64(&g_npt_pa_count, 0, 0);
+}
+
+void yghv_npt_pa_range(uint64_t *lo, uint64_t *hi) {
+    uint64_t l = ~(uint64_t)0, h = 0;
+    LONG n = (LONG)InterlockedCompareExchange64(&g_npt_pa_count, 0, 0);
+    LONG i;
+    if (n > YGHV_NPT_PA_MAX) n = YGHV_NPT_PA_MAX;
+    for (i = 0; i < n; i++) {
+        if (g_npt_pa[i] < l) l = g_npt_pa[i];
+        if (g_npt_pa[i] > h) h = g_npt_pa[i];
+    }
+    if (lo) *lo = (n > 0) ? l : 0;
+    if (hi) *hi = (n > 0) ? h : 0;
+}
+
 static npt_entry_t *npt_alloc_table(void) {
     npt_entry_t*t=(npt_entry_t*)MmAllocateContiguousMemory(HV_PAGE_SIZE,(PHYSICAL_ADDRESS){.QuadPart=0xFFFFFFFF});
-    if(t)RtlZeroMemory(t,HV_PAGE_SIZE); return t;
+    if(t){
+        RtlZeroMemory(t,HV_PAGE_SIZE);
+        /* 9.384: note the physical address of every NPT page, so a bugcheck's
+         * faulting address can be checked against them arithmetically instead of
+         * being guessed from a symbol table that cannot name it. */
+        yghv_npt_note_pa(MmGetPhysicalAddress(t).QuadPart);
+    }
+    return t;
 }
 static uint64_t npt_va_to_pa(void*va){return MmGetPhysicalAddress(va).QuadPart;}
 

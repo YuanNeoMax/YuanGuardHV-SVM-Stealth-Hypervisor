@@ -2304,6 +2304,40 @@ try {
                 Write-Host '  #BP interception to be live, set this flag BEFORE loading the driver.'
             }
         }
+        'npt-range' {
+            # 9.384: the physical addresses this driver allocated for NPT tables.
+            #
+            # WHY THIS EXISTS: three recent bugchecks faulted on two ADJACENT pages
+            # that looked like NPT tables, and the .map could not name the crashing
+            # instruction (an import thunk table sits right after 0x24120, making
+            # every offset in that range ambiguous). This turns "does it look like
+            # NPT" into arithmetic against what was actually allocated.
+            #
+            # usage:
+            #   npt-range            count, lowest and highest NPT page
+            #   npt-range <hexpa>    is this address one of ours?
+            if ($null -eq $Arg1) {
+                $req = New-Object byte[] 32
+                [BitConverter]::GetBytes([uint64]5).CopyTo($req, 0)
+                $o = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x827)) -InBytes $req -OutputLength 24
+                $cnt = [BitConverter]::ToUInt64($o, 0)
+                $lo  = [BitConverter]::ToUInt64($o, 8)
+                $hi  = [BitConverter]::ToUInt64($o, 16)
+                Write-Host ("npt-range: {0} page(s) allocated" -f $cnt)
+                if ($cnt -gt 0) {
+                    Write-Host ("  lowest  0x{0:X}" -f $lo)
+                    Write-Host ("  highest 0x{0:X}" -f $hi)
+                }
+                return
+            }
+            $pa = [Convert]::ToUInt64(("$Arg1" -replace '^0[xX]',''),16)
+            $req2 = New-Object byte[] 32
+            [BitConverter]::GetBytes([uint64]6).CopyTo($req2, 0)
+            [BitConverter]::GetBytes([uint64]$pa).CopyTo($req2, 8)
+            $o2 = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x827)) -InBytes $req2 -OutputLength 8
+            $ours = [BitConverter]::ToUInt64($o2, 0)
+            Write-Host ("npt-range: 0x{0:X} -> {1}" -f $pa, $(if($ours){'IS one of our NPT pages'}else{'not an NPT page'}))
+        }
         'sys-auth' {
             # 9.371 (Tier 9.2): authenticated control commands.
             #

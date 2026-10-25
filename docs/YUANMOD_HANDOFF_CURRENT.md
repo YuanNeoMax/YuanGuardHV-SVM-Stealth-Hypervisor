@@ -11124,3 +11124,90 @@ BUGCHECK_P3:    0000000000000008   (8-byte access)
 > 用 `.map` 做函数级归因之前，先确认目标偏移**落在 `.text` 的函数符号上而不是
 > import thunk 表上**。判据：相邻符号的地址间隔。间隔 6-16 字节的是 thunk，
 > 不是函数。这一条能避免把一次崩溃归因到一个从来没执行过的函数上。
+
+---
+
+#### 9.385 第十七次：`sc stop` 直接硬挂 —— 加载安全，卸载必死，且不是 bugcheck
+
+**两个决定性实验**
+
+| 实验 | 脚本 | 结果 |
+|---|---|---|
+| **只加载** | `t_loadonly.ps1`：create + start，**绝不 stop/delete** | **完全正常**，驱动 RUNNING，机器稳定 6.4 分钟 |
+| **只停止** | `t_stoponly.ps1`：第一行就是 `Set-Content`，然后 `sc stop` | **`stoponly.txt` 根本没生成** |
+
+第二行是本次会话最干净的一个证据：
+
+> 一个脚本的第一条语句是写文件，而那个文件**不存在**。说明 `sc stop` 在
+> `Set-Content` 都还没落盘时就把机器带下去了 —— 或者更准确地说，`sc stop`
+> 的卸载路径在**几毫秒内**硬挂，连一次文件写都来不及完成。
+
+而且 **13:59 那次重启没有 dump**（最新 dump 仍是 13:52 那个 `0xD1`）。
+没有 dump + 没有 bugcheck = **不是蓝屏，是硬挂/复位**。
+
+**所以现在有三个互不相同的事实**
+
+1. 加载路径**安全**（已验证，机器稳定 6.4 分钟）
+2. `sc stop` → **硬挂**（无 dump）
+3. `sc delete`（在已 RUNNING 状态）→ **`0xD1`**（有 dump，故障地址是两个相邻 NPT 页）
+
+2 和 3 都走卸载路径，但表现不同 —— 这说明卸载路径上有**不止一个问题**，
+或者同一个问题的两种时序。
+
+**9.383 的 ack 修复没有改善任何一项**
+
+我最后一次的推理是「ack 未写 → 反虚拟化空转 → 核仍在 guest → npt_cleanup 释放活表 → 0xD1」。
+如果成立，补上 ack 就该好。补了（`VpRegs->Rcx = 'SSVM'`，写进**调用方真正读的那个寄存器**），
+**加载仍安全、卸载仍死**。
+
+所以那个推理也不成立 —— 至少不是全部。
+
+**读代码时发现的一个具体疑点（未验证）**
+
+`SvAllocatePageAlingedPhysicalMemory` 的名字里写着 "PageAlinged"，实现是：
+
+```c
+memory = ExAllocatePoolWithTag(NonPagedPool, NumberOfBytes, 'MVSS');
+if (memory != nullptr) {
+    NT_ASSERT(PAGE_ALIGN(memory) == memory);   /* ← free build 里是空的 */
+    RtlZeroMemory(memory, NumberOfBytes);
+}
+```
+
+**`ExAllocatePoolWithTag` 不保证页对齐。** 该函数靠 `NT_ASSERT` 声明这个前提，
+而 `NT_ASSERT` 在 free build 里**不做任何事**。于是：
+
+- `VpData` 的地址不一定是页对齐的
+- 而 `VpData->HostStackLayout.GuestVmcbPa`、`HostVmcbPa` 都按"这是页基址"计算
+- VMCB 相关的物理地址若偏移，`vmload`/`vmrun`/`vmsave` 会作用到**错误的页**
+- 崩溃地址恰好是**两个相邻页**（`…9000` 和 `…a000`）—— 偏移后跨页的典型形状
+
+这与 §6.6 的"断言了自己的假设"是同一类：**一个只在 checked build 里成立的保证，
+被当作在任何 build 里都成立**。而这个函数的**名字**（Page Aligned）让它看起来已经成立。
+
+**为什么这一条比前面几条更值得怀疑**
+
+它是唯一一条能同时解释"加载没事、卸载死"的：
+加载时 `VpData` 刚分配、页内容干净，偏移不大可能立刻致命；
+卸载时 `vmload`/`vmsave` 要按页基址回写**整页**状态，偏移就会踩到相邻页。
+
+**但我不会用一次重启去验证它** —— 这是十七次重启之后的判断。
+
+**当前状态与建议**
+
+- 代码停在 `eu1710c` + 未提交的 ack 修复 + `npt-range` 诊断工具（已构建、已验证加载）
+- **加载安全**，因此任何**只读**功能都可以在加载后测试
+- 卸载是死路：`sc stop` 硬挂、`sc delete` 崩溃
+
+建议下一步（都不需要卸载）：
+1. 用 `npt-range` 读一次 NPT 页清单，与我记录的崩溃地址比对 —— 这是我新加的那个工具，
+   它就是为了把"像 NPT"变成"是 NPT"
+2. 若确认是 NPT，则上面那条 `ExAllocatePoolWithTag` 不对齐的疑点优先级最高
+3. 卸载路径在修好之前**一律不测**
+
+**规则（补进 §4）**
+
+> `NT_ASSERT` 在 free build 里不执行。任何**只靠 `NT_ASSERT` 支撑**的前置条件
+> （对齐、范围、互斥），在 release 驱动里等于不存在。判据：如果去掉这个 assert
+> 之后代码会算错地址，那这个 assert 就必须变成运行时的检查或一次真实的对齐分配
+> （`MmAllocateContiguousMemory` / `ExAllocatePool2` with `POOL_FLAG_NON_PAGED`）。

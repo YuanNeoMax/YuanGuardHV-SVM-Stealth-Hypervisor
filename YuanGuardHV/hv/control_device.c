@@ -48,6 +48,11 @@ extern int    yghv_s206_tsc_freeze(UINT32 on, UINT64 cr3, UINT32 max_ms);
 extern void   yghv_s206_tsc_stats(UINT64 *out);
 extern int    yghv_s206_tsc_armed(void);
 extern void   yghv_s206_tsc_probe(UINT64 *out);
+/* 9.384: the NPT page inventory, so a bugcheck's faulting address can be checked
+ * arithmetically instead of guessed from a symbol. */
+extern void     yghv_npt_pa_range(UINT64 *lo, UINT64 *hi);
+extern int      yghv_npt_is_our_page(UINT64 pa);
+extern UINT64   yghv_npt_alloc_count(void);
 
 NTKERNELAPI PEPROCESS IoGetRequestorProcess(PIRP Irp);
 NTKERNELAPI HANDLE PsGetProcessId(PEPROCESS Process);
@@ -1076,6 +1081,34 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
             ULONG op = (ULONG)in[0];
             uint64_t pa = (uint64_t)in[1];
 
+            /*
+             * 9.384, op 5: THE NPT PAGE RANGE.
+             *
+             * Fifteen restarts, three of them landing on two ADJACENT pages that
+             * looked like NPT tables. "Looks like" is not a measurement, so this
+             * reports the physical addresses the driver actually allocated for NPT
+             * - recorded at the single allocation site - and lets a faulting address
+             * be checked by arithmetic instead of guessed from a symbol table.
+             *
+             * out[0] = count, out[1] = lowest PA, out[2] = highest PA
+             */
+            if (op == 5) {
+                uint64_t lo = 0, hi = 0;
+                yghv_npt_pa_range(&lo, &hi);
+                out[0] = yghv_npt_alloc_count();
+                out[1] = lo;
+                out[2] = hi;
+                info = 24;
+                status = STATUS_SUCCESS;
+                break;
+            }
+            /* op 6: is this address one of ours? in[1] = the faulting address. */
+            if (op == 6) {
+                out[0] = (UINT64)(yghv_npt_is_our_page(pa) ? 1 : 0);
+                info = 8;
+                status = STATUS_SUCCESS;
+                break;
+            }
             if (op == 0) {
                 uint32_t len = (uint32_t)in[2];
                 uint32_t off = (uint32_t)in[3];
