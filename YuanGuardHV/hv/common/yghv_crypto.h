@@ -64,4 +64,46 @@ int yghv_crypto_selftest(void);
 /* 9.343: same, but run once and cached (the answer cannot change). */
 int yghv_crypto_selftest_cached(void);
 
+/* ============================================================================
+ * 9.371 (Tier 9.2): HMAC-SHA256, for authenticating control commands.
+ * ==========================================================================*/
+
+/*
+ * Why HMAC and not "SHA256(key || message)"
+ * ------------------------------------------
+ * The naive concatenation is broken for SHA-256 when the key and the message are
+ * both attacker-influenced and the hash can be length-extended: an attacker who
+ * knows H(k||m) can compute H(k||m||padding||m2) without the key. HMAC closes
+ * that by hashing the key twice, outside and inside, so the inner digest an
+ * attacker would need to extend is never exposed.
+ *
+ * Why this exists at all
+ * ----------------------
+ * The device already restricts who can OPEN it (owner process, owner CR3, and
+ * SeDebugPrivilege — control_device.c). Tier 9.2 asks the next question: given a
+ * handle, can that caller COMMAND us? A signature over (sequence number ||
+ * command || arguments) answers no, because the key never leaves the loader.
+ *
+ * Honest limit: this authenticates commands, it does not encrypt them. The IOCTL
+ * buffer is METHOD_BUFFERED and its contents are visible to anyone who can see
+ * the IRP. Encrypting the channel is a separate capability with a separate
+ * failure mode; claiming this one covers it would be the same over-claim the
+ * 35-VMEXIT sentence made.
+ */
+#define YGHV_HMAC_KEY_MAX  64
+#define YGHV_HMAC_TAG      32
+
+void yghv_hmac_sha256(const uint8_t *key, uint32_t key_len,
+                      const void *msg, uint32_t msg_len,
+                      uint8_t out[YGHV_HMAC_TAG]);
+
+/*
+ * Self-test against RFC 4231 test case 2:
+ *   key  = "Jefe", data = "what do ya want for nothing?"
+ *   tag  = 5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843
+ * A MAC that is silently wrong is worse than none: every command would verify.
+ */
+int yghv_hmac_selftest(void);
+int yghv_hmac_selftest_cached(void);
+
 #endif /* YGHV_CRYPTO_H */

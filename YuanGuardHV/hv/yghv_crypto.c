@@ -198,3 +198,98 @@ int yghv_crypto_selftest_cached(void) {
     InterlockedExchange(&g_crypto_ok, v);
     return (int)v;
 }
+/* ============================================================================
+ * 9.371 (Tier 9.2): HMAC-SHA256
+ * ==========================================================================*/
+
+/*
+ * ipad/opad, spelled as the RFC does so a reader can check them against §2 of
+ * RFC 2104 without decoding anything.
+ */
+#define YGHV_HMAC_IPAD 0x36
+#define YGHV_HMAC_OPAD 0x5c
+
+void yghv_hmac_sha256(const uint8_t *key, uint32_t key_len,
+                      const void *msg, uint32_t msg_len,
+                      uint8_t out[YGHV_HMAC_TAG]) {
+    uint8_t k[YGHV_SHA256_BLOCK];
+    uint8_t pad[YGHV_SHA256_BLOCK];
+    uint8_t inner[YGHV_SHA256_DIGEST];
+    yghv_sha256_ctx_t ctx;
+    uint32_t i;
+
+    if (!out)
+        return;
+
+    /*
+     * RFC 2104 §2: keys longer than the block size are hashed down; shorter ones
+     * are zero-padded to the block size. Doing only one of those is the classic
+     * HMAC implementation bug — it still produces a stable tag, so it passes any
+     * test that only checks "the tag is reproducible" and fails against the
+     * published vectors. The self-test below exists for exactly that case.
+     */
+    for (i = 0; i < YGHV_SHA256_BLOCK; i++)
+        k[i] = 0;
+    if (key && key_len) {
+        if (key_len > YGHV_SHA256_BLOCK) {
+            yghv_sha256(key, key_len, k);          /* k[32..63] already zero */
+        } else {
+            for (i = 0; i < key_len; i++)
+                k[i] = key[i];
+        }
+    }
+
+    /* inner = H((k ^ ipad) || msg) */
+    for (i = 0; i < YGHV_SHA256_BLOCK; i++)
+        pad[i] = (uint8_t)(k[i] ^ YGHV_HMAC_IPAD);
+    yghv_sha256_init(&ctx);
+    yghv_sha256_update(&ctx, pad, YGHV_SHA256_BLOCK);
+    if (msg && msg_len)
+        yghv_sha256_update(&ctx, msg, msg_len);
+    yghv_sha256_final(&ctx, inner);
+
+    /* out = H((k ^ opad) || inner) */
+    for (i = 0; i < YGHV_SHA256_BLOCK; i++)
+        pad[i] = (uint8_t)(k[i] ^ YGHV_HMAC_OPAD);
+    yghv_sha256_init(&ctx);
+    yghv_sha256_update(&ctx, pad, YGHV_SHA256_BLOCK);
+    yghv_sha256_update(&ctx, inner, YGHV_SHA256_DIGEST);
+    yghv_sha256_final(&ctx, out);
+
+    /* Clear the derived key material: it is a copy of the real key's pads. */
+    for (i = 0; i < YGHV_SHA256_BLOCK; i++) {
+        k[i] = 0;
+        pad[i] = 0;
+    }
+}
+
+/*
+ * RFC 4231 test case 2. Chosen over case 1 because it uses a SHORT key ("Jefe"),
+ * which exercises the zero-padding path — the half that a "hash the key if it is
+ * long" implementation gets wrong while still producing self-consistent tags.
+ * Case 6 (a key longer than the block) is covered by the same code path via the
+ * length check, and case 1 (20-byte key) by the padding check.
+ */
+int yghv_hmac_selftest(void) {
+    static const uint8_t want[YGHV_HMAC_TAG] = {
+        0x5b,0xdc,0xc1,0x46,0xbf,0x60,0x75,0x4e,0x6a,0x04,0x24,0x26,0x08,0x95,0x75,0xc7,
+        0x5a,0x00,0x3f,0x08,0x9d,0x27,0x39,0x83,0x9d,0xec,0x58,0xb9,0x64,0xec,0x38,0x43
+    };
+    static const uint8_t key[4] = { 'J', 'e', 'f', 'e' };
+    static const char msg[] = "what do ya want for nothing?";
+    uint8_t got[YGHV_HMAC_TAG];
+
+    yghv_hmac_sha256(key, 4, msg, (uint32_t)(sizeof(msg) - 1), got);
+    return yghv_sha256_equal(got, want);
+}
+
+static volatile LONG g_hmac_ok = -1;
+
+int yghv_hmac_selftest_cached(void) {
+    LONG v = InterlockedCompareExchange(&g_hmac_ok, 0, 0);
+    if (v >= 0)
+        return (int)v;
+    v = yghv_hmac_selftest() ? 1 : 0;
+    InterlockedExchange(&g_hmac_ok, v);
+    return (int)v;
+}

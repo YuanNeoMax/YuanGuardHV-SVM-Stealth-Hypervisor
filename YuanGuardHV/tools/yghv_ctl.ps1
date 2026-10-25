@@ -2032,6 +2032,143 @@ try {
             }
             throw 'sys-sentry: use surface, reset, cpuid-view, or tsc'
         }
+        'sys-auth' {
+            # 9.371 (Tier 9.2): authenticated control commands.
+            #
+            # usage:
+            #   sys-auth                        stats
+            #   sys-auth key <hexbytes>         install a shared key
+            #   sys-auth mode off|monitor|enforce
+            #   sys-auth reset
+            #   sys-auth sign <seq> <fn> [hexargs]
+            #
+            # WHAT EACH PART IS FOR
+            #   key      authority that is NOT a handle. The device already checks
+            #            owner process/CR3/SeDebugPrivilege; a key survives a handle
+            #            being duplicated or inherited, an ACL does not.
+            #   seq      monotonic; the driver refuses anything not STRICTLY greater
+            #            than the last accepted. Without it a captured command
+            #            replays forever and the MAC cannot tell the two apart.
+            #   mode     off (default) / monitor (verify and count, but allow) /
+            #            enforce (refuse). monitor exists so the key can be tested
+            #            on a live machine before a wrong key locks it out.
+            #   sign     the DRIVER produces the tag, so this client never
+            #            re-derives the signed layout. A client that signs a
+            #            different layout than the driver verifies looks exactly
+            #            like a wrong key - the worst possible error message.
+            if ($null -eq $Arg1) {
+                $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x829)) -OutputLength 80
+                $mode = [BitConverter]::ToUInt64($out, 0)
+                $klen = [BitConverter]::ToUInt64($out, 8)
+                $acc  = [BitConverter]::ToUInt64($out, 16)
+                $rej  = [BitConverter]::ToUInt64($out, 24)
+                $wld  = [BitConverter]::ToUInt64($out, 32)
+                $bad  = [BitConverter]::ToUInt64($out, 40)
+                $nt   = [BitConverter]::ToUInt64($out, 48)
+                $seq  = [BitConverter]::ToUInt64($out, 56)
+                $st   = [BitConverter]::ToUInt64($out, 64)
+                $mn = 'off'
+                if ($mode -eq 1) { $mn = 'monitor' }
+                elseif ($mode -eq 2) { $mn = 'enforce' }
+                Write-Host ("sys-auth: mode={0}  key={1} byte(s)" -f $mn, $klen)
+                Write-Host ("  accepted={0} rejected={1} would-reject={2}" -f $acc, $rej, $wld)
+                Write-Host ("  bad-seq={0} no-tag={1} last-seq={2}" -f $bad, $nt, $seq)
+                Write-Host ("  HMAC self-test: " + $(if($st -eq 1){'PASS (RFC 4231 case 2)'}else{'FAIL - tags are NOT trustworthy'}))
+                if ($klen -eq 0 -and $mode -ne 0) {
+                    Write-Host '  WARNING: a mode is set but no key is installed. Enforce'
+                    Write-Host '           with no key would refuse every command including'
+                    Write-Host '           the one that turns it off, so the driver refuses'
+                    Write-Host '           that combination; seeing it means something reset.'
+                }
+                return
+            }
+            $v = "$Arg1".ToLower()
+            if ($v -eq 'key') {
+                # 9.371b: PASSING AN EMPTY STRING DOES NOT ARRIVE AS AN EMPTY STRING.
+                # 'sys-auth key ""' reaches here as $Arg2 == $null, so the clearing
+                # case threw "a hex byte string is required" and a test that
+                # cleared the key then tried enforce saw key=16B still installed.
+                # Measured on G41 step 7: exactly that, and it read as "enforce
+                # accepted with no key" - a security finding invented by a caller
+                # convention.
+                #
+                # So clearing is an explicit token. A command that removes a key is
+                # worth being explicit about anyway: it is the one that drops the
+                # channel back to ACL-only.
+                if ("$Arg2".ToLower() -eq 'clear') {
+                    $req = New-Object byte[] 32
+                    [BitConverter]::GetBytes([uint64]1).CopyTo($req, 0)
+                    [BitConverter]::GetBytes([uint64]0).CopyTo($req, 8)
+                    $o = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x829)) -InBytes $req -OutputLength 8
+                    Write-Host ("sys-auth key: cleared -> {0}" -f $(if([BitConverter]::ToUInt64($o,0)){'OK'}else{'REJECTED'}))
+                    return
+                }
+                if ($null -eq $Arg2) { throw 'sys-auth key: a hex byte string, or the word clear' }
+                $hex = ("$Arg2" -replace '^0[xX]','') -replace '[^0-9A-Fa-f]',''
+                if ($hex.Length % 2 -ne 0) { throw 'sys-auth key: odd number of hex digits' }
+                $n = $hex.Length / 2
+                if ($n -gt 64) { throw 'sys-auth key: at most 64 bytes' }
+                $bytes = New-Object byte[] $n
+                for ($i = 0; $i -lt $n; $i++) { $bytes[$i] = [Convert]::ToByte($hex.Substring($i*2,2),16) }
+                $req = New-Object byte[] (32 + $n)
+                [BitConverter]::GetBytes([uint64]1).CopyTo($req, 0)
+                [BitConverter]::GetBytes([uint64]$n).CopyTo($req, 8)
+                $bytes.CopyTo($req, 32)
+                $o = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x829)) -InBytes $req -OutputLength 8
+                Write-Host ("sys-auth key: {0} byte(s) -> {1}" -f $n, $(if([BitConverter]::ToUInt64($o,0)){'installed'}else{'REJECTED'}))
+                return
+            }
+            if ($v -eq 'mode') {
+                if ($null -eq $Arg2) { throw 'sys-auth mode: off, monitor or enforce is required' }
+                $m = 0
+                if ("$Arg2".ToLower() -eq 'monitor') { $m = 1 }
+                elseif ("$Arg2".ToLower() -eq 'enforce') { $m = 2 }
+                elseif ("$Arg2".ToLower() -ne 'off') { throw 'sys-auth mode: off, monitor or enforce only' }
+                $req = New-Object byte[] 32
+                [BitConverter]::GetBytes([uint64]2).CopyTo($req, 0)
+                [BitConverter]::GetBytes([uint64]$m).CopyTo($req, 8)
+                $o = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x829)) -InBytes $req -OutputLength 8
+                Write-Host ("sys-auth mode: {0} -> {1}" -f "$Arg2", $(if([BitConverter]::ToUInt64($o,0)){'OK'}else{'REFUSED'}))
+                if ([BitConverter]::ToUInt64($o,0) -eq 0 -and $m -eq 2) {
+                    Write-Host '  enforce with no key installed would lock out every command,'
+                    Write-Host '  including the one that turns it back off. Install a key first.'
+                }
+                return
+            }
+            if ($v -eq 'reset') {
+                $req = New-Object byte[] 32
+                [BitConverter]::GetBytes([uint64]3).CopyTo($req, 0)
+                Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x829)) -InBytes $req -OutputLength 8 | Out-Null
+                Write-Host 'sys-auth: stats reset'
+                return
+            }
+            if ($v -eq 'sign') {
+                if ($null -eq $Arg2 -or $null -eq $Arg3) { throw 'sys-auth sign: a seq and a function number are required' }
+                $seq  = [uint64]::Parse($Arg2)
+                $fn   = [uint64]::Parse($Arg3)
+                $argsLen = 0
+                $argsBytes = New-Object byte[] 0
+                if ($null -ne $Arg4) {
+                    $h = ("$Arg4" -replace '^0[xX]','') -replace '[^0-9A-Fa-f]',''
+                    if ($h.Length % 2 -ne 0) { throw 'sys-auth sign: odd number of hex digits in args' }
+                    $argsLen = $h.Length / 2
+                    $argsBytes = New-Object byte[] $argsLen
+                    for ($i = 0; $i -lt $argsLen; $i++) { $argsBytes[$i] = [Convert]::ToByte($h.Substring($i*2,2),16) }
+                }
+                $req = New-Object byte[] (32 + $argsLen)
+                [BitConverter]::GetBytes([uint64]4).CopyTo($req, 0)
+                [BitConverter]::GetBytes([uint64]$seq).CopyTo($req, 8)
+                [BitConverter]::GetBytes([uint64]$argsLen).CopyTo($req, 16)
+                [BitConverter]::GetBytes([uint64]$fn).CopyTo($req, 24)
+                if ($argsLen -gt 0) { $argsBytes.CopyTo($req, 32) }
+                $o = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x829)) -InBytes $req -OutputLength 40
+                if ([BitConverter]::ToUInt64($o,0) -eq 0) { Write-Host 'sys-auth sign: FAILED'; return }
+                $tag = -join (8..39 | ForEach-Object { '{0:x2}' -f $o[$_] })
+                Write-Host ("sys-auth sign: seq={0} fn=0x{1:X} args={2}B -> {3}" -f $seq, $fn, $argsLen, $tag)
+                return
+            }
+            throw 'sys-auth: use key, mode, reset or sign'
+        }
         'guest-cpuid' {
             # 9.368 (A4, Tier 5.4): read CPUID the way a DETECTOR reads it.
             #

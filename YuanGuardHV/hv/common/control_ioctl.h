@@ -205,6 +205,22 @@ typedef struct {
 #define IOCTL_YGHV_SENTRY \
     YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x828, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
 #define YGHV_SENTRY_OUT_QWORDS 14
+/* 9.371 (Tier 9.2): authenticated control commands.
+   32-byte input {ULONG op, pad, ULONG_PTR a, b} plus optional bytes after it:
+     op 0 stats  -> 10 qwords: mode, key_len, accepted, rejected, would_reject,
+                                bad_seq, no_tag, last_seq, selftest, reserved
+     op 1 set key <- in[1]=key_len, key bytes at in[4..]
+     op 2 set mode <- in[1]=0 off / 1 monitor / 2 enforce
+     op 3 reset stats
+     op 4 sign   <- in[1]=seq, in[2]=args_len, args at in[4..]
+                 -> out[0]=1, tag (32 bytes) at out[1..4]
+        The DRIVER signs on request so a client never re-derives the signed
+        layout. A client that signs a different layout than the driver verifies is
+        indistinguishable from a wrong key - the worst possible error message - so
+        the layout lives in exactly one place. */
+#define IOCTL_YGHV_AUTH \
+    YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x829, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
+#define YGHV_AUTH_OUT_QWORDS 10
 #define IOCTL_YGHV_PA \
     YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x827, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
 #define IOCTL_YGHV_GUARD \

@@ -10288,3 +10288,92 @@ powershell），第二次采样时自动过期已经触发。`exits 405814 -> 40
 - BSOD 取证流程已验证：`kd -z <dump> -y "C:\symbols"` 用**本地**符号；
   `srv*` 符号服务器会 `Could not write to pipe` 并让 `!analyze` 完全失效
   （248631 行全是该错误、0 个结果字段）—— 这一条值得单独记，因为它看起来像"分析没找到问题"
+
+---
+
+### 9.371 2026-10-18 **B3 完成：Tier 9.2 控制通道认证（HMAC-SHA256 + 序列号）**
+
+**问题**
+
+设备已经限制了**谁能打开**它（owner process / owner CR3 / SeDebugPrivilege，
+`control_device.c` 的 P0 hardening）。Tier 9.2 问的是下一层：**拿到句柄的人能否下命令？**
+
+ACL 回答不了这个问题 —— 句柄可以被继承、复制，或由一个后来被攻陷的进程持有。
+一个覆盖「序列号 ‖ 命令 ‖ 参数」的签名可以回答，因为密钥不进内核镜像。
+
+**做了什么**
+
+三部分，每一部分都不可省：
+
+| 部件 | 作用 | 少了它会怎样 |
+|---|---|---|
+| `yghv_auth.c` 密钥页 | 64 字节密钥，page-exact union | 密钥与冷计数器共页 → 隐藏该页会连带移除计数器 |
+| HMAC-SHA256 | 覆盖 (seq, code, len, args) 的定宽布局 | 只校验"标签稳定"的实现全部通过 |
+| 单调序列号 | 严格大于上次接受的值 | 捕获的命令可以永久重放，MAC 分不出两次出现 |
+
+**为什么不是 `SHA256(key‖msg)`**：可长度扩展。知道 `H(k‖m)` 的攻击者能算出
+`H(k‖m‖pad‖m2)` 而无需密钥。HMAC 把密钥哈希两次（外/内），被扩展的那层内层摘要
+从不暴露。
+
+**为什么由驱动签名**（IOCTL op 4）：被签的布局是 `(seq, code, len, args)`。
+如果客户端自己拼这个布局，一旦不一致，报出来的是"tag 不对"—— 和"密钥错"**完全同一条
+错误信息**，真因不可见。驱动签一次，布局只存在于一个文件里。
+
+**★ 测试设计：每一项都要能失败**
+
+「产生了一个标签并被接受」对一个忽略密钥的 MAC、一个忽略消息的 MAC、一个恒返回 1
+的实现**全都成立**。所以 G41 的每一步都针对一种具体失效：
+
+```
+1  self-test   RFC 4231 case 2 —— 静默算错的 MAC 会验证一切，是最坏的失效
+2  换密钥      A 签的标签在 B 下必须不通过（唯一能证明密钥是输入的检查）
+3  换命令号    同一标签换一个 fn 必须不通过（证明命令被覆盖，不只是 seq）
+4  换序列号    不同 seq 必须给出不同标签
+5  换参数      A 参数的标签在 B 参数下必须不通过
+6  monitor     计数但放行；enforce 拒绝 —— 两种模式必须不同
+7  无密钥 enforce 必须被拒，否则唯一能撤销它的命令正是被它挡住的
+8  还原        实际的可用状态
+9  通道仍可用  认证测试之后普通命令照常
+```
+
+**实测（G41，镜像 `206zS_auth`，13/13 ALL PASS）**
+
+```
+1  HMAC vectors match                 True
+2  tag produced under key A           True
+2  different keys give different tags True   ← 密钥确实是输入
+3  command number is covered          True
+4  sequence is covered                True
+5  argument bytes are covered         True
+6a monitor accepted                   True
+6b enforce accepted (key installed)   True
+7  enforce needs a key                True   ← 无密钥 enforce 被 REFUSED
+7a key really cleared                 True
+8  restored to off with key           True
+9  channel usable after auth tests    True
+```
+
+**★ 第 7 项一开始是 FAIL，而它是调用约定造出来的假缺陷**
+
+```
+after clearing the key: key=16B mode=enforce
+   CRITICAL: enforce was accepted with no key
+```
+
+`sys-auth key ''` 在 PowerShell 里**不会以空串到达** —— 它作为 `$null` 传入，客户端抛出
+"需要 hex 串"，密钥**根本没被清**。测试随后看到 `key=16B`，报出一个真实存在的
+安全发现，而实际上什么都没发生。
+
+修法：清空密钥改为**显式令牌 `key clear`**。删掉一个密钥本身就值得显式 ——
+它是把通道退回"仅 ACL"的那一步。
+
+> 这又是一次 §6.6 的形状：断言测的是"我以为的入参"，而不是"入参实际是什么"。
+> 区别在于这次的误报指向一个**安全结论**，比误报某个计数器更值得记。
+
+**诚实边界**（写在头文件里，不只是文档里）
+- 认证命令，**不加密**：METHOD_BUFFERED 的内容对任何能看到 IRP 的一方可见。
+- 证明调用方知道密钥，不证明调用方是善意的。
+- 不防"能读调用方自己内存里密钥"的攻陷。
+
+**静态检查**：7/7 PASS；IOCTL 41→42，命令 58→59。
+**回归**：G25 13/13、G40 walk 12/12。

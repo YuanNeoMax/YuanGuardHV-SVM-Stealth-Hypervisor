@@ -18,6 +18,7 @@
 #include "yghv_crypto.h"   /* 9.342: SHA-256 */
 #include "yghv_guard.h"    /* Tier 7.1/7.3: self-hiding + integrity */
 #include "yghv_sentry.h"   /* Tier 7.4/7.5/7.6: timing/escape/surface */
+#include "yghv_auth.h"     /* 9.371 (Tier 9.2): authenticated commands */
 #include "debug.h"
 
 /*
@@ -1845,6 +1846,120 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
             status = STATUS_INVALID_PARAMETER;
             break;
         }
+        status = STATUS_INVALID_PARAMETER;
+        break;
+    }
+    case IOCTL_YGHV_AUTH: {
+        /*
+         * 9.371 (Tier 9.2): the control channel's own front door.
+         *
+         * NOTE ON ORDERING, because it is a security decision and not a
+         * convenience: this handler is reached only after
+         * yghv_control_ioctl_authorized() has already checked owner process,
+         * owner CR3 and SeDebugPrivilege. So authentication is a SECOND gate, not
+         * a replacement - an ACL and a key fail differently (a handle can be
+         * duplicated; a key cannot be guessed), and the feature is worth having
+         * only because both are in the path.
+         */
+        UINT64 *out = (UINT64 *)buf;
+        ULONG op = 0;
+
+        if (in_len >= 32)
+            op = (ULONG)((UINT64 *)buf)[0];
+
+        if (op == 0) {
+            if (out_len >= YGHV_AUTH_OUT_QWORDS * sizeof(UINT64)) {
+                yghv_auth_stats_t as;
+                yghv_auth_stats_get(&as);
+                out[0] = as.mode;
+                out[1] = as.key_len;
+                out[2] = as.accepted;
+                out[3] = as.rejected;
+                out[4] = as.would_reject;
+                out[5] = as.bad_seq;
+                out[6] = as.no_tag;
+                out[7] = as.last_seq;
+                out[8] = as.selftest;
+                out[9] = 0;
+                info = YGHV_AUTH_OUT_QWORDS * sizeof(UINT64);
+                status = STATUS_SUCCESS;
+                break;
+            }
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+
+        if (op == 1 && in_len >= 32) {
+            UINT64 klen = ((UINT64 *)buf)[1];
+            const uint8_t *kbytes = (const uint8_t *)&((UINT64 *)buf)[4];
+            int ok = 0;
+            if (klen <= YGHV_AUTH_KEY_MAX && in_len >= 32 + (ULONG)klen)
+                ok = yghv_auth_set_key(klen ? kbytes : NULL, (uint32_t)klen);
+            out[0] = (UINT64)(ok ? 1 : 0);
+            info = 8;
+            status = STATUS_SUCCESS;
+            break;
+        }
+
+        if (op == 2 && in_len >= 32) {
+            UINT64 m = ((UINT64 *)buf)[1];
+            out[0] = (UINT64)(yghv_auth_set_mode((uint32_t)m) ? 1 : 0);
+            info = 8;
+            status = STATUS_SUCCESS;
+            break;
+        }
+
+        if (op == 3) {
+            yghv_auth_reset_stats();
+            out[0] = 1;
+            info = 8;
+            status = STATUS_SUCCESS;
+            break;
+        }
+
+        if (op == 4 && in_len >= 32) {
+            /*
+             * Sign a command on the caller's behalf.
+             *
+             * WHY THE DRIVER SIGNS AT ALL: the signed layout is (seq, code, len,
+             * args) in a fixed byte order. If the client re-derived that layout,
+             * a mismatch would surface as "bad tag" - the same error a wrong key
+             * produces - and the real cause would be invisible. Signing here
+             * means there is one layout, in one file, and the client cannot drift
+             * from it.
+             *
+             * `code` comes from the request, not from the IOCTL being executed:
+             * the client is asking "what tag WOULD authenticate command N", which
+             * is normally a different command than this one.
+             */
+            UINT64 seq = ((UINT64 *)buf)[1];
+            UINT64 alen_raw = ((UINT64 *)buf)[2];
+            UINT64 code_arg = ((UINT64 *)buf)[3];
+            const uint8_t *args = (const uint8_t *)&((UINT64 *)buf)[4];
+            uint8_t tag[YGHV_AUTH_TAG];
+            uint32_t alen;
+            (void)tag;
+            if (alen_raw > 0xFFFF) {
+                out[0] = 0;
+                info = 8;
+                status = STATUS_SUCCESS;
+                break;
+            }
+            alen = (uint32_t)alen_raw;
+            if (alen && in_len < 32 + alen) {
+                out[0] = 0;
+                info = 8;
+                status = STATUS_SUCCESS;
+                break;
+            }
+            yghv_auth_sign(seq, (uint32_t)code_arg, alen ? args : NULL, alen, tag);
+            out[0] = 1;
+            RtlCopyMemory(&out[1], tag, YGHV_AUTH_TAG);
+            info = (ULONG)(8 + YGHV_AUTH_TAG);
+            status = STATUS_SUCCESS;
+            break;
+        }
+
         status = STATUS_INVALID_PARAMETER;
         break;
     }
