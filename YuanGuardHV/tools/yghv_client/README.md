@@ -91,6 +91,7 @@ yghv_ctl.ps1 pa-io read <hex_pa> [len] [off]|write <hex_pa> <value>
 yghv_ctl.ps1 sys-crypto
 yghv_ctl.ps1 sys-bp-int3 [on|off]
 yghv_ctl.ps1 npt-range [<hexpa>]
+yghv_ctl.ps1 unload-trace
 yghv_ctl.ps1 sys-auth [key <hexbytes>|key clear|mode off|monitor|enforce|reset|sign <seq> <fn> [hexargs]]
 yghv_ctl.ps1 sys-sentry [surface|reset|cpuid-view [0|1|2]|tsc [offset <hex>|freeze <cr3> [max_ms]|freeze thaw|probe]]
 yghv_ctl.ps1 sys-guard [arm|hidecore|add|del|verify|list|uncovered|why]

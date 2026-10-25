@@ -2304,6 +2304,34 @@ try {
                 Write-Host '  #BP interception to be live, set this flag BEFORE loading the driver.'
             }
         }
+        'unload-trace' {
+            # 9.390: the unload progress record.
+            #
+            # WHY THIS EXISTS: five bugchecks died on the unload path with nothing
+            # observable afterwards. Two scripts wrote a file as their FIRST action
+            # and the file did not appear - a user-mode write cannot survive. So the
+            # driver stamps its teardown steps into a page that is never freed and
+            # never hidden, and a crash dump carries the last stamp.
+            #
+            # Reading it here proves the mechanism works on a LIVE machine; if this
+            # returns step=0, no dump would show anything either.
+            $req = New-Object byte[] 32
+            [BitConverter]::GetBytes([uint64]7).CopyTo($req, 0)
+            $o = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x827)) -InBytes $req -OutputLength 24
+            $pa   = [BitConverter]::ToUInt64($o, 0)
+            $step = [BitConverter]::ToUInt32($o, 8)
+            $val  = [BitConverter]::ToUInt64($o, 16)
+            Write-Host ("unload-trace: page PA=0x{0:X}  last step={1}  value={2}" -f $pa, $step, $val)
+            if ($step -eq 0) {
+                Write-Host '  step=0 means nothing has been stamped yet: a driver that'
+                Write-Host '  has only loaded never runs DriverUnload. This is expected'
+                Write-Host '  before any unload attempt.'
+            }
+            if ($pa -eq 0) {
+                Write-Host '  PA=0 means the page could not be resolved, so a dump would'
+                Write-Host '  not find it either. That is a real problem for the record.'
+            }
+        }
         'npt-range' {
             # 9.384: the physical addresses this driver allocated for NPT tables.
             #

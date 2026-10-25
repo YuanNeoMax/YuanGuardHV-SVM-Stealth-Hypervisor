@@ -53,6 +53,11 @@ extern void   yghv_s206_tsc_probe(UINT64 *out);
 extern void     yghv_npt_pa_range(UINT64 *lo, UINT64 *hi);
 extern int      yghv_npt_is_our_page(UINT64 pa);
 extern UINT64   yghv_npt_alloc_count(void);
+/* 9.390: the unload-progress page. Readable AFTER a fatal unload because it is
+ * static, non-paged and never hidden. */
+extern UINT64   yghv_ut_page_pa(void);
+extern UINT32   yghv_ut_last_step(void);
+extern UINT64   yghv_ut_last_value(void);
 
 NTKERNELAPI PEPROCESS IoGetRequestorProcess(PIRP Irp);
 NTKERNELAPI HANDLE PsGetProcessId(PEPROCESS Process);
@@ -1098,6 +1103,23 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
                 out[0] = yghv_npt_alloc_count();
                 out[1] = lo;
                 out[2] = hi;
+                info = 24;
+                status = STATUS_SUCCESS;
+                break;
+            }
+            /*
+             * 9.390, op 7: the unload-progress page address and its last stamp.
+             *
+             * out[0] = page PA, out[1] = last step, out[2] = step's value.
+             *
+             * This exists so the record can be confirmed working on a LIVE machine:
+             * if this reads 0 here, no dump will show anything either, and finding
+             * that out by crashing would be a wasted restart.
+             */
+            if (op == 7) {
+                out[0] = yghv_ut_page_pa();
+                out[1] = (UINT64)yghv_ut_last_step();
+                out[2] = yghv_ut_last_value();
                 info = 24;
                 status = STATUS_SUCCESS;
                 break;

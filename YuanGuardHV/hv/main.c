@@ -7,6 +7,7 @@
 #include "control_device.h"
 #include "protect.h"
 #include "debug.h"
+#include "yghv_unload_trace.h"   /* 9.390: unload progress record */
 
 #define YGHV_R1_SKIP_NPT_TEST 0
 #define YGHV_R1_NPT_UNIT_TEST 1
@@ -4876,14 +4877,29 @@ static void yghv_join_system_thread(HANDLE h) {
 }
 
 void DriverUnload(struct _DRIVER_OBJECT *d) {
+    /*
+     * 9.390: EVERY STEP BELOW IS STAMPED, because this is the path that has
+     * killed the machine five times and nothing on it can be observed afterwards.
+     *
+     * The stamps go into a page that is never freed and never hidden (see
+     * common/yghv_unload_trace.h). After a fatal unload the dump carries the last
+     * stamp, which answers the only question that matters: how far did teardown
+     * get before something freed memory a live core was still using.
+     */
+    yghv_ut_mark(YGHV_UT_START);
 #if YGHV_BAREMETAL_STEP == 206 && defined(YGHV_206B_COEXIST)
     /* 9.258: unregister the target-exit watchdog BEFORE any teardown so no
      * callback fires into a half-dismantled protect engine. */
     (void)PsSetCreateProcessNotifyRoutine(yghv_s206_process_notify, TRUE);
+    yghv_ut_mark(YGHV_UT_NOTIFY_OFF);
     /* 9.246: devirtualize all cores (upstream CPUID-backdoor loop) + unregister
      * the vendored power callback BEFORE any yghv teardown frees the NPT the
      * host loops still translate through. */
+    yghv_ut_mark(YGHV_UT_COOP_UNLOAD);
     { extern void Sv206CoopUnload(void); Sv206CoopUnload(); }
+    /* The mark after it is the one that matters: if the dump's last stamp is
+     * COOP_UNLOAD and not this, the de-virtualize walk never returned. */
+    yghv_ut_mark(YGHV_UT_COOP_UNLOAD + 5);
     /* 9.251: flush the island's DENY telemetry (bare-metal now; file I/O safe).
      * The file handle must still be open — yghv_trace_close runs later. */
     { extern void yghv_s206_flush_deny_log(void); yghv_s206_flush_deny_log(); }
@@ -4901,6 +4917,7 @@ void DriverUnload(struct _DRIVER_OBJECT *d) {
        alive/watchdog threads break out on the same flag.  Join all three before
        any teardown so no thread runs in the unloaded module (fixes 0xCE). */
     g_os_guest_stop_requested = TRUE;
+    yghv_ut_mark(YGHV_UT_STOP_REQUESTED);
     yghv_join_system_thread(g_os_guest_resident_thread);
     yghv_join_system_thread(g_os_guest_alive_thread);
     yghv_join_system_thread(g_os_guest_watchdog_thread);
@@ -4908,6 +4925,7 @@ void DriverUnload(struct _DRIVER_OBJECT *d) {
      * continuation VMEXITs on its ~10ms CPUID poll once stop_requested is set
      * (svm_dispatch_exit returns 1 -> host_done -> PsTerminateSystemThread),
      * so these joins complete in bounded time on a live system. */
+    yghv_ut_mark(YGHV_UT_JOIN_GUEST);
     {
         ULONG s203;
         for (s203 = 0; s203 < g_s203_online && s203 < SVM_MAX_CORES; s203++) {
@@ -4916,6 +4934,7 @@ void DriverUnload(struct _DRIVER_OBJECT *d) {
             g_s203_threads[s203] = NULL;
         }
     }
+    yghv_ut_mark_val(YGHV_UT_JOIN_203, (uint64_t)g_s203_online);
     /* observer breaks on stop_requested and exits ~5ms later; join in host ctx */
     yghv_join_system_thread(g_s203_observer);
     g_s203_observer = NULL;
@@ -4926,17 +4945,24 @@ void DriverUnload(struct _DRIVER_OBJECT *d) {
     g_os_guest_alive_thread = NULL;
     g_os_guest_watchdog_thread = NULL;
     g_os_guest_stop_requested = FALSE;
+    yghv_ut_mark(YGHV_UT_STOP_RESIDENTS);
     svm_core_stop_all_residents();
     svm_core_wait_all_stopped(g_vcpu_count);
+    yghv_ut_mark_val(YGHV_UT_WAIT_RESIDENTS, (uint64_t)g_vcpu_count);
+    yghv_ut_mark(YGHV_UT_CONTROL_CLEANUP);
     yghv_control_device_cleanup(d);
     KeSetSystemAffinityThread((KAFFINITY)1);
+    yghv_ut_mark(YGHV_UT_PROTECT_CLEANUP);
     yghv_protect_cleanup();
     if (g_guest_code_page) MmFreeContiguousMemory(g_guest_code_page);
     g_guest_code_page = NULL;
     if (g_resident_workload_page) MmFreeContiguousMemory(g_resident_workload_page);
     g_resident_workload_page = NULL;
+    yghv_ut_mark(YGHV_UT_NPT_CLEANUP);
     npt_cleanup(&g_npt);
+    yghv_ut_mark(YGHV_UT_CORE_CLEANUP);
     svm_core_cleanup();
+    yghv_ut_mark(YGHV_UT_DONE);
     KeRevertToUserAffinityThread();
     g_watchdog_stop = TRUE;
     if (g_watchdog_thread) {
@@ -5015,6 +5041,14 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
         return sv;
     }
     yghv_trace("entry");
+    /*
+     * 9.390: announce the unload-trace page's physical address at load.
+     *
+     * A crash dump has no symbol for a static in an unloaded driver, so the only
+     * way to find this page afterwards is to have written down where it is. This
+     * is that: one line, at load, while the driver still exists.
+     */
+    yghv_trace_u64("unload-trace pa", yghv_ut_page_pa());
     LOG_ERROR("driver entry pre");
 
     /* The direct-map pages returned by MmAllocateContiguousMemory are NX in

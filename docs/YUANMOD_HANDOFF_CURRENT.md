@@ -11423,3 +11423,97 @@ B 类的根因是**"等谁停下来"这份名单不完整**，而四条修改没
 > `svm_core_wait_all_stopped` 只覆盖前两套。判据：对每个
 > `PsCreateSystemThread` / `KeSetSystemAffinityThread` / `vmrun` 循环，
 > 都必须能在同一个等待函数里找到对应的"停止 + 确认"。
+
+---
+
+#### 9.390 观测通道建成 —— 并且它第一次运行就排除了 NPT 假设
+
+**做了什么**
+
+`common/yghv_unload_trace.h` + `yghv_unload_trace.c`：一个**专用页**，静态分配、
+page-exact、`DECLSPEC_ALIGN(4096)` 加一个 pad 页，**不释放、不隐藏、不进 guard 清单**。
+`DriverUnload` 的每一步把 `(step, value, tsc, seq)` 盖进去。
+
+设计上的三个刻意选择：
+
+1. **不进 guard 的 `state_add` 清单**。这是一条硬约束：guard 隐藏的页正是"事后读不到"
+   的页，而这个页的唯一职责就是事后被读到。两者是相反的需求。
+2. **写操作是裸 store，不加锁**。`yghv_ut_mark` 跑在会杀死机器的那几步之间；如果它持锁
+   时崩溃，dump 里只会看到锁。写序是 `seq -> value -> tsc -> step`，step 最后写，所以
+   dump 里 seq 与 step 不匹配就是"这一笔在飞"，而不是一个已完成的步骤。
+3. **单调序号而非位图**。位图回答"第 N 步跑过吗"，单调序号回答"第 N 步跑过、之后
+   什么都没跑" —— 机器死在两步之间时，后者才是真问题。
+
+**埋点位置（14 个）**
+
+```
+START(1) -> NOTIFY_OFF(10) -> COOP_UNLOAD(20) -> COOP_UNLOAD+5(25)
+  -> STOP_REQUESTED(30) -> JOIN_GUEST(40) -> JOIN_203(50,携带 g_s203_online)
+  -> STOP_RESIDENTS(60) -> WAIT_RESIDENTS(70,携带 g_vcpu_count)
+  -> CONTROL_CLEANUP(80) -> PROTECT_CLEANUP(90)
+  -> NPT_CLEANUP(100) -> CORE_CLEANUP(110) -> DONE(120)
+```
+
+`COOP_UNLOAD+5` 是刻意的第二个戳：如果 dump 的最后一步停在 20 而不是 25，
+就说明**反虚拟化遍历没有返回** —— 这直接验证 9.387 记的第 2 条可疑。
+
+**观测通道本身已验证可用（未卸载，零风险）**
+
+```
+unload-trace: page PA=0x9988A000  last step=0  value=0
+npt-range: 1030 page(s) allocated, lowest 0xC7BCC000, highest 0xC7DF9000
+sys-health: degraded=0 total=0 fatal=0
+```
+
+`PA=0x9988A000` 是加载时就能拿到并写下来的地址 —— dump 里没有符号也能找到这一页。
+
+**★ 而 `npt-range` 顺手排除了一个我错了三次的假设**
+
+NPT 页全部落在 **`0xC7BCC000` – `0xC7DF9000`**。
+
+五次 B 类崩溃的故障地址分别是：
+
+```
+0x194bfd000 / 0x194bfe000
+0x2187f6000 / 0x2187f7000
+0x3d0b19000 / 0x3d0b1a000
+0x1894fc000 / 0x1894fd000
+0x25601a000 / 0x25601b000
+```
+
+**没有一个在 0xC7B…–0xC7D… 区间内。** 所以：
+
+> **"npt_cleanup 提前释放了活表" 这个假设，是错的。**
+
+9.381（`pt_reg` 悬挂 VA）和 9.386（VPD 页对齐）都是建立在这个假设上的修改。
+它们作为代码修复各自有道理（前者确实是一个 USE-AFTER-FREE 的入口，后者确实是一个
+只有 `NT_ASSERT` 支撑的前置条件），但**它们不是这五次崩溃的原因**。
+
+这与 9.389 的结论一致：故障地址是 `VpData` 的 `HostStackLayout`（因为 ASM 桩
+`mov rax,[rsp]` 读的就是它），而不是 NPT 表。
+
+**这个工具的价值就在于此**
+
+从第 11 次到第 19 次，我一直在猜"那两个相邻页是不是 NPT"。`npt-range` 用一次
+只读 IOCTL 把这个问题变成了算术。**一个能在不崩溃的前提下回答问题的工具，
+比九次崩溃换来的推断更可靠。**
+
+**现在的状态**
+
+- 加载安全（已验证多次）
+- 卸载仍会死，但**下一次卸载会把最后一步留在 dump 里**
+- 观测通道已验证（live 读取正常）
+
+**下一步（真正的下一步，不是又一次盲改）**
+
+做一次卸载，然后从 dump 里读 `g_ut` 那一页（PA 在加载时打印）。回答：
+
+- 最后一步是 20（`COOP_UNLOAD`）还是 25（`COOP_UNLOAD+5`）？
+  → 反虚拟化遍历有没有返回
+- 是 70（`WAIT_RESIDENTS`）还是 100（`NPT_CLEANUP`）？
+  → 卡在等 resident，还是已经进了释放阶段
+- `value` 字段里 `g_vcpu_count` 是多少？
+  → 等待函数等的对象数量对不对
+
+**在此之前不再改卸载代码。** 19 次重启的教训是：没有观测通道时改卸载代码是用重启赌。
+现在通道有了，这一次卸载才有信息量。
