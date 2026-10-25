@@ -62,6 +62,7 @@ yghv_ctl.ps1 mmf-hold <path> <sec> [info]
 yghv_ctl.ps1 mmf-write <path>
 yghv_ctl.ps1 mmf-read <path>
 yghv_ctl.ps1 guest-cpuid [leaf]
+yghv_ctl.ps1 guest-rdtsc [interval [n]]
 yghv_ctl.ps1 scan-pid <pid> [count]
 yghv_ctl.ps1 wpm-write <pid> <hex_va> <hex_val>
 yghv_ctl.ps1 wpm-read <pid> <hex_va>
@@ -87,7 +88,7 @@ yghv_ctl.ps1 mem-frame [reserve <gpa> [len]|read <slot> [off] [len]|list|release
 yghv_ctl.ps1 sys-health                                # Tier 7.2/7.7 降级计数器
 yghv_ctl.ps1 pa-io read <hex_pa> [len] [off]|write <hex_pa> <value>
 yghv_ctl.ps1 sys-crypto
-yghv_ctl.ps1 sys-sentry [surface|reset|cpuid-view [0|1|2]]
+yghv_ctl.ps1 sys-sentry [surface|reset|cpuid-view [0|1|2]|tsc [offset <hex>|freeze <cr3> [max_ms]|freeze thaw]]
 yghv_ctl.ps1 sys-guard [arm|hidecore|add|del|verify|list|uncovered|why]
 ```
 

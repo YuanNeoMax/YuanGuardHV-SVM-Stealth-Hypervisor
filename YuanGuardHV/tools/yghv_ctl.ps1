@@ -310,6 +310,50 @@ public static class YghvMmf
 # for the whole guest regardless of CPL, so this is the path that exercises the
 # policy - and it is also exactly what a detector would do.
 Add-Type -TypeDefinition @'
+/* 9.368 (B1/B2, Tier 5.1): GUEST-side RDTSC / RDTSCP.
+   Same reason as YghvCpuid above: __rdtsc called from the DRIVER would read the
+   host clock and never reach SvHandleVmExit. A time test built on a driver-side
+   read proves nothing about what the guest sees. */
+public static class YghvTsc
+{
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+    private static extern System.IntPtr VirtualAlloc(System.IntPtr addr, System.UIntPtr size,
+        uint allocType, uint protect);
+
+    /*  mfence; rdtsc; shl rdx,32; or rax,rdx; ret   (Win64: retval in rax)
+     *  mfence is required: without it rdtsc may execute before earlier stores,
+     *  which makes interval measurements noisy enough to hide a real effect. */
+    private static readonly byte[] RdtscStub = new byte[]
+    {
+        0x0F, 0xAE, 0xF0,              /* mfence                  */
+        0x0F, 0x31,                    /* rdtsc                   */
+        0x48, 0xC1, 0xE2, 0x20,        /* shl rdx, 32             */
+        0x48, 0x09, 0xD0,              /* or rax, rdx             */
+        0xC3                           /* ret                     */
+    };
+
+    [System.Runtime.InteropServices.UnmanagedFunctionPointer(
+        System.Runtime.InteropServices.CallingConvention.Cdecl)]
+    private delegate ulong TscFn();
+
+    private static TscFn _fn;
+
+    public static ulong Read()
+    {
+        if (_fn == null)
+        {
+            System.IntPtr mem = VirtualAlloc(System.IntPtr.Zero,
+                (System.UIntPtr)RdtscStub.Length, 0x3000, 0x40);
+            if (mem == System.IntPtr.Zero)
+                throw new System.InvalidOperationException("VirtualAlloc for RDTSC stub failed");
+            System.Runtime.InteropServices.Marshal.Copy(RdtscStub, 0, mem, RdtscStub.Length);
+            _fn = (TscFn)System.Runtime.InteropServices.Marshal.GetDelegateForFunctionPointer(
+                mem, typeof(TscFn));
+        }
+        return _fn();
+    }
+}
+
 public static class YghvCpuid
 {
     [System.Runtime.InteropServices.UnmanagedFunctionPointer(
@@ -1816,7 +1860,146 @@ try {
                 Write-Host ("sys-sentry cpuid-view: set to {0} -> {1}" -f $want, $(if($ok){'OK'}else{'REJECTED (out of range)'}))
                 return
             }
-            throw 'sys-sentry: use surface, reset, or cpuid-view 0/1/2'
+            if ($v -eq 'tsc') {
+                # 9.368 (B1/B2, Tier 5.1): the guest's clock.
+                #
+                #   sys-sentry tsc                 read policy + counters
+                #   sys-sentry tsc offset <hex>    set a constant shift
+                #   sys-sentry tsc freeze 1|0      freeze / thaw
+                #
+                # WHAT EACH CAN DO, because they are not interchangeable:
+                #   offset  hardware adds it to every RDTSC. NO exit, no cost.
+                #           It hides WHEN, not HOW LONG: a measured interval is
+                #           unchanged because a constant cancels in a subtraction.
+                #   freeze  needs the RDTSC intercept (one exit per read) and makes
+                #           every reading identical, so intervals become 0.
+                if ($null -eq $Arg2) {
+                    $r3 = New-Object byte[] 32
+                    [BitConverter]::GetBytes([uint64]5).CopyTo($r3, 0)
+                    $o3 = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x828)) -InBytes $r3 -OutputLength 112
+                    $offs = [BitConverter]::ToUInt64($o3, 0)
+                    $mode = [BitConverter]::ToUInt64($o3, 8)
+                    $froze = [BitConverter]::ToUInt64($o3, 16)
+                    $icpt = [BitConverter]::ToUInt64($o3, 24)
+                    $supp = [BitConverter]::ToUInt64($o3, 32)
+                    $armed = [BitConverter]::ToUInt64($o3, 40)
+                    $real = [BitConverter]::ToUInt64($o3, 48)
+                    $mn = 'normal'
+                    if ($mode -eq 1) { $mn = 'FROZEN' }
+                    Write-Host ("sys-sentry tsc: offset=0x{0:X} mode={1}" -f $offs, $mn)
+                    Write-Host ("  rdtsc exits handled={0}  answers changed={1}" -f $icpt, $supp)
+                    Write-Host ("  intercept bit armed={0}  real rdtsc now={1}" -f $armed, $real)
+                    # 9.369: scoping fields. Without them "FROZEN" was ambiguous:
+                    # it could mean the OS clock was held, which is what hung the
+                    # machine, or that one address space was.
+                    $scope = 0; $exp = 0; $expired = 0; $sco = 0
+                    if ($o3.Length -ge 88) {
+                        $scope   = [BitConverter]::ToUInt64($o3, 56)
+                        $exp     = [BitConverter]::ToUInt64($o3, 64)
+                        $expired = [BitConverter]::ToUInt64($o3, 72)
+                        $sco     = [BitConverter]::ToUInt64($o3, 80)
+                    }
+                    Write-Host ("  scope cr3=0x{0:X} expires-at={1}" -f $scope, $exp)
+                    $budget = 0; $budgetHits = 0
+                    if ($o3.Length -ge 104) {
+                        $budget     = [BitConverter]::ToUInt64($o3, 88)
+                        $budgetHits = [BitConverter]::ToUInt64($o3, 96)
+                    }
+                    Write-Host ("  self-thawed={0}  reads let through (not in scope)={1}" -f $expired, $sco)
+                    $selfdis = 0
+                    if ($o3.Length -ge 112) { $selfdis = [BitConverter]::ToUInt64($o3, 104) }
+                    Write-Host ("  exit budget left={0}  freezes cut short by budget={1}" -f $budget, $budgetHits)
+                    Write-Host ("  cores that disarmed themselves={0}" -f $selfdis)
+                    if ($mode -eq 1 -and $scope -eq 0) {
+                        Write-Host '  WARNING: frozen with NO scope - this shape is refused by'
+                        Write-Host '           the setter now, so seeing it means an older driver.'
+                    }
+                    if ($mode -eq 1 -and $armed -eq 0) {
+                        Write-Host '  WARNING: frozen but the intercept is NOT armed'
+                        Write-Host '           the guest reads hardware and never asks us, so'
+                        Write-Host '           the freeze will not take effect until a core re-enters'
+                        Write-Host '           prepare (CPUID handshake).'
+                    }
+                    if ($mode -eq 0 -and $offs -eq 0 -and $armed -eq 0) {
+                        Write-Host '  (nothing set: the guest reads the real clock, no exits)'
+                    }
+                    return
+                }
+                $what = "$Arg2".ToLower()
+                if ($what -eq 'offset') {
+                    if ($null -eq $Arg3) { throw 'sys-sentry tsc offset: a hex value is required' }
+                    $ov = [Convert]::ToUInt64(("$Arg3" -replace '^0[xX]',''),16)
+                    $r4 = New-Object byte[] 32
+                    [BitConverter]::GetBytes([uint64]6).CopyTo($r4, 0)
+                    [BitConverter]::GetBytes([uint64]$ov).CopyTo($r4, 8)
+                    $o4 = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x828)) -InBytes $r4 -OutputLength 8
+                    Write-Host ("sys-sentry tsc offset: set to 0x{0:X} -> {1}" -f $ov, $(if([BitConverter]::ToUInt64($o4,0)){'OK'}else{'REJECTED'}))
+                    return
+                }
+                if ($what -eq 'freeze') {
+                    # 9.369: THE SHAPE OF THIS COMMAND CHANGED BECAUSE THE OLD ONE
+                    # HUNG THE MACHINE.
+                    #
+                    # The first freeze had no scope and no deadline: it stopped
+                    # every RDTSC, including the ones Windows uses for its
+                    # scheduler and timers, and the box stopped making progress
+                    # with no bugcheck and no dump. Manual reboot.
+                    #
+                    # So freeze now REQUIRES a cr3 and a deadline, and refuses to
+                    # run without them. The deadline is real milliseconds, capped
+                    # at 10000, after which the driver thaws itself.
+                    #
+                    #   sys-sentry tsc freeze <cr3> [max_ms]
+                    #   sys-sentry tsc freeze 0            thaw
+                    if ($null -eq $Arg3) { throw 'sys-sentry tsc freeze: a cr3 is required, or the word thaw' }
+                    $ms = 2000
+                    if ($null -ne $Arg4) { $ms = [int]$Arg4 }
+                    # 9.369: `thaw` is an EXPLICIT intent, not "cr3 == 0".
+                    #
+                    # The first version treated a cr3 of 0 as thaw. But 0 is also
+                    # the value a test passes to check that a GLOBAL freeze is
+                    # refused, so that check was silently answered with a thaw and
+                    # the safety gate could never fire. Two intents, two tokens:
+                    #   freeze thaw            -> thaw (on=0)
+                    #   freeze 0x0 [ms]        -> forwarded as a freeze request, so
+                    #                             the DRIVER's refusal is the answer
+                    #
+                    # 9.369c: and the token is checked BEFORE the hex parse. The
+                    # first version parsed "$Arg3" as a number first, so the literal
+                    # word `thaw` threw FormatException instead of thawing - the
+                    # script's own thaw was broken by the check meant to make it
+                    # explicit.
+                    if ("$Arg3" -eq 'thaw') {
+                        $r5 = New-Object byte[] 32
+                        [BitConverter]::GetBytes([uint64]7).CopyTo($r5, 0)
+                        [BitConverter]::GetBytes([uint64]0).CopyTo($r5, 8)
+                        $o5 = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x828)) -InBytes $r5 -OutputLength 8
+                        Write-Host ("sys-sentry tsc freeze: THAW -> {0}" -f $(if([BitConverter]::ToUInt64($o5,0)){'OK'}else{'REJECTED'}))
+                        return
+                    }
+                    $cr3 = [Convert]::ToUInt64(("$Arg3" -replace '^0[xX]',''),16)
+                    if ($ms -lt 1)  { $ms = 1 }
+                    if ($ms -gt 10000) { $ms = 10000 }
+                    $r5 = New-Object byte[] 32
+                    [BitConverter]::GetBytes([uint64]7).CopyTo($r5, 0)
+                    [BitConverter]::GetBytes([uint64]1).CopyTo($r5, 8)
+                    [BitConverter]::GetBytes([uint64]$cr3).CopyTo($r5, 16)
+                    [BitConverter]::GetBytes([uint64]$ms).CopyTo($r5, 24)
+                    $o5 = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x828)) -InBytes $r5 -OutputLength 8
+                    $rc = [BitConverter]::ToUInt64($o5, 0)
+                    if ($rc) {
+                        Write-Host ("sys-sentry tsc freeze: cr3=0x{0:X} for {1}ms -> OK (self-thaws at the deadline)" -f $cr3, $ms)
+                    } else {
+                        Write-Host ("sys-sentry tsc freeze: cr3=0x{0:X} -> REFUSED" -f $cr3)
+                        Write-Host '  A cr3 of 0 means "every address space", which stops the OS'
+                        Write-Host '  clock and hung this machine once (9.369). Pass the address'
+                        Write-Host '  space to hold instead.'
+                    }
+                    return
+                }
+                throw 'sys-sentry tsc: offset takes a hex value, freeze takes 1 or 0'
+            }
+            throw 'sys-sentry: use surface, reset, cpuid-view, or tsc'
         }
         'guest-cpuid' {
             # 9.368 (A4, Tier 5.4): read CPUID the way a DETECTOR reads it.
@@ -1867,6 +2050,40 @@ try {
                 $vs = $sb.ToString()
                 Write-Host ("  max-leaf={0}  vendor='{1}'" -f $eax, $vs)
                 if ($vs.Length -eq 0) { Write-Host '  (all zero: the guest is told no hypervisor exists here)' }
+            }
+        }
+        'guest-rdtsc' {
+            # 9.368 (B1/B2, Tier 5.1): read the clock the GUEST sees.
+            #
+            # usage:
+            #   guest-rdtsc                 one reading
+            #   guest-rdtsc interval <n>    n spaced readings + the deltas
+            #
+            # The interval form is the one that matters: a constant TscOffset
+            # cancels out of a delta, while a freeze makes every delta zero. Those
+            # are different claims and a single reading cannot tell them apart.
+            $n = 1
+            if ($Arg1 -eq 'interval') {
+                $n = 5
+                if ($null -ne $Arg2) { $n = [int]$Arg2 }
+            }
+            $vals = @()
+            for ($i = 0; $i -lt $n; $i++) {
+                $vals += [YghvTsc]::Read()
+                if ($n -gt 1) { Start-Sleep -Milliseconds 20 }
+            }
+            if ($n -eq 1) {
+                Write-Host ("guest-rdtsc: {0} (0x{1:X})" -f $vals[0], $vals[0])
+            } else {
+                Write-Host ("guest-rdtsc interval: {0} readings" -f $n)
+                for ($i = 0; $i -lt $vals.Count; $i++) { Write-Host ("  [{0}] {1}" -f $i, $vals[$i]) }
+                $zeros = 0
+                for ($i = 1; $i -lt $vals.Count; $i++) {
+                    $d = [Int64]($vals[$i] - $vals[$i-1])
+                    if ($d -eq 0) { $zeros++ }
+                    Write-Host ("  delta[{0}] = {1}" -f $i, $d)
+                }
+                Write-Host ("  zero deltas: {0} of {1}" -f $zeros, ($vals.Count - 1))
             }
         }
         'sys-guard' {

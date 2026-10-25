@@ -32,6 +32,23 @@
 #define SVM_INTERCEPT_MISC2_VMRUN       (1UL << 0)
 #define SVM_NP_ENABLE_NP_ENABLE         (1UL << 0)
 
+/*
+ * 9.368 (B1, Tier 5.1): RDTSC = InterceptMisc1 bit 14; RDTSCP = overall bit 39,
+ * i.e. bit 7 of InterceptMisc2 (Misc2 covers 32..63).
+ *
+ * MEASURED BEFORE ADDING THESE: this build only ever set CPUID(18), MSR_PROT(28)
+ * and SHUTDOWN(31) in InterceptMisc1. MEM_ENGINE_PLAN_TIER5.md states that
+ * "现有 INTERCEPT_RDTSC 已在 206 主线启用" — that is FALSE here, and it is the
+ * same error 9.367.1 recorded: the plan counted AMD's exit-code catalogue as if
+ * it were this build's mask.
+ *
+ * Both bits sit in fields the VMCB struct already declares. That is why this pair
+ * was chosen over the WBINVD/MWAIT group: those are in InterceptMisc3, which the
+ * struct does not have (9.367.2).
+ */
+#define SVM_INTERCEPT_MISC1_RDTSC       (1UL << 14)
+#define SVM_INTERCEPT_MISC2_RDTSCP      (1UL << (39 - 32))
+
 typedef struct _VMCB_CONTROL_AREA
 {
     UINT16 InterceptCrRead;             // +0x000

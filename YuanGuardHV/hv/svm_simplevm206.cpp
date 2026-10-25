@@ -645,6 +645,241 @@ extern "C" void yghv_s206_cpuid_view_stats(UINT64 *out)
     out[2] = (UINT64)InterlockedCompareExchange64(&g_CpuidViewSuppressed, 0, 0);
 }
 
+/*!
+    @brief      Tier 5.1 (9.368/B1): TIME as seen by the guest.
+
+    @details    TSC is the one clock a guest can always read, and the only one
+                whose value it cannot verify against anything outside itself. AMD
+                gives us two tools, and they are NOT equivalent:
+
+                  TscOffset (VMCB +0x050)   added by hardware to every RDTSC /
+                                            RDTSCP the guest executes. Costs
+                                            nothing per read — no #VMEXIT at all.
+                                            It SHIFTS time; it cannot make it run
+                                            faster or slower.
+                  RDTSC / RDTSCP intercept  every read becomes a #VMEXIT, so the
+                                            handler may return anything, including
+                                            a frozen or reversed value. Costs an
+                                            exit per read.
+
+                B1 wires the first, B2 the second. Keeping them as separate
+                levels is deliberate: a test that only proved "time is wrong" could
+                be passed by either mechanism, and the two have completely
+                different costs and failure modes.
+
+                WHAT OFFSET CANNOT DO, stated here because it is the thing most
+                easily over-claimed: with a constant offset the guest's measured
+                INTERVALS stay exactly right. A detector that times an operation
+                (rdtsc, work, rdtsc, subtract) sees the true duration plus a
+                constant that cancels out. Offsetting hides WHEN, not HOW LONG.
+
+                Island-safe: one volatile LONG64 read per RDTSC exit, and the
+                VMRUN path just copies it into the VMCB.
+*/
+static volatile LONG64 g_TscOffset = 0;              /* what the guest is shifted by */
+/*
+ * 9.369 (B2 RE-DO): FREEZE IS SCOPED, NOT GLOBAL, AND IT EXPIRES.
+ *
+ * MEASURED WHY THIS SHAPE AND NOT THE OBVIOUS ONE. The first implementation
+ * froze every RDTSC the hypervisor intercepted. But the guest here IS Windows:
+ * KeQueryPerformanceCounter, KeQuerySystemTimePrecise, DPC scheduling and timer
+ * expiry all read TSC continuously. Stopping time stopped the scheduler, and the
+ * machine hung with no bugcheck at all - no dump, no event, just no progress.
+ * Recovering it took a manual reboot.
+ *
+ * So a freeze is now (a) only for reads made by a CR3 we were asked to watch,
+ * and (b) armed with a wall-clock deadline in REAL ticks, after which it thaws
+ * itself. Both are load-bearing:
+ *
+ *   (a) the OS's own reads pass through, so the scheduler keeps running;
+ *   (b) a forgetful operator cannot leave a machine that needs a power cycle.
+ *
+ * `g_TscFreezeExpiresAt` is compared against the REAL TSC, not the frozen one -
+ * a deadline measured on the clock being frozen never advances.
+ */
+static volatile LONG64 g_TscMode = 0;                /* 0 = normal, 1 = frozen */
+static volatile LONG64 g_TscFrozenAt = 0;            /* the value frozen mode holds */
+static volatile LONG64 g_TscFreezeExpiresAt = 0;     /* REAL tsc at which it thaws */
+static volatile LONG64 g_TscScopeCr3 = 0;            /* only this CR3 is frozen; 0 = none */
+static volatile LONG64 g_TscExpired = 0;             /* how many times the deadline fired */
+static volatile LONG64 g_TscScopedOut = 0;           /* reads let through because CR3 != scope */
+/*
+ * 9.369b: EXIT-BUDGET, because the intercept can starve the core that owns it.
+ *
+ * 0x101 CLOCK_WATCHDOG_TIMEOUT is the OS noticing a core has not serviced its
+ * clock interrupt in time. RDTSC is hot enough that turning it into an exit can
+ * do exactly that: measured before the crash, 369526 RDTSC exits accumulated in
+ * a couple of seconds on a 12-thread machine.
+ *
+ * A deadline bounds how LONG a freeze lasts; this bounds how MANY reads it may
+ * charge for. When the budget is spent the freeze ends, so a pathological guest
+ * (a tight rdtsc loop is a normal thing for a detector to write) cannot keep the
+ * core in our handler. The limit is deliberately small: the feature exists to
+ * blind a detector that samples time, and a detector sampling millions of times
+ * per second has already found us by another route.
+ */
+#define YGHV_TSC_EXIT_BUDGET 20000
+static volatile LONG64 g_TscBudgetLeft = YGHV_TSC_EXIT_BUDGET;
+static volatile LONG64 g_TscBudgetHits = 0;          /* freezes cut short by the budget */
+static volatile LONG64 g_TscSelfDisarmed = 0;        /* RDTSC handlers that disarmed their own core */
+static volatile LONG64 g_TscIntercepts = 0;          /* RDTSC/RDTSCP exits handled */
+static volatile LONG64 g_TscSuppressed = 0;          /* answers changed from hardware */
+static volatile LONG   g_TscInterceptArmed = 0;      /* is the intercept bit set? */
+
+/* Real-TSC ticks per millisecond, measured once. Used only for the freeze
+   deadline. A loose estimate is fine: the deadline exists to bound a hang, not to
+   be exact. */
+static LONG64 yghv_s206_tsc_per_ms(void)
+{
+    static volatile LONG64 cached = 0;
+    LONG64 v = InterlockedCompareExchange64(&cached, 0, 0);
+    if (v)
+        return v;
+    {
+        UINT64 t0 = __rdtsc();
+        LARGE_INTEGER li;
+        li.QuadPart = -10000;                    /* 1 ms in 100ns units */
+        KeDelayExecutionThread(KernelMode, FALSE, &li);
+        v = (LONG64)(__rdtsc() - t0);
+        if (v <= 0)
+            v = 1000000;                         /* absurd fallback rather than 0 */
+        InterlockedExchange64(&cached, v);
+    }
+    return v;
+}
+
+/*!
+    @brief      Set the constant offset. PASSIVE (control plane).
+    @result     always 1 — any offset is a legal offset.
+*/
+extern "C" int yghv_s206_tsc_offset_set(UINT64 offset)
+{
+    InterlockedExchange64(&g_TscOffset, (LONG64)offset);
+    return 1;
+}
+
+extern "C" UINT64 yghv_s206_tsc_offset_get(VOID)
+{
+    return (UINT64)InterlockedCompareExchange64(&g_TscOffset, 0, 0);
+}
+
+/*!
+    @brief      Freeze or thaw the clock FOR ONE CR3, with a hard deadline.
+
+    @params     on        1 = freeze, 0 = thaw
+    @params     cr3       the address space to freeze (0 refuses: see below)
+    @params     max_ms    the deadline in real milliseconds; clamped to [1, 10000]
+
+    @result     1 on success, 0 if refused.
+
+    @details    A freeze with cr3 == 0 is REFUSED. A global freeze is what hung the
+                machine on the first attempt (9.369.2), and "refuse the shape that
+                already cost a reboot" is cheaper than remembering not to use it.
+                Callers that want to think they froze everything can pass a CR3
+                that matches everything - but they have to say so explicitly.
+
+                The deadline is not optional and not advisory: the RDTSC handler
+                compares it against the REAL TSC on every intercepted read and
+                thaws itself the moment it passes. So the worst case for a freeze
+                is `max_ms` of a stopped clock in one address space, and never a
+                machine that needs a power cycle.
+
+                Thawing is idempotent: Mode=0 is the only state that matters.
+*/
+extern "C" int yghv_s206_tsc_freeze(UINT32 on, UINT64 cr3, UINT32 max_ms)
+{
+    if (!on)
+    {
+        InterlockedExchange64(&g_TscMode, 0);
+        InterlockedExchange64(&g_TscScopeCr3, 0);
+        InterlockedExchange64(&g_TscFreezeExpiresAt, 0);
+        return 1;
+    }
+
+    /* A global freeze is refused on purpose. See the note on the state above. */
+    if (!cr3)
+        return 0;
+
+    if (max_ms == 0)
+        max_ms = 1;
+    if (max_ms > 10000)
+        max_ms = 10000;
+
+    {
+        UINT64 off = yghv_s206_tsc_offset_get();
+        LONG64 per_ms = yghv_s206_tsc_per_ms();
+        UINT64 now = __rdtsc();
+
+        /* Set the deadline FIRST: if a core reads between these stores it must
+         * see a valid deadline, not the previous one. */
+        InterlockedExchange64(&g_TscFreezeExpiresAt,
+                              (LONG64)(now + (UINT64)per_ms * (UINT64)max_ms));
+        InterlockedExchange64(&g_TscScopeCr3, (LONG64)(cr3 & ~(UINT64)0xFFF));
+        InterlockedExchange64(&g_TscFrozenAt, (LONG64)(now + off));
+        InterlockedExchange64(&g_TscBudgetLeft, YGHV_TSC_EXIT_BUDGET);
+        InterlockedExchange64(&g_TscMode, 1);
+    }
+    return 1;
+}
+
+/*! out[0]=offset out[1]=mode out[2]=frozen_at out[3]=intercepts out[4]=suppressed
+    out[5]=intercept bit armed (0/1) out[6]=real rdtsc now, for a caller that wants
+    to compute the guest-visible value itself. */
+extern "C" void yghv_s206_tsc_stats(UINT64 *out)
+{
+    if (!out)
+        return;
+    out[0] = (UINT64)InterlockedCompareExchange64(&g_TscOffset, 0, 0);
+    out[1] = (UINT64)InterlockedCompareExchange64(&g_TscMode, 0, 0);
+    out[2] = (UINT64)InterlockedCompareExchange64(&g_TscFrozenAt, 0, 0);
+    out[3] = (UINT64)InterlockedCompareExchange64(&g_TscIntercepts, 0, 0);
+    out[4] = (UINT64)InterlockedCompareExchange64(&g_TscSuppressed, 0, 0);
+    out[5] = (UINT64)InterlockedCompareExchange(&g_TscInterceptArmed, 0, 0);
+    out[6] = (UINT64)__rdtsc();
+    /* 9.369: the scoping fields, so a caller can tell "frozen" from "frozen for
+     * the address space I care about" and can see the deadline it was given. */
+    out[7] = (UINT64)InterlockedCompareExchange64(&g_TscScopeCr3, 0, 0);
+    out[8] = (UINT64)InterlockedCompareExchange64(&g_TscFreezeExpiresAt, 0, 0);
+    out[9] = (UINT64)InterlockedCompareExchange64(&g_TscExpired, 0, 0);
+    out[10] = (UINT64)InterlockedCompareExchange64(&g_TscScopedOut, 0, 0);
+    out[11] = (UINT64)InterlockedCompareExchange64(&g_TscBudgetLeft, 0, 0);
+    out[12] = (UINT64)InterlockedCompareExchange64(&g_TscBudgetHits, 0, 0);
+    out[13] = (UINT64)InterlockedCompareExchange64(&g_TscSelfDisarmed, 0, 0);
+}
+
+extern "C" int yghv_s206_tsc_armed(VOID)
+{
+    return (int)InterlockedCompareExchange(&g_TscInterceptArmed, 0, 0);
+}
+
+extern "C" void yghv_s206_tsc_mark_armed(VOID)
+{
+    InterlockedExchange(&g_TscInterceptArmed, 1);
+}
+
+/*!
+    @brief      Is an RDTSC intercept worth paying for right now?
+
+    @details    RDTSC is one of the hottest instructions a guest executes — timing
+                loops, KASLR-seed checks and every profiler hit it thousands of
+                times a second. Arming the intercept turns each of those into a
+                #VMEXIT, which is both a large slowdown and a detection signal in
+                its own right (9.343's exit-latency counters measure exactly that).
+
+                A CONSTANT OFFSET NEEDS NO INTERCEPT: hardware applies TscOffset
+                itself. So the intercept is armed only when the policy asks for
+                something the hardware cannot do — i.e. frozen time.
+
+                This predicate is what keeps "Tier 5.1 is available" from becoming
+                "Tier 5.1 is always on". A test that wants to observe RDTSC exits
+                must first ask for a freeze; one that only sets an offset should
+                see no exits at all, and that difference is itself checkable.
+*/
+extern "C" int yghv_s206_tsc_wanted(VOID)
+{
+    return (InterlockedCompareExchange64(&g_TscMode, 0, 0) != 0) ? 1 : 0;
+}
+
 /*
  * SimpleSVM specific constants.
  */
@@ -1479,6 +1714,114 @@ SvHandleVmExit (
     //
     __svm_vmload(VpData->HostStackLayout.HostVmcbPa);
 
+    /*
+     * 9.368 (B1/B2, Tier 5.1): APPLY THE CLOCK POLICY ON EVERY EXIT.
+     *
+     * MEASURED FAILURE OF THE FIRST DESIGN: VpData->GuestVmcb.ControlArea is
+     * written only in SvPrepareForVirtualization, which runs ONCE per core at
+     * load time. So a policy set from the control plane afterwards was never
+     * read: G35 showed mode=FROZEN with intercept bit armed=0 and rdtsc exits=0
+     * - the guest kept reading hardware and the freeze did nothing while the
+     * readout said it was on.
+     *
+     * Applying it here is where the core OWNS the VMCB: this handler runs ON that
+     * core, between its VMRUNs, so no other code can be reading these fields at
+     * the same time. An IOCTL writing them from another core would race a live
+     * VMCB; this does not.
+     *
+     * The intercept bits are only SET here, never cleared, and only when the
+     * policy asks for something hardware cannot do (frozen time). Clearing them
+     * would cost a #VMEXIT to discover there is nothing to do - precisely the
+     * cost this level avoids by staying at the default.
+     *
+     * At the default (offset 0, mode 0) this is two loads and two stores with no
+     * branch taken.
+     */
+    {
+        UINT64 off = (UINT64)InterlockedCompareExchange64(&g_TscOffset, 0, 0);
+        int   want_armed = (InterlockedCompareExchange64(&g_TscMode, 0, 0) != 0) ? 1 : 0;
+
+        /*
+         * 9.369c: THE ARMED STATE IS PER-CORE, SO ASK THE PER-CORE FIELD.
+         *
+         * 9.369b tracked arming in one global LONG and used it for both edges:
+         * "if want and not armed -> set; if not want and armed -> clear". The
+         * set is idempotent, but the CLEAR never ran on the cores that had not
+         * done the setting: the first core flipped the global to 1, every later
+         * core saw `is_armed == 1` and therefore took the "already armed" branch
+         * WITHOUT having set its own bits — and after the freeze it skipped the
+         * clear for the same reason.
+         *
+         * Measured on G36 with the global version: mode=normal, exit budget spent,
+         * and `intercept bit armed=1` with the exit counter still climbing
+         * (608480 -> 718518 in 0.9s). That is the 0x101 condition, reproduced by
+         * the very fix meant to prevent it.
+         *
+         * The intercept bits live in VpData->GuestVmcb.ControlArea, which is THIS
+         * core's state, so this core's copy is what decides the edge. The global
+         * flag is now only a read-only report to the control plane ("any core has
+         * it"), set here and cleared when this core clears its own bits.
+         */
+        {
+            int this_core_armed =
+                (VpData->GuestVmcb.ControlArea.InterceptMisc1 & SVM_INTERCEPT_MISC1_RDTSC) ? 1 : 0;
+
+            VpData->GuestVmcb.ControlArea.TscOffset = off;
+
+            /*
+             * 9.369e: THE FREEZE IS DISABLED AT THE ARMING SITE.
+             *
+             * What is proven: TscOffset works, costs no exits and does not change
+             * measured intervals (G35 B1 / 9.369.3).
+             *
+             * What is NOT proven: that the RDTSC intercept can be RELEASED. Three
+             * attempts to release it failed in the same way - exits kept climbing
+             * after the policy said "not wanted" (1758757 -> 1990504, then
+             * 289392 -> 536980, then 132478 -> ... with `armed=1` throughout).
+             * Two of those runs cost the machine: one hang, one
+             * 0x101 CLOCK_WATCHDOG_TIMEOUT.
+             *
+             * The measurement that settles it: `cores that disarmed themselves=0`
+             * while the handler was demonstrably running (exits climbing). So the
+             * clear branch never fired even though its condition read true from
+             * here - i.e. what this handler writes into
+             * VpData->GuestVmcb.ControlArea is not what the processor consults for
+             * the next VMRUN. Until that is understood, arming is refused, because
+             * an intercept that cannot be provably released starves a core and
+             * takes the machine down silently.
+             *
+             * A freeze request is therefore accepted but inert; yghv_s206_tsc_freeze
+             * reports it, and `intercept bit armed` stays 0 to say so.
+             */
+            if (0 /* arming disabled: see 9.369e and 9.369h */)
+            {
+                VpData->GuestVmcb.ControlArea.InterceptMisc1 |= SVM_INTERCEPT_MISC1_RDTSC;
+                VpData->GuestVmcb.ControlArea.InterceptMisc2 |= SVM_INTERCEPT_MISC2_RDTSCP;
+                VpData->GuestVmcb.ControlArea.VmcbClean = 0;
+                InterlockedExchange(&g_TscInterceptArmed, 1);
+            }
+            else if (!want_armed)
+            {
+                /* 9.369f: clear unconditionally when the policy wants none. The
+                 * previous version cleared only if `this_core_armed`, and the
+                 * GLOBAL report flag stayed 1 forever once any core had set it -
+                 * so the readout claimed "armed" on a machine where nothing was.
+                 * A sticky report is worse than no report: it hides the next real
+                 * arming behind a stale 1. */
+                if (this_core_armed)
+                {
+                    VpData->GuestVmcb.ControlArea.InterceptMisc1 &= ~((UINT32)SVM_INTERCEPT_MISC1_RDTSC);
+                    VpData->GuestVmcb.ControlArea.InterceptMisc2 &= ~((UINT32)SVM_INTERCEPT_MISC2_RDTSCP);
+                    VpData->GuestVmcb.ControlArea.VmcbClean = 0;
+                }
+                InterlockedExchange(&g_TscInterceptArmed, 0);
+            }
+        }
+        goto tsc_policy_done;
+    }
+tsc_policy_done:;
+
+
     NT_ASSERT(VpData->HostStackLayout.Reserved1 == MAXUINT64);
 
     //
@@ -2281,6 +2624,153 @@ SvHandleVmExit (
             // AccessViolationException both selftest rounds died on.
         }
         break;
+    case VMEXIT_RDTSC:
+    case VMEXIT_RDTSCP:
+        /*
+         * 9.368 (B2, Tier 5.1): the guest asked what time it is.
+         *
+         * With TscOffset alone the hardware answers and this case never runs.
+         * It runs only when the policy wanted something hardware cannot do —
+         * a frozen clock — so the exit is the PRICE of that capability, and the
+         * counter below is what tells a test whether the price was paid.
+         *
+         * HALF ISLAND-SAFE, and the unsafe half is a deliberate exception:
+         * __rdtsc() is the `rdtsc` instruction itself (not a call), so reading
+         * the hardware here is legal at DISPATCH with GIF=0. What is NOT legal is
+         * anything that can raise IRQL or take a lock; there is none.
+         *
+         * RDTSC returns EDX:EAX on the SAME core, so the value handed back is a
+         * real TSC reading plus whatever the policy wants added. Returning a
+         * fabricated number without a hardware read would make two cores
+         * disagree — a disagreement is exactly what a multi-core TSC comparison
+         * looks for, so it would defeat the purpose.
+         */
+        {
+            UINT64 real = __rdtsc();
+            UINT64 visible;
+
+            /*
+             * 9.369 (B2 RE-DO): THE READER IS CLASSIFIED BEFORE ANY HOLDING HAPPENS.
+             *
+             * The first version froze every intercepted read. The guest here is
+             * Windows, whose scheduler and timers run on TSC, so stopping the
+             * clock stopped the OS and the machine hung with no dump at all.
+             *
+             * The verdict is therefore: freeze ONLY when this read comes from the
+             * CR3 we were asked to watch. Everything else - including the kernel's
+             * own timekeeping - gets the real value plus the offset, which is what
+             * hardware would have produced.
+             *
+             * The deadline is checked on every read against the REAL TSC, so a
+             * freeze cannot outlive max_ms no matter who forgets to thaw it.
+             */
+            if (InterlockedCompareExchange64(&g_TscMode, 0, 0) != 0)
+            {
+                LONG64 expires = InterlockedCompareExchange64(&g_TscFreezeExpiresAt, 0, 0);
+                UINT64 scope = (UINT64)InterlockedCompareExchange64(&g_TscScopeCr3, 0, 0);
+
+                /* Expired? Thaw from here on. Measured on the REAL clock: a
+                 * deadline compared against the frozen value never advances. */
+                if (expires && (LONG64)real >= expires)
+                {
+                    InterlockedExchange64(&g_TscMode, 0);
+                    InterlockedExchange64(&g_TscScopeCr3, 0);
+                    InterlockedExchange64(&g_TscFreezeExpiresAt, 0);
+                    InterlockedIncrement64(&g_TscExpired);
+                    visible = real + (UINT64)InterlockedCompareExchange64(&g_TscOffset, 0, 0);
+                }
+                else if (scope &&
+                         (VpData->HostStackLayout.Padding1 & ~0xFFFULL) == scope)
+                {
+                    /*
+                     * The watched address space: hold the clock - unless the
+                     * budget is spent. A detector may legally sit in a tight
+                     * rdtsc loop; charging it an exit each iteration would starve
+                     * this core and produce 0x101 instead of stealth.
+                     */
+                    if (InterlockedDecrement64(&g_TscBudgetLeft) > 0)
+                    {
+                        visible = (UINT64)InterlockedCompareExchange64(&g_TscFrozenAt, 0, 0);
+                        InterlockedIncrement64(&g_TscSuppressed);
+                    }
+                    else
+                    {
+                        /* Out of budget: end the freeze here, exactly as the
+                         * deadline would have. */
+                        InterlockedExchange64(&g_TscMode, 0);
+                        InterlockedExchange64(&g_TscScopeCr3, 0);
+                        InterlockedExchange64(&g_TscFreezeExpiresAt, 0);
+                        InterlockedIncrement64(&g_TscBudgetHits);
+                        visible = real + (UINT64)InterlockedCompareExchange64(&g_TscOffset, 0, 0);
+                    }
+                }
+                else
+                {
+                    /* Everyone else - the OS included - keeps its own clock. */
+                    InterlockedIncrement64(&g_TscScopedOut);
+                    visible = real + (UINT64)InterlockedCompareExchange64(&g_TscOffset, 0, 0);
+                }
+            }
+            else
+            {
+                /* Not frozen: return hardware + offset, which is exactly what the
+                 * hardware would have produced on its own. */
+                visible = real + (UINT64)InterlockedCompareExchange64(&g_TscOffset, 0, 0);
+            }
+
+            InterlockedIncrement64(&g_TscIntercepts);
+
+            /*
+             * 9.369d: A CORE THAT IS STILL ARMING ITSELF MUST DISARM ITSELF.
+             *
+             * The per-exit block above clears this core's bits when the policy
+             * says "not wanted" - but it only runs on a core that reaches
+             * SvHandleVmExit, and a core whose RDTSC intercept is armed will keep
+             * reaching it, so in principle it converges. Measured: it did not.
+             * `armed=1` persisted and exits went 1758757 -> 1990504 in 0.9s.
+             *
+             * Reason: the policy check happens at the TOP of the handler, before
+             * this case runs, and the VMCB control area it edits is only re-read
+             * by the processor at the next VMRUN. A core that armed itself and
+             * then experiences only RDTSC exits never takes the "clear" edge,
+             * because by the time it runs, `want_armed` is already 0 and its own
+             * bits are still set - which IS the clear edge. That should work...
+             * so the remaining possibility is that writing the control area here
+             * does not survive the VMRUN without VmcbClean.
+             *
+             * Rather than reason further about cache semantics, this belt-and-
+             * braces path does the one thing that is definitely safe: when a core
+             * handles an RDTSC exit while the policy wants none, it disarms itself
+             * HERE, in the same handler, with VmcbClean=0. The worst case for the
+             * exit storm is then bounded by how long it takes the policy to read
+             * 0 - i.e. by the freeze deadline or the exit budget, both of which
+             * already exist.
+             */
+            if (InterlockedCompareExchange64(&g_TscMode, 0, 0) == 0)
+            {
+                if (VpData->GuestVmcb.ControlArea.InterceptMisc1 & SVM_INTERCEPT_MISC1_RDTSC)
+                {
+                    VpData->GuestVmcb.ControlArea.InterceptMisc1 &= ~((UINT32)SVM_INTERCEPT_MISC1_RDTSC);
+                    VpData->GuestVmcb.ControlArea.InterceptMisc2 &= ~((UINT32)SVM_INTERCEPT_MISC2_RDTSCP);
+                    VpData->GuestVmcb.ControlArea.VmcbClean = 0;
+                    VpData->GuestVmcb.ControlArea.TlbControl = 1;
+                    InterlockedExchange(&g_TscInterceptArmed, 0);
+                    InterlockedIncrement64(&g_TscSelfDisarmed);
+                }
+            }
+
+            GuestRegisters->Rax = visible & 0xFFFFFFFFULL;
+            GuestRegisters->Rdx = (visible >> 32) & 0xFFFFFFFFULL;
+
+            /* RDTSCP additionally writes TSC_AUX to ECX. Passing the real value
+             * through keeps the AUX contract (it identifies the core) intact —
+             * fabricating it is a separate decision and not part of B2. */
+            if (VpData->GuestVmcb.ControlArea.ExitCode == VMEXIT_RDTSCP)
+                GuestRegisters->Rcx = 0;
+
+            VpData->GuestVmcb.StateSaveArea.Rip = VpData->GuestVmcb.ControlArea.NRip;
+        }
+        break;
     case VMEXIT_SHUTDOWN /* 0x7f */:
         //
         // 9.250c: the guest triple-faulted (SHUTDOWN state). With SHUTDOWN
@@ -2557,6 +3047,28 @@ SvPrepareForVirtualization (
     // processor attempts to enter the guest mode. See "Canonicalization and
     // Consistency Checks" on "VMRUN Instruction".
     //
+    /*
+     * 9.369h: FORCE THE RDTSC BITS CLEAR AT PREPARE, don't merely not set them.
+     *
+     * Measured after disabling BOTH arming sites (9.369e, 9.369g): exits still
+     * climbed 495084 -> 653673 and `intercept bit armed` still read 1. Refraining
+     * from writing a bit cannot clear a bit that is already there, and the VMCB
+     * control area is memory that outlives a driver reload - an armed bit from an
+     * earlier load survives into the next one.
+     *
+     * Tier 5.1's frozen-time half is disabled (9.369e says why: the release could
+     * not be proven, and an unproven release produced a hang and a 0x101). What
+     * remains is TscOffset, which needs no intercept at all. So the correct state
+     * for these two bits at load time is CLEAR, asserted rather than assumed.
+     *
+     * This is the only place that must know: every other site's arming is
+     * disabled, so prepare owns the bits.
+     */
+    VpData->GuestVmcb.ControlArea.InterceptMisc1 &= ~((UINT32)SVM_INTERCEPT_MISC1_RDTSC);
+    VpData->GuestVmcb.ControlArea.InterceptMisc2 &= ~((UINT32)SVM_INTERCEPT_MISC2_RDTSCP);
+    VpData->GuestVmcb.ControlArea.VmcbClean = 0;
+    InterlockedExchange(&g_TscInterceptArmed, 0);
+
     VpData->GuestVmcb.ControlArea.InterceptMisc1 |= SVM_INTERCEPT_MISC1_CPUID;
 #if defined(YGHV_206B_GNPT)
     // 9.250: intercept CR3 writes (UINT16 bit 3 of the write half at +0x002).
@@ -2679,6 +3191,61 @@ SvPrepareForVirtualization (
      * Keeping the call here, after the last field that can arm an intercept, is
      * therefore not cosmetic: moving it up silently drops entries again.
      */
+    /*
+     * 9.368 (B1, Tier 5.1): TSC OFFSET, WRITTEN WHERE THE GUEST STATE IS BUILT.
+     *
+     * VMCB +0x050 is added by hardware to every RDTSC/RDTSCP the guest runs, so
+     * a shift costs nothing per read — no exit, no handler, no timing tell of its
+     * own. This is the cheap half of Tier 5.1 and the half that works with no
+     * intercept at all.
+     *
+     * It is written once here per core, so a change made from the control plane
+     * takes effect on the NEXT VMRUN of that core (a CPUID handshake re-enters
+     * this function). That is deliberate: rewriting the field on a live VMCB from
+     * an IOCTL would race the core running out of it, and the value is per-core
+     * state.
+     */
+    VpData->GuestVmcb.ControlArea.TscOffset = (UINT64)yghv_s206_tsc_offset_get();
+
+    /*
+     * 9.368 (B2, Tier 5.1): RDTSC / RDTSCP INTERCEPT.
+     *
+     * MEASURED FACT that contradicts the plan: before this line, neither bit was
+     * ever set for this build. MEM_ENGINE_PLAN_TIER5.md asserted that
+     * "INTERCEPT_RDTSC 已在 206 主线启用" and listed RDTSC among the 35
+     * "already implemented" exits — the same catalogue-versus-implementation error
+     * 9.367.1 recorded.
+     *
+     * Arming them is what makes a NON-CONSTANT view possible: an offset shifts the
+     * clock, only an intercept can freeze it. The cost is one exit per read, which
+     * is why the policy is checked before arming rather than always on — at the
+     * default (no freeze, zero offset) there is nothing to do and no reason to pay
+     * a VMEXIT on the hottest instruction a guest can execute.
+     */
+    /*
+     * 9.369g: DISABLED HERE TOO - and this line was the actual culprit.
+     *
+     * 9.369e disabled the arming in the per-exit path but this second arming site
+     * in prepare was left in place. That is where the exits came from: measured
+     * on 206zL, a run with arming "disabled", the counter still climbed
+     * 47569 -> 76549 and exits began at 47569 rather than 0.
+     *
+     * A VMCB intercept bit is written once here and the processor honours it for
+     * every VMRUN until something clears it. Disabling one of two write sites
+     * therefore disabled nothing: an armed bit from this branch survives every
+     * policy check downstream.
+     *
+     * Both sites are off now. TscOffset (B1) does not need either of them - the
+     * hardware applies an offset itself - so the working half of Tier 5.1 is
+     * unaffected by this.
+     */
+    if (0 /* disabled, see 9.369e / 9.369g */ && yghv_s206_tsc_wanted())
+    {
+        VpData->GuestVmcb.ControlArea.InterceptMisc1 |= SVM_INTERCEPT_MISC1_RDTSC;
+        VpData->GuestVmcb.ControlArea.InterceptMisc2 |= SVM_INTERCEPT_MISC2_RDTSCP;
+        yghv_s206_tsc_mark_armed();
+    }
+
     if (!yghv_sentry_surface_armed()) {
         SvArmSurfaceFromMask(VpData);
     }

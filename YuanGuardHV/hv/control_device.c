@@ -28,6 +28,16 @@ extern int    yghv_s206_cpuid_view_set(UINT32 level);
 extern UINT32 yghv_s206_cpuid_view_get(void);
 extern void   yghv_s206_cpuid_view_stats(UINT64 *out);
 
+/*
+ * 9.368 (B1/B2, Tier 5.1): the guest's clock, controlled from the same place —
+ * what the guest observes is one subject, and 7.6 already owns that subject.
+ */
+extern int    yghv_s206_tsc_offset_set(UINT64 offset);
+extern UINT64 yghv_s206_tsc_offset_get(void);
+extern int    yghv_s206_tsc_freeze(UINT32 on, UINT64 cr3, UINT32 max_ms);
+extern void   yghv_s206_tsc_stats(UINT64 *out);
+extern int    yghv_s206_tsc_armed(void);
+
 NTKERNELAPI PEPROCESS IoGetRequestorProcess(PIRP Irp);
 NTKERNELAPI HANDLE PsGetProcessId(PEPROCESS Process);
 /* Phase 1: the WDK km headers here do not declare this, so declare it
@@ -934,6 +944,55 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
         if (op == 4 && in_len >= 32) {
             UINT64 lvl = ((UINT64 *)buf)[1];
             out[0] = (UINT64)(INT64)yghv_s206_cpuid_view_set((UINT32)lvl);
+            info = 8;
+            status = STATUS_SUCCESS;
+            break;
+        }
+        /*
+         * 9.368 (B1/B2, Tier 5.1): the guest's clock.
+         *
+         *   op 5  read -> out[0]=offset out[1]=mode(0 normal / 1 frozen)
+         *                 out[2]=frozen_at out[3]=rdtsc exits handled
+         *                 out[4]=answers changed out[5]=intercept bit armed
+         *                 out[6]=real rdtsc now
+         *   op 6  set offset <- in[1]
+         *   op 7  freeze    <- in[1] (1 freeze / 0 thaw)
+         *
+         * `intercept bit armed` is the field that separates the two mechanisms:
+         * an OFFSET needs no intercept (hardware applies it), a FREEZE cannot work
+         * without one. So (mode=1, armed=0) is a policy that will not take effect,
+         * and this readout says so instead of leaving it to be discovered.
+         */
+        if (op == 5 && out_len >= 14 * sizeof(UINT64)) {
+            UINT64 st[14];
+            yghv_s206_tsc_stats(st);
+            out[0]  = st[0];  out[1]  = st[1];  out[2]  = st[2];
+            out[3]  = st[3];  out[4]  = st[4];  out[5]  = st[5];
+            out[6]  = st[6];  out[7]  = st[7];  out[8]  = st[8];
+            out[9]  = st[9];  out[10] = st[10]; out[11] = st[11];
+            out[12] = st[12]; out[13] = st[13];
+            info = 14 * sizeof(UINT64);
+            status = STATUS_SUCCESS;
+            break;
+        }
+        if (op == 6 && in_len >= 32) {
+            UINT64 v = ((UINT64 *)buf)[1];
+            out[0] = (UINT64)(INT64)yghv_s206_tsc_offset_set(v);
+            info = 8;
+            status = STATUS_SUCCESS;
+            break;
+        }
+        if (op == 7 && in_len >= 32) {
+            /* 9.369: freeze now takes a SCOPE and a DEADLINE.
+             *   in[1] = on (1/0)  in[2] = cr3 to freeze (0 = refused)
+             *   in[3] = max_ms     (clamped to [1,10000])
+             * A global freeze is refused: it stopped the OS and hung the machine
+             * with no dump, and refusing the shape costs less than remembering. */
+            UINT64 on    = ((UINT64 *)buf)[1];
+            UINT64 cr3   = ((UINT64 *)buf)[2];
+            UINT64 maxms = ((UINT64 *)buf)[3];
+            out[0] = (UINT64)(INT64)yghv_s206_tsc_freeze((UINT32)(on ? 1 : 0),
+                                                         cr3, (UINT32)maxms);
             info = 8;
             status = STATUS_SUCCESS;
             break;
