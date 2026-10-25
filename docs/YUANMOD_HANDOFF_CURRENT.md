@@ -10938,3 +10938,103 @@ GuestContext->ExitVm = TRUE;
 > 先证"ack 未写"（`grep` 即可），再证"卸载器空转"（加计数，读出来），再证
 > "核仍在 guest"（读 EFER）。三步都有独立证据之后，因果链才成立。
 > 直接跳到"补 ack 就该好"，是用一次重启赌一条链。
+
+---
+
+#### 9.380-9.382 第十一、十二次蓝屏：EFER 移除生效了，但暴露出 NPT 的悬挂 VA
+
+**三次的演进（说明修法在起作用，问题是下一个）**
+
+| 次 | 码 | 崩溃点 | 说明 |
+|---|---|---|---|
+| 8-10 | `0x1E` `0xC0000096` | `svm_core_ipi_cleanup+0x5F` 的 `wrmsr` | 清 EFER.SVME |
+| 11 | `0xD1` `P2=2` `P3=8` | `yghv_g44+0x23d2d` | **不再是 wrmsr** |
+| 12 | `0xD1` | `usbwifi+341c0`（第三方） | 与本项目无关的独立故障 |
+
+**第 11 次的性质变了**：`wrmsr` 不再出现，说明 9.380 的修法（移除 IPI 里的 EFER 写）**生效了**。
+
+**9.380 的修法（有文档依据，不是猜的）**
+
+AMD APM 关于 `EFER.SVME`（bit 12）的原文：
+
+> *The effect of turning off EFER.SVME **while a guest is running is undefined**;
+> therefore the VMM should ...*
+
+而本树**已经**有一处合法清除：`svm_simplevm206.cpp:3094`，在 `ExitVm` 路径里，
+顺序是 `__svm_vmload`（退出 guest）→ `__svm_stgi`（设 GIF）→ `wrmsr` 清 SVME。
+这正是 APM 描述的窗口。
+
+而 `svm_core_ipi_cleanup` 是通过 `KeIpiGenericCall` 在**中断里**写同一个 MSR ——
+那个核可能仍在 guest 或正在离开 guest，属于 APM 明确称为 undefined 的情形。
+
+所以 9.380 不是"绕过崩溃"，而是**删掉一段本就冗余且被文档禁止的写**。保留
+`MSR_VM_HSAVE` 的恢复（普通 MSR 写，任何上下文都合法）。
+
+**第 11 次暴露出下一层：NPT 的悬挂 VA**
+
+栈：
+
+```
+nt!KiPageFault
+  -> yghv_g44+0x23d2d
+     faulting address 0x180e31000  (and 0x180e32000 right after)
+```
+
+`0x180e31xxx` 是 NPT 表页的地址形态，两个相邻页 = PDPT/PD/PT 中的相邻两层。
+
+读 `npt_cleanup`（npt_core.c:266）找到了机制：
+
+```c
+for(...) {
+    uint64_t pt_pa = pd[k].pfn << 12;
+    for(r = 0; r < m->pt_reg_count; r++)
+        if (m->pt_reg[r].pa == pt_pa) { pt = m->pt_reg[r].va; break; }
+    if (pt) MmFreeContiguousMemory(pt);        /* ← 释放了 */
+}
+...
+/* 9.283: do NOT free pt_reg here ... pt_reg exists for VA lookup only. */
+```
+
+而 `npt_reg_pt`（npt_core.c:45）**只增不减**：
+
+```c
+m->pt_reg[m->pt_reg_count].pa = pa;
+m->pt_reg[m->pt_reg_count].va = va;
+m->pt_reg_count++;
+```
+
+**所以 `MmFreeContiguousMemory(pt)` 之后，`pt_reg` 里那一项的 `.pa` 和 `.va`
+都还在。** 任何后续操作（`npt_split_2mb_to_4kb` 需要该 PA，或第二次 `npt_cleanup`）
+都会拿到一个**已释放的 VA** 并写它 —— 正是 `0xD1`：在 DISPATCH 写 8 字节到不存在的页。
+
+9.283 的注释说得很清楚它防的是"重复 free"，**它没有防"用悬挂 VA"**，两者是不同的失效：
+
+| 失效 | 9.283 是否处理 |
+|---|---|
+| 对同一 VA 调两次 `MmFreeContiguousMemory` | **是**（不再遍历 pt_reg 释放）|
+| 释放后仍从 pt_reg 取出该 VA 使用 | **否** ← 本次 |
+
+**为什么前七次没暴露**：卸载路径在 9.378 之前根本没真正执行过（ack 缺陷），而
+9.380 之后完整遍历才第一次跑起来。所以这是一个**一直存在、但此前无路可达**的缺陷。
+
+**第 12 次与本项目无关**
+
+`102526-8375-01.dmp`：`MODULE_NAME: usbwifi`、`PROCESS_NAME: PixPin.exe`。
+第三方 USB WiFi 驱动在 DISPATCH_LEVEL 访问非分页内存。记为环境噪声，不计入本项目。
+
+**停止理由**
+
+十二次重启。第 11 次已经是一个**新缺陷**（不是 8-10 的延续），修它需要改
+`pt_reg` 的生命周期 —— 而这又要一次加载来验证。按既定规则停手。
+
+**待修（下一项，需要一次机器）**
+
+`npt_cleanup` 释放每个 PT 之后，必须把 `pt_reg[r]` 置无效（`pa = 0, va = NULL`），
+并让 `npt_reg_pt` 复用空槽而不是无限追加。**两处一起改**，否则"清除后仍追加"
+会让计数继续涨、槽位继续被占。
+
+**规则（补进 §4）**
+
+> 一个"VA 注册表"型结构（`pt_reg` 这种 PA→VA 缓存）在它所指向的内存被释放后，
+> 必须同步失效对应项。只阻止"重复释放"是不够的 —— 释放与**使用**是两条路径，
+> 分别需要各自的证据。

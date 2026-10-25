@@ -551,6 +551,43 @@ int svm_core_init(void) {
     return STATUS_SUCCESS;
 }
 
+/*
+ * 9.380: THE EFER WRITE IS GONE, AND THAT IS THE FIX - NOT A WORKAROUND.
+ *
+ * WHAT THE DOCUMENTATION SAYS (AMD APM, EFER.SVME, bit 12):
+ *
+ *   "The effect of turning off EFER.SVME WHILE A GUEST IS RUNNING IS UNDEFINED;
+ *    therefore the VMM should ..."
+ *
+ * What this tree already does correctly: svm_simplevm206.cpp:3094 clears
+ * EFER.SVME INSIDE the ExitVm path, after STGI and after vmload of the guest
+ * state - i.e. at the one moment the CPU is no longer in guest mode. That is the
+ * documented sequence and it has been running for the whole 206 line.
+ *
+ * What this function did, and why it crashed three times:
+ *
+ *   KeIpiGenericCall(svm_core_ipi_cleanup)  fires an IPI at every core
+ *     -> that core runs this callback IN AN INTERRUPT, possibly still in guest
+ *        mode or in the middle of leaving it
+ *     -> yg_write_msr(MSR_EFER, efer & ~EFER_SVME)   UNDEFINED per the APM
+ *     -> measured: 0x1E KMODE_EXCEPTION_NOT_HANDLED, P1=0xC0000096
+ *        PRIVILEGED_INSTRUCTION, at exactly the `wrmsr` (svm_core_ipi_cleanup+0x5F)
+ *
+ * Three attempts failed to fix it by changing WHEN the ack was written, because
+ * the ack was never the problem: the ack only decides whether the branch is
+ * entered, and the branch should not exist in this build at all.
+ *
+ * Why it is safe to remove: on the 206 path, de-virtualization happens through
+ * the CPUID_UNLOAD_SIMPLE_SVM backdoor (Sv206CoopUnload -> SvDevirtualizeAll-
+ * Processors), and each core clears its own EFER.SVME from the ExitVm path. By
+ * the time this IPI runs, SVME is either already clear (the branch would skip on
+ * its own condition) or is being cleared from a context where it is legal. Either
+ * way this IPI's EFER write adds nothing except a race.
+ *
+ * What is kept: MSR_VM_HSAVE. Restoring that is not undefined in any context -
+ * it is a plain MSR write - and it is the thing that must be undone before the
+ * VPD is freed.
+ */
 static ULONG_PTR svm_core_ipi_cleanup(ULONG_PTR arg) {
     (void)arg;
     ULONG core = KeGetCurrentProcessorNumber();
@@ -559,14 +596,9 @@ static ULONG_PTR svm_core_ipi_cleanup(ULONG_PTR arg) {
     if (vcpu) {
         if (vcpu->old_hsave)
             yg_write_msr(MSR_VM_HSAVE, vcpu->old_hsave);
-        if (vcpu->old_efer) {
-            uint64_t efer = yg_read_msr(MSR_EFER);
-            if ((efer & EFER_SVME) && !(vcpu->old_efer & EFER_SVME)) {
-                efer &= ~EFER_SVME;
-                yg_write_msr(MSR_EFER, efer);
-                LOG_INFO("SVM disabled on core %u", core);
-            }
-        }
+        /* EFER.SVME intentionally NOT written here. See the note above: the APM
+         * calls that undefined while a guest may still be running, and the 206
+         * ExitVm path already does it in the only legal window. */
     }
     return 0;
 }
