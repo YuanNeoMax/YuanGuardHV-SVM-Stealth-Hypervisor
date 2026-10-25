@@ -1,4 +1,10 @@
 #include <ntddk.h>
+
+/* 9.381b: how often a PT lookup missed the registry. This used to be silent
+ * because the fallback returned something (possibly garbage); now it is a number
+ * a test can read. */
+static volatile LONG64 g_npt_pt_miss;
+
 #include "npt.h"
 #include "debug.h"
 /* YGHV_DEBUG_LOG is provided by build.bat; do not redefine locally. */
@@ -38,11 +44,59 @@ static npt_entry_t *npt_get_pt(npt_mgr_t *m, uint32_t p4, uint32_t p2, uint32_t 
     pt_pa = (uint64_t)pd[p1].pfn << 12;
     for (i = 0; i < m->pt_reg_count; i++)
         if (m->pt_reg[i].pa == pt_pa) return m->pt_reg[i].va;
-    return (npt_entry_t*)MmGetVirtualForPhysical(
-        (PHYSICAL_ADDRESS){ .QuadPart = (LONGLONG)pt_pa });
+    /*
+     * 9.381b: NO MmGetVirtualForPhysical FALLBACK.
+     *
+     * The registry is supposed to hold every split PT, so a miss means either the
+     * registry is full or the entry was invalidated - and in both cases the honest
+     * answer is "I do not know where this page is", not a translation attempt.
+     *
+     * mem_pa.c's header states why: "MmGetVirtualForPhysical is not reliable for
+     * arbitrary physical pages" - it returns a pointer for some and NULL for
+     * others, and a lookup that succeeds at PML4 can silently read garbage deeper
+     * down (that is the 9.299 FIX-2 lesson, and it is why mem_pte.c exists).
+     *
+     * After 9.381 the invalidated slots are reused, so a miss is now genuinely
+     * exceptional rather than routine. Returning NULL makes it visible instead of
+     * turning it into a bogus pointer.
+     */
+    InterlockedIncrement64(&g_npt_pt_miss);
+    return NULL;
 }
 
+/*
+ * 9.381: THE REGISTRY REUSES SLOTS, AND THE CLEANUP MUST INVALIDATE THEM.
+ *
+ * Measured (11th restart, 0xD1 at DISPATCH writing 8 bytes to 0x180e31000 - two
+ * adjacent NPT pages): npt_cleanup freed each split PT with
+ * MmFreeContiguousMemory(pt) and left pt_reg[r].pa / .va untouched. The registry
+ * is PA -> VA memory, so after that free any later lookup for the same PA hands
+ * back a VIRTUAL ADDRESS THAT NO LONGER EXISTS.
+ *
+ * 9.283 (the note at the end of npt_cleanup) fixed DOUBLE FREE. That is a
+ * different failure from USE AFTER FREE, and it is the second one that fired:
+ *
+ *   same VA freed twice                        -> fixed by 9.283
+ *   VA taken from pt_reg after its page is gone -> NOT fixed, this is 9.381
+ *
+ * Two changes, and they have to be made together: invalidating without slot
+ * reuse leaves pt_reg_count climbing until the table is full and every lookup
+ * falls through to MmGetVirtualForPhysical; reusing without invalidating keeps
+ * handing out dead VAs.
+ */
 static void npt_reg_pt(npt_mgr_t *m, uint64_t pa, npt_entry_t *va) {
+    uint32_t i;
+
+    /* Reuse a slot that was invalidated by npt_cleanup (S9.381) before growing.
+     * Without this, a load/unload cycle leaks one slot per split PT and after 256
+     * of them every PT lookup takes the MmGetVirtualForPhysical fallback. */
+    for (i = 0; i < m->pt_reg_count; i++) {
+        if (m->pt_reg[i].pa == 0 && m->pt_reg[i].va == NULL) {
+            m->pt_reg[i].pa = pa;
+            m->pt_reg[i].va = va;
+            return;
+        }
+    }
     if (m->pt_reg_count < 256) {
         m->pt_reg[m->pt_reg_count].pa = pa;
         m->pt_reg[m->pt_reg_count].va = va;
@@ -281,10 +335,20 @@ int npt_cleanup(npt_mgr_t*m){
                         if(pd[k].present&&!pd[k].large_page){
                             uint32_t r;
                             npt_entry_t *pt=NULL;
+                            uint32_t pt_slot = 0;
                             uint64_t pt_pa=(uint64_t)pd[k].pfn<<12;
                             for(r=0;r<m->pt_reg_count;r++)
-                                if(m->pt_reg[r].pa==pt_pa){pt=m->pt_reg[r].va;break;}
-                            if(pt)MmFreeContiguousMemory(pt);
+                                if(m->pt_reg[r].pa==pt_pa){pt=m->pt_reg[r].va;pt_slot=r;break;}
+                            if(pt){
+                                MmFreeContiguousMemory(pt);
+                                /*
+                                 * 9.381: INVALIDATE THE SLOT, or the registry keeps
+                                 * handing this dead VA out. Measured consequence:
+                                 * 0xD1 writing 8 bytes at DISPATCH to 0x180e31000.
+                                 */
+                                m->pt_reg[pt_slot].pa = 0;
+                                m->pt_reg[pt_slot].va = NULL;
+                            }
                         }
                     }
                     MmFreeContiguousMemory(pd);
