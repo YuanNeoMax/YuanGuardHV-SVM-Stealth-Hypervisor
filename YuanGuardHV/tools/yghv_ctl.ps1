@@ -232,6 +232,153 @@ public static class YghvMmf
         return r;
     }
 
+    /*
+     * 9.372 (C1): an EXECUTABLE mapping of the same section.
+     *
+     * MapFile above asks for PAGE_READWRITE, so a byte written there can never be
+     * fetched - and a 0xCC that is never fetched cannot raise #BP. That is why
+     * the INT3 test since Tier 4.4 has only ever proved "the byte was written and
+     * restored": its own target page comment says "never executed".
+     *
+     * This variant asks for PAGE_EXECUTE_READWRITE and VirtualProtect's the view
+     * executable, so the same section can be RUN FROM. The page is still a guest
+     * physical page we can point mem-bp int3 at, which is what makes the hot path
+     * testable.
+     */
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool VirtualProtect(IntPtr addr, System.UIntPtr size,
+        uint newProtect, out uint oldProtect);
+
+    public static YghvMapView MapFileExec(string path, uint size)
+    {
+        /*
+         * 9.372 (C1) CORRECTION: a file mapping object CANNOT be created with
+         * PAGE_EXECUTE_READWRITE.
+         *
+         * Measured: CreateFileMapping(..., PAGE_EXECUTE_READWRITE, ...) returns
+         * Win32 error 5 (ACCESS_DENIED). The section object has no "executable"
+         * notion - executability is a property of the VIEW, applied by
+         * MapViewOfFile's access mask and then by VirtualProtect. Asking the
+         * mapping for XRW looks like the obvious spelling and is simply invalid.
+         *
+         * So the section is created PAGE_READWRITE (the only thing it accepts),
+         * the view is mapped with FILE_MAP_ALL_ACCESS, and VirtualProtect makes
+         * the VIEW executable. The physical page is the same either way, which is
+         * what matters: mem-bp int3 patches the GPA, and this process fetches
+         * from that GPA.
+         */
+        IntPtr f = CreateFileW(path, 0x80000000u | 0x40000000u,
+            0x1u | 0x2u, IntPtr.Zero, 4 /* OPEN_ALWAYS */, 0, IntPtr.Zero);
+        if (f == (IntPtr)(-1))
+            throw new Exception("CreateFile failed, Win32 error " +
+                Marshal.GetLastWin32Error());
+        IntPtr m = CreateFileMappingW(f, IntPtr.Zero, 0x4 /* PAGE_READWRITE */,
+            0, size, IntPtr.Zero);
+        if (m == IntPtr.Zero)
+        {
+            CloseHandle(f);
+            throw new Exception("CreateFileMapping failed, Win32 error " +
+                Marshal.GetLastWin32Error());
+        }
+        IntPtr v = MapViewOfFile(m, 0xF001Fu /* FILE_MAP_ALL_ACCESS */, 0, 0, (UIntPtr)size);
+        if (v == IntPtr.Zero)
+        {
+            CloseHandle(m);
+            CloseHandle(f);
+            throw new Exception("MapViewOfFile failed, Win32 error " +
+                Marshal.GetLastWin32Error());
+        }
+        YghvMapView r = new YghvMapView();
+        r.View = v; r.Map = m; r.File = f;
+        return r;
+    }
+
+    /*
+     * 9.372 (C1): make an ALREADY-MAPPED view executable.
+     *
+     * Separate from the mapping because VirtualProtect on a fresh view failed
+     * with error 87 in this container: the protect must come AFTER the pages are
+     * touched, not before. Ordering it this way also means the executable window
+     * is as short as it can be - the stub is written, then the page becomes
+     * executable, then it is called.
+     */
+    public static string MakeExecutable(IntPtr view, uint size)
+    {
+        uint old = 0;
+        /* Return the error instead of a bool: "false" alone cannot distinguish
+           an invalid argument from a refused protection, and both were seen. */
+        if (VirtualProtect(view, new System.UIntPtr(size), 0x40, out old))
+            return "OK";
+        return "ERR " + Marshal.GetLastWin32Error();
+    }
+
+    /*
+     * 9.372 (C1): allocate a page, write the `xor eax,eax; ret` stub, return its VA.
+     *
+     * PAGE_EXECUTE_READWRITE at allocation time is what makes the page both
+     * patchable (mem-bp writes 0xCC through the GPA) and fetchable (we call it).
+     * The same pattern already works for the CPUID/RDTSC stubs above.
+     *
+     * A FILE MAPPING CANNOT DO THIS - measured twice: CreateFileMapping with
+     * PAGE_EXECUTE_READWRITE returns error 5 (a section has no executability),
+     * and VirtualProtect on a mapped view returns error 87. An allocated page is
+     * also exactly what mem-pte can resolve to a GPA, which is the property the
+     * INT3 test actually needs.
+     */
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern System.IntPtr VirtualAlloc(System.IntPtr addr,
+        System.UIntPtr size, uint allocType, uint protect);
+
+    [System.Runtime.InteropServices.UnmanagedFunctionPointer(
+        System.Runtime.InteropServices.CallingConvention.Cdecl)]
+    private delegate int ExecStubFn();
+
+    public static ulong AllocExecStub()
+    {
+        System.IntPtr mem = VirtualAlloc(System.IntPtr.Zero, (System.UIntPtr)4096,
+            0x3000 /* COMMIT|RESERVE */, 0x40 /* PAGE_EXECUTE_READWRITE */);
+        if (mem == System.IntPtr.Zero)
+            throw new Exception("VirtualAlloc(RWX) failed, Win32 error " +
+                Marshal.GetLastWin32Error());
+        byte[] stub = new byte[] { 0x31, 0xC0, 0xC3, 0x90, 0x90, 0x90, 0x90, 0x90 };
+        Marshal.Copy(stub, 0, mem, stub.Length);
+        return (ulong)mem.ToInt64();
+    }
+
+    /*
+     * Call into a guest page with the fault CATCHABLE.
+     *
+     * A 0xCC we placed should be handled and re-executed, so the caller sees a
+     * normal return. If the chain is broken the exception reaches this managed
+     * frame, and an unhandled one in a powershell child is a WER dialog and a dead
+     * process - indistinguishable from "the driver hung". So the outcome is
+     * RETURNED as a string.
+     *
+     * This has to be a REAL call. A placeholder that reported success without
+     * transferring control would make the INT3 test pass while never fetching the
+     * 0xCC, which is exactly the defect C1 exists to remove.
+     */
+    [System.Runtime.ExceptionServices.HandleProcessCorruptedStateExceptions]
+    [System.Security.SecurityCritical]
+    public static string CallAddress(ulong va)
+    {
+        try
+        {
+            ExecStubFn fn = (ExecStubFn)System.Runtime.InteropServices.Marshal
+                .GetDelegateForFunctionPointer(new System.IntPtr((long)va), typeof(ExecStubFn));
+            int r = fn();
+            return "returned " + r;
+        }
+        catch (System.AccessViolationException) { return "AVE"; }
+        catch (System.Exception ex_) { return "EX " + ex_.GetType().Name; }
+    }
+
+    public static string CallView(System.IntPtr view)
+    {
+        return CallAddress((ulong)view.ToInt64());
+    }
+
+
     public static void UnmapFile(YghvMapView v)
     {
         if (v == null) return;
@@ -1361,6 +1508,81 @@ try {
                 [YghvMmf]::UnmapFile($map)
             }
         }
+        'exec-page' {
+            # 9.372 (C1): a guest-EXECUTABLE page, ALLOCATED rather than mapped.
+            #
+            # Measured twice that a file mapping is the wrong tool:
+            #   CreateFileMapping(PAGE_EXECUTE_READWRITE) -> Win32 error 5
+            #     (a section object has no notion of executability)
+            #   VirtualProtect on a mapped view          -> Win32 error 87
+            # VirtualAlloc with MEM_COMMIT|MEM_RESERVE and PAGE_EXECUTE_READWRITE
+            # is the shape that already works in this file for the CPUID/RDTSC
+            # stubs, and it is also exactly what mem-pte can resolve to a GPA -
+            # which is the property the INT3 test needs.
+            #
+            # usage:
+            #   exec-page hold <sec> <info_path>   allocate, write stub, publish VA, sleep
+            #   exec-page run                      allocate, write stub, CALL it
+            #   exec-page call <hex_va>            call an address in an existing page
+            if ($null -eq $Arg1) { throw 'exec-page: hold, run or call is required' }
+            $mode = "$Arg1".ToLower()
+            if ($mode -eq 'call') {
+                if ($null -eq $Arg2) { throw 'exec-page call: a hex va is required' }
+                $va = [Convert]::ToUInt64(("$Arg2" -replace '^0[xX]',''),16)
+                $r = [YghvMmf]::CallAddress($va)
+                Write-Host ("exec-page: called 0x{0:X} -> {1}" -f $va, $r)
+                return
+            }
+            $secs = 0
+            $infoPath = $null
+            # hold and spinhit share the same argument shape: <sec> [info_path].
+            if ($mode -eq 'hold' -or $mode -eq 'spinhit') {
+                if ($null -eq $Arg2) { throw ('exec-page ' + $mode + ': a duration in seconds is required') }
+                $secs = [int]$Arg2
+                if ($null -ne $Arg3) { $infoPath = "$Arg3" }
+            } elseif ($mode -ne 'run') {
+                throw 'exec-page: mode must be hold, spinhit, run or call'
+            }
+            $va = [YghvMmf]::AllocExecStub()
+            $pidVal = [YghvCtlNative]::GetCurrentProcessId()
+            $line = ("exec-page: pid={0} va=0x{1:X}" -f $pidVal, $va)
+            Write-Host $line
+            if ($null -ne $infoPath) { Set-Content -LiteralPath $infoPath -Value $line -Encoding ASCII }
+            if ($mode -eq 'run') {
+                $r = [YghvMmf]::CallAddress($va)
+                Write-Host ("exec-page: returned {0}" -f $r)
+            } elseif ($mode -eq 'spinhit') {
+#
+# 9.372 (C1): HOLD AND REPEATEDLY CALL, in the SAME process.
+# 
+# A VA belongs to the process that allocated it, so a controller
+# calling into a holder's address from another process is calling
+# a wild pointer - measured: G42 step 3 produced NO output at all
+# (the child died silently), while steps 5/6 showed the patch and
+# the restore had both worked. The chain was fine; the caller was
+# wrong.
+# 
+# So the process that owns the page is also the one that fetches
+# it. The controller patches the GPA; this loop keeps executing
+# the same page, and any 0xCC placed underneath becomes a #BP on
+# the next iteration.
+# /
+                $end = (Get-Date).AddSeconds($secs)
+                $n = 0
+                while ((Get-Date) -lt $end) {
+                    $r = [YghvMmf]::CallAddress($va)
+                    $n++
+                    if ($r -ne 'returned 0') {
+                        Write-Host ("exec-page: iteration {0} -> {1}" -f $n, $r)
+                    }
+                    Start-Sleep -Milliseconds 50
+                }
+                Write-Host ("exec-page: spinhit done, {0} calls, last={1}" -f $n, $r)
+            } else {
+                Start-Sleep -Seconds $secs
+                Write-Host 'exec-page: done'
+            }
+        }
         'mmf-read' {
             # 9.366: THE GUEST'S OWN READ OF THE PAGE - the half `mmf-write`
             # never covered.
@@ -2031,6 +2253,40 @@ try {
                 throw 'sys-sentry tsc: offset takes a hex value, freeze takes 1 or 0, or probe'
             }
             throw 'sys-sentry: use surface, reset, cpuid-view, or tsc'
+        }
+        'sys-bp-int3' {
+            # 9.372 (C1): the #BP exception intercept, opt-in.
+            #
+            # WHY A SWITCH AND NOT ALWAYS-ON: measured in 9.367.3, bit 3 of
+            # InterceptException was never set, so `case VMEXIT_EXCEPTION_BP` has
+            # never executed. Turning an exception intercept on has already cost
+            # this project a bugcheck once (#GP, PatchGuard, 0xE2 - 9.244). The
+            # default boot path stays exactly as the 13/13 suite verified it; a
+            # test asks for the intercept, measures the chain, and turns it off.
+            #
+            # usage:
+            #   sys-bp-int3          state
+            #   sys-bp-int3 on|off
+            if ($null -eq $Arg1) {
+                $r0 = New-Object byte[] 32
+                [BitConverter]::GetBytes([uint64]9).CopyTo($r0, 0)
+                $o = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x828)) -InBytes $r0 -OutputLength 8
+                $v = [BitConverter]::ToUInt64($o, 0)
+                Write-Host ("sys-bp-int3: intercept={0} ({1})" -f $v, $(if($v){'#BP exits are ours'}else{'default: the guest handles its own #BP'}))
+                if ($v -and $v -ne 1) { Write-Host '  WARNING: reported value is not 0/1' }
+                return
+            }
+            $w = "$Arg1".ToLower()
+            if ($w -ne 'on' -and $w -ne 'off') { throw 'sys-bp-int3: use on or off' }
+            $req = New-Object byte[] 32
+            [BitConverter]::GetBytes([uint64]10).CopyTo($req, 0)
+            [BitConverter]::GetBytes([uint64]$(if($w -eq 'on'){1}else{0})).CopyTo($req, 8)
+            $o2 = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x828)) -InBytes $req -OutputLength 8
+            Write-Host ("sys-bp-int3: {0} -> {1}" -f $w, $(if([BitConverter]::ToUInt64($o2,0)){'OK'}else{'FAILED'}))
+            if ($w -eq 'on') {
+                Write-Host '  NOTE: this takes effect at the next VMRUN of each core. A core'
+                Write-Host '        that is already running keeps its old mask until it exits.'
+            }
         }
         'sys-auth' {
             # 9.371 (Tier 9.2): authenticated control commands.

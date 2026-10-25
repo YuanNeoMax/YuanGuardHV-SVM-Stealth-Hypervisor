@@ -10377,3 +10377,87 @@ after clearing the key: key=16B mode=enforce
 
 **静态检查**：7/7 PASS；IOCTL 41→42，命令 58→59。
 **回归**：G25 13/13、G40 walk 12/12。
+
+---
+
+### 9.372 C1 部分完成：INT3 热路径首次有证据，但无限自旋会打死机器
+
+**已取得的关键证据（镜像 `206zT_int3hot`）**
+
+这是**自从 Tier 4.4 以来第一次**有证据表明 INT3 的热路径真的运行过：
+
+```
+3  bp int3 OK
+5  byte re-patched to 0xCC        = True    ← #DB 把 0xCC 重新打回去了
+6  del restores original (0x31)   = True    ← 恢复干净
+```
+
+第 5 步是决定性的：`#BP → 记录 → 恢复原字节 → TF → 指令重执行 → #DB → 重打 0xCC`
+整条链走完，字节才会又一次变成 `0xCC`。
+
+在此之前，g18 的 B1-B3 只在**数据页**上验了「写入 0xCC / 恢复 0x31」，
+而它的目标页注释自己写着 "never executed" —— 字节从未被取指。
+
+**为做这个测试而新增的三样东西**
+
+| 新增 | 为什么必要的 |
+|---|---|
+| `exec-page`（分配页而非映射）| 文件映射无法执行：`CreateFileMapping(PAGE_EXECUTE_READWRITE)` → error 5，`VirtualProtect` 于映射视图 → error 87。`VirtualAlloc(PAGE_EXECUTE_READWRITE)` 才是能取指的形状 |
+| `sys-bp-int3 on\|off` | `InterceptException` 只设过 bit 1（#DB），bit 3（#BP）从未设置 —— 处理器里那个 case 是死代码（9.367.3）|
+| `yghv_s206_bp_int3_apply_all()` | 第一次只在 prepare 里设 flag 完全无效（B2 已证明 prepare 每核只跑一次）；改为逐核遍历写 VMCB |
+
+**★ 第四次崩溃：0x139 MISSING_GSFRAME_STACKPTR_ERROR**
+
+```
+BUGCHECK_CODE:  139   (KERNEL_SECURITY_CHECK_FAILURE)
+BUGCHECK_P1:    4     (FAST_FAIL_INCORRECT_STACK)
+SYMBOL_NAME:    nt!KiFastFailDispatch+d0
+FAILURE_BUCKET: 0x139_MISSING_GSFRAME_STACKPTR_ERROR
+PROCESS_NAME:   powershell.exe
+```
+
+发生在 G42 第 4 步（`mem-bp drain`），而此刻 **holder 进程仍在以 20Hz 反复执行被打了
+0xCC 的页**。所以每次执行都是：取指 0xCC → #BP → `yghv_bp_on_int3` →
+`yghv_protect_guest_va_to_pa`（页表遍历）→ 恢复字节 → TF → #DB → 重打。
+
+**每次迭代都要在 island 里做一次完整的页表遍历**。20Hz 本身不高，但
+`yghv_bp_on_int3` 里的 `yghv_protect_guest_va_to_pa` 与 `yghv_pa_write` 都不是
+island-safe 的设计（前者遍历 guest 页表，后者用 MDL），它们在 GIF=0 的上下文里
+被高频重入。
+
+诚实的说法是：**我还没有证明栈损坏的确切位置**。`SYMBOL_NAME` 指向 nt 的
+fast-fail dispatch，说明是栈检查在自己发现不对时主动 bugcheck，而不是在我们的
+代码里直接崩。要定位需要 dump 里那一帧的完整调用栈，而这条 0x139 的栈没有被
+保存成可解析的形式。
+
+**两个已确认的事实**（可以用来说明方向）
+
+1. **问题只在 holder 持续执行 0xCC 时出现。** g42a（不起 holder、只开关拦截）
+   跑得完全干净：`intercept=0 → on → 1 → off → 0`，健康计数器全 0。
+2. **一次性的 #BP 是好的。** 第一次 G42（holder 用 `hold` 不执行）拿到了
+   第 5/6 步的两个 True。
+
+所以区别不在于"#BP 能不能处理"，而在于**同样的 #BP 被高频重放时，处理路径里
+有不是 island-safe 的东西**。
+
+**按既定规则停在这里的理由**
+
+用户规则：蓝屏风险大的先确认。这一项已经：
+- 验证了 C1 的目标（热路径有证据）—— 已经完成
+- 并且确认了一个**新的、具体的**风险：高频 #BP 重放会打死机器
+
+继续改下去需要先做的是**把 `yghv_bp_on_int3` 的路径变成真正 island-safe**
+（去掉页表遍历与 MDL 写），这是一个比 C1 本身大得多的改动，且每试一次都可能是
+一次重启。
+
+**C1 的结论**
+
+| 断言 | 状态 |
+|---|---|
+| 可执行页能取指 | ✔ 已证 |
+| #BP 拦截位能逐核武装 | ✔ 已证（`apply_all`）|
+| 一次 #BP 走完整条链 | ✔ 已证（第 5/6 步）|
+| 页面无断点时反射不误伤 | ✔ 已证（g42a 第 4 步）|
+| 高频重放安全 | ✘ **未证，且已观察到 0x139** |
+
+前四项是 C1 真正要回答的问题，都回答了。第五项超出 C1 范围，单独记入剩余项。

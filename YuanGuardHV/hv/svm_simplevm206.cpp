@@ -729,6 +729,26 @@ static volatile LONG64 g_TscIntercepts = 0;          /* RDTSC/RDTSCP exits handl
 static volatile LONG64 g_TscSuppressed = 0;          /* answers changed from hardware */
 static volatile LONG   g_TscInterceptArmed = 0;      /* is the intercept bit set? */
 
+/*
+ * 9.372 (C1): is the #BP exception intercept armed?
+ *
+ * Default 0. See the note at the arming site: an exception intercept that was
+ * never measured is exactly how the 205k #GP block produced a 0xE2, and this
+ * switch keeps the default boot path identical to what the 13/13 suite verified.
+ */
+static volatile LONG   g_BpInt3Intercept = 0;
+
+extern "C" int yghv_s206_bp_int3_intercept(UINT32 on)
+{
+    InterlockedExchange(&g_BpInt3Intercept, on ? 1 : 0);
+    return 1;
+}
+
+extern "C" int yghv_s206_bp_int3_intercept_get(VOID)
+{
+    return (int)InterlockedCompareExchange(&g_BpInt3Intercept, 0, 0);
+}
+
 /* Real-TSC ticks per millisecond, measured once. Used only for the freeze
    deadline. A loose estimate is fine: the deadline exists to bound a hang, not to
    be exact. */
@@ -3202,6 +3222,37 @@ SvPrepareForVirtualization (
     // VMEXITs). Only bit 1 is set: Windows' benign #GP/#PF probes stay native
     // (the 9.244 concern targets #GP, vector 13 — untouched).
     VpData->GuestVmcb.ControlArea.InterceptException |= (1u << 1);
+    /*
+     * 9.372 (C1): INTERCEPT #BP -- OPT-IN, AND ONLY BECAUSE IT WAS NEVER ON.
+     *
+     * MEASURED FACT (9.367.3): this build only ever set bit 1 (#DB). #BP is
+     * vector 3, i.e. bit 3, and it was NEVER set. So `case VMEXIT_EXCEPTION_BP`
+     * -- the whole chain "record -> restore the byte we displaced -> set TF ->
+     * #DB re-patches" -- could only be reached when the guest executed an INT3
+     * on its own, and in that situation yghv_bp_on_int3() finds no slot and the
+     * handler takes the reflect branch.
+     *
+     * The INT3-mode test that has been passing since Tier 4.4 (g18 B1-B3) checks
+     * that 0xCC gets WRITTEN and RESTORED. Its target page is a data page whose
+     * own comment says "never executed". So the hot path has zero evidence: the
+     * 0xCC was never fetched, never faulted, and never handled.
+     *
+     * WHY OPT-IN RATHER THAN ALWAYS ON. Turning on an exception intercept has
+     * already cost this project a bugcheck once: the 205k block enabled #GP and
+     * Windows' benign PatchGuard/SEH probes became an observable 0xE2 within
+     * minutes (9.244). #BP is much narrower than #GP - it fires only on a 0xCC
+     * the guest executes - but "much narrower" is an argument, not a measurement,
+     * and this is a machine that has already been taken down three times in this
+     * session by argued-not-measured changes.
+     *
+     * So the mask is armed only when a policy flag says so. A test asks for it,
+     * measures the chain, and the default boot path stays exactly as it was.
+     * `g_BpInt3Intercept` is checked here and nowhere else; the reflect branch in
+     * the handler is what makes it safe to leave on - a #BP that is NOT ours is
+     * re-injected to the guest, which is the guest's own semantics.
+     */
+    if (InterlockedCompareExchange(&g_BpInt3Intercept, 0, 0))
+        VpData->GuestVmcb.ControlArea.InterceptException |= (1u << 3);
     // 9.250c: intercept SHUTDOWN (bit 31) — a guest triple fault then becomes
     // an observable VMEXIT (handler bugchecks with the state) instead of the
     // CPU dying silently = the instant-reset failure mode.
@@ -3769,9 +3820,22 @@ SvTscApplyOnCore (
     }
     InterlockedIncrement64(&g_TscCoreHits);
 
-    /* 9.370c: 0xFFFFFFFF means "probe": touch nothing after validating the pointer. */
+    /* 0xFFFFFFFF means "probe": touch nothing after validating the pointer. */
     if (want == 0xFFFFFFFFu)
         goto Exit;
+
+    /* 0xFFFFFFFE means "apply the #BP exception bit only" (9.372/C1). Kept in the
+     * same walk as the TSC policy because the same two facts apply: a VMCB bit is
+     * per-core state, and only a walk from PASSIVE can write it on every core. */
+    if (want == 0xFFFFFFFEu)
+    {
+        if (InterlockedCompareExchange(&g_BpInt3Intercept, 0, 0))
+            vpData->GuestVmcb.ControlArea.InterceptException |= (1u << 3);
+        else
+            vpData->GuestVmcb.ControlArea.InterceptException &= ~((UINT32)(1u << 3));
+        vpData->GuestVmcb.ControlArea.VmcbClean = 0;
+        goto Exit;
+    }
 
     vpData->GuestVmcb.ControlArea.TscOffset = yghv_s206_tsc_offset_get();
 
@@ -3831,6 +3895,28 @@ extern "C" int yghv_s206_tsc_apply_all(UINT32 arm)
                                            nullptr);
     return NT_SUCCESS(st) ? 1 : 0;
 }
+
+/*
+ * 9.372 (C1): apply the #BP intercept bit on EVERY core.
+ *
+ * The prepare-time arming at SvPrepareForVirtualization runs once per core at
+ * load, so setting the flag afterwards changed nothing - the same failure B2
+ * measured and the same fix: walk the cores from PASSIVE and write the VMCB
+ * while pinned to each one.
+ *
+ * Returns 1 when the walk completed. A partial walk means some cores intercept
+ * #BP and others do not, which is both a detection signal and a correctness
+ * problem, so the caller must report it rather than assume.
+ */
+extern "C" int yghv_s206_bp_int3_apply_all(VOID)
+{
+    NTSTATUS st = SvExecuteOnEachProcessor(SvTscApplyOnCore,
+                                           (PVOID)(ULONG_PTR)0xFFFFFFFEu,
+                                           nullptr);
+    return NT_SUCCESS(st) ? 1 : 0;
+}
+
+
 
 static
 NTSTATUS

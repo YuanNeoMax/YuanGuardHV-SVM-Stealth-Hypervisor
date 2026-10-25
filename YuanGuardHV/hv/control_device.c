@@ -30,6 +30,15 @@ extern UINT32 yghv_s206_cpuid_view_get(void);
 extern void   yghv_s206_cpuid_view_stats(UINT64 *out);
 
 /*
+ * 9.372 (C1): the #BP exception intercept, opt-in. Default off, because an
+ * exception intercept that was never measured is how the 205k #GP block produced
+ * a 0xE2 (9.244). See the arming site in svm_simplevm206.cpp.
+ */
+extern int    yghv_s206_bp_int3_intercept(UINT32 on);
+extern int    yghv_s206_bp_int3_intercept_get(void);
+extern int    yghv_s206_bp_int3_apply_all(void);
+
+/*
  * 9.368 (B1/B2, Tier 5.1): the guest's clock, controlled from the same place —
  * what the guest observes is one subject, and 7.6 already owns that subject.
  */
@@ -982,6 +991,31 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
             UINT64 v = ((UINT64 *)buf)[1];
             out[0] = (UINT64)(INT64)yghv_s206_tsc_offset_set(v);
             info = 8;
+            status = STATUS_SUCCESS;
+            break;
+        }
+        /* 9.372 (C1): the #BP intercept flag, in the same IOCTL as the rest of
+         * what the guest can observe.
+         *   op 9  read  -> out[0]=intercept on/off
+         *   op 10 write <- in[1]=1 on / 0 off
+         */
+        if (op == 9 && out_len >= sizeof(UINT64)) {
+            out[0] = (UINT64)yghv_s206_bp_int3_intercept_get();
+            info = 8;
+            status = STATUS_SUCCESS;
+            break;
+        }
+        if (op == 10 && in_len >= 32) {
+            UINT64 onv = ((UINT64 *)buf)[1];
+            int ok = yghv_s206_bp_int3_intercept((UINT32)(onv ? 1 : 0));
+            int walked = 0;
+            /* 9.372: setting the flag is not enough - the VMCB bit is per-core
+             * state and prepare runs once at load. Walk the cores and write it. */
+            if (ok)
+                walked = yghv_s206_bp_int3_apply_all();
+            out[0] = (UINT64)((ok && walked) ? 1 : 0);
+            out[1] = (UINT64)walked;
+            info = 16;
             status = STATUS_SUCCESS;
             break;
         }
