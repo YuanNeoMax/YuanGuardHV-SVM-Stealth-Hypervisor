@@ -3964,10 +3964,29 @@ extern "C" int yghv_s206_tsc_apply_all(UINT32 arm)
  */
 extern "C" int yghv_s206_bp_int3_apply_all(VOID)
 {
-    NTSTATUS st = SvExecuteOnEachProcessor(SvTscApplyOnCore,
-                                           (PVOID)(ULONG_PTR)0xFFFFFFFEu,
-                                           nullptr);
-    return NT_SUCCESS(st) ? 1 : 0;
+    /*
+     * 9.374: DISABLED. Two restarts (0x139 both times) traced to this walk.
+     *
+     * 9.370 proved that walking the cores from PASSIVE is the only way to write a
+     * per-core VMCB bit, and that it works for the TSC intercept. The difference
+     * here is the #BP window: while this walk runs, another process is executing
+     * the very page the bit is about to govern. Measured on G42: the holder was
+     * spinning on its stub page and `sys-bp-int3 on` was the last line before the
+     * machine died - the same 0x139 MISSING_GSFRAME_STACKPTR as the run where the
+     * bit had merely survived from an earlier boot.
+     *
+     * So "walk the cores" is not a general-purpose primitive. It is safe when
+     * nothing is executing the state being changed and unsafe otherwise, and
+     * nothing in this tree can guarantee the first condition for an arbitrary
+     * guest page.
+     *
+     * The bit therefore stays exactly where the 13/13 suite verified it: set at
+     * prepare, from the policy flag, once per core at load. That is enough for the
+     * OPT-IN contract - a caller who wants #BP intercepted sets the flag before
+     * loading. It is not enough to toggle at runtime, and pretending otherwise
+     * has now cost two machines.
+     */
+    return 0;
 }
 
 

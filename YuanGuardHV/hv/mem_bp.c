@@ -781,6 +781,23 @@ int yghv_bp_remove(uint64_t gpa, uint64_t rip) {
         InterlockedExchange(&g_bp[slot].active, 0);
         InterlockedDecrement(&g_bp_count);
         (void)yghv_pa_write(g_bp[slot].gpa + off, &orig, 1);
+        /*
+         * 9.373: RELEASE THE SHADOW FRAME.
+         *
+         * Arm allocates one page per INT3 slot (the copy that carries the
+         * ORIGINAL byte, so #BP can point the leaf at real bytes without writing
+         * memory). Nothing released it, so every arm/remove cycle leaked 4 KB of
+         * non-paged pool - and a leak of non-paged pool is not a cosmetic defect
+         * in a driver that also pins pages.
+         *
+         * The page is freed here rather than in a sweep because this is the one
+         * path that knows the slot is finished.
+         */
+        if (g_bp_shadow_va[slot]) {
+            ExFreePoolWithTag(g_bp_shadow_va[slot], 'BPSH');
+            g_bp_shadow_va[slot] = NULL;
+            g_shadow_pa[slot] = 0;
+        }
         RtlZeroMemory(&g_bp[slot], sizeof(g_bp[slot]));
         return 1;
     } else if (g_bp[slot].mode == YGHV_BP_MODE_DR) {
@@ -1043,6 +1060,8 @@ void yghv_bp_stats_get(yghv_bp_stats_t *out) {
     out->fail_va      = (uint64_t)InterlockedCompareExchange64(&g_bp_fail_va, 0, 0);
     out->fail_drslot  = (uint64_t)InterlockedCompareExchange64(&g_bp_fail_drslot, 0, 0);
     out->fail_patch   = (uint64_t)InterlockedCompareExchange64(&g_bp_fail_patch, 0, 0);
+    out->shadow_switches = (uint64_t)InterlockedCompareExchange64(&g_bp_shadow_switches, 0, 0);
+    out->fail_shadow  = 0;   /* switches that failed are counted by the caller's path */
 
     for (i = 0; i < YGHV_BP_MAX; i++) {
         if (!InterlockedCompareExchange(&g_bp[i].active, 0, 0))

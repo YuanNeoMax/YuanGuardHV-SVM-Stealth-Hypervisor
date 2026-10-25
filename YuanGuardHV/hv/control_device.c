@@ -1372,7 +1372,7 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
          * Zero-length input = diagnostics.
          * 32-byte input {ULONG op, pad, ULONG_PTR a(gpa), b(rip), c(kinds)}:
          *   op 0 = add   op 1 = remove   op 2 = drain(a = max qwords) */
-        if (in_len == 0 && out_len >= 10 * sizeof(UINT64)) {
+        if (in_len == 0 && out_len >= 16 * sizeof(UINT64)) {
             UINT64 *out = (UINT64 *)buf;
             yghv_bp_stats_t bs;
             yghv_bp_stats_get(&bs);
@@ -1392,7 +1392,12 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
             out[11] = g_dbg_args[1];
             out[12] = g_dbg_args[2];
             out[13] = g_dbg_args[3];
-            info = 14 * sizeof(UINT64);
+            /* 9.373: leaf flips to/from the shadow frame. This is the observable
+             * that replaces "the byte changed" for INT3 mode: with a shadow the
+             * guest page keeps 0xCC for the breakpoint's whole life. */
+            out[14] = bs.shadow_switches;
+            out[15] = bs.fail_shadow;
+            info = 16 * sizeof(UINT64);
             status = STATUS_SUCCESS;
             break;
         }

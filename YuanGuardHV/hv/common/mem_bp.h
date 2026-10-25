@@ -194,6 +194,16 @@ typedef struct {
     uint64_t fail_va;
     uint64_t fail_drslot;
     uint64_t fail_patch;
+    /*
+     * 9.373: how many times an INT3 hit flipped a page's NPT leaf to its shadow
+     * frame (and back). This is the DIRECT evidence that the new mechanism ran:
+     * with the shadow approach the guest page keeps 0xCC for the breakpoint's
+     * whole life and the original byte only ever exists in the shadow, so "the
+     * byte changed" is no longer an observable. A test that wanted to prove the
+     * #BP chain executed has to read this counter instead.
+     */
+    uint64_t shadow_switches;
+    uint64_t fail_shadow;
 } yghv_bp_stats_t;
 
 extern uint64_t g_dbg_args[8];   /* 9.327: last bp_add_ex arguments */

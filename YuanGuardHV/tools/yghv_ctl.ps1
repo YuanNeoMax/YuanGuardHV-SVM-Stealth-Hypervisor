@@ -2281,11 +2281,27 @@ try {
             $req = New-Object byte[] 32
             [BitConverter]::GetBytes([uint64]10).CopyTo($req, 0)
             [BitConverter]::GetBytes([uint64]$(if($w -eq 'on'){1}else{0})).CopyTo($req, 8)
-            $o2 = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x828)) -InBytes $req -OutputLength 8
-            Write-Host ("sys-bp-int3: {0} -> {1}" -f $w, $(if([BitConverter]::ToUInt64($o2,0)){'OK'}else{'FAILED'}))
-            if ($w -eq 'on') {
-                Write-Host '  NOTE: this takes effect at the next VMRUN of each core. A core'
-                Write-Host '        that is already running keeps its old mask until it exits.'
+            $o2 = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x828)) -InBytes $req -OutputLength 16
+            $ok = [BitConverter]::ToUInt64($o2, 0)
+            $walk = 0
+            if ($o2.Length -ge 16) { $walk = [BitConverter]::ToUInt64($o2, 8) }
+            # 9.374: TWO SEPARATE OUTCOMES, reported separately on purpose.
+            #   flag set   the policy now says "intercept #BP"
+            #   walk done  every core's VMCB was updated at runtime
+            # The walk is DISABLED (it cost two restarts - see the note at
+            # yghv_s206_bp_int3_apply_all), so `walk=0` is the expected answer and
+            # NOT a failure. The flag takes effect at the next load, where prepare
+            # arms it per core.
+            if ($ok) {
+                Write-Host ("sys-bp-int3: policy flag -> {0}" -f $(if($w -eq 'on'){'ON'}else{'OFF'}))
+            } else {
+                Write-Host ("sys-bp-int3: {0} -> REFUSED" -f $w)
+            }
+            Write-Host ("  runtime per-core walk: {0}" -f $(if($walk){'applied to every core'}else{'DISABLED - takes effect at next load'}))
+            if (-not $walk -and $w -eq 'on') {
+                Write-Host '  The flag is set but the VMCB bits are NOT: a core keeps its old'
+                Write-Host '  mask until it re-enters prepare, which only happens at load. So for'
+                Write-Host '  #BP interception to be live, set this flag BEFORE loading the driver.'
             }
         }
         'sys-auth' {
@@ -2833,7 +2849,7 @@ try {
             #   mem-bp drain [max]                     drain the hit ring
             # kinds: r (read), w (write), x (execute); default w for npf, x for int3/dr
             if ($null -eq $Arg1) {
-                $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x823)) -OutputLength 112
+                $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x823)) -OutputLength 128
                 Write-Host ("mem-bp: count={0}  hits={1} recorded={2} refusals={3} missed={4}" -f `
                     [BitConverter]::ToUInt64($out,16), [BitConverter]::ToUInt64($out,24),
                     [BitConverter]::ToUInt64($out,32), [BitConverter]::ToUInt64($out,40),
@@ -2846,6 +2862,13 @@ try {
                     [BitConverter]::ToUInt64($out,96),
                     ([BitConverter]::ToUInt64($out,104) -band 0xFFFFFFFF),
                     ([BitConverter]::ToUInt64($out,104) -shr 32))
+                # 9.373: leaf flips to/from the shadow frame. For INT3 mode this
+                # replaces "the byte changed" as the proof the chain ran: with a
+                # shadow the guest page keeps 0xCC and the original byte only
+                # exists in the shadow copy.
+                if ($out.Length -ge 128) {
+                    Write-Host ("  shadow leaf flips={0}" -f [BitConverter]::ToUInt64($out,112))
+                }
                 return
             }
             $v = "$Arg1".ToLower()
