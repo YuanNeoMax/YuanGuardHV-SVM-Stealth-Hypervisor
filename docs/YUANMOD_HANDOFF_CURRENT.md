@@ -10781,3 +10781,84 @@ svm_core_cleanup()                      svm_core.c:574
 > `KeIpiGenericCall` 只保证回调到达，不保证回调的执行上下文允许它做想做的事。
 > 任何在 IPI 回调里执行特权指令（`wrmsr`/`rdmsr` 中的写方向、`mov crX`、
 > `invlpg` 之外的 TLB 操作）的代码，必须先证明目标核不在 guest 模式。
+
+---
+
+#### 9.378 纯代码阅读的结论：卸载器从来是空的 —— 第二个「没人写过的 ack」
+
+**方法**：不加载驱动，只用代码路径区分 9.377 留下的三种可能。
+
+**结论**
+
+| 可能 | 判定 | 依据 |
+|---|---|---|
+| ① `SvDevirtualizeProcessor` 提前 `goto Exit`，不反虚拟化 | **成立，且是唯一根因** | 见下 |
+| ② 两条路径对"是否虚拟化"判断不一致 | **排除** | 全树只有一个 `SvIsSimpleSvmHypervisorInstalled`，且它只看 CPUID 40000000h 的厂商标识 |
+| ③ `YGHV_NO_DEVICE` 跳过某条清理 | **排除** | `YGHV_NO_DEVICE` 只出现在 `control_device.c` 的 `yghv_control_device_init` 里，卸载路径一处未碰 |
+
+**根因（与 9.370 完全同形，第二次）**
+
+```c
+/* 调用方 */
+__cpuidex(registers, CPUID_UNLOAD_SIMPLE_SVM, CPUID_UNLOAD_SIMPLE_SVM);
+if (registers[2] != 'SSVM')      /* ECX */
+    goto Exit;                   /* ← 每一次都走这里 */
+
+/* 被调用的叶子 */
+case CPUID_UNLOAD_SIMPLE_SVM:
+    if (subLeaf == CPUID_UNLOAD_SIMPLE_SVM) {
+        attribute.AsUInt16 = ...SsAttrib;
+        if (attribute.Fields.Dpl == DPL_SYSTEM)
+            GuestContext->ExitVm = TRUE;      /* 只做这个 */
+    }
+    break;                                    /* ECX 从未被写 */
+```
+
+`registers[2]` 是 **ECX**，CPUID 输出时由硬件写。这个分支**从不设置它**，于是
+ECX 保留的是硬件对未实现叶的返回值 —— 永远不会是 `'SSVM'`。
+
+**因此 `SvDevirtualizeAllProcessors()` 遍历了每个核，一个也没反虚拟化。**
+
+后果正是 9.377 那次蓝屏：`svm_core_ipi_cleanup+0x5F` 的 `wrmsr` 清 EFER.SVME，
+在一个**仍在 guest 模式**的核上执行 → `0x1E PRIVILEGED_INSTRUCTION`。
+
+**卸载器的存在意义就是防止那个状态，而它从未运行过。**
+
+**这是本项目第二次被「没人写过的 ack」咬到**
+
+| 次 | 叶子 | 断言的值 | 谁写过 |
+|---|---|---|---|
+| 第一次（9.370）| `CPUID_FAKE_VPD` | `'1VSS'` | **没人** |
+| 第二次（本次）| `CPUID_UNLOAD_SIMPLE_SVM` | `'SSVM'` | **没人** |
+
+形态完全一致：**一个只被断言提及、从未被产生的值**。第一次让两个调用方成为死代码，
+第二次让整个卸载器成为空操作，并为此赔上一台机器。
+
+**修法**
+
+```c
+registers[2] = 'SSVM';                      /* ack */
+registers[3] = static_cast<int>(vpdVa >> 32);
+registers[0] = static_cast<int>(vpdVa & MAXUINT32);
+registers[1] = 0;
+GuestContext->ExitVm = TRUE;
+```
+
+**⚠️ 这个修复带来的风险必须先说清楚**
+
+补上 ack 之后，`SvDevirtualizeProcessor` 里那段**本来就存在但从没执行过**的代码会
+第一次运行：`NT_ASSERT(vpData->HostStackLayout.Reserved1 == MAXUINT64)`、
+读 `SharedVpData`、`SvFreePageAlingedPhysicalMemory(vpData)`。
+
+它从未在本树里跑过。按 §6.6 的教训，这是一段"看起来对、但没有任何证据"的代码 ——
+而它现在会被每一个核执行。
+
+所以下一次加载的验证顺序必须是：
+1. 先只做**正常加载 + 正常卸载**（不碰 CPUID 通道），确认卸载不崩；
+2. 确认卸载后机器仍在正常工作（不是半虚拟化残留）；
+3. 再碰通道。
+
+**规则（补进 §4，与"没人写过的 ack"并列为同一类）**
+
+> 任何 `X != 'MAGIC'` 形式的握手判断，必须同时确认 **`'MAGIC'` 在树的某处被赋值**。
+> 一条 `grep MAGIC` 就能避免：本项目已有两次它返回空。

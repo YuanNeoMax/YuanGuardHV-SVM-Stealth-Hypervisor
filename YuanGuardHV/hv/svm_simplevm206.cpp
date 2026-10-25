@@ -1373,13 +1373,48 @@ SvHandleCpuid (
     case CPUID_UNLOAD_SIMPLE_SVM:
         if (subLeaf == CPUID_UNLOAD_SIMPLE_SVM)
         {
-            //
-            // Unload itself if the request is from the kernel mode.
-            //
+            /*
+             * 9.378: THE ACK FOR THIS LEAF WAS NEVER WRITTEN, SO THE UNLOADER
+             * HAS NEVER DE-VIRTUALIZED ANYTHING.
+             *
+             * SvDevirtualizeProcessor does:
+             *
+             *     __cpuidex(registers, CPUID_UNLOAD_SIMPLE_SVM, ...);
+             *     if (registers[2] != 'SSVM')
+             *         goto Exit;                  <-- always taken
+             *     ... free the VPD ...
+             *
+             * registers[2] is ECX, which CPUID WRITES ON OUTPUT. This branch
+             * never set it, so ECX held whatever the hardware returned for an
+             * unimplemented leaf - never 'SSVM'. Every call therefore took the
+             * goto, meaning SvDevirtualizeAllProcessors() walked every core and
+             * de-virtualized none of them.
+             *
+             * Consequence, measured: eight machine restarts, one of which was
+             * exactly this - 0x1E PRIVILEGED_INSTRUCTION at
+             * svm_core_ipi_cleanup+0x5F, a `wrmsr` clearing EFER.SVME on a core
+             * that was STILL IN GUEST MODE. The unloader exists precisely to
+             * prevent that state, and it had never run.
+             *
+             * This is the SECOND time this project has been bitten by an ack
+             * nobody wrote (the first was CPUID_FAKE_VPD's '1VSS', 9.370). The
+             * shape is identical: an assertion about a value that only the
+             * assertion mentions.
+             */
             attribute.AsUInt16 = VpData->GuestVmcb.StateSaveArea.SsAttrib;
             if (attribute.Fields.Dpl == DPL_SYSTEM)
             {
+                UINT64 vpdVa = reinterpret_cast<UINT64>(VpData);
+                registers[2] = 'SSVM';          /* ack: the VPD pointer follows */
+                registers[3] = static_cast<int>(vpdVa >> 32);
+                registers[0] = static_cast<int>(vpdVa & MAXUINT32);
+                registers[1] = 0;
                 GuestContext->ExitVm = TRUE;
+            }
+            else
+            {
+                /* Kernel-mode only, as before: a ring-3 caller learns nothing. */
+                registers[0] = registers[1] = registers[2] = registers[3] = 0;
             }
         }
         break;
@@ -4056,8 +4091,16 @@ SvDevirtualizeProcessor (
     // of per processor data to be freed.
     //
     __cpuidex(registers, CPUID_UNLOAD_SIMPLE_SVM, CPUID_UNLOAD_SIMPLE_SVM);
+    /*
+     * 9.378: this check now means what it says. It compared against 'SSVM', which
+     * the leaf never produced, so this function always returned without doing
+     * anything - and SvDevirtualizeAllProcessors, whose whole job is to bring the
+     * cores back to bare metal before teardown, was a no-op. See the note at the
+     * leaf for the crash that proved it (0x1E at svm_core_ipi_cleanup+0x5F).
+     */
     if (registers[2] != 'SSVM')
     {
+        SvDebugPrint("SvDevirtualizeProcessor: not virtualized, nothing to do\n");
         goto Exit;
     }
 
