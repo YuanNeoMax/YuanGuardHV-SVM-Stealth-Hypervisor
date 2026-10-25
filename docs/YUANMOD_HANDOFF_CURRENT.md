@@ -11609,3 +11609,83 @@ DriverUnload 开始
 > 跨崩溃存活的观测点，其存储**不能属于会被卸载的模块**。判据：问"这段内存在我要观测的
 > 那一刻还属于我吗"。静态变量、模块数据段、模块内分配的全部 page 答案都是"不属于"。
 > 必须用模块外的存储（故意泄漏的分配、系统日志、内核调试器、第二台机器）。
+
+---
+
+#### 9.393 第二十一次：kernel dump 没生成的原因找到了，观测页已确认在模块外
+
+**9.392 的修复有证据了**
+
+```
+静态变量时代:  unload-trace: page PA=0x9988A000
+改为分配之后:  unload-trace: page PA=0xC7BDA000
+```
+
+PA **变了**，而且新地址与 NPT 的最低页（`0xC7BDD000`）相邻——两者都是
+`MmAllocateContiguousMemory` 分配的。这证明该页**不再位于驱动模块的数据段**，
+而是系统池里的一页。9.391 的设计错误已修正。
+
+**`MEMORY.DMP` 为什么不生成：三个层次，逐层排除**
+
+1. **事件日志说它写了**
+
+```
+15:12:48  已将转储的数据保存在: C:\Windows\MEMORY.DMP
+14:49:16  已将转储的数据保存在: C:\Windows\Minidump\102526-8296-01.dmp
+```
+
+配置**确实改变了**——最新一次指向 MEMORY.DMP，而之前指向 minidump。所以
+`CrashDumpEnabled=2` 生效了。
+
+2. **但文件不存在**，且 `PagefileTooSmall = 134361641593378295`
+
+这是一个**失败残留标记**（值大到不可能是有意义的字节数）。系统在写入失败后
+会设它，并且**后续会跳过写入**。已清零。
+
+3. **`AlwaysKeepMemoryDump` 原本不存在**
+
+默认行为是"成功启动后删除 MEMORY.DMP"。即使这次写成了，下次开机也会被清掉。
+已设为 1。
+
+**配置现在是这样**
+
+| 项 | 值 | 为什么 |
+|---|---|---|
+| `CrashDumpEnabled` | 2 | kernel dump |
+| `CrashDumpType` | 已删除 | 原值 1 会覆盖上面那项 |
+| `PagefileTooSmall` | **0** | 清掉失败标记，否则后续跳过写入 |
+| `AlwaysKeepMemoryDump` | **1** | 否则成功启动后删掉我刚要读的文件 |
+| `DumpFilters` | `dumpfve.sys` | 系统自带（BitLocker FVE），未动 |
+
+空间与内存：C: 8.45 GB 空闲，pagefile 16 GB，物理内存 15.8 GB，提交上限 31.8 GB。
+kernel dump 需约 5-6 GB —— **够**。
+
+**minidump 为什么彻底没用（已验证，不再猜）**
+
+```
+kd> !vm
+Physical Memory:                0 (          0 Kb)
+Available Pages:                0 (          0 Kb)
+Pagefile Hash Pages:            0 (          0 Kb)
+```
+
+minidump 的物理内存覆盖是 **0**。所以「从 minidump 读 `g_ut` 那一页」在这个方向上
+**永远不可能成功**，无论我把页放在哪里。这解释了 9.391 的第 1 条漏洞为什么是决定性的：
+不是"dump 可能不含它"，而是"minidump 不含任何物理页"。
+
+**所以现在只差一次重启**
+
+`PagefileTooSmall=0` 与 `AlwaysKeepMemoryDump=1` 都是**启动时读取**的值。
+重启之后：
+
+1. 加载驱动 → `unload-trace` 打印 PA
+2. `sc stop` → 崩溃 → `MEMORY.DMP` 应生成
+3. `kd -z C:\Windows\MEMORY.DMP` → `!db <PA>` → **读到最后一次 stamp**
+
+这将是第一次真正看到"卸载停在哪一步"。
+
+**仍然没变的那条规则**
+
+在读到那一步之前，**不改卸载代码**。今晚已经有四条修改（avic、pt_reg、对齐、ack）
+无法判断是否有效，全部因为卸载不给观测机会。观测通道现在是**唯一**没被验证过的一环——
+而它恰好是"能不能验证别的东西"的前提。
