@@ -77,6 +77,10 @@
  * but it is written to be lock-free and branch-light, because the interesting
  * case is when the next instruction faults.
  */
+/* 9.392: allocate the page that outlives this module. Call ONCE at load, PASSIVE.
+ * Returns 1 on success; the page is deliberately NEVER freed. */
+int yghv_ut_init(void);
+
 void yghv_ut_mark(uint32_t step);
 
 /*

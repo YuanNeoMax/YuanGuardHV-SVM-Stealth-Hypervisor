@@ -5048,6 +5048,15 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
      * way to find this page afterwards is to have written down where it is. This
      * is that: one line, at load, while the driver still exists.
      */
+    /*
+     * 9.392: allocate the unload-trace page HERE, at load, PASSIVE.
+     *
+     * It must exist before DriverUnload runs, and it must not be freed by it - the
+     * whole point is that it outlives the module (see yghv_unload_trace.c). So it
+     * is created once, early, and never released.
+     */
+    if (!yghv_ut_init())
+        LOG_ERROR("unload-trace: allocation FAILED - unload progress will not be recorded");
     yghv_trace_u64("unload-trace pa", yghv_ut_page_pa());
     LOG_ERROR("driver entry pre");
 

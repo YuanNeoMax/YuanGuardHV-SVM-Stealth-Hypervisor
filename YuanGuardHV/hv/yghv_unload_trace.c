@@ -39,23 +39,58 @@ typedef union {
 } yghv_ut_region_t;
 
 /*
- * Statically allocated, page exact, and with a named pad page after it so the
- * linker cannot place a neighbour on the same page (9.348's rule).
+ * 9.392: THE STORE MUST OUTLIVE THE MODULE, SO IT IS NOT IN THE MODULE.
  *
- * NOT registered with yghv_guard_state_add(): this page must stay READABLE. A
- * guard-hidden page is a page whose contents a post-mortem cannot see, which is
- * the opposite of this page's only job.
+ * 9.390 put this in a static (DECLSPEC_ALIGN(4096) region). Measured on the 20th
+ * restart:
+ *
+ *     Unloaded modules:
+ *     fffff801`c9d40000 fffff801`c9da4000   yghv_tr.sys   <-- already unloaded
+ *
+ * and the crash address was inside that range. A static lives in the driver's
+ * data section - when the driver is unloaded, so is that section. So the page
+ * that was supposed to record the unload was destroyed BY the unload, before the
+ * crash that needed recording.
+ *
+ * The fix has to be memory this module does NOT own. There are three ways and
+ * this one is chosen because it needs no reboot and no second machine:
+ *
+ *   allocate ONE page at load with MmAllocateContiguousMemory
+ *   NEVER free it
+ *
+ * That is a deliberate, documented leak of 4 KB per load. The trade is explicit:
+ * a 4 KB leak per load buys a record that survives the unload, in a machine that
+ * leaks nothing else per load. A cleanup path that freed it would put it back in
+ * the same class as the static, which is the defect being fixed.
+ *
+ * The physical address is stable for the machine's life, so it can be printed at
+ * load and read out of a kernel dump afterwards.
  */
-DECLSPEC_ALIGN(4096) static yghv_ut_region_t g_ut;
-DECLSPEC_ALIGN(4096) static yghv_ut_region_t g_ut_pad;
+static volatile LONG64 g_ut_pa;
+static PVOID           g_ut_page;      /* kept only so the VA is not lost */
 
-_Static_assert(sizeof(yghv_ut_state_t) <= 4096, "unload trace fits a page");
-_Static_assert(sizeof(yghv_ut_region_t) == 4096, "unload trace is exactly one page");
+#define UT_STATE ((volatile yghv_ut_state_t *)g_ut_page)
 
-#define g_seq   (g_ut.s.seq)
-#define g_step  (g_ut.s.step)
-#define g_val   (g_ut.s.value)
-#define g_tsc   (g_ut.s.tsc)
+/*
+ * 9.392: called once from the load path, at PASSIVE. Allocates the page that will
+ * outlive this module. Returns 1 on success.
+ */
+int yghv_ut_init(void) {
+    PHYSICAL_ADDRESS highest;
+
+    if (g_ut_page)
+        return 1;
+
+    highest.QuadPart = 0xFFFFFFFFLL;
+    g_ut_page = MmAllocateContiguousMemory(4096, highest);
+    if (!g_ut_page)
+        return 0;
+
+    RtlZeroMemory(g_ut_page, 4096);
+    InterlockedExchange64(&g_ut_pa,
+                          (LONG64)MmGetPhysicalAddress(g_ut_page).QuadPart);
+    return 1;
+}
 
 void yghv_ut_mark_val(uint32_t step, uint64_t value) {
     /*
@@ -64,10 +99,15 @@ void yghv_ut_mark_val(uint32_t step, uint64_t value) {
      * not match its sequence, which a reader can recognise as "this stamp was in
      * flight" rather than misreading it as a completed step.
      */
-    InterlockedIncrement64(&g_seq);
-    g_val = value;
-    g_tsc = (LONG64)__rdtsc();
-    InterlockedExchange(&g_step, (LONG)step);
+    volatile yghv_ut_state_t *st = UT_STATE;
+
+    if (!st)
+        return;                     /* not initialised: nothing to record into */
+
+    InterlockedIncrement64(&st->seq);
+    st->value = (LONG64)value;
+    st->tsc = (LONG64)__rdtsc();
+    InterlockedExchange(&st->step, (LONG)step);
 }
 
 void yghv_ut_mark(uint32_t step) {
@@ -75,28 +115,15 @@ void yghv_ut_mark(uint32_t step) {
 }
 
 uint32_t yghv_ut_last_step(void) {
-    return (uint32_t)InterlockedCompareExchange(&g_step, 0, 0);
+    volatile yghv_ut_state_t *st = UT_STATE;
+    return st ? (uint32_t)InterlockedCompareExchange(&st->step, 0, 0) : 0;
 }
 
 uint64_t yghv_ut_last_value(void) {
-    return (uint64_t)InterlockedCompareExchange64(&g_val, 0, 0);
+    volatile yghv_ut_state_t *st = UT_STATE;
+    return st ? (uint64_t)InterlockedCompareExchange64(&st->value, 0, 0) : 0;
 }
 
 uint64_t yghv_ut_page_pa(void) {
-    /*
-     * Resolved once and cached. Called from the load path and from the control
-     * device, never from an exit handler, so a direct call is fine here (unlike
-     * the island paths, which cache for the same reason but under a different
-     * constraint).
-     */
-    static volatile LONG64 cached;
-    LONG64 pa = InterlockedCompareExchange64(&cached, 0, 0);
-
-    if (pa)
-        return (uint64_t)pa;
-
-    pa = (LONG64)MmGetPhysicalAddress(&g_ut).QuadPart;
-    if (pa)
-        InterlockedExchange64(&cached, pa);
-    return (uint64_t)pa;
+    return (uint64_t)InterlockedCompareExchange64(&g_ut_pa, 0, 0);
 }
