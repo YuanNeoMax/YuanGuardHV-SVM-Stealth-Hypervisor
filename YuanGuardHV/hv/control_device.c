@@ -37,6 +37,7 @@ extern UINT64 yghv_s206_tsc_offset_get(void);
 extern int    yghv_s206_tsc_freeze(UINT32 on, UINT64 cr3, UINT32 max_ms);
 extern void   yghv_s206_tsc_stats(UINT64 *out);
 extern int    yghv_s206_tsc_armed(void);
+extern void   yghv_s206_tsc_probe(UINT64 *out);
 
 NTKERNELAPI PEPROCESS IoGetRequestorProcess(PIRP Irp);
 NTKERNELAPI HANDLE PsGetProcessId(PEPROCESS Process);
@@ -963,15 +964,16 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
          * without one. So (mode=1, armed=0) is a policy that will not take effect,
          * and this readout says so instead of leaving it to be discovered.
          */
-        if (op == 5 && out_len >= 14 * sizeof(UINT64)) {
-            UINT64 st[14];
+        if (op == 5 && out_len >= 17 * sizeof(UINT64)) {
+            UINT64 st[17];
             yghv_s206_tsc_stats(st);
             out[0]  = st[0];  out[1]  = st[1];  out[2]  = st[2];
             out[3]  = st[3];  out[4]  = st[4];  out[5]  = st[5];
             out[6]  = st[6];  out[7]  = st[7];  out[8]  = st[8];
             out[9]  = st[9];  out[10] = st[10]; out[11] = st[11];
-            out[12] = st[12]; out[13] = st[13];
-            info = 14 * sizeof(UINT64);
+            out[12] = st[12]; out[13] = st[13]; out[14] = st[14];
+            out[15] = st[15]; out[16] = st[16];
+            info = 17 * sizeof(UINT64);
             status = STATUS_SUCCESS;
             break;
         }
@@ -979,6 +981,17 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
             UINT64 v = ((UINT64 *)buf)[1];
             out[0] = (UINT64)(INT64)yghv_s206_tsc_offset_set(v);
             info = 8;
+            status = STATUS_SUCCESS;
+            break;
+        }
+        if (op == 8 && out_len >= 3 * sizeof(UINT64)) {
+            /* 9.370c: walk every core and VALIDATE the VPD pointer, arming nothing.
+             * The previous attempt at this walk faulted at +0x36 because the
+             * handshake returned a physical address that the caller dereferenced. */
+            UINT64 pr[3];
+            yghv_s206_tsc_probe(pr);
+            out[0] = pr[0]; out[1] = pr[1]; out[2] = pr[2];
+            info = 3 * sizeof(UINT64);
             status = STATUS_SUCCESS;
             break;
         }

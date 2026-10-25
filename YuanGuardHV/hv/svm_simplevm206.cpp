@@ -722,6 +722,9 @@ static volatile LONG64 g_TscScopedOut = 0;           /* reads let through becaus
 static volatile LONG64 g_TscBudgetLeft = YGHV_TSC_EXIT_BUDGET;
 static volatile LONG64 g_TscBudgetHits = 0;          /* freezes cut short by the budget */
 static volatile LONG64 g_TscSelfDisarmed = 0;        /* RDTSC handlers that disarmed their own core */
+static volatile LONG64 g_TscApplyFailures = 0;       /* per-core walks that did not complete */
+static volatile LONG64 g_TscCoreHits = 0;            /* cores where a walk reached a VPD */
+static volatile LONG64 g_TscCoreMisses = 0;          /* cores where the handshake answered no */
 static volatile LONG64 g_TscIntercepts = 0;          /* RDTSC/RDTSCP exits handled */
 static volatile LONG64 g_TscSuppressed = 0;          /* answers changed from hardware */
 static volatile LONG   g_TscInterceptArmed = 0;      /* is the intercept bit set? */
@@ -747,6 +750,8 @@ static LONG64 yghv_s206_tsc_per_ms(void)
     }
     return v;
 }
+
+extern "C" int yghv_s206_tsc_apply_all(UINT32 arm);
 
 /*!
     @brief      Set the constant offset. PASSIVE (control plane).
@@ -793,6 +798,25 @@ extern "C" int yghv_s206_tsc_freeze(UINT32 on, UINT64 cr3, UINT32 max_ms)
         InterlockedExchange64(&g_TscMode, 0);
         InterlockedExchange64(&g_TscScopeCr3, 0);
         InterlockedExchange64(&g_TscFreezeExpiresAt, 0);
+        /*
+         * 9.370: THE RELEASE IS A PER-CORE WRITE, NOT A HOPE.
+         *
+         * 9.369b/c/d all assumed each core would clear its own bit the next time
+         * it took an exit. Measured on G36: it did not, exits kept climbing, and
+         * one run died of 0x101. So the control plane walks every core here and
+         * clears the bit itself, with VmcbClean=0 (the same mechanism the
+         * fake-write NCr3 switch has used in production).
+         *
+         * The walk is attempted EVEN IF the policy flags were already zero: an
+         * armed bit can survive from an earlier load (VMCB memory outlives the
+         * driver), so thaw is also the "make sure nobody is armed" operation.
+         */
+        {
+            int ok = yghv_s206_tsc_apply_all(0);
+            InterlockedExchange(&g_TscInterceptArmed, 0);
+            if (!ok)
+                InterlockedIncrement64(&g_TscApplyFailures);
+        }
         return 1;
     }
 
@@ -818,6 +842,26 @@ extern "C" int yghv_s206_tsc_freeze(UINT32 on, UINT64 cr3, UINT32 max_ms)
         InterlockedExchange64(&g_TscFrozenAt, (LONG64)(now + off));
         InterlockedExchange64(&g_TscBudgetLeft, YGHV_TSC_EXIT_BUDGET);
         InterlockedExchange64(&g_TscMode, 1);
+        /*
+         * 9.370: arm every core from here. If the walk fails, the freeze is
+         * ROLLED BACK rather than left half-armed - a half-armed walk means some
+         * cores exit on every RDTSC and others do not, which is both a detection
+         * signal and a starvation risk.
+         */
+        {
+            int ok = yghv_s206_tsc_apply_all(1);
+            if (!ok)
+            {
+                InterlockedExchange64(&g_TscMode, 0);
+                InterlockedExchange64(&g_TscScopeCr3, 0);
+                InterlockedExchange64(&g_TscFreezeExpiresAt, 0);
+                (void)yghv_s206_tsc_apply_all(0);
+                InterlockedExchange(&g_TscInterceptArmed, 0);
+                InterlockedIncrement64(&g_TscApplyFailures);
+                return 0;                /* refused: could not arm every core */
+            }
+            InterlockedExchange(&g_TscInterceptArmed, 1);
+        }
     }
     return 1;
 }
@@ -845,6 +889,9 @@ extern "C" void yghv_s206_tsc_stats(UINT64 *out)
     out[11] = (UINT64)InterlockedCompareExchange64(&g_TscBudgetLeft, 0, 0);
     out[12] = (UINT64)InterlockedCompareExchange64(&g_TscBudgetHits, 0, 0);
     out[13] = (UINT64)InterlockedCompareExchange64(&g_TscSelfDisarmed, 0, 0);
+    out[14] = (UINT64)InterlockedCompareExchange64(&g_TscApplyFailures, 0, 0);
+    out[15] = (UINT64)InterlockedCompareExchange64(&g_TscCoreHits, 0, 0);
+    out[16] = (UINT64)InterlockedCompareExchange64(&g_TscCoreMisses, 0, 0);
 }
 
 extern "C" int yghv_s206_tsc_armed(VOID)
@@ -1195,15 +1242,67 @@ SvHandleCpuid (
         // de-virtualizing. Kernel mode only (the fake-write resync runs at
         // APC_LEVEL from yghv's control plane).
         //
+        /*
+         * 9.370: THE ACK NOW EXISTS. It did not before, and that is why two
+         * callers were dead code.
+         *
+         * Both callers (SvFakeNcr3Resync and the TSC applier added with it)
+         * checked `registers[2] != '1VSS'` to mean "this core answered". But this
+         * branch never wrote ECX, so the check compared against whatever the
+         * hardware's own CPUID had put in ECX for an unimplemented leaf - which
+         * is not '1VSS'. Measured: '1VSS' appears only in those two comparisons
+         * and in no assignment anywhere in the tree, so both callers took the
+         * goto Exit path EVERY time.
+         *
+         * That is the project's recurring shape once more: an assertion about a
+         * value nobody produces. The cost here was silent - SvFakeNcr3Resync has
+         * been a no-op, and its "wire together" comment claimed otherwise.
+         *
+         * The ack is now written, so the check means what it says:
+         *   ECX = 'SSV1' when the pointer is being returned
+         *   ECX = 0      when refused (not kernel mode)
+         */
         if (subLeaf == CPUID_FAKE_VPD)
         {
             attribute.AsUInt16 = VpData->GuestVmcb.StateSaveArea.SsAttrib;
             if (attribute.Fields.Dpl == DPL_SYSTEM)
             {
-                PHYSICAL_ADDRESS vpdPa;
-                vpdPa = MmGetPhysicalAddress(VpData);
-                registers[3] = static_cast<int>(vpdPa.HighPart);
-                registers[0] = static_cast<int>(vpdPa.LowPart);
+                /*
+                 * 9.370b: RETURN THE VIRTUAL ADDRESS, NOT THE PHYSICAL ONE.
+                 *
+                 * This returned MmGetPhysicalAddress(VpData), and BOTH callers
+                 * then dereferenced it as if it were a pointer:
+                 *
+                 *     vpData = (PVIRTUAL_PROCESSOR_DATA)(high << 32 | low);
+                 *     vpData->GuestVmcb.ControlArea...
+                 *
+                 * That is the VA/PA confusion this project has recorded four
+                 * times (KERNEL_API_CHECKLIST §21, §27) - and this instance had
+                 * never fired because both callers were ALSO dead: they checked
+                 * for an ack ('1VSS') that nothing wrote, so they always took the
+                 * early exit. Fixing the ack (9.370) exposed the dereference, and
+                 * it produced 0x3B at SvTscApplyOnCore+0x36 on the first run:
+                 *
+                 *     mov ecx, [rbx+600Ch]     ; vpData->...InterceptMisc1
+                 *
+                 * VpData IS a virtual address already - it is the argument the
+                 * hypervisor was handed - so no translation is needed at all. The
+                 * physical form bought nothing and cost a bugcheck.
+                 *
+                 * Honest note on why the physical one was chosen originally: the
+                 * unload path (SvDevirtualizeProcessor) DOES need a PA, because it
+                 * frees the page by physical address. That is a different caller
+                 * reading a different leaf, and the two got conflated.
+                 */
+                UINT64 vpdVa = reinterpret_cast<UINT64>(VpData);
+                registers[3] = static_cast<int>(vpdVa >> 32);
+                registers[0] = static_cast<int>(vpdVa & MAXUINT32);
+                registers[2] = 'SSV1';           /* ack: the pointer is valid */
+                registers[1] = 0;
+            }
+            else
+            {
+                registers[0] = registers[1] = registers[2] = registers[3] = 0;
             }
         }
         break;
@@ -3585,7 +3684,7 @@ SvFakeNcr3Resync (
     UNREFERENCED_PARAMETER(Context);
 
     __cpuidex(registers, CPUID_FAKE_VPD, CPUID_FAKE_VPD);
-    if (registers[2] != '1VSS')
+    if (registers[2] != 'SSV1')
     {
         goto Exit;
     }
@@ -3612,6 +3711,125 @@ yghv_protect_fake_ncr3_resync (
     NT_VERIFY(NT_SUCCESS(SvExecuteOnEachProcessor(SvFakeNcr3Resync,
                                                   nullptr,
                                                   nullptr)));
+}
+
+/*
+ * 9.370 (B2 re-do): APPLY THE CLOCK POLICY ON EVERY CORE, FROM THE CONTROL PLANE.
+ *
+ * THE TWO QUESTIONS THAT BLOCKED B2, ANSWERED WITHOUT GUESSING
+ *
+ *   1 "how do we reach another core's VMCB?"
+ *     We do not need to. SvExecuteOnEachProcessor already exists and is used by
+ *     SvFakeNcr3Resync below it - it pins this thread to each core in turn and
+ *     runs a callback THERE. SvFakeNcr3Resync then obtains that core's VPD with
+ *     the CPUID_FAKE_VPD leaf, because the VPD address lives in the guest's
+ *     registers on that core. Same trick, no stored handles, no per-core table.
+ *
+ *   2 "when does a VMCB write become visible to the processor?"
+ *     VmcbClean = 0 before the next VMRUN. That is exactly what
+ *     SvFakeNcr3Resync does with NCr3, and what the fake-write path does with
+ *     its NCr3 switch - both are in production and were verified on hardware.
+ *
+ * So the arming and the release both become a per-core write from PASSIVE,
+ * instead of a hope that each core converges by itself. That is the difference
+ * between the version that produced 0x101 and this one: the exit storm existed
+ * because the release depended on the core happening to re-enter the handler
+ * with the right policy; here the control plane walks every core and writes the
+ * bit itself, with VmcbClean=0, while that core is pinned.
+ *
+ * The per-exit and per-prepare sites stay disabled (9.369e/9.369g): a third
+ * writer would reintroduce the "which write won" ambiguity that cost two
+ * machines.
+ */
+static
+NTSTATUS
+SvTscApplyOnCore (
+    _In_opt_ PVOID Context
+    )
+{
+    int registers[4];
+    UINT64 high, low;
+    PVIRTUAL_PROCESSOR_DATA vpData;
+    UINT32 want = (UINT32)(ULONG_PTR)Context;
+
+    __cpuidex(registers, CPUID_FAKE_VPD, CPUID_FAKE_VPD);
+    if (registers[2] != 'SSV1')
+    {
+        InterlockedIncrement64(&g_TscCoreMisses);
+        goto Exit;                       /* this core is not virtualized */
+    }
+
+    high = registers[3];
+    low = registers[0] & MAXUINT32;
+    vpData = reinterpret_cast<PVIRTUAL_PROCESSOR_DATA>(high << 32 | low);
+    if (!vpData)
+    {
+        InterlockedIncrement64(&g_TscCoreMisses);
+        goto Exit;
+    }
+    InterlockedIncrement64(&g_TscCoreHits);
+
+    /* 9.370c: 0xFFFFFFFF means "probe": touch nothing after validating the pointer. */
+    if (want == 0xFFFFFFFFu)
+        goto Exit;
+
+    vpData->GuestVmcb.ControlArea.TscOffset = yghv_s206_tsc_offset_get();
+
+    if (want)
+    {
+        vpData->GuestVmcb.ControlArea.InterceptMisc1 |= SVM_INTERCEPT_MISC1_RDTSC;
+        vpData->GuestVmcb.ControlArea.InterceptMisc2 |= SVM_INTERCEPT_MISC2_RDTSCP;
+    }
+    else
+    {
+        vpData->GuestVmcb.ControlArea.InterceptMisc1 &= ~((UINT32)SVM_INTERCEPT_MISC1_RDTSC);
+        vpData->GuestVmcb.ControlArea.InterceptMisc2 &= ~((UINT32)SVM_INTERCEPT_MISC2_RDTSCP);
+    }
+    vpData->GuestVmcb.ControlArea.VmcbClean = 0;
+
+Exit:
+    return STATUS_SUCCESS;
+}
+
+/*
+ * Walk every core and write the clock policy. PASSIVE (the control plane calls
+ * this; SvExecuteOnEachProcessor pins and migrates, which needs PASSIVE).
+ *
+ * Returns 1 when the walk completed, 0 when it did not. A failed walk leaves
+ * SOME cores armed - which is precisely the condition that produced 0x101 - so
+ * the caller must treat 0 as "the machine may be about to starve", not as a
+ * cosmetic error.
+ */
+/*
+ * 9.370c: A PROBE THAT WALKS BUT DOES NOT ARM.
+ *
+ * 0x3B at SvTscApplyOnCore+0x36 proved the walk reached a bogus pointer. The fix
+ * (returning the VA) is a two-line change whose failure mode is another bugcheck,
+ * so it gets verified WITHOUT arming the intercept: this walks every core, reads
+ * the VPD pointer, and touches nothing else. If the pointer is wrong it still
+ * faults - but the machine has no exit storm to compound it.
+ *
+ * out: [0]=cores reached  [1]=cores missed  [2]=walk status
+ */
+extern "C" void yghv_s206_tsc_probe(UINT64 *out)
+{
+    int ok;
+    if (!out)
+        return;
+    InterlockedExchange64(&g_TscCoreHits, 0);
+    InterlockedExchange64(&g_TscCoreMisses, 0);
+    ok = yghv_s206_tsc_apply_all(0xFFFFFFFFu);   /* 0xFFFFFFFF = probe only */
+    out[0] = (UINT64)InterlockedCompareExchange64(&g_TscCoreHits, 0, 0);
+    out[1] = (UINT64)InterlockedCompareExchange64(&g_TscCoreMisses, 0, 0);
+    out[2] = (UINT64)(ok ? 1 : 0);
+}
+
+extern "C" int yghv_s206_tsc_apply_all(UINT32 arm)
+{
+    NTSTATUS st = SvExecuteOnEachProcessor(SvTscApplyOnCore,
+                                           (PVOID)(ULONG_PTR)(arm ? 1 : 0),
+                                           nullptr);
+    return NT_SUCCESS(st) ? 1 : 0;
 }
 
 static

@@ -10180,3 +10180,111 @@ G36 现在的决定性断言是**反向的**：freeze 请求之后退出流必�
 - B1 成立、B2 禁用，本项**未提交**（就地待提交）
 - 镜像 `206zO_tscclear`（md5 `15ee9424`）
 - 事故记录：1 次 hang（无 dump）+ 1 次 0x101（有 dump `102526-25062-01.dmp`）
+
+#### 9.370 B2 完成：逐核武装与释放 —— 并揭出一个从未执行过的 handshake
+
+**结论**
+
+```
+G39  1 idle quiet                    = True   载入后不自行武装
+     2 offset needs no exits         = True   B1 不需拦截
+     3 cores armed                  = True   逐核武装真的生效
+     4 exit stream stopped          = True   ★ 逐核释放真的生效
+     5 deadband clean               = True   无人自己重新武装
+     6 auto-expiry stops exits      = True   无人值守也会自己释放
+     7 offset still applies         = True
+     OVERALL: ALL PASS
+G40  walk reached 12/12 cores, arms nothing, machine responsive
+G25 13/13 · G31 hidecore 3/3 · G33 ALL PASS
+```
+
+第 4 项是杀死机器两次的那个性质，现在成立。
+
+**解法：不需要保存句柄，用现成的遍历**
+
+`SvExecuteOnEachProcessor` 早就在用（`SvFakeNcr3Resync`、`SvDevirtualizeProcessor`），
+它把当前线程依次绑到每个核上执行回调。回调里用 `CPUID_FAKE_VPD` 叶拿到**当前核**的
+VPD，然后直接写它的 VMCB，`VmcbClean=0`。
+
+于是「各核 VMCB 句柄不可达」这个问题**不存在**——从来不需要句柄，只需要在正确的核上
+执行。武装与释放都成了 PASSIVE 下的写操作，不再指望每核自己收敛。
+
+**★ 揭出的真相：那个 handshake 的 ack 从来没被写过**
+
+`CPUID_FAKE_VPD` 只填 EAX/EDX（指针的低/高 32 位），**从不写 ECX**。而两个调用方都用
+`registers[2] != '1VSS'` 判断「这一核有没有回答」。
+
+`'1VSS'` 在整个代码树里**只出现在这两处比较中，任何赋值都不存在**。所以：
+
+```
+SvFakeNcr3Resync      一直是死代码（每次 goto Exit）
+我的 SvTscApplyOnCore 照抄了同一个校验，于是也是死代码
+```
+
+这是本项目第八次「断言了一个没有人产生出来的值」。前七次的代价是误报，
+这一次的代价是**一个功能被当成"已接线"记在文档里，实际上从未运行过**。
+
+修法：分支现在真的写 ack（`registers[2] = 'SSV1'`），两处校验改为 `'SSV1'`
+（原来写的是字节反序的 `'1VSS'`）。
+
+**★ ack 一修好，立刻炸出第二个缺陷：0x3B**
+
+第一次跑 G39 就蓝屏：`0x3B` `0xC0000005`，`SYMBOL_NAME: yghv_g39+20ba6`。
+用 `.map` 映射：`SvTscApplyOnCore + 0x36`。反汇编：
+
+```
+mov  eax, 41414142h      ; CPUID_FAKE_VPD
+cpuid
+cmp  ecx, 53535631h      ; 'SSV1'   ← 现在通过了
+movsxd rbx, edx
+shl  rbx, 20h
+mov  eax, eax
+or   rbx, rax            ; vpData = high<<32 | low
+je   +0x20bec
+mov  ecx, [rbx+600Ch]    ; ← 崩溃：vpData->GuestVmcb.ControlArea.InterceptMisc1
+```
+
+**`FAKE_VPD` 返回的是 `MmGetPhysicalAddress(VpData)`，而调用方把它当虚拟地址解引用。**
+这是文档 §21 / §27 记录过四次的 VA/PA 混淆，第五次。
+
+它一直没暴露，因为两处调用方都因为 ack 缺失而从未执行到这一行。
+**修好 ack 等于把两个潜伏缺陷同时揭开。**
+
+修法：返回 **VA**（`VpData` 本身就是 VA，它是 hypervisor 收到的入参，一次翻译都不需要）。
+原代码用 PA 的唯一理由在**另一条路径**——卸载时按物理地址释放页，被混到了一起。
+
+**★ 第三个缺陷：请求长度不足会静默落到下一个分支**
+
+stats 一度全是垃圾值（`self-thawed=9500224802349`、`cut off by budget=93348`）。
+原因：客户端请求 112 字节（14 字段），而内核 `op 5` 要求 ≥120 字节（15 字段）。
+条件不满足时**落到下一个分支**，用 escape stats 的布局填同一个 buffer，于是每个字段都错位。
+
+这类"错位但看起来像数据"的返回值，比直接失败危险得多。修法：请求 136 字节
+（17 字段），并把每个字段读取都 gated 在 `Length -ge 136` 上。
+
+**★ 第四个：采样时机**
+
+step 3 一度报「武装失败」，因为窗口 600ms 而一次控制器往返约 4s（每次都新开
+powershell），第二次采样时自动过期已经触发。`exits 405814 -> 405814, armed 0 -> 0`
+读起来像失败，而 **405814 次退出本身就是武装成功的证据**。
+断言改为对比 freeze **之前**的值。
+
+#### 9.370.1 这一项一共修掉四个缺陷
+
+| # | 缺陷 | 形态 |
+|---|---|---|
+| 1 | `FAKE_VPD` 的 ack 从未被写 | 断言了没人产生的值（第八次）|
+| 2 | 调用方把 PA 当 VA 解引用 | VA/PA 混淆（第五次）|
+| 3 | 请求长度不足静默落到下一分支 | 检查读错了产物 |
+| 4 | 采样落在窗口之外 | 断言了自己的时序假设 |
+
+前两个是**联动的**：修一个就揭开另一个。这是 9.361 那条教训的又一次验证 ——
+**一个正确的修复会暴露出寄生缺陷**。
+
+#### 9.370.2 状态
+
+- 镜像 `206zR_va`（md5 `db7547ab`）
+- 事故：累计 1 次 hang + 2 次 BSOD（一次 0x101、一次 0x3B，后者有 dump 可查）
+- BSOD 取证流程已验证：`kd -z <dump> -y "C:\symbols"` 用**本地**符号；
+  `srv*` 符号服务器会 `Could not write to pipe` 并让 `!analyze` 完全失效
+  （248631 行全是该错误、0 个结果字段）—— 这一条值得单独记，因为它看起来像"分析没找到问题"

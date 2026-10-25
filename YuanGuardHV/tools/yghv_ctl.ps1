@@ -1876,7 +1876,7 @@ try {
                 if ($null -eq $Arg2) {
                     $r3 = New-Object byte[] 32
                     [BitConverter]::GetBytes([uint64]5).CopyTo($r3, 0)
-                    $o3 = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x828)) -InBytes $r3 -OutputLength 112
+                    $o3 = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x828)) -InBytes $r3 -OutputLength 136
                     $offs = [BitConverter]::ToUInt64($o3, 0)
                     $mode = [BitConverter]::ToUInt64($o3, 8)
                     $froze = [BitConverter]::ToUInt64($o3, 16)
@@ -1893,7 +1893,7 @@ try {
                     # it could mean the OS clock was held, which is what hung the
                     # machine, or that one address space was.
                     $scope = 0; $exp = 0; $expired = 0; $sco = 0
-                    if ($o3.Length -ge 88) {
+                    if ($o3.Length -ge 136) {
                         $scope   = [BitConverter]::ToUInt64($o3, 56)
                         $exp     = [BitConverter]::ToUInt64($o3, 64)
                         $expired = [BitConverter]::ToUInt64($o3, 72)
@@ -1901,15 +1901,28 @@ try {
                     }
                     Write-Host ("  scope cr3=0x{0:X} expires-at={1}" -f $scope, $exp)
                     $budget = 0; $budgetHits = 0
-                    if ($o3.Length -ge 104) {
+                    if ($o3.Length -ge 136) {
                         $budget     = [BitConverter]::ToUInt64($o3, 88)
                         $budgetHits = [BitConverter]::ToUInt64($o3, 96)
                     }
                     Write-Host ("  self-thawed={0}  reads let through (not in scope)={1}" -f $expired, $sco)
                     $selfdis = 0
-                    if ($o3.Length -ge 112) { $selfdis = [BitConverter]::ToUInt64($o3, 104) }
+                    if ($o3.Length -ge 136) { $selfdis = [BitConverter]::ToUInt64($o3, 104) }
                     Write-Host ("  exit budget left={0}  freezes cut short by budget={1}" -f $budget, $budgetHits)
                     Write-Host ("  cores that disarmed themselves={0}" -f $selfdis)
+                    $walkFail = 0
+                    if ($o3.Length -ge 136) { $walkFail = [BitConverter]::ToUInt64($o3, 112) }
+                    Write-Host ("  per-core walk failures={0}" -f $walkFail)
+                    $hits = 0; $misses = 0
+                    if ($o3.Length -ge 136) {
+                        $hits   = [BitConverter]::ToUInt64($o3, 120)
+                        $misses = [BitConverter]::ToUInt64($o3, 128)
+                    }
+                    Write-Host ("  walk: cores reached={0} cores missed={1}" -f $hits, $misses)
+                    if ($walkFail -gt 0) {
+                        Write-Host '  WARNING: a per-core walk did not complete. Some cores may'
+                        Write-Host '           still be armed - that is the 0x101 condition.'
+                    }
                     if ($mode -eq 1 -and $scope -eq 0) {
                         Write-Host '  WARNING: frozen with NO scope - this shape is refused by'
                         Write-Host '           the setter now, so seeing it means an older driver.'
@@ -1997,7 +2010,25 @@ try {
                     }
                     return
                 }
-                throw 'sys-sentry tsc: offset takes a hex value, freeze takes 1 or 0'
+                if ($what -eq 'probe') {
+                    # 9.370c: walk every core and VALIDATE the VPD pointer, arming
+                    # NOTHING. 0x3B at SvTscApplyOnCore+0x36 came from dereferencing
+                    # a physical address as a pointer, so the fix gets checked by a
+                    # path that touches nothing even if the pointer is still wrong.
+                    $rp = New-Object byte[] 32
+                    [BitConverter]::GetBytes([uint64]8).CopyTo($rp, 0)
+                    $op2 = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x828)) -InBytes $rp -OutputLength 24
+                    $hits   = [BitConverter]::ToUInt64($op2, 0)
+                    $misses = [BitConverter]::ToUInt64($op2, 8)
+                    $st     = [BitConverter]::ToUInt64($op2, 16)
+                    Write-Host ("sys-sentry tsc probe: cores reached={0} missed={1} walk={2}" -f $hits, $misses, $(if($st){'completed'}else{'FAILED'}))
+                    if ($hits -eq 0) {
+                        Write-Host '  No core answered the VPD handshake, so no walk can'
+                        Write-Host '  reach a VMCB. Arming would be a no-op (or a crash).'
+                    }
+                    return
+                }
+                throw 'sys-sentry tsc: offset takes a hex value, freeze takes 1 or 0, or probe'
             }
             throw 'sys-sentry: use surface, reset, cpuid-view, or tsc'
         }
