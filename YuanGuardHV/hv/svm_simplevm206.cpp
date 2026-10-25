@@ -1044,12 +1044,70 @@ SvAllocatePageAlingedPhysicalMemory (
     //
     NT_ASSERT(NumberOfBytes >= PAGE_SIZE);
 
-    // YGHV C0 local patch (2026-09-18): Win10 19045 ntoskrnl has no
-    // ExAllocatePool2 export (Win11+). With-tag + zero preserves semantics.
-    memory = ExAllocatePoolWithTag(NonPagedPool, NumberOfBytes, 'MVSS');
-    if (memory != nullptr)
+    /*
+     * 9.386: THE PAGE ALIGNMENT WAS ONLY ASSERTED, AND THE ASSERTION IS EMPTY.
+     *
+     * The function is named PageAlinged and the only thing enforcing that was:
+     *
+     *     NT_ASSERT(PAGE_ALIGN(memory) == memory);
+     *
+     * NT_ASSERT compiles to nothing in a free build. So in the driver that
+     * actually ships, this returned whatever ExAllocatePoolWithTag gave - which is
+     * 8- or 16-byte aligned, NOT page aligned.
+     *
+     * Why that is fatal rather than cosmetic: the VPD's own address is used to
+     * compute GuestVmcbPa and HostVmcbPa, and both are treated as PAGE BASES by
+     * vmload/vmrun/vmsave. An offset VPD means those instructions read and write
+     * the wrong page - and the faulting addresses in the last three bugchecks were
+     * two ADJACENT pages (0x194bfd000/0x194bfe000, 0x2187f6000/0x2187f7000,
+     * 0x3d0b19000/0x3d0b1a000), which is the shape of a calculation whose base was
+     * not page aligned.
+     *
+     * Loading survived it because a fresh allocation has clean neighbouring pages;
+     * unloading did not, because vmload/vmsave write whole-page state back.
+     *
+     * HOW THE ALIGNMENT IS NOW GUARANTEED
+     *
+     * Not by MmAllocateContiguousMemory: the VPD is ~32 KB (a 24 KB HostStackLimit
+     * plus two 4 KB VMCBs), and asking for that much PHYSICALLY CONTIGUOUS memory
+     * on a machine that has been up for a while fails often. A control path that
+     * cannot allocate its own state is not more correct than a misaligned one.
+     *
+     * So: over-allocate by one page and carve an aligned span out of it. The
+     * original pointer is kept immediately BELOW the aligned span, so the free
+     * path can recover it without a side table (which would itself have to be
+     * size-checked against every allocation).
+     */
     {
-        NT_ASSERT(PAGE_ALIGN(memory) == memory);
+        SIZE_T total = NumberOfBytes + PAGE_SIZE;
+        PVOID raw;
+
+        raw = ExAllocatePoolWithTag(NonPagedPool, total, 'MVSS');
+        if (raw == nullptr)
+            return nullptr;
+
+        memory = (PVOID)PAGE_ALIGN((ULONG_PTR)raw);
+
+        /*
+         * Store the raw pointer just below the aligned base - BUT ONLY IF THAT
+         * SLOT IS INSIDE OUR OWN ALLOCATION.
+         *
+         * When `raw` happens to be page aligned already (which is not rare: pool
+         * blocks for large allocations are often page aligned), memory == raw and
+         * memory[-1] would write 8 bytes BEFORE the block - a heap underrun that
+         * corrupts the pool header. That is the same class of bug as the one this
+         * function is being fixed for: a guarantee assumed rather than checked.
+         *
+         * So the aligned span is never the first 8 bytes of the block: if raw is
+         * already aligned, the span is moved one page in, which always leaves room.
+         */
+        if ((ULONG_PTR)memory == (ULONG_PTR)raw)
+            memory = (PVOID)((ULONG_PTR)raw + PAGE_SIZE);
+
+        /* Now raw <= memory - PAGE_SIZE, so the slot below the span is inside the
+         * allocation and outside the span itself. */
+        ((PVOID *)memory)[-1] = raw;
+
         RtlZeroMemory(memory, NumberOfBytes);
     }
     return memory;
@@ -1069,7 +1127,21 @@ SvFreePageAlingedPhysicalMemory (
     _Pre_notnull_ __drv_freesMem(Mem) PVOID BaseAddress
     )
 {
-    ExFreePoolWithTag(BaseAddress, 'MVSS');
+    /*
+     * 9.386: the allocation over-allocates by a page and stores the raw pointer
+     * immediately below the aligned span. Recover it from there - this is what
+     * keeps the free path from needing a side table.
+     */
+    PVOID raw;
+
+    if (BaseAddress == nullptr)
+        return;
+
+    raw = ((PVOID *)BaseAddress)[-1];
+    if (raw == nullptr)
+        return;                 /* not one of ours; refuse rather than corrupt */
+
+    ExFreePoolWithTag(raw, 'MVSS');
 }
 
 /*!
