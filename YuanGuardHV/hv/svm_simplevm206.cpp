@@ -46,9 +46,7 @@ extern "C" void Sv206LeaveToHost(VOID);
  * depend on the build machine, which is exactly the kind of assumption this tree
  * has already paid for.
  *
- * Declared HERE, at the top, because Sv206GuestExited (defined a few lines below)
- * is the redirect target that SvHandleVmExit points SvLV20 at, and it needs both
- * the limit and the counter.
+ * Declared HERE, at the top, because the exit path needs the limit and the counter.
  */
 #define SVM206_MAX_THREADS 64
 static HANDLE g_S206CoreThreads[SVM206_MAX_THREADS] = { 0 };
@@ -56,11 +54,21 @@ static volatile LONG g_S206CoresStarted = 0;
 static volatile LONG g_S206CoresExited = 0;
 
 /*
- * 9.444: the per-core thread RSP, saved immediately before SvVirtualizeProcessor is
- * called. SvLV20 is handed this value as its new stack pointer so that the exit
- * lands on the thread's REAL stack - see the note at Sv206LeaveToHost.
+ * 9.444: the per-core exit stack pointer.
+ *
+ * Sv206EnterHypervisor records, per core, the address where its call into
+ * Sv206VirtualizeC pushed a return address. SvLV20 is handed exactly that value as
+ * its new stack pointer, so the exit lands on the thread's OWN stack at the right
+ * frame - see the note at Sv206LeaveToHost for why both earlier attempts (a
+ * driver-allocated stack, then a wrong offset) crashed the machine.
  */
-static volatile UINT64 g_S206ThreadRsp[SVM206_MAX_THREADS] = { 0 };
+/*
+ * 9.444: the entry trampoline writes this table directly (see Sv206EnterHypervisor
+ * in the ASM), so it must be addressable from assembly - hence extern "C" and the
+ * non-static form. It is written once per core before that core's loop starts, and
+ * read by SvHandleVmExit on every VMMCALL.
+ */
+extern "C" { volatile UINT64 g_S206ThreadRsp[SVM206_MAX_THREADS] = { 0 }; }
 
 //
 // 9.246 step206-B seams (both gated; with the gates OFF this file is the
@@ -907,8 +915,9 @@ extern "C" int Sv206VmrunShouldExit(VOID)
      * waiter would conclude "all cores stopped" while eleven of them were still
      * running. A counter that measures ticks is not a counter of cores.
      *
-     * The core count is incremented exactly once per core, in Sv206GuestExited, which
-     * a core reaches only after SvLV20 has taken it out of the guest permanently.
+     * The core count is incremented exactly once per core, in Sv206CoreThread, which
+     * a core reaches only after SvLV20 has taken it out of the guest permanently and
+     * control has returned through Sv206LeaveToHost and the entry trampoline.
      * That is the number DriverUnload actually needs.
      */
     return (InterlockedCompareExchange(&g_VmrunStopRequested, 0, 0) != 0) ? 1 : 0;
@@ -1016,9 +1025,10 @@ extern "C" int yghv_s206_vmrun_stopped_count(VOID)
      * ticks - microseconds - while every core was still in its VMRUN loop. The
      * waiter would then free the VMCB and NPT out from under twelve live cores.
      *
-     * g_S206CoresExited is incremented once per core, in Sv206GuestExited, after
-     * SvLV20 has taken that core out of the guest for good. That is the only number
-     * that means what the caller thinks it means.
+     * g_S206CoresExited is incremented once per core, in Sv206CoreThread, after
+     * SvLV20 has taken that core out of the guest for good and control has unwound
+     * back through the entry trampoline. That is the only number that means what the
+     * caller thinks it means.
      */
     return (int)InterlockedCompareExchange(&g_S206CoresExited, 0, 0);
 }
@@ -3641,17 +3651,25 @@ tsc_policy_done:;
          * Our 206 guest is different in kind: it is a stub WE own, it was never
          * doing anything on behalf of a Windows thread, and the only sane thing to
          * do with it after the stop flag is to LEAVE - not to resume it. So this
-         * branch hands SvLV20 a HOST stack and a HOST continuation instead:
+         * branch hands SvLV20 the thread's own stack and a one-instruction thunk
+         * that returns through the entry trampoline:
          *
-         *     rcx = &VpData->HostStackLayout  (this core's own host stack, the same
-         *           one Sv206LaunchVm switched to, so it is mapped and stable)
-         *     rbx = Sv206GuestExited          (noreturn C: ends the thread)
+         *     rcx = g_S206ThreadRsp[core]  (the address where the trampoline's
+         *          call pushed a return address - this thread's real stack)
+         *     rbx = Sv206LeaveToHost       (a single `ret`)
          *
          * The consequence is the one 9.442 said was missing: the core stops
          * executing driver code entirely before DriverUnload returns, so the image
          * can be unmapped without anything of ours left running on it. A stub that
          * merely parked (cli/hlt) would only have moved the PAGED_IP crash from
          * `vmsave` to `hlt`.
+         *
+         * Two earlier attempts got the stack wrong and each cost a machine:
+         *   9.443   used &VpData->HostStackLayout (driver memory) -> the scheduler
+         *           faulted inside KiSwapContext, 0x1E C0000005 / STACKPTR_ERROR.
+         *   9.444a  captured a function's own return-address slot instead of the
+         *           call site -> the `ret` popped a saved register, 0x0E at
+         *           nt!KiStartSystemThread+0x34.
          *
          * Which path is taken is decided by the exit code: only a VMMCALL from our
          * stub reaches here with the stop flag set, and the CPUID_UNLOAD leaf is a
@@ -3660,27 +3678,25 @@ tsc_policy_done:;
         if (VpData->GuestVmcb.ControlArea.ExitCode == VMEXIT_VMMCALL)
         {
             /*
-             * 9.444: THE STACK POINTER MUST BE THE THREAD'S OWN.
+             * 9.444: THE STACK POINTER MUST BE THE ONE THE TRAMPOLINE RECORDED.
              *
-             * 9.443 set this to &VpData->HostStackLayout - a stack this driver
-             * allocated - and the machine died with 0x1E C0000005 / STACKPTR_ERROR
-             * (#GP inside KiSwapContext, reached from PsTerminateSystemThread). A
-             * context switch saves RSP into the KTHREAD and restores it later; from
-             * a foreign stack the scheduler's frame lands somewhere it cannot
-             * survive.
+             * Sv206EnterHypervisor stored, immediately before its `call`, the address
+             * where that call pushed a return address. Handing exactly that to
+             * SvLV20 means `mov rsp, rcx` lands on the thread's own stack at the
+             * right frame, and Sv206LeaveToHost's single `ret` resumes the
+             * trampoline - which then returns normally into Sv206CoreThread.
              *
-             * Sv206CoreThread records its real RSP into g_S206ThreadRsp immediately
-             * before calling into the hypervisor, so that is the value to restore.
-             * With it, `mov rsp, rcx` lands on the thread's own stack, and the thunk
-             * can simply `ret` back into Sv206CoreThread - which then terminates the
-             * thread from a context where every kernel API is legal.
+             * Two earlier attempts failed here, both on the stack:
+             *   9.443   used &VpData->HostStackLayout (driver memory) -> the
+             *           scheduler faulted in KiSwapContext, 0x1E.
+             *   9.444a  used a function's own return-address slot instead of the
+             *           call site -> `ret` popped a saved register, 0x0E at
+             *           nt!KiStartSystemThread+0x34.
              */
             ULONG coreIndex = KeGetCurrentProcessorNumber() & (SVM206_MAX_THREADS - 1);
             UINT64 threadRsp = g_S206ThreadRsp[coreIndex];
 
-            guestContext.VpRegs->Rcx = (threadRsp != 0)
-                ? threadRsp
-                : reinterpret_cast<UINT64>(&VpData->HostStackLayout);
+            guestContext.VpRegs->Rcx = threadRsp;
             guestContext.VpRegs->Rbx =
                 reinterpret_cast<UINT64>(&Sv206LeaveToHost);
         }
@@ -5115,59 +5131,58 @@ typedef struct _SV206_CORE_THREAD_CONTEXT
 } SV206_CORE_THREAD_CONTEXT, *PSV206_CORE_THREAD_CONTEXT;
 
 /*
- * 9.444: A NOINLINE TRAMPOLINE, SO THERE IS A REAL RETURN ADDRESS TO COME BACK TO.
+ * 9.444: ENTER THE HYPERVISOR THROUGH AN ASM TRAMPOLINE THAT RECORDS THE EXIT POINT.
  *
- * Sv206LeaveToHost ends with a bare `ret`, which pops [rsp] and jumps there. For
- * that to land in the right place, [savedRsp] must be the return address of a call
- * that actually exists on the stack - not a compiler-allocated slot, and not an
- * inlined body with no frame of its own.
+ * SvLV20 leaves the guest with `mov rsp, rcx; jmp rbx`, so the two values handed to
+ * it decide both the stack the exit runs on and where it resumes. 9.443 supplied a
+ * driver-allocated stack and the scheduler faulted in KiSwapContext (0x1E); a
+ * follow-up captured the wrong pointer and the `ret` popped a saved register (0x0E
+ * at nt!KiStartSystemThread+0x34).
  *
- * The optimiser inlines SvVirtualizeProcessor into Sv206CoreThread, so calling it
- * directly leaves no such return address. This wrapper exists only to be a real,
- * non-inlined `call` target: its own frame supplies the address, and Sv206CoreThread
- * records RSP immediately before calling it.
+ * The trampoline (Sv206EnterHypervisor, in ASM) captures the one correct value: the
+ * address where its `call` into Sv206VirtualizeC pushes a return address. Because it
+ * is captured three instructions before the call, by the same function, it cannot
+ * drift from the call site - which is precisely what went wrong before.
  *
- * Everything about the hypervisor's behaviour is unchanged; this is purely about
- * giving the exit path a stack that can be returned into.
+ * Sv206LeaveToHost then does a single `ret` from there, landing back in the
+ * trampoline, which returns normally into Sv206CoreThread. Both returns are on this
+ * thread's own stack, so PsTerminateSystemThread is legal at the end.
  */
-__declspec(noinline)
-static NTSTATUS Sv206EnterHypervisor(PSHARED_VIRTUAL_PROCESSOR_DATA SharedVpData)
+extern "C" LONG Sv206EnterHypervisor(
+    PSHARED_VIRTUAL_PROCESSOR_DATA SharedVpData,
+    ULONG CoreIndex);
+
+/*
+ * The C half of the entry: a real function so the trampoline has something to call
+ * and a return address to be captured. It is NOT inlined into the trampoline (that
+ * is impossible across languages) and must not be static, or the assembler could not
+ * name it.
+ */
+extern "C" LONG Sv206VirtualizeC(PSHARED_VIRTUAL_PROCESSOR_DATA SharedVpData)
 {
-    return SvVirtualizeProcessor(SharedVpData);
+    return (LONG)SvVirtualizeProcessor(SharedVpData);
 }
 
 static VOID Sv206CoreThread(PVOID Context)
 {
     PSV206_CORE_THREAD_CONTEXT ctx =
         static_cast<PSV206_CORE_THREAD_CONTEXT>(Context);
-    UINT64 savedRsp;
 
     KeSetSystemAffinityThread((KAFFINITY)(1ULL << ctx->CoreIndex));
 
     /*
-     * 9.444: SAVE THE REAL STACK POINTER BEFORE ENTERING THE LOOP.
+     * 9.444: ENTER THE HYPERVISOR THROUGH THE ASM TRAMPOLINE.
      *
-     * SvLV20 exits the guest with `mov rsp, rcx`. If that value points anywhere
-     * other than this thread's own stack, the next context switch faults (#GP in
-     * KiSwapContext) because the scheduler saves RSP into the KTHREAD and restores
-     * it later - see the note at Sv206LeaveToHost for the crash that proved it.
+     * The trampoline records this core's exit stack pointer into
+     * g_S206ThreadRsp[CoreIndex] BEFORE entering the loop, because SvHandleVmExit
+     * reads it on the very first VMMCALL.
      *
-     * The value captured here is the stack pointer as it stands just before the
-     * call below, so [savedRsp] is that call's return address. Sv206LeaveToHost
-     * does `ret` from there and control resumes right after the call, in this
-     * function, on this thread's real stack - where terminating the thread is legal.
-     *
-     * The call MUST be to the noinline trampoline. Calling SvVirtualizeProcessor
-     * directly lets the optimiser inline it, which leaves no return address on the
-     * stack for the thunk to pop; that is why Sv206EnterHypervisor exists.
+     * It does not return on the normal path. It DOES return after a stop:
+     * Sv206LeaveToHost does one `ret`, landing back in the trampoline, whose epilogue
+     * returns to this statement - both on the thread's own stack, which is what makes
+     * the termination below legal. It also returns on the early-out and error paths.
      */
-    savedRsp = (UINT64)(uintptr_t)_AddressOfReturnAddress();
-    if (ctx->CoreIndex < SVM206_MAX_THREADS)
-    {
-        g_S206ThreadRsp[ctx->CoreIndex] = savedRsp;
-    }
-
-    ctx->Status = (LONG)Sv206EnterHypervisor(ctx->SharedVpData);
+    ctx->Status = Sv206EnterHypervisor(ctx->SharedVpData, ctx->CoreIndex);
 
     InterlockedIncrement(&g_S206CoresExited);
     PsTerminateSystemThread(STATUS_SUCCESS);

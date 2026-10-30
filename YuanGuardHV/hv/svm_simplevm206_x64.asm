@@ -16,6 +16,14 @@ MACHINE_FRAME_SIZE          equ     28h
 
 extern SvHandleVmExit : proc
 
+; 9.444: the C half of the 206 entry (see Sv206EnterHypervisor). Declared here so
+; the entry trampoline can call it; the name is unmangled because it is extern "C".
+extern Sv206VirtualizeC : proc
+
+; 9.444: per-core exit stack pointers. The entry trampoline fills the slot for its
+; own core before the loop starts; SvHandleVmExit reads it on every VMMCALL.
+extern g_S206ThreadRsp : qword
+
 ; 9.422: the in-vmrun counter. Bumped before vmrun, dropped immediately after
 ; vmsave. The stop-flag externs of 9.416 are gone: those variables are static
 ; again (9.419) because the inline check they served was proven useless (9.417).
@@ -455,17 +463,94 @@ Sv206GuestStub endp
 ; This thunk must not call anything: it only moves RSP and returns.
 Sv206LeaveToHost proc
     ;
-    ; RSP is the value Sv206CoreThread saved immediately before it called
-    ; SvVirtualizeProcessor, so [rsp] is that call's return address.
+    ; ARRIVE ON THE THREAD'S OWN STACK, THEN RETURN ONE FRAME.
     ;
-    ; Returning there resumes Sv206CoreThread normally. SvVirtualizeProcessor's own
-    ; frame is abandoned along with the VMRUN loop - deliberately, because that
-    ; frame can never be completed (Sv206LaunchVm is "should never return to here").
+    ; SvLV20 has already executed `mov rsp, rcx` with the value Sv206EnterHypervisor
+    ; captured, so RSP now points exactly at the return-address slot that
+    ; `call Sv206VirtualizeC` pushed. A single `ret` pops it and resumes
+    ; Sv206EnterHypervisor right after that call - on the thread's real stack, which
+    ; is the only stack a context switch can survive on.
     ;
-    ; We are on the real stack, so a plain `ret` is safe and no kernel API is
-    ; needed here at all.
+    ; 9.443 and the first 9.444 attempt both failed here for different reasons:
+    ;   9.443  handed SvLV20 a DRIVER-ALLOCATED stack; the scheduler faulted inside
+    ;          KiSwapContext (0x1E C0000005 / STACKPTR_ERROR).
+    ;   9.444a did a bare `ret` from the WRONG pointer (a function's own
+    ;          return-address slot instead of the call site), so it popped a saved
+    ;          register and jumped into it (0x0E at nt!KiStartSystemThread+0x34).
+    ;
+    ; This version is exact: the pointer was captured by the same function that made
+    ; the call, eight bytes below its own entry RSP, so [rsp] here is guaranteed to
+    ; be that call's return address.
+    ;
+    ; Nothing else is needed. SVM is already off (the ExitVm path cleared
+    ; EFER.SVME) and interrupts are already enabled (it restored RFLAGS).
     ;
     ret
 Sv206LeaveToHost endp
+
+;
+; ============================================================================
+; 9.444: THE ENTRY TRAMPOLINE - CAPTURE THE EXIT POINT, THEN ENTER THE LOOP.
+; ============================================================================
+;
+; Called as:  Sv206EnterHypervisor(SharedVpData, coreIndex)
+;   rcx = SharedVpData   (forwarded to the C wrapper)
+;   rdx = core index     (selects the g_S206ThreadRsp slot to fill)
+;
+; THE SLOT MUST BE FILLED BEFORE THE LOOP RUNS, NOT AFTER IT RETURNS.
+;
+; An earlier revision took an `&exitRsp` out-parameter and stored it in C after this
+; function returned. That is too late: SvHandleVmExit reads g_S206ThreadRsp[core] on
+; every VMMCALL, including the very first one - by which time the slot must already
+; hold the exit stack. Writing it here, before the call into the loop, removes the
+; ordering dependency entirely.
+;
+; WHY THIS IS ASM AND NOT C
+;
+; The value stored must be the address where `call Sv206VirtualizeC` pushes its
+; return address - i.e. (RSP after alignment) - 8. Capturing that from C means
+; asking the compiler where its own stack pointer is at an arbitrary point, and the
+; optimiser is free to put anything in between. Measured cost of getting it wrong
+; once already: 0x0E at nt!KiStartSystemThread+0x34.
+;
+; Here the alignment and the capture are three instructions apart, so they cannot
+; drift.
+;
+; THE TWO-STEP RETURN, WHICH IS THE WHOLE TRICK
+;
+;   entry            RSP = S        [S]   = return address into Sv206CoreThread
+;   sub rsp, 8       RSP = S-8      (aligns the call, see below)
+;   exitRsp = S-16                  <-- where `call` will push
+;   call wrapper     RSP = S-16     [S-16] = return address into THIS function
+;   ... VMRUN loop runs, never returns normally ...
+;   SvLV20: mov rsp, S-16 ; jmp thunk
+;   thunk:  ret      pops [S-16] -> back into THIS function, RSP = S-8
+;   add rsp, 8       RSP = S
+;   ret              pops [S]    -> back into Sv206CoreThread, RSP = S+8
+;
+; Both returns land on the thread's own stack, and Sv206CoreThread's frame - its
+; locals and saved registers - is exactly as it left it. That is what makes
+; PsTerminateSystemThread legal at the end of it.
+;
+; THE ALIGNMENT
+;
+; On entry RSP is 8 mod 16 (the caller's `call` pushed 8). A callee expects the same
+; at ITS entry, so the call site must be 0 mod 16. Hence `sub rsp, 8` before the
+; call, and the matching `add rsp, 8` after it.
+;
+Sv206EnterHypervisor proc
+    sub     rsp, 8
+    ;
+    ; Record where the CALL below will push its return address, into this core's
+    ; slot, BEFORE entering the loop - SvHandleVmExit reads it on the very first
+    ; VMMCALL and must find a valid stack there.
+    ;
+    lea     rax, [rsp - 8]
+    lea     r8, g_S206ThreadRsp
+    mov     qword ptr [r8 + rdx*8], rax
+    call    Sv206VirtualizeC
+    add     rsp, 8
+    ret
+Sv206EnterHypervisor endp
 
         end
