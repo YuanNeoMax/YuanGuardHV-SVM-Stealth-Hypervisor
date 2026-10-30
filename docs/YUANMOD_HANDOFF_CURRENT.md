@@ -14368,3 +14368,103 @@ SvLV20:
 | 反虚拟化遍历恢复为无条件（9.441） | **保留** —— 它负责释放 VPD，跳过会泄漏；但它**不是**停止机制 |
 | 等待改等 `g_inVmrunCount`（9.441） | 保留，但**它永远等不到 0**（悬挂帧不 dec），所以只是记录用 |
 | stop flag 在 `SvHandleVmExit` 里设 `ExitVm`（9.442 短暂采用） | **已撤回** —— `SvLV20` 是「回 guest」不是「回宿主」 |
+
+---
+
+#### 9.445 ★★★★★ 卸载首次干净成功：`invmrun` 归零，三轮连续无蓝屏
+
+**这是 29 次崩溃之后第一次做到「加载 + 运行 + 卸载」全部正常。**
+
+### 9.445.1 实机结果（三轮连续）
+
+| 轮次 | start | stop | 结果 |
+|---|---|---|---|
+| 1 | 6.54s → RUNNING | 3.2s → STOPPED | **无蓝屏** |
+| 2 | 0.85s → RUNNING | 2.64s → STOPPED | **无蓝屏** |
+| 3 | 0.79s → RUNNING | 2.73s → STOPPED | **无蓝屏** |
+
+第一轮卸载时的计数器：
+
+```
+s206 exits at unload   = 0x112e658e = 288,352,654
+s206 vmmcall at unload = 0x11285c06 = 287,973,382
+s206 invmrun at unload = 0x0            ← 归零
+WIN32_EXIT_CODE        = 0
+```
+
+**`invmrun = 0` 是整棵树第一次出现的值。** 它意味着 12 个核全部干净离开了
+VMRUN 循环，`lock dec` 都执行了。这直接证明 9.442 的「悬挂帧」分析是对的，
+也证明修法有效。
+
+### 9.445.2 最终修法：两件事，都不推导
+
+**（1）`Sv206LaunchVm` 自己保存线程 RSP**
+
+```asm
+Sv206LaunchVm proc frame
+        mov rax, rsp                              ; 线程真实栈
+        mov qword ptr [rcx - 5FD0h + 6110h], rax  ; -> VMCB.ControlArea.HostExitRsp
+        mov rsp, rcx                              ; 然后才切到 HostStackLayout
+```
+
+`rcx` = `&HostStackLayout` = `VPD + 0x5FD0`，所以 `0x6110 - 0x5FD0 = 0x140`。
+
+**这是唯一同时持有「线程栈」和「VpData」的地方**，而之前六次都在别处重建这个值。
+
+**（2）`Sv206LeaveToHost` 在正确栈上结束线程，不碰任何 C 帧**
+
+```asm
+Sv206LeaveToHost proc
+        sub     rsp, 28h          ; 0x20 shadow + 8 对齐
+        xor     ecx, ecx          ; STATUS_SUCCESS
+        call    rax               ; rax = PsTerminateSystemThread
+        add     rsp, 28h
+Sv206LeavePark:
+        hlt
+        jmp     Sv206LeavePark
+Sv206LeaveToHost endp
+```
+
+`SvHandleVmExit` 的 VMMCALL 分支写三个槽：
+
+```
+Rcx (slot +0x70) = VMCB.ControlArea.HostExitRsp   （线程真实栈）
+Rax (slot +0x78) = &PsTerminateSystemThread
+Rbx (slot +0x60) = &Sv206LeaveToHost
+```
+
+### 9.445.3 六次失败的完整谱系 —— 每次一个 ABI 违规
+
+| 版本 | 做法 | 崩溃 |
+|---|---|---|
+| 9.443 | 驱动自造栈 `&HostStackLayout` | `0x1E` `KiSwapContext` #GP |
+| 9.444a | 函数自己的 cookie 槽 `_AddressOfReturnAddress()` | `0x0E` `KiStartSystemThread` |
+| 9.444b | 全局表 + `KeGetCurrentProcessorNumber()` 索引 | `0x50` `MiSystemFault` |
+| 9.444c | 手工越过 `/GS` 帧 | `0xF7` `_report_gsfailure` |
+| 9.445a | `call rax` 覆盖栈顶返回槽 | `0x1E` `yghv_pa+0x2501c` |
+| 9.445b | `call rax` 但 `rax` 没设 | `0x1E` `yghv_pa+0x2501b` |
+
+**共同教训（值得单独记住）**：
+
+> **C 函数的栈帧只能由它自己的 epilogue 离开。**
+> 它拥有 `/GS` cookie、SEH 链、对齐。任何「算好偏移手工 ret/jmp」的做法
+> 都会在某一层 ABI 上撞墙，而且每次撞的墙不一样。
+>
+> **正确的退出不是「重建栈」，而是「在正确的栈上做一次合法调用」。**
+
+### 9.445.4 `GUEST_REGISTERS` 槽位（thunk 靠 POPAQ 取值）
+
+```c
++0x58 Rsp   +0x60 Rbx   +0x68 Rdx   +0x70 Rcx   +0x78 Rax
+```
+
+`PUSHAQ` 在 VM-exit 时把 guest GPR 压栈，`POPAQ` 在 `jnz SvLV20` 之前恢复。
+所以 `SvHandleVmExit` 写进这些槽的值，就是 thunk 看到的寄存器值。
+**9.445b 的教训**：thunk 用哪个寄存器，就必须设哪个槽 —— 漏一个就是拿 guest 的残留值当函数指针。
+
+### 9.445.5 仍未验证的部分
+
+- **G25 13/13 回归**（hide / decoy / sha / health 等）尚未在本版本跑过
+- `Sv206GuestStub` 的 `ud2` 分支从未被触发（说明协议没被破坏，但也说明它没被验证过）
+- 卸载路径的 `SvDevirtualizeAllProcessors` 遍历现在是无条件执行的，它释放 VPD；
+  需要确认重复加载/卸载多轮后没有 VPD 泄漏（本轮三轮未见异常）

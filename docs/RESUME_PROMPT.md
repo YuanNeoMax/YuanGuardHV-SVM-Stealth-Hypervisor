@@ -8,22 +8,48 @@
 
 ## 0. 一句话现状
 
-**裸机 SVM/NPT hypervisor：能加载、能虚拟化、能隐藏页、能跑 13/13 回归；
-但「卸载」这条路有 29 次崩溃，根因已定位到设计层面，尚未解决。**
+**裸机 SVM/NPT hypervisor：加载、虚拟化、隐藏页、卸载 —— 全部跑通。
+卸载路径在 29 次崩溃后于 9.445 首次干净成功，三轮连续无蓝屏，`invmrun` 归零。**
 
 | 能做什么 | 状态 |
 |---|---|
-| 加载驱动 | **可以**（最后一次改动前已验证多次）|
+| 加载驱动 | **可以**（`sc start` → RUNNING，0.8–6.5 秒）|
 | 虚拟化 12 核 + NPT | **可以**（`g_npt.pml4_pa` 有效、12 个 VCPU 全建好）|
-| 隐藏页 / decoy / 13 项回归 | **可以**（G25 13/13）|
+| 隐藏页 / decoy / 13 项回归 | **可以**（G25 13/13，但未在 9.445 版本重跑）|
 | Tier 9.1 无设备 CPUID 通道 | **可以**（设备可移除，门铃可达）|
 | Tier 9.2 控制通道认证 | **可以**（G41 13/13）|
-| **卸载驱动** | **会崩或挂死**（见第 4 节）|
+| **卸载驱动** | **可以**（`sc stop` → STOPPED，2.6–3.2 秒，`WIN32_EXIT_CODE=0`）|
 
-**当前代码状态：源码已回滚到可加载的语义，构建 7/7 全绿，尚未实机验证。**
-`9.439` 已回滚 9.436（guest 入口恢复 `ContextRecord->Rip`）、把
-`case VMEXIT_VMMCALL` 改成 `ExitVm = TRUE`，并在反汇编层面复核过产物。
-**待办：机器重启后 `sc start yghvpa` 验证加载不再挂死。**（见第 3 节）
+**当前代码状态：可用。** `9.445` 修好了卸载路径，三轮连续验证：
+
+```
+s206 exits at unload   = 288,352,654     （2.88 亿次 VMEXIT，说明循环正常在跑）
+s206 vmmcall at unload = 287,973,382     （vmmcall 拦截正常）
+s206 invmrun at unload = 0               ← 归零：12 个核全部干净离开 VMRUN
+WIN32_EXIT_CODE        = 0
+```
+
+**下一步待办**：在本版本上重跑 G25 13/13 回归（见第 8.1 节）。
+
+---
+
+## 0.1 卸载为什么曾经崩（一句话版）
+
+**guest 曾是「调用者续行」，于是 `SvVirtualizeProcessor` 以 guest 身份 `return`，
+控制流回到 `SvExecuteOnEachProcessor` 继续下一个核，而上一帧永不返回 —— 12 个核
+留下 12 个悬挂的 `vmrun` 帧。驱动 unmap 后这些帧执行 `vmsave` 撞失效代码页。**
+
+修法是两件事，**都不推导、都不手工展开 C 帧**：
+
+1. `Sv206LaunchVm` 在 `mov rsp,rcx` 之前用自己的 RSP 存进 `VMCB.ControlArea.HostExitRsp`
+   —— 那是唯一同时持有「线程栈」和「VpData」的地方。
+2. `Sv206LeaveToHost` 在正确栈上直接 `call PsTerminateSystemThread` 结束线程。
+
+**六次失败的共同教训**（详见 `YUANMOD_HANDOFF_CURRENT.md` 9.445.3）：
+> **C 函数的栈帧只能由它自己的 epilogue 离开。**
+> 它拥有 `/GS` cookie、SEH 链、对齐。任何「算好偏移手工 ret/jmp」都会在某一层
+> ABI 上撞墙，而且每次撞的墙不一样。
+> **正确的退出不是「重建栈」，而是「在正确的栈上做一次合法调用」。**
 
 ---
 
@@ -67,167 +93,149 @@ dump 配置     CrashDumpEnabled=2, CrashDumpType 已删除, AlwaysKeepMemoryDum
 ## 3. 当前代码状态与第一件事
 
 ```
-HEAD = 9.439 那一笔（源码回滚，未推送）
-       b3a4277    docs(9.438)  重构交接文档
-       f7e1e8c    docs(9.437)
-       3690dba    fix(9.435-9.436)  ← 已被 9.439 回滚
-       48742f2    docs(9.434)
-       e8629ca    fix(9.433)  VMMCALL bit1
-       6152887    fix(9.432)  武装 VMMCALL
+HEAD = b52434a  fix(9.445b)  卸载首次干净成功，invmrun 归零
+       f04d0ff  fix(9.445)   Sv206LaunchVm 自己保存线程 RSP
+       23f34df  fix(9.444b)  exit 栈指针移入 VMCB
+       d6af154  fix(9.444)   两步返回协议（失败，被 9.445 取代）
+       eacde8b  fix(9.444)   两步返回协议（失败）
+       cf13c30  feat(9.443)  方案 B：专用 guest 桩 + 每核线程（失败）
+       354db2c  docs(9.440)  复核 9.434 因果链
+       5866fb5  fix(9.439)   回滚 9.436 + VMMCALL 改 ExitVm
 ```
 
-**`3690dba` 做了三件事，其中一件错 —— 9.439 已处理完：**
+**卸载路径已修好，三轮实机验证通过。** 关键改动只有三处：
 
-| 改动 | 判断 | 9.439 实际做了什么 |
+| # | 位置 | 改动 |
 |---|---|---|
-| 9.432/9.433 武装 `SVM_INTERCEPT_MISC2_VMMCALL = (1UL << 1)` | **保留**（位号已按 bhyve 表核对）| 未动 |
-| 9.435 加 `case VMEXIT_VMMCALL`（原来是 `break;`）| **保留但改** | 已改为 `InterlockedIncrement64; ExitVm = TRUE;` |
-| 9.436 把 guest 入口设为 `svm_trampoline_test_guest` | **回滚** | 已恢复 `StateSaveArea.Rip = ContextRecord->Rip`，并删掉只为它存在的 `extern` 声明 |
+| 1 | `Sv206LaunchVm`（ASM 开头） | `mov rax,rsp` → `mov [rcx-5FD0h+6110h],rax`，在切栈**之前**保存线程 RSP |
+| 2 | `Sv206LeaveToHost`（ASM） | `sub rsp,28h / xor ecx,ecx / call rax`，在正确栈上结束线程，不碰 C 帧 |
+| 3 | `SvHandleVmExit` 的 VMMCALL 分支 | 写 `VpRegs->Rcx`（栈）/`Rax`（终止例程）/`Rbx`（thunk）三个槽 |
 
-**已构建验证：7 项静态检查全绿 + `Build SUCCESS`，并在 `dumpbin /disasm` 产物里
-确认了 `[r13+0xF8]`（ContextRecord->Rip）写入 VMCB，以及 VMMCALL case 的 `mov dil,1`；
-全二进制对 `svm_trampoline_test_guest` 的引用数为 0。**
+**验证读数**（`progress.log`）：
 
-**下一步（需要用户确认，因为会改机器状态）：重启**，清掉 `yghvpa` 的
-`START_PENDING`（`sc stop` 返回 1052 "该服务此刻不可控制"），
-重启后 `sc start yghvpa` 验证加载不再挂死。重启前确认工作树干净。
+```
+s206 exits at unload   = 0x112e658e = 288,352,654
+s206 vmmcall at unload = 0x11285c06 = 287,973,382
+s206 invmrun at unload = 0x0          ← 归零
+```
 
-**在加载验证通过之前，不要动卸载路径的任何代码。**
+**第一件事：在本版本上重跑 G25 13/13 回归**，确认卸载修好之后保护功能没被破坏。
+回归基线镜像曾是 `206zR_va`（`db7547ab`），那是最后一次 G25 全绿的版本。
 
 ---
 
-## 4. 核心结论：卸载为什么崩（29 次崩溃的最终归因）
+## 4. 核心结论：卸载为什么崩，以及怎么修好的
 
-> **⚠ 9.440 先把「实测」和「推断」分开。** 下面 4.1 那条链引用的四个读数里，
-> **只有 `g_inVmrunCount = 12` 是真正的测量**。另外三个的实际情况：
->
-> | 读数 | 9.440 复核结果 |
-> |---|---|
-> | `g_S206VrLog` 为空 | **只说明「没有受保护页的写 NPF」**。全文件唯一写入点在 NPF 写裁决分支里（`svm_simplevm206.cpp:2651`），没 arm 保护页的机器即使 VMEXIT 跑一千万次，它也必然为空。**这是保护引擎仪表，不是 exit 计数器。** |
-> | `snap_vmrun_stopped = 0` | **恒等式**。`g_VmrunStopped` 唯一递增点在 `Sv206VmrunShouldExit()`，而该函数**在产物里零引用**（9.419 删了 ASM 里的检查，C 侧没删）。`dumpbin` 查 `1400223340h` 命中 0 次。 |
-> | `snap_resident_threads = 0` | **恒等式**。206-B 模式不启动 resident（`main.c:5521` 注释「Residents are not started」），所以它读的 `g_resident_thread_count` 从来没被写过。 |
->
-> **推论**：`main.c:5047` 的判据 `stopped == 0 && resident_threads_at_entry == 0`
-> **两个条件都是恒真的**，那个分支实际上无条件执行。9.405/9.406 基于它做的
-> 「nothing was running」判断不成立。
->
-> **详见 `YUANMOD_HANDOFF_CURRENT.md` 的 9.440 节。**
-
-### 4.1 完整的因果链（每一环都有实测数据）
-
-> **这一节的标题在 9.440 之后是不准确的**：链上有三环不是实测。保留原链是为了
-> 让后来者看到推理是怎么走的，但**不要把它当已证结论**。
+### 4.1 真正的根因（9.442 定位，9.445 验证）
 
 ```
 DriverEntry
-  └─ svm_core_init()                     12 个 VCPU + VMCB + hsave 全部建好（已证：dump 逐字段）
   └─ Sv206Entry()
        └─ SvVirtualizeAllProcessors()
             └─ 每核 SvVirtualizeProcessor
+                 └─ RtlCaptureContext(contextRecord)      ← 抓本函数当下的 RIP
                  └─ SvPrepareForVirtualization
-                      └─ StateSaveArea.Rip = ContextRecord->Rip   ★ 关键
+                      └─ StateSaveArea.Rip = ContextRecord->Rip   ★ guest = 本函数续行
                  └─ Sv206LaunchVm()
-                      └─ vmrun  ← guest 从此执行「SvVirtualizeProcessor 自己的续行代码」
+                      └─ vmrun  ← guest 以 guest 身份跑完本函数剩余代码
+                                → 执行 `return`
+                                → 控制流回到 SvExecuteOnEachProcessor 的 for 循环
+                                → 线程被 pin 到下一个核 → 再次 vmrun
+                                → 但上一帧永不返回，lock dec 永不执行
 ```
 
-**★ 核心事实（9.434）：guest 的入口不是任何测试 guest，而是
-`SvVirtualizeProcessor` 自己捕获的 RIP。** 那行代码就在
-`SvPrepareForVirtualization` 里：
+**12 核走完 = 12 个永久悬挂的 vmrun 帧。** 每核的 `vpData` 独立分配，
+所以 12 个 `HostStackLayout` 各自持有一个永不返回的帧。
 
-```c
-VpData->GuestVmcb.StateSaveArea.Rip = ContextRecord->Rip;
-```
+卸载时 `DriverUnload` 走完 14 步、返回、操作系统 unmap 驱动镜像，
+那些悬挂帧的下一条 `vmsave` 执行了已失效的代码页 → `0xD1 PAGED_IP`。
 
-而 `ContextRecord` 是几行之前 `RtlCaptureContext` 抓的 —— 抓的是那个函数当下的位置。
-它之后是 `Sv206LaunchVm()` / `SV_DEBUG_BREAK()` / `KeBugCheck()` —— **没有任何被拦截指令**。
+**9.434 的推理错在哪**：它说「这行之后没有拦截指令」—— 对**那个函数剩下的三行**成立，
+但那三行 `return` 之后进入的是 `SvExecuteOnEachProcessor` 和整个内核，
+VMEXIT 一直在发生。**它把「函数剩余部分」当成了「guest 的全部生命周期」。**
 
-> **⚠ 9.439 修正这一句的适用范围。** 「没有任何被拦截指令」描述的是
-> `SvVirtualizeProcessor` **剩下的那三行**，不是那三行 `return` 进去的内核代码。
-> guest 是调用者续行，它下一件事就是执行真实内核指令，CPUID / CR3 写 / MSR / NPF 都会来。
-> **所以下面这条后果链的起点（「永不产生 #VMEXIT」）从未被证明，只是被假设。**
-> 9.439 已把 guest 恢复成续行，这一环现在是**待查**而非**已定**。
->
-> **⚠ 9.440 补充：这一环不但没被证明，而且无法用现有仪表证明。**
-> 这棵树上「有没有 VMEXIT」目前**没有任何计数器能回答** —— 见本节开头的表格。
-> 要回答它，必须先加一个无条件 exit 计数器（见 8.2）。
-
-**后果链**（`【实测】` / `【非测量】` / `【推断】` 逐行标注）：
+### 4.2 实测数据（9.441 加的 exit 计数器第一次给出答案）
 
 ```
-guest 执行 SvVirtualizeProcessor 的续行代码
-  → 不执行 CPUID、不执行 vmmcall、不碰 CR3                  【推断】
-  → 永不产生 #VMEXIT                                        【推断 ← 无仪表可证】
-  → vmrun 永不返回                                          【实测】g_inVmrunCount = 12
-  → vmsave 不执行 → lock dec 不执行                          【实测】同上
-  → SvHandleVmExit 一次不跑                                  【非测量】g_S206VrLog 是 NPF 仪表
-  → stop flag 检查点永不执行                                  【非测量】恒等式，该检查已被删除
-  → DriverUnload 走完 14 步但等不到计数归零                    【实测】step = 120 DONE
-  → 返回后操作系统 unmap 驱动镜像
-  → 卡在 vmrun 里的核执行已失效的代码页                        【实测】PAGED_IP 崩溃桶
+s206 exits at unload  = 213,601      ← 9.434 说「永不产生 VMEXIT」，错
+s206 vmmcall at unload = 0            ← 排除整个 trampoline 假设族
+s206 invmrun at unload = 12           ← 12 个悬挂帧，不是「卡死」
 ```
 
-### 4.2 崩溃点的三次修正（前两次都错了）
+`vmmcall = 0` 是决定性的：拦截位武装着，21 万次退出里一次 vmmcall 都没有 ——
+因为 guest 执行的是**真实内核代码**，内核不发 `vmmcall`。
 
-| 版本 | 我说崩溃在 | 实际 |
+### 4.3 修法：两件事，都不推导、都不手工展开 C 帧
+
+**（1）`Sv206LaunchVm` 自己保存线程 RSP**（在切栈之前）
+
+```asm
+Sv206LaunchVm proc frame
+        mov rax, rsp                              ; 线程真实栈
+        mov qword ptr [rcx - 5FD0h + 6110h], rax  ; -> VMCB.ControlArea.HostExitRsp
+        mov rsp, rcx                              ; 然后才切到 HostStackLayout
+```
+
+`rcx` = `&HostStackLayout` = `VPD + 0x5FD0`，所以 `0x6110 - 0x5FD0 = 0x140`。
+**这是唯一同时持有「线程栈」和「VpData」的地方。**
+
+**（2）`Sv206LeaveToHost` 在正确栈上结束线程**
+
+```asm
+Sv206LeaveToHost proc
+        sub     rsp, 28h          ; 0x20 shadow + 8 对齐
+        xor     ecx, ecx          ; STATUS_SUCCESS
+        call    rax               ; rax = PsTerminateSystemThread
+        add     rsp, 28h
+Sv206LeavePark:
+        hlt
+        jmp     Sv206LeavePark
+Sv206LeaveToHost endp
+```
+
+`SvHandleVmExit` 的 VMMCALL 分支写三个槽（`GUEST_REGISTERS` 偏移）：
+`Rcx(+0x70)` = 线程栈、`Rax(+0x78)` = 终止例程、`Rbx(+0x60)` = thunk。
+
+### 4.4 六次失败的谱系 —— 每次一个 ABI 违规
+
+| 版本 | 做法 | 崩溃 |
 |---|---|---|
-| 9.389/9.395/9.407 | `mov rax,[rsp]`（读 `VpData->HostStackLayout`）| ✗ |
-| 9.421 | `vmsave rax`（写已释放的 VMCB）| ✗ |
-| **9.427** | — | **`vmrun rax` 本身，且 `PAGED_IP`（代码页已失效）** |
+| 9.443 | 驱动自造栈 `&HostStackLayout` | `0x1E` `KiSwapContext` #GP |
+| 9.444a | `_AddressOfReturnAddress()` | `0x0E` `KiStartSystemThread` |
+| 9.444b | 全局表 + `KeGetCurrentProcessorNumber()` 索引 | `0x50` `MiSystemFault` |
+| 9.444c | 手工越过 `/GS` 帧 | `0xF7` `_report_gsfailure` |
+| 9.445a | `call rax` 覆盖栈顶返回槽 | `0x1E` `yghv_pa+0x2501c` |
+| 9.445b | `call rax` 但 `rax` 没设 | `0x1E` `yghv_pa+0x2501b` |
 
-按 ASM 桩布局算偏移（含 `lock inc/dec`）：
+> **共同教训：C 函数的栈帧只能由它自己的 epilogue 离开。**
+> 它拥有 `/GS` cookie、SEH 链、对齐。任何「算好偏移手工 ret/jmp」都会在某一层
+> ABI 上撞墙，而且每次撞的墙不一样。
+> **正确的退出不是「重建栈」，而是「在正确的栈上做一次合法调用」。**
 
-```
-+0x00 mov rsp, rcx      +0x03 mov rax,[rsp]   +0x07 vmload rax
-+0x0A lock inc           +0x12 vmrun rax  ← 崩溃在 +0x14（操作数 D8）
-+0x15 vmsave rax         +0x18 lock dec
-```
-
-**`FAILURE_BUCKET: ..._PAGED_IP_`** 是这个结论的判词：不是「访问了错误的**数据**」，
-而是「执行了已失效的**代码**」。
-
-### 4.3 29 次崩溃的分类
-
-| 类 | 次数 | 崩溃码 | 已修？ |
-|---|---|---|---|
-| 值/位置类 | 7 | hang / `0x101` / `0x3B` / `0x139`×3 / 6008 | **是**（各有提交与测试）|
-| EFER 类 | 3 | `0x1E` — IPI 里清 `EFER.SVME`（APM 明文 undefined）| **是**（9.380，已证生效）|
-| 卸载顺序类 | 5 | `0xD1` / `0x7F` | 否 |
-| 硬复位 | 4 | 无 dump 无 bugcheck | 否 |
-| 本会话新引入 | 3 | `0x101`（无界等待）、`START_PENDING`（guest 入口）| **`START_PENDING` 已由 9.439 回滚** |
-| 第三方 | 1 | `usbwifi` | 无关 |
-
-### 4.4 已证伪的 8 个推断（别再重走）
+### 4.5 已证伪的推断（别再重走）
 
 | 推断 | 证伪依据 |
 |---|---|
 | `npt_cleanup` 提前释放活表（9.381）| `npt-range` 工具：NPT 在 `0xC7B...`，故障地址全不在 |
 | VPD 页对齐是根因（9.386）| 改真页对齐后崩溃不变 |
 | AVIC timer 是元凶（9.388）| 加了 cancel+drain 后崩溃不变 |
-| ack 从未被写是根因（9.378/9.383）| ack 早在 ASM 桩 `SvLV20` 里就有（`mov ecx,'SSVM'`）|
-| 有第二套 VMRUN 循环在跑（9.395）| `g_S206VrLog=0`、`resident=0`、`s203=0` |
-| stop check 位置错（9.413/9.414/9.416，三次）| 零 call 的内联版照样 `0x7F/8`，崩溃点不动 |
+| ack 从未被写是根因（9.378/9.383）| ack 早在 ASM 桩 `SvLV20` 里就有 |
+| stop check 位置错（9.413/9.414/9.416）| 三次都死在 `SvLV20` 的坏 rsp 上（9.383），不是检查本身 |
 | `vmsave` 写已释放 VMCB（9.421）| `PAGED_IP` —— 是代码页失效不是数据 |
-| guest 是 trampoline、缺 VMMCALL 位（9.431）| 加位加 case 后反而**加载挂死**（9.437）|
+| guest 是 trampoline（9.431）| 9.434 读了赋值语句，9.443 实测加桩后加载挂死 |
+| 「永不产生 #VMEXIT」（9.434）| **`exits = 213,601`** |
+| 「有第二套 VMRUN 循环」（9.395 证伪）| 证伪所用三个读数全部失效（见 9.440）|
 
-**注意最后一行**：9.431 的「guest 是 trampoline」是**从 `svm_trampoline.asm` 的存在
-推断的**，而 9.434 读了赋值语句本身才发现不是。**「有个文件存在」不等于「它被用了」。**
+### 4.6 三个曾经被当成「实测」的恒等式（9.440）
 
-**9.439 追加第 9 条证伪**：
-
-| 推断 | 证伪依据 |
+| 读数 | 实际情况 |
 |---|---|
-| 换成测试 guest + 武装 VMMCALL，vmrun 就会正常返回（9.436）| **加载就挂死**（9.437 的 `START_PENDING`）。vmmcall 是心跳不是退出请求，`break` 让循环无限重进 vmrun。|
+| `g_S206VrLog` 为空 | 只说明「没有受保护页的写 NPF」。唯一写入点在 NPF 写裁决分支，**没 arm 保护页的机器必然为空** |
+| `snap_vmrun_stopped = 0` | **恒等式**。唯一递增点 `Sv206VmrunShouldExit()` 在产物里零引用（9.419 删了 ASM 检查，C 侧没删）|
+| `snap_resident_threads = 0` | **恒等式**。206-B 不启动 resident |
 
-**9.440 追加第 10 条 —— 而且它让上面表格里的第 3 条失去依据：**
-
-| 推断 | 9.440 复核 |
-|---|---|
-| 「有第二套 VMRUN 循环在跑」（9.395 证伪）| **证伪所依据的三个读数全部失效**：`g_S206VrLog=0` 是 NPF 仪表不是 exit 计数、`resident=0` 在 206-B 下是恒等式、`s203=0` 同样因为 resident 没启动。**这条证伪不成立**，「第二套循环」需要重新排除。|
-
-**另注（9.440）**：表格第 3 条「ack 早已在 ASM 桩 `SvLV20` 里」是对的 ——
-`SvLV20` 确实有 `mov ecx,'SSVM'`。**但这恰恰说明 9.383 那行
-`VpRegs->Rcx = 'SSVM'` 是多余的**（`SvLV20` 自己会写 ECX），
-而它把 `mov rsp, rcx` 的输入变成了垃圾。见 8.2。
+**判据**：一个计数器能当证据，前提是**它在被测事件没发生时也会动**。
+做不到这一点的计数器，为空和为 0 都不说明任何事。
 
 ---
 
@@ -350,60 +358,37 @@ yghv_ctl.ps1 unload-trace   → page PA / last step / value
 
 ## 8. 剩余工作清单（诚实版）
 
-### 8.1 必须马上做（不做则代码不可用）
-1. ~~**回滚 9.436**（guest 入口改动）→ 恢复 `Rip = ContextRecord->Rip`~~ **已完成（9.439）**
-2. ~~**把 `case VMEXIT_VMMCALL` 改成 `ExitVm = TRUE`**（不是 `break`）~~ **已完成（9.439）**
-3. **重启机器**清 `START_PENDING` —— **待做，需用户确认**
-4. **重启后 `sc start yghvpa`** 验证加载不再挂死 —— **这是回滚生效的唯一证据**
+### 8.1 已完成（9.439 → 9.445）
 
-### 8.2 卸载问题的下一步（9.440 重写：先补仪表，再谈根因）
+1. ~~回滚 9.436，恢复 `Rip = ContextRecord->Rip`~~ —— 9.439
+2. ~~`case VMEXIT_VMMCALL` 改成 `ExitVm = TRUE`~~ —— 9.439
+3. ~~修 9.383 的 `rsp = 'SSVM'` 栈损坏~~ —— 9.441
+4. ~~加无条件 exit 计数器~~ —— 9.441（这个仪表带来了后面全部结论）
+5. ~~卸载路径修好~~ —— 9.445b，三轮连续验证通过
 
-9.434 留下的问题被 9.436 用「换成测试 guest」回答了，9.437 证明那个答案会让加载挂死。
-9.439 已回到透明虚拟化。**而 9.440 复核发现：这个问题目前连「问清楚」都做不到 ——
-因为没有任何仪表能回答「有没有 VMEXIT」。**
+### 8.2 下一步：在本版本上重跑 G25 13/13 回归
 
-**所以下一步不是改代码，是加一个无条件计数器。**
+卸载修好之后，**保护功能是否还完好尚未验证**。这是唯一剩下的「必须做」。
 
-最小仪表（三行，`SvHandleVmExit` 开头即可）：
-
-```c
-extern "C" { volatile LONG64 g_S206Exits = 0; }
-/* SvHandleVmExit 的第一条语句 */
-InterlockedIncrement64(&g_S206Exits);
+```powershell
+# 加载后按 G25 的流程跑 13 项：arm / hide / decoy / sha / health / unload
+# 基线镜像曾是 206zR_va (db7547ab)，最后一次全绿
 ```
 
-加完要能回答三个问题，**每个答案对应完全不同的修法**：
+**如果 G25 有项失败**：优先怀疑 9.443 引入的每核线程模型改变了核的归属
+（每个 VMCB 现在绑在一个专属线程上，而不再由 `SvExecuteOnEachProcessor` 轮转）。
+这不一定是 bug，但任何依赖「某个核上发生过什么」的检查都需要重新审视。
 
-| 读数 | 含义 | 下一步 |
-|---|---|---|
-| `g_S206Exits == 0` | 真的没有 VMEXIT（9.434 成立）| 查 VMCB 拦截位是否真进了硬件；查 guest 到底在执行什么 |
-| `g_S206Exits > 0` 且 `g_inVmrunCount == 12` | 有 VMEXIT 但核回不到宿主 | 查 `SvLV20` / ExitVm 出口（**`rsp = 'SSVM'` 就在这条路上**）|
-| `g_S206Exits` 增长极快 | VMEXIT 风暴 | 查 guest 是否在自陷循环 |
+### 8.3 已知的三处死代码 / 假判据（不影响功能，影响读数可信度）
 
-**顺带要修的三处死代码/假判据（都不改行为，只让读数有意义）**：
-
-1. `g_VmrunStopped` / `Sv206VmrunShouldExit` —— 无调用者，删掉或接回 ASM。
+1. `g_VmrunStopped` / `Sv206VmrunShouldExit` —— 无调用者（9.419 删了 ASM 检查）。
    只要它还在，`stopped == 0` 就会被误读成「一个都没停」。
-2. `main.c:5047` 的 `stopped == 0 && resident_threads_at_entry == 0` ——
-   两个条件恒真，该分支无条件执行。要么补真实判据，要么明说它是兜底。
+2. `main.c` 里 `stopped == 0 && resident_threads_at_entry == 0` ——
+   两个条件在 206-B 下恒真（见 4.6）。9.443 起遍历已改为无条件执行，
+   但这个判据的注释还留着旧结论。
 3. `g_S206VrLog` 的注释 —— 它不是 exit 日志，是 NPF 写裁决日志。
 
-**候选根因（9.440 记入，未修，按铁律等用户点名）**：9.383 把
-`guestContext.VpRegs->Rcx` 从 guest RSP 改成 `'SSVM'`，而 ASM `SvLV20` 第一句是
-`mov rsp, rcx` —— 栈指针被设成 `0x4D565353`（非规范地址，任何栈操作立刻 #GP）。
-反汇编已确认该赋值进了产物（`14002 40AD: mov qword ptr [r14+70h],5353564Dh` /
-`14002 4C30: mov rsp,rcx`）。
-
-**它还是冗余的**：`'SSVM'` 的用途是让 `SvDevirtualizeProcessor` 的
-`registers[2] != 'SSVM'` 通过，而那个检查已由 CPUID leaf 自己的
-`registers[2] = 'SSVM'` 满足（`svm_simplevm206.cpp:1649`，9.378 修的）。
-**所以这一行既是栈损坏，又没起任何作用。**
-
-**为什么它必须优先排除**：在一个 rsp 是垃圾的上下文里，
-**所有关于「卸载顺序」「时序」「竞态」的推理都不成立**。9.413/9.414/9.416
-那三次 `0x139`/`0x7F` 也可能与它有关（栈已坏，再加任何栈操作都放大）。
-
-### 8.3 原清单（Tier 5/6/8/9，共 30 项）
+### 8.4 原清单（Tier 5/6/8/9，共 30 项）
 | Tier | 项 | 状态 |
 |---|---|---|
 | 5.1 TSC | offset 平移 / freeze | offset **成立**；freeze **已禁用**（无法证明释放）|
@@ -441,27 +426,31 @@ InterlockedIncrement64(&g_S206Exits);
 ## 10. 新窗口的第一个动作（照着做）
 
 ```powershell
-# 1. 确认状态（这一步永远是只读的，可以直接跑）
+# 1. 确认状态（只读，可以直接跑）
 cd D:\yuanguard && git log --oneline -3 && git status --porcelain
-sc.exe query yghvpa      # 若 START_PENDING → 需重启（9.439 后仍是这个状态）
+sc.exe query yghvpa                       # 期望 STOPPED（不是 START_PENDING）
 
-# 2. 第 2、3、4 步已在 9.439 做完并构建验证过（见第 3 节），
-#    不要再改一遍 —— 改之前先 git log 看有没有 9.439 那一笔。
-#    复核方式（只读）：
-git log --oneline -3 -- YuanGuardHV/hv/svm_simplevm206.cpp
-grep -n "StateSaveArea.Rip = ContextRecord->Rip" YuanGuardHV/hv/svm_simplevm206.cpp
-grep -n -A2 "case VMEXIT_VMMCALL" YuanGuardHV/hv/svm_simplevm206.cpp   # 应见 ExitVm = TRUE
+# 2. 确认卸载修复还在（只读）
+git log --oneline -3 -- YuanGuardHV/hv/svm_simplevm206_x64.asm
+findstr /C:"HostExitRsp" YuanGuardHV\hv\svm_simplevm206.hpp     # 应有 +0x110 槽
+grep -n "sub     rsp, 28h" YuanGuardHV/hv/svm_simplevm206_x64.asm
 
 # 3. 构建（改动后才需要；构建和蓝屏取证不需要确认）
 cd YuanGuardHV && set YGHV_BAREMETAL_STEP=206 && set YGHV_206B_COEXIST=1 `
   && set YGHV_206B_GNPT=1 && build.bat    # 必须 7/7 全绿
 
-# 4. 重启（清 START_PENDING）—— 会改机器状态，需要用户明确确认
-#    重启后第一件事：sc start yghvpa，看它是否真的进入 RUNNING
+# 4. 部署 + 验证（会改机器状态，需要用户明确确认）
+Copy-Item D:\yuanguard\YuanGuardHV\bin\yuanguard_hv.sys C:\yghv_pa.sys -Force
+sc.exe start yghvpa      # 期望 RUNNING
+sc.exe stop  yghvpa      # 期望 STOPPED，WIN32_EXIT_CODE=0，无蓝屏
+Get-Content C:\Windows\yghv_progress.log | Select-String "invmrun at unload"
+#   ★ 期望 invmrun = 0x0 —— 这是卸载成功的唯一判据
 ```
 
-**在「`sc start` 能进 RUNNING」这条被实测确认之前，不要动卸载路径的任何代码。**
-29 次崩溃里 8 次是因为「在不可观测的路径上改代码」。
+**判据只有一条：`invmrun at unload = 0x0`。**
+非 0 说明还有核没离开 VMRUN，驱动 unmap 后必崩。
+
+**下一步是 G25 13/13 回归**（见 8.2）—— 卸载修好之后，保护功能尚未验证。
 
 ---
 
@@ -469,7 +458,8 @@ cd YuanGuardHV && set YGHV_BAREMETAL_STEP=206 && set YGHV_206B_COEXIST=1 `
 
 | 测试 | 内容 | 结果 |
 |---|---|---|
-| G25 | 13 项回归（arm/hide/decoy/sha/health/unload） | **13/13** |
+| **9.445b** | **加载 → 运行 → 卸载，三轮连续** | **全部通过，无蓝屏** |
+| G25 | 13 项回归（arm/hide/decoy/sha/health/unload） | **13/13**（旧版本，未在 9.445 重跑）|
 | G33 | snapshot 非破坏 + drain 消费 | ALL PASS |
 | G39 | TSC 逐核武装与释放 | ALL PASS |
 | G40 | 逐核 walk 可达性（12/12 核） | ALL PASS |
@@ -477,7 +467,18 @@ cd YuanGuardHV && set YGHV_BAREMETAL_STEP=206 && set YGHV_206B_COEXIST=1 `
 | G43 | 无设备 CPUID 通道 | 部分（设备可移除已验证）|
 | G18/G28/G29/G30/G31 | hide/decoy/border/why | 见各 9.3xx |
 
-**回归基线镜像**：`206zR_va`（`db7547ab`）—— 那是最后一次 G25 13/13 全绿的版本。
+**9.445b 的三轮明细**
+
+| 轮 | start | stop | `invmrun` |
+|---|---|---|---|
+| 1 | 6.54s | 3.2s | `0x0` |
+| 2 | 0.85s | 2.64s | `0x0` |
+| 3 | 0.79s | 2.73s | `0x0` |
+
+第一轮 `exits = 288,352,654`、`vmmcall = 287,973,382`、`WIN32_EXIT_CODE = 0`。
+
+**回归基线镜像**：`206zR_va`（`db7547ab`）—— 那是最后一次 G25 13/13 全绿的版本，
+但**不含 9.439–9.445 的卸载修复**。当前的可用镜像是 9.445b 构建（见第 3 节）。
 
 ---
 
@@ -511,6 +512,20 @@ findstr /C:"14005FFE0h" dis.txt
 findstr /C:"Sv206VmrunShouldExit" YuanGuardHV\bin\yuanguard_hv.map
 dumpbin /disasm:nobytes YuanGuardHV\bin\yuanguard_hv.sys | findstr /C:"1400223340h"
 # 同理可查 g_VmrunStopped 的唯一递增点是否可达
+
+# 9.445 新增：卸载路径的三处关键指令（改动后必查）
+dumpbin /disasm:nobytes YuanGuardHV\bin\yuanguard_hv.sys > dis.txt
+# a) Sv206LaunchVm 开头：保存线程 RSP（rcx=VPD+5FD0，所以偏移是 140h）
+findstr /C:"mov         rax,rsp" dis.txt
+# b) Sv206LeaveToHost：sub rsp,28h / xor ecx,ecx / call rax / hlt
+findstr /C:"sub         rsp,28h" dis.txt
+# c) SvHandleVmExit 写三个槽：+70h Rcx / +78h Rax / +60h Rbx
+findstr /C:"r14+70h" dis.txt
+findstr /C:"r14+78h" dis.txt
+
+# 卸载后确认成功（不是看 md5）
+Get-Content C:\Windows\yghv_progress.log | Select-String "invmrun at unload"
+#   期望 invmrun = 0x0；非 0 说明还有核没离开 VMRUN
 ```
 
 **构建判据**：不是 md5（每次重签都变）。看 `ALL SOURCE CHECKS PASS` +
@@ -550,3 +565,28 @@ dumpbin /disasm:nobytes YuanGuardHV\bin\yuanguard_hv.sys | findstr /C:"140022334
 **判据只有一句：一个计数器能当证据，前提是它在被测事件没发生时也会动。**
 做不到这一点的计数器，为空和为 0 都不说明任何事 —— 它只会让一个未经验证的假设
 看起来像一次观测。
+
+---
+
+**9.445 追加最后一条，关于「怎么修」而不是「怎么看」**：
+
+**C 函数的栈帧只能由它自己的 epilogue 离开。**
+
+卸载路径修了六次，每次都在同一个地方换一种算法：怎么把线程的真实栈指针
+「重建」出来，然后 `ret` 或 `jmp` 回某个 C 帧。六次撞了六堵不同的 ABI 墙：
+
+```
+0x1E KiSwapContext #GP     驱动自造栈
+0x0E KiStartSystemThread   函数自己的 cookie 槽
+0x50 MiSystemFault         全局表索引错位
+0xF7 _report_gsfailure     手工越过 /GS 帧
+0x1E +0x2501c              call 覆盖栈顶返回槽
+0x1E +0x2501b              call rax 但 rax 没设
+```
+
+**最后一次成功的改动反而更小**：不再重建任何东西 —— `Sv206LaunchVm` 在切栈前
+用自己的 RSP 存一下（一条指令），退出时在**那个栈上做一次合法调用**结束线程，
+一个 C 帧都不碰。
+
+> **所以：当修复方案需要「算偏移手工跳转」时，那是设计错了的信号，不是偏移算错了。**
+> 正确的退出不是「重建栈」，而是「在正确的栈上做一次合法调用」。
