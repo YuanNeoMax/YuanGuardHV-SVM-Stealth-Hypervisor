@@ -12032,3 +12032,77 @@ stopped = 1, active = 12   ->   stopped < active   ->   走 if (stopped < active
 如果 hits 远小于 12，说明**逐核遍历本身在那个时刻就不完整**，问题不在 stop flag。
 
 这一步是只读的，不需要加载驱动，不需要改代码。
+
+---
+
+#### 9.401 读数推翻了我自己的推断：没有第二套 VMRUN 循环在跑
+
+**读到的四个 0**
+
+```
+g_TscCoreHits       = 0     (VA 0x14005efb0)
+g_TscCoreMisses     = 0     (VA 0x14005efb8)
+g_s203_online       = 0     (VA 0x14002c304)    <- s203 每核线程从未启动
+g_resident_thread_count = 0 (VA 0x140030730)    <- resident 线程数 0
+g_CpuidView / Sets  = 0     (VA 0x14005eb28/0x14005ef50)
+g_S206VrLog         = 全 0  (VA 0x14005e920)    <- 206 VMRUN 日志一条没记
+g_S206VrIdx         = 0     (VA 0x14005eb20)
+```
+
+而 `g_vcpu_count = 12`（同一个 `.bss` 段，有效值）。
+页表项已验证有效（`!pte` 读到真实 PTE），所以这些 0 不是"读不到内存"，是真实值。
+
+**这意味着我 9.395 / 9.396 / 9.397 的整套推断错了**
+
+我写的是：
+
+> 本树有两套虚拟化同一批核上，DriverUnload 只停 resident 那套，
+> `Sv206Entry` → `Sv206LaunchVm` 的 VMRUN 循环还在跑，所以释放它的 VpData 会崩。
+
+但数据说：
+
+- `g_S206VrLog` **一条记录都没有** → `Sv206LaunchVm` 的循环**没有产生过 VMEXIT**
+- `g_resident_thread_count = 0`、`g_s203_online = 0` → 那两套线程**都没在跑**
+- `g_vcpu_count = 12` → `svm_core_init` **确实分配了 12 个 VCPU**
+
+**所以 12 个核上有 12 个 VCPU 结构，但没有任何一个执行体在 VMRUN。**
+
+那 `g_VmrunStopped = 1` 是怎么回事？
+
+stop flag 只在 `ExitCode == VMEXIT_CPUID` 时递增。如果没有任何 VMRUN 在跑，
+就没有 VMEXIT，也就不会递增。**但它是 1。**
+
+所以有 **恰好一个** VMEXIT 发生了 —— 而 `g_S206VrLog` 是 0，说明那个出口**不是 206 主线记录的**。
+
+**剩下的解释：那一次 VMEXIT 来自 `svm_core_init` 的某一核，在它自己的初始化期间。**
+
+**这改变了整件事的性质**
+
+不是"卸载顺序错了"，而是：
+
+> **卸载时，12 个 VCPU 结构存在，但没有任何执行体在跑 VMRUN。
+> 于是 `SvDevirtualizeAllProcessors` 用 `__cpuidex` 去问每个核"你被虚拟化了吗"，
+> 每核都回答"没有"（因为没人 VMRUN），ack 也就无从谈起。
+> 而 `npt_cleanup` / `svm_core_cleanup` 释放的是这 12 个从未被真正使用过的 VCPU。**
+
+**而 `0x7F/8` 双故障在 `SvDevirtualizeAllProcessors+0xC0`** —— 那是
+`SvExecuteOnEachProcessor` 内联进来的 `KeSetSystemGroupAffinityThread` 循环。
+在已经历过 `PsSetCreateProcessNotifyRoutine(..., TRUE)` 注销、
+`ExUnregisterCallback` 之后的上下文里切核，本身就可能踩到不一致状态。
+
+**下一步需要的不是继续猜，是先把"虚拟化到底成没成"这件事查清楚**
+
+`g_npt.pml4_pa`、`g_npt_alt_ready`、`g_vcpus[]` 里每个 VCPU 的 `vmcb` 指针和
+`hsave` 值都在 dump 里。读一轮就能回答：
+
+- 12 个 VCPU 的 `vmcb` 是否都非 NULL（分配成功）
+- 每核的 `hsave` 是否被写过（写过 = 真的 VMRUN 过）
+- `g_npt.pml4_pa` 是否有效（NPT 建过）
+
+**这一步纯只读，不加载驱动，不改代码。** 在此之前不再猜测。
+
+**规则（补进 §4）**
+
+> 用一个计数器推断"某个东西在运行"之前，先确认那个计数器**自己有写入路径被触发过**。
+> `g_VmrunStopped = 1` 让我相信"有 1 个循环在跑"，而 `g_S206VrLog = 0` 说明
+> 那个循环根本没记录过任何出口 —— 两个计数器互相矛盾，而我只看了其中一个。
