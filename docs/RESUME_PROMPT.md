@@ -98,7 +98,25 @@ HEAD = 9.439 那一笔（源码回滚，未推送）
 
 ## 4. 核心结论：卸载为什么崩（29 次崩溃的最终归因）
 
+> **⚠ 9.440 先把「实测」和「推断」分开。** 下面 4.1 那条链引用的四个读数里，
+> **只有 `g_inVmrunCount = 12` 是真正的测量**。另外三个的实际情况：
+>
+> | 读数 | 9.440 复核结果 |
+> |---|---|
+> | `g_S206VrLog` 为空 | **只说明「没有受保护页的写 NPF」**。全文件唯一写入点在 NPF 写裁决分支里（`svm_simplevm206.cpp:2651`），没 arm 保护页的机器即使 VMEXIT 跑一千万次，它也必然为空。**这是保护引擎仪表，不是 exit 计数器。** |
+> | `snap_vmrun_stopped = 0` | **恒等式**。`g_VmrunStopped` 唯一递增点在 `Sv206VmrunShouldExit()`，而该函数**在产物里零引用**（9.419 删了 ASM 里的检查，C 侧没删）。`dumpbin` 查 `1400223340h` 命中 0 次。 |
+> | `snap_resident_threads = 0` | **恒等式**。206-B 模式不启动 resident（`main.c:5521` 注释「Residents are not started」），所以它读的 `g_resident_thread_count` 从来没被写过。 |
+>
+> **推论**：`main.c:5047` 的判据 `stopped == 0 && resident_threads_at_entry == 0`
+> **两个条件都是恒真的**，那个分支实际上无条件执行。9.405/9.406 基于它做的
+> 「nothing was running」判断不成立。
+>
+> **详见 `YUANMOD_HANDOFF_CURRENT.md` 的 9.440 节。**
+
 ### 4.1 完整的因果链（每一环都有实测数据）
+
+> **这一节的标题在 9.440 之后是不准确的**：链上有三环不是实测。保留原链是为了
+> 让后来者看到推理是怎么走的，但**不要把它当已证结论**。
 
 ```
 DriverEntry
@@ -127,24 +145,25 @@ VpData->GuestVmcb.StateSaveArea.Rip = ContextRecord->Rip;
 > `SvVirtualizeProcessor` **剩下的那三行**，不是那三行 `return` 进去的内核代码。
 > guest 是调用者续行，它下一件事就是执行真实内核指令，CPUID / CR3 写 / MSR / NPF 都会来。
 > **所以下面这条后果链的起点（「永不产生 #VMEXIT」）从未被证明，只是被假设。**
-> 链上**实测到的**部分（`g_inVmrunCount = 12`、`g_S206VrLog` 为空、
-> `snap_vmrun_stopped = 0`、`step = 120 DONE`、`PAGED_IP` 桶）都是真的；
-> 把它们串起来的那一环是推断。9.439 已把 guest 恢复成续行，这一环现在是**待查**而非**已定**。
+> 9.439 已把 guest 恢复成续行，这一环现在是**待查**而非**已定**。
+>
+> **⚠ 9.440 补充：这一环不但没被证明，而且无法用现有仪表证明。**
+> 这棵树上「有没有 VMEXIT」目前**没有任何计数器能回答** —— 见本节开头的表格。
+> 要回答它，必须先加一个无条件 exit 计数器（见 8.2）。
 
-**后果链**：
+**后果链**（`【实测】` / `【非测量】` / `【推断】` 逐行标注）：
 
 ```
 guest 执行 SvVirtualizeProcessor 的续行代码
-  → 不执行 CPUID、不执行 vmmcall、不碰 CR3
-  → 永不产生 #VMEXIT
-  → vmrun 永不返回
-  → vmsave 不执行 → lock dec 不执行 → g_inVmrunCount = 12（永远，已实测）
-  → SvHandleVmExit 一次不跑（g_S206VrLog 整场为空，已实测）
-  → stop flag 检查点（在循环回边）永不执行（snap_vmrun_stopped=0，已实测）
-  → DriverUnload 走完 14 步（step=120 DONE，已实测）但等不到计数归零
+  → 不执行 CPUID、不执行 vmmcall、不碰 CR3                  【推断】
+  → 永不产生 #VMEXIT                                        【推断 ← 无仪表可证】
+  → vmrun 永不返回                                          【实测】g_inVmrunCount = 12
+  → vmsave 不执行 → lock dec 不执行                          【实测】同上
+  → SvHandleVmExit 一次不跑                                  【非测量】g_S206VrLog 是 NPF 仪表
+  → stop flag 检查点永不执行                                  【非测量】恒等式，该检查已被删除
+  → DriverUnload 走完 14 步但等不到计数归零                    【实测】step = 120 DONE
   → 返回后操作系统 unmap 驱动镜像
-  → 卡在 vmrun 里的核执行已失效的代码页
-  → FAILURE_BUCKET = AV_CODE_AV_STACKPTR_ERROR_PAGED_IP
+  → 卡在 vmrun 里的核执行已失效的代码页                        【实测】PAGED_IP 崩溃桶
 ```
 
 ### 4.2 崩溃点的三次修正（前两次都错了）
@@ -198,6 +217,17 @@ guest 执行 SvVirtualizeProcessor 的续行代码
 | 推断 | 证伪依据 |
 |---|---|
 | 换成测试 guest + 武装 VMMCALL，vmrun 就会正常返回（9.436）| **加载就挂死**（9.437 的 `START_PENDING`）。vmmcall 是心跳不是退出请求，`break` 让循环无限重进 vmrun。|
+
+**9.440 追加第 10 条 —— 而且它让上面表格里的第 3 条失去依据：**
+
+| 推断 | 9.440 复核 |
+|---|---|
+| 「有第二套 VMRUN 循环在跑」（9.395 证伪）| **证伪所依据的三个读数全部失效**：`g_S206VrLog=0` 是 NPF 仪表不是 exit 计数、`resident=0` 在 206-B 下是恒等式、`s203=0` 同样因为 resident 没启动。**这条证伪不成立**，「第二套循环」需要重新排除。|
+
+**另注（9.440）**：表格第 3 条「ack 早已在 ASM 桩 `SvLV20` 里」是对的 ——
+`SvLV20` 确实有 `mov ecx,'SSVM'`。**但这恰恰说明 9.383 那行
+`VpRegs->Rcx = 'SSVM'` 是多余的**（`SvLV20` 自己会写 ECX），
+而它把 `mov rsp, rcx` 的输入变成了垃圾。见 8.2。
 
 ---
 
@@ -326,23 +356,52 @@ yghv_ctl.ps1 unload-trace   → page PA / last step / value
 3. **重启机器**清 `START_PENDING` —— **待做，需用户确认**
 4. **重启后 `sc start yghvpa`** 验证加载不再挂死 —— **这是回滚生效的唯一证据**
 
-### 8.2 卸载问题的下一步（9.439 后的新措辞）
-9.434 留下的问题被 9.436 用「换成测试 guest」回答了，而 9.437 证明那个答案会让加载挂死。
-9.439 已经回到 **(a) 透明虚拟化**，所以现在的问题不再是「guest 该是什么」，
-而是更具体的一条：
+### 8.2 卸载问题的下一步（9.440 重写：先补仪表，再谈根因）
 
-> **guest 是调用者续行，`SvVirtualizeProcessor` 之后执行的是真实内核代码，
-> CPUID / CR3 写 / MSR / NPF 都该来。为什么 `g_S206VrLog` 整场为空、
-> `g_inVmrunCount` 停在 12？**
+9.434 留下的问题被 9.436 用「换成测试 guest」回答了，9.437 证明那个答案会让加载挂死。
+9.439 已回到透明虚拟化。**而 9.440 复核发现：这个问题目前连「问清楚」都做不到 ——
+因为没有任何仪表能回答「有没有 VMEXIT」。**
 
-9.434 说「这行之后没有任何被拦截指令」——**那句话描述的是这个函数剩下的三行，
-不是那三行 return 进去的内核代码**。这是 9.434 推理的漏洞，也是现在唯一的开口。
+**所以下一步不是改代码，是加一个无条件计数器。**
 
-**候选根因（已发现，未修，按铁律等用户点名）**：9.383 把
+最小仪表（三行，`SvHandleVmExit` 开头即可）：
+
+```c
+extern "C" { volatile LONG64 g_S206Exits = 0; }
+/* SvHandleVmExit 的第一条语句 */
+InterlockedIncrement64(&g_S206Exits);
+```
+
+加完要能回答三个问题，**每个答案对应完全不同的修法**：
+
+| 读数 | 含义 | 下一步 |
+|---|---|---|
+| `g_S206Exits == 0` | 真的没有 VMEXIT（9.434 成立）| 查 VMCB 拦截位是否真进了硬件；查 guest 到底在执行什么 |
+| `g_S206Exits > 0` 且 `g_inVmrunCount == 12` | 有 VMEXIT 但核回不到宿主 | 查 `SvLV20` / ExitVm 出口（**`rsp = 'SSVM'` 就在这条路上**）|
+| `g_S206Exits` 增长极快 | VMEXIT 风暴 | 查 guest 是否在自陷循环 |
+
+**顺带要修的三处死代码/假判据（都不改行为，只让读数有意义）**：
+
+1. `g_VmrunStopped` / `Sv206VmrunShouldExit` —— 无调用者，删掉或接回 ASM。
+   只要它还在，`stopped == 0` 就会被误读成「一个都没停」。
+2. `main.c:5047` 的 `stopped == 0 && resident_threads_at_entry == 0` ——
+   两个条件恒真，该分支无条件执行。要么补真实判据，要么明说它是兜底。
+3. `g_S206VrLog` 的注释 —— 它不是 exit 日志，是 NPF 写裁决日志。
+
+**候选根因（9.440 记入，未修，按铁律等用户点名）**：9.383 把
 `guestContext.VpRegs->Rcx` 从 guest RSP 改成 `'SSVM'`，而 ASM `SvLV20` 第一句是
-`mov rsp, rcx` —— 栈指针被设成 `0x4D565353`。反汇编已确认该赋值进了产物
-（`14002 40AD: mov qword ptr [r14+70h],5353564Dh` / `14002 4C30: mov rsp,rcx`）。
-9.383 的注释「RSP 不丢」对被调用方成立，对 `SvLV20` 自己不成立。
+`mov rsp, rcx` —— 栈指针被设成 `0x4D565353`（非规范地址，任何栈操作立刻 #GP）。
+反汇编已确认该赋值进了产物（`14002 40AD: mov qword ptr [r14+70h],5353564Dh` /
+`14002 4C30: mov rsp,rcx`）。
+
+**它还是冗余的**：`'SSVM'` 的用途是让 `SvDevirtualizeProcessor` 的
+`registers[2] != 'SSVM'` 通过，而那个检查已由 CPUID leaf 自己的
+`registers[2] = 'SSVM'` 满足（`svm_simplevm206.cpp:1649`，9.378 修的）。
+**所以这一行既是栈损坏，又没起任何作用。**
+
+**为什么它必须优先排除**：在一个 rsp 是垃圾的上下文里，
+**所有关于「卸载顺序」「时序」「竞态」的推理都不成立**。9.413/9.414/9.416
+那三次 `0x139`/`0x7F` 也可能与它有关（栈已坏，再加任何栈操作都放大）。
 
 ### 8.3 原清单（Tier 5/6/8/9，共 30 项）
 | Tier | 项 | 状态 |
@@ -446,10 +505,23 @@ dumpbin /disasm:nobytes YuanGuardHV\bin\yuanguard_hv.sys > dis.txt
 findstr /C:"000000F8h" dis.txt
 # 找 VMMCALL case 是否真的设了 ExitVm（应见 lock inc g_S206Vmmcalls 后紧跟 mov dil,1）
 findstr /C:"14005FFE0h" dis.txt
+
+# 9.440 新增：查某个函数在产物里到底有没有调用者（判死代码）
+# 先从 map 取 RVA，再数产物里的引用次数；0 = 死代码，它的计数器是恒等式
+findstr /C:"Sv206VmrunShouldExit" YuanGuardHV\bin\yuanguard_hv.map
+dumpbin /disasm:nobytes YuanGuardHV\bin\yuanguard_hv.sys | findstr /C:"1400223340h"
+# 同理可查 g_VmrunStopped 的唯一递增点是否可达
 ```
 
 **构建判据**：不是 md5（每次重签都变）。看 `ALL SOURCE CHECKS PASS` +
 `ALL MAP CHECKS PASS` + `Build SUCCESS` 三行。
+
+**读数判据（9.440 新增）**：在把这棵树上的任何计数器写进结论之前，先问三个问题：
+1. 它**只有**那个过程会写吗？（`g_S206VrLog` 只有 NPF 分支写 ⇒ 它不测 exit）
+2. 它的写入点**在产物里可达**吗？（`g_VmrunStopped` 唯一递增点零引用 ⇒ 恒等式）
+3. 在这个 build 模式下**那个机制启动了吗**？（206-B 不启 resident ⇒ 该计数器恒为 0）
+
+三个问题里有一个答不上，那个读数就不能当证据。**本树已有 3 个读数栽在这里。**
 
 ---
 
@@ -466,3 +538,15 @@ findstr /C:"14005FFE0h" dis.txt
 结果加载挂死。同一个动作，一次纠正了错误，一次制造了错误 —— 差别不在读没读源码，
 在**有没有问「改完之后谁会不满意」**。`SvVirtualizeAllProcessors` 是同步的，
 一个永不返回的 guest 必然让 `sc start` 挂住 —— 这一条在动手前就能推出来。
+
+**9.440 追加一条最狠的，因为它打的是「实测」这两个字本身**：
+
+**这个项目最大的风险不是改错代码，是把「恒等式」当成「测量结果」。**
+今晚的因果链上有三个这样的读数：一个只测了别的东西（`g_S206VrLog` 测 NPF 不测 exit）、
+一个的写入点根本没有调用者（`g_VmrunStopped`）、一个测的机制在本 build 下没启动
+（`g_resident_thread_count`）。它们都以「已实测」的身份进了文档，
+并支撑了至少一条「已证伪」结论（4.4 第 3 条）。
+
+**判据只有一句：一个计数器能当证据，前提是它在被测事件没发生时也会动。**
+做不到这一点的计数器，为空和为 0 都不说明任何事 —— 它只会让一个未经验证的假设
+看起来像一次观测。

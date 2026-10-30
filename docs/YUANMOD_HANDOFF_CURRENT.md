@@ -13856,3 +13856,206 @@ SHA256 251c600e935da466e03f0f948eb6aa437eaf474db626908d52c6151941f333da
 
 **机器状态**：`yghvpa` 仍 `START_PENDING`，`sc stop` 返回 1052。**需要重启**才能清掉。
 重启后第一件事是 `sc start yghvpa` 验证加载不再挂死（这才能证明 9.436 的回滚生效）。
+
+---
+
+#### 9.440 ★★★★★ 复核 9.434 因果链的四个支点：两个不是测量，一个是死变量
+
+**这一节不改代码，只读代码 + 读产物。目的是把「实测」和「推断」分开 —— 因为
+`RESUME_PROMPT` 第 4.1 节那条链是后续所有修法的前提，而它引用的四个读数里，
+有两个根本不测量它所声称的东西。**
+
+**支点 1：`g_S206VrLog` 整场为空 —— 这不是「没有 VMEXIT」的证据**
+
+`RESUME_PROMPT` 4.1 与 9.434 都写：「`g_S206VrLog` 整场为空 ⇒ `SvHandleVmExit` 一次没跑
+⇒ 没有 VMEXIT」。
+
+**读写入点**（`svm_simplevm206.cpp:2651`）：
+
+```c
+vr = yghv_protect_on_npf_write_bare(curCr3, Cpl, gpa, &rearmGpa, &flip);
+/* 9.255: verdict telemetry */
+if (g_S206VrIdx + 2 <= 64) {
+    g_S206VrLog[g_S206VrIdx] = gpa;
+    g_S206VrLog[g_S206VrIdx + 1] = (UINT64)vr | (TF << 3);
+    g_S206VrIdx += 2;
+}
+```
+
+**全文件只有这一个写入点**（grep 确认：162/163 是定义，183-191 是 flush，2651-2657 是唯一写）。
+它在 **NPF 写裁决分支内部**，而那个分支只有在 `yghv_protect` 装了目标页时才有内容。
+
+所以：
+
+| 这个日志为空能推出什么 | 推不出什么 |
+|---|---|
+| 没有「受保护页的写 NPF」 | **不能**推出「没有 VMEXIT」 |
+
+一台**没有 arm 任何保护页**的机器，即使 VMEXIT 跑了一千万次，这个日志也必然为空。
+**它是一个「保护引擎有没有被打过」的仪表，不是「虚拟机有没有退出过」的计数器。**
+
+**支点 2：`snap_vmrun_stopped = 0` —— 这是一个恒等式，不是测量**
+
+`g_VmrunStopped` 的**唯一递增点**在 `Sv206VmrunShouldExit()`（`svm_simplevm206.cpp:835`）：
+
+```c
+extern "C" int Sv206VmrunShouldExit(VOID)
+{
+    if (InterlockedCompareExchange(&g_VmrunStopRequested, 0, 0) == 0) return 0;
+    InterlockedIncrement(&g_VmrunStopped);   /* <-- 全树唯一一处 */
+    return 1;
+}
+```
+
+而 `Sv206VmrunShouldExit` **在产物里零引用**：
+
+```
+map:   0001:00022340  Sv206VmrunShouldExit  0000000140023340  svm_simplevm206.obj
+产物:  dumpbin /disasm | grep -c "1400223340h"   ->   0
+```
+
+因为 **9.419 把 ASM 循环里的检查整个删掉了**（`svm_simplevm206_x64.asm:130-145`：
+「THE INLINE CHECK IS GONE - 9.417 PROVED IT DOES NOT HELP」），而 C 侧的函数和计数器
+**没有跟着删**。它现在是死代码，链接器 `/OPT:NOREF` 保留了符号，但没有任何 call/jmp 指向它。
+
+**结论：`g_VmrunStopped` 永远是 0，无论发生什么。**
+`snap_vmrun_stopped = 0`、`stopped=0`、`stopped >= active ? 1 : 0 → 0` 全部是恒等式。
+
+这直接推翻 `main.c:5047` 那个判据的有效性：
+
+```c
+if (stopped == 0 && resident_threads_at_entry == 0) {
+    /* "walk skipped: nothing was running" */
+    yghv_s206_power_callback_release();
+    yghv_ut_mark_val(22, 0);
+}
+```
+
+`stopped == 0` 这一半**永远为真**。所以「什么都没在跑」这个结论，实际只由
+`resident_threads_at_entry == 0` 一个条件支撑 —— 而 9.405 的读数说明
+resident 机制本来就没启用（`snap_resident_threads = 0` 也是恒等式，见下）。
+
+**支点 3：`snap_resident_threads = 0` 也不是测量**
+
+`svm_core_resident_threads_for_trace()` 读的是 `g_resident_thread_count`，
+而 `svm_core.c` 里 resident 机制在 206-B 模式下**根本没启动**
+（`main.c:5521` 注释：「Residents are not started」）。
+
+所以 9.405 那条「snap_resident_threads = 0 ⇒ never started（not 'cleared here'）」是对的，
+**但它对「有没有东西在跑」没有任何判别力** —— 206 的 VMRUN 循环跑在
+`SvExecuteOnEachProcessor` 的**调用线程**上，不是 resident 线程。
+
+**支点 4：`g_inVmrunCount = 12` —— 这个是真的，而且它是最硬的一条**
+
+`lock inc` 在 `vmrun` 之前、`lock dec` 在 `vmsave` 之后，都在 ASM 桩里，
+没有条件分支。12 个核都 inc 了但都没 dec ⇒ **12 个核确实都没有从 vmrun 返回过**。
+反汇编确认这两条指令都在（`14002 4B7A: lock inc` / `14002 4B87: lock dec`）。
+
+**这是四个支点里唯一一个真正的测量。**
+
+---
+
+**四个支点重新归类后，9.434 的因果链变成这样**
+
+```
+【实测】g_inVmrunCount = 12                    12 个核都没从 vmrun 返回
+【实测】step = 120 DONE                        DriverUnload 走完了
+【实测】PAGED_IP 崩溃桶                        卸载后执行了失效代码页
+【实测】g_S206Vmmcalls（9.439 新增，待跑）       vmmcall 到底有没有被拦
+---
+【非测量】g_S206VrLog = 0                     只说明"没有受保护页的写 NPF"
+【非测量】snap_vmrun_stopped = 0              恒等式（唯一递增点无调用者）
+【非测量】snap_resident_threads = 0           恒等式（206 不启动 resident）
+【推断】  "所以没有 VMEXIT"                    ← 这一环从来没有被测量支撑
+```
+
+**「没有 VMEXIT」这个中间结论，是被两个恒等式和一个错位仪表「证明」的。**
+
+而这恰好解释了 9.439 之前的困惑：如果 VMEXIT 其实在跑，那
+`g_inVmrunCount = 12` 该怎么解释？答案是 **`lock dec` 在 `vmsave` 之后，
+而崩溃在 `vmrun` 的操作数字节（+0x14）** —— 核从来没走到 `lock dec`。
+但这不是因为「没有 VMEXIT」，而是因为**核卡在 vmrun 里面出不来，原因另有其处**。
+
+---
+
+**★ 由此浮出一个比 9.434 更早、更硬、且一直被忽略的候选：9.383 的 `Rcx = 'SSVM'`**
+
+这一条在 9.439 的提交信息里记过，这里补全证据链。
+
+**事实**
+
+`SvHandleVmExit` 的 ExitVm 出口（`svm_simplevm206.cpp:3372-3373`）设：
+
+```c
+guestContext.VpRegs->Rax = (UINT64)VpData & MAXUINT32;
+guestContext.VpRegs->Rbx = VpData->GuestVmcb.ControlArea.NRip;
+guestContext.VpRegs->Rcx = 'SSVM';        /* 9.383 改的，原来是 StateSaveArea.Rsp */
+guestContext.VpRegs->Rdx = (UINT64)VpData >> 32;
+```
+
+**ASM 侧（`svm_simplevm206_x64.asm:299-324`，SvLV20）**
+
+```asm
+SvLV20:
+        mov rsp, rcx          ; <-- RCX 被当成"原 guest 栈指针"用
+        mov ecx, 'SSVM'
+        jmp rbx
+```
+
+**产物确认（`dumpbin /disasm:nobytes`）**
+
+```
+14002 40AD:  mov qword ptr [r14+70h], 5353564Dh   ; VpRegs->Rcx = 'SSVM'
+14002 4C30:  mov rsp, rcx                          ; SvLV20 第一句
+```
+
+（`r14` = GuestRegisters 基址，`+0x70` 是 Rcx 槽位；`POPAQ` 之后 `pop rcx` 把它装回 RCX。）
+
+**所以：每一次走 ExitVm 出口，`rsp` 都被设成 `0x4D565353`。**
+
+`0x4D565353` 不是规范地址（bit 47 ≠ bits 48-63），在 x64 上**任何** `push`/`pop`/`call`/`ret`
+都会立刻 `#GP`。而 `jmp rbx` 跳回 `NRip` —— 那是 guest 里 CPUID 的下一条指令 ——
+执行的第一件事几乎必然是碰栈。
+
+**9.383 的注释为什么错**
+
+> 「RSP is not lost: SvDevirtualizeProcessor only reads EAX:EDX for the VPD address.」
+
+这句话对**被调用方** `SvDevirtualizeProcessor` 成立（它确实只读 EAX/EDX/ECX）。
+但 `mov rsp, rcx` 发生在 **`SvLV20` 里、`jmp rbx` 之前**，与 `SvDevirtualizeProcessor`
+无关。**9.383 论证了一个不相关的事实。**
+
+**它可能解释的东西**
+
+| 观察 | 用 `rsp = 'SSVM'` 解释 |
+|---|---|
+| `PAGED_IP` 崩溃（9.427）| 不直接解释；但 `#GP` 在 VM-exit 之后、驱动 unmap 前后都可能 |
+| `g_inVmrunCount = 12` | 不解释（`lock dec` 在 `vmsave` 后，与 rsp 无关）|
+| 9.413/9.414/9.416 三次 0x139/0x7F | **可能相关**：栈已经坏了，再加任何栈操作都放大 |
+| `0x1E PRIVILEGED_INSTRUCTION` | **可能相关**：非规范 rsp 上的操作 |
+
+**所以它不是一个已经证明的根因，是一个从未被评估过的、由 9.383 亲手引入的栈损坏。**
+它必须在任何「卸载顺序」讨论之前被排除 —— 因为**在一个 rsp 是垃圾的上下文里，
+所有关于顺序和时序的推理都不成立。**
+
+**修法（未实施，等用户点名）**
+
+上游原样是 `VpRegs->Rcx = StateSaveArea.Rsp`。`'SSVM'` 的用途是让
+`SvDevirtualizeProcessor` 的 `registers[2] != 'SSVM'` 检查通过 —— 但那个检查
+**已经在 CPUID leaf 自己的 `registers[2] = 'SSVM'` 里满足了**（`svm_simplevm206.cpp:1649`，
+9.378 修的），根本不需要 ExitVm 出口再写一次。
+
+也就是说：**9.383 这一行既是栈损坏，又是冗余的。**
+
+---
+
+**本节结论**
+
+1. `RESUME_PROMPT` 4.1 的因果链，中间一环（「没有 VMEXIT」）**没有测量支撑**；
+2. `g_VmrunStopped` 与 `g_resident_thread_count` 在 206-B 下都是恒等式，
+   任何以它们为判据的分支（`main.c:5047`）实际只由单条件决定；
+3. `g_S206VrLog` 是保护引擎仪表，不是 exit 计数器 —— 要看 exit，
+   必须用 9.439 新增的 `g_S206Vmmcalls`（且它只覆盖 vmmcall）；
+4. **真正缺的是一个无条件的 VMEXIT 计数器。** 在这棵树上，
+   「有没有 VMEXIT」这个最基本的问题，目前**没有任何仪表能回答**。
+   这是比修任何 bug 都优先的事 —— 符合本项目第 13 节那句「先建观测，再改代码」。
