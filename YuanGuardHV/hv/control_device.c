@@ -5,6 +5,7 @@
 #include "mem_pte.h"      /* Phase 1: page-table walk (Engine B foundation) */
 #include "mem_engine.h"   /* Phase 3: dual-engine typed access */
 #include "mem_pa.h"       /* Phase 2: physical frame primitives */
+#include "mem_bench.h"    /* Phase 5 (Tier 1.5): Engine A vs B measurement */
 #include "mem_selfmap.h"  /* Phase 2b: self-built mapping window */
 #include "mem_coop.h"     /* Phase 7: guard cooperation */
 #include "mem_island.h"   /* Phase 6: island (direct-map) access */
@@ -719,6 +720,86 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
             break;
         }
         status = STATUS_INVALID_PARAMETER;
+        break;
+    }
+    case IOCTL_YGHV_MEM_BENCH: {
+        /*
+         * 9.449 (Tier 1.5): Engine A vs Engine B on the same range.
+         *
+         * PASSIVE_LEVEL only: yghv_mem_bench allocates a page buffer and calls
+         * MmCopyVirtualMemory, neither of which is legal at DISPATCH.
+         */
+        if (in_len >= sizeof(yghv_ioctl_bench_req_t) &&
+            out_len >= YGHV_BENCH_OUT_QWORDS * sizeof(UINT64)) {
+            yghv_ioctl_bench_req_t *req = (yghv_ioctl_bench_req_t *)buf;
+            UINT64 *out = (UINT64 *)buf;
+            ULONG req_pid = req->pid;
+            ULONG req_pat = req->pat_len;
+            ULONG req_budget = req->page_budget;
+            ULONG_PTR req_start = req->range_start;
+            ULONG_PTR req_end = req->range_end;
+            UCHAR pat[64], msk[64];
+            PEPROCESS proc = NULL;
+            NTSTATUS lst;
+            yghv_bench_result_t bres;
+
+            /* Copy the pattern out of the shared buffer BEFORE writing any
+             * reply: METHOD_BUFFERED gives input and output the same memory, so
+             * a reply store would overwrite the request (the note at the top of
+             * this file's MEM_READ handler exists because this was learned once
+             * already). */
+            RtlCopyMemory(pat, req->pattern, 64);
+            RtlCopyMemory(msk, req->mask, 64);
+
+            if (req_pat == 0 || req_pat > 64) {
+                status = STATUS_INVALID_PARAMETER;
+                break;
+            }
+            if (req_start >= req_end) {
+                status = STATUS_INVALID_PARAMETER;
+                break;
+            }
+
+            lst = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)req_pid, &proc);
+            if (!NT_SUCCESS(lst) || proc == NULL) {
+                status = STATUS_INVALID_CID;
+                break;
+            }
+
+            if (!yghv_mem_bench(proc, (uint64_t)req_start, (uint64_t)req_end,
+                                pat, msk, req_pat, (uint64_t)req_budget, &bres)) {
+                ObDereferenceObject(proc);
+                status = STATUS_UNSUCCESSFUL;
+                break;
+            }
+
+            ObDereferenceObject(proc);
+
+            out[0] = bres.a_cycles;
+            out[1] = bres.a_reads;
+            out[2] = bres.a_bytes;
+            out[3] = bres.a_hits;
+            out[4] = bres.b_cycles;
+            out[5] = bres.b_reads;
+            out[6] = bres.b_bytes;
+            out[7] = bres.b_hits;
+            out[8] = bres.pages_visited;
+            out[9] = bres.speedup_x100;
+            /*
+             * 9.449: the CR3 the walk actually used.
+             *
+             * The first two runs reported `pages visited = 0` alongside a 26,594x
+             * "speedup" - an artefact, because B had done no work and the timing
+             * could not tell the difference between "fast" and "idle". Exposing the
+             * CR3 lets a caller see WHY the walk found nothing: 0 means we could not
+             * read the target's DTB at all.
+             */
+            out[10] = bres.walk_cr3;
+            info = YGHV_BENCH_OUT_QWORDS * sizeof(UINT64);
+            status = STATUS_SUCCESS;
+        } else {
+            status = STATUS_BUFFER_TOO_SMALL;
+        }
         break;
     }
     case IOCTL_YGHV_MEM_SCAN: {

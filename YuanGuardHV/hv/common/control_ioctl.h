@@ -270,6 +270,46 @@ typedef struct {
 #define IOCTL_YGHV_EXITMASK \
     YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x82A, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
 #define YGHV_EXITMASK_OUT_QWORDS 5
+
+/*
+ * 9.449 (Tier 1.5): Engine A vs Engine B, head to head, on the same range.
+ *
+ * The plan claimed B is faster on large ranges and on large pages. This is the
+ * command that TIMES it instead of asserting it. See mem_bench.c for how the
+ * comparison is kept fair: same bytes, same pattern, same budget, and A runs
+ * second so B gets the colder cache.
+ *
+ * Input is the same shape as MEM_SCAN so a caller can reuse its request, plus a
+ * per-engine page budget:
+ *   {ULONG pid, ULONG pat_len, ULONG page_budget, ULONG flags,
+ *    ULONG_PTR range_start, ULONG_PTR range_end, UCHAR pattern[64], UCHAR mask[64]}
+ *
+ * Output (10 QWORDs), field for field yghv_bench_result_t:
+ *   [0] a_cycles  [1] a_reads  [2] a_bytes  [3] a_hits
+ *   [4] b_cycles  [5] b_reads  [6] b_bytes  [7] b_hits
+ *   [8] pages_visited  [9] speedup_x100  [10] walk_cr3
+ *
+ * a_hits and b_hits are SEPARATE on purpose. A functional disagreement between
+ * the engines is a finding worth more than the timing, so it must be visible
+ * rather than averaged into the performance number.
+ *
+ * speedup_x100 = a_cycles * 100 / b_cycles, integer hundredths so no float
+ * crosses the IOCTL boundary. Above 100 means B was faster WITH the warmer cache
+ * going to A.
+ */
+#define IOCTL_YGHV_MEM_BENCH \
+    YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x82B, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
+#define YGHV_BENCH_OUT_QWORDS 11
+typedef struct {
+    ULONG     pid;
+    ULONG     pat_len;
+    ULONG     page_budget;
+    ULONG     flags;
+    ULONG_PTR range_start;
+    ULONG_PTR range_end;
+    UCHAR     pattern[64];
+    UCHAR     mask[64];
+} yghv_ioctl_bench_req_t;
 typedef struct {
     ULONG_PTR gpa;
     ULONG_PTR spa;

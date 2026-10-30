@@ -1738,6 +1738,108 @@ try {
                              -InBytes ([BitConverter]::GetBytes([uint32]$sel)) | Out-Null
             Write-Host ("mem-engine: set to $v")
         }
+        'mem-bench' {
+            # 9.449 (Tier 1.5): Engine A vs Engine B, same range, same pattern.
+            #
+            # This replaces "B should be 5-20x faster" with a stopwatch. Both
+            # engines read the same bytes and match the same pattern; A pays one
+            # MmCopyVirtualMemory per ADDRESS, B pays one walk per PAGE plus one
+            # physical read.
+            #
+            # usage: mem-bench <pid> <hex_pattern> [start_hex] [end_hex] [budget]
+            #
+            # HOW TO READ IT
+            #   reads  A's unit is an address, B's is a page. On a range with holes
+            #          B's count is smaller by the number of absent pages - that IS
+            #          the page-table-driven claim, in numbers.
+            #   hits   printed SEPARATELY, never averaged. If A and B disagree, the
+            #          disagreement is the finding; folding it into a speed number
+            #          would hide the more important result.
+            #   faster B ran FIRST, so A had the warmer cache. Above 1.00x means B
+            #          won despite that.
+            if ($null -eq $Arg1 -or $null -eq $Arg2) {
+                throw 'mem-bench: usage: mem-bench <pid> <hex_pattern> [start_hex] [end_hex] [budget]'
+            }
+            $bpid = [uint32]::Parse($Arg1)
+            $toks = ("$Arg2" -split '[\s,]+') | Where-Object { $_ -ne '' }
+            $patLen = $toks.Count
+            if ($patLen -lt 1 -or $patLen -gt 64) { throw 'mem-bench: pattern must be 1..64 bytes' }
+
+            $pat = New-Object byte[] 64
+            $msk = New-Object byte[] 64
+            for ($i = 0; $i -lt $patLen; $i++) {
+                if ($toks[$i] -eq '??') { $pat[$i] = 0; $msk[$i] = 0 }
+                else {
+                    $pat[$i] = [Convert]::ToByte(($toks[$i] -replace '^0x',''), 16)
+                    $msk[$i] = 0xFF
+                }
+            }
+
+            $bstart = [uint64]0x10000
+            $bend   = [uint64]0x7FFFFFFF0000
+            if ($null -ne $Arg3) { $bstart = [Convert]::ToUInt64(($Arg3 -replace '^0x',''), 16) }
+            if ($null -ne $Arg4) { $bend   = [Convert]::ToUInt64(($Arg4 -replace '^0x',''), 16) }
+            $budget = 0
+            if ($null -ne $Arg5) { $budget = [uint32]::Parse($Arg5) }
+
+            # yghv_ioctl_bench_req_t is 160 bytes, not 152:
+            #   pid(4) pat_len(4) page_budget(4) flags(4) = 16
+            #   range_start(8) range_end(8)             = 32
+            #   pattern[64]                             = 96
+            #   mask[64]                                = 160
+            # Copying mask at offset 96 into a 152-byte buffer is what threw
+            # "destination array is not long enough" on the first attempt.
+            $req = New-Object byte[] 160
+            [BitConverter]::GetBytes($bpid).CopyTo($req, 0)
+            [BitConverter]::GetBytes([uint32]$patLen).CopyTo($req, 4)
+            [BitConverter]::GetBytes([uint32]$budget).CopyTo($req, 8)
+            [BitConverter]::GetBytes([uint32]0).CopyTo($req, 12)
+            [BitConverter]::GetBytes([uint64]$bstart).CopyTo($req, 16)
+            [BitConverter]::GetBytes([uint64]$bend).CopyTo($req, 24)
+            $pat.CopyTo($req, 32)
+            $msk.CopyTo($req, 96)
+
+            # 11 qwords = 88 bytes. Asking for less produces STATUS_BUFFER_TOO_SMALL
+            # (0x7A), not a truncated reply - the driver refuses rather than lies.
+            $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x82B)) `
+                                     -InBytes $req -OutputLength 88
+
+            $ac  = [BitConverter]::ToUInt64($out, 0)
+            $ar  = [BitConverter]::ToUInt64($out, 8)
+            $ab  = [BitConverter]::ToUInt64($out, 16)
+            $ah  = [BitConverter]::ToUInt64($out, 24)
+            $bc  = [BitConverter]::ToUInt64($out, 32)
+            $brd = [BitConverter]::ToUInt64($out, 40)
+            $bb  = [BitConverter]::ToUInt64($out, 48)
+            $bh  = [BitConverter]::ToUInt64($out, 56)
+            $pv  = [BitConverter]::ToUInt64($out, 64)
+            $sp  = [BitConverter]::ToUInt64($out, 72)
+            $wcr3 = [BitConverter]::ToUInt64($out, 80)
+
+            Write-Host ("mem-bench: pid={0} range=0x{1:X}-0x{2:X} pattern={3} byte(s)" -f $bpid, $bstart, $bend, $patLen)
+            Write-Host ("  A (api) : {0} cycles, {1} reads, {2} bytes, {3} hits" -f $ac, $ar, $ab, $ah)
+            Write-Host ("  B (pte) : {0} cycles, {1} reads, {2} bytes, {3} hits  (pages visited {4})" -f $bc, $brd, $bb, $bh, $pv)
+            Write-Host ("  faster  : {0:N2}x  (B ran first, so A had the warmer cache)" -f ($sp / 100.0))
+            Write-Host ("  walk    : cr3=0x{0:X}" -f $wcr3)
+
+            if ($pv -eq 0 -or $brid -eq 0) {
+                Write-Host '  INVALID : B visited 0 pages / read 0 bytes, so the ratio above is'
+                Write-Host '            an artefact, NOT a speedup. Check the walk CR3 (0 = the'
+                Write-Host '            target DTB could not be read) and the range.'
+            }
+
+            if ($ar -gt 0 -and $brd -gt 0) {
+                Write-Host ("  reads   : A/B = {0:N1}x more reads for A" -f ($ar / [double]$brd))
+            }
+            if ($ah -ne $bh) {
+                Write-Host ("  WARNING : hits DISAGREE (A={0} B={1}) - a functional finding," -f $ah, $bh)
+                Write-Host  '            worth more than the timing above.'
+            }
+            if ($ac -gt 0 -and $bc -gt 0 -and $sp -lt 100) {
+                Write-Host '  NOTE    : B was not faster here. That is a result, not a failure -'
+                Write-Host '            the range has too few absent pages for the walk to pay off.'
+            }
+        }
         'mem-scan' {
             # Phase 4 (2026-10-11): page-table driven signature scan.
             # usage: mem-scan <pid> <hex_pattern> [max_results] [writable] [exec]

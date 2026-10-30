@@ -82,6 +82,10 @@ public class YghvCtl {
      * exit codes; which of them are armed decides which can fire, so this is
      * the only way to turn "35 codes implemented" into a measurement. */
     private static final int FN_EXITMASK = 0x82A;
+    /* 9.449 (Tier 1.5): Engine A vs Engine B on the same range. The plan claimed
+     * B is faster on large ranges; this is the command that times it instead of
+     * asserting it. */
+    private static final int FN_MEM_BENCH = 0x82B;
 
     private static native long openHandle();
     private static native void closeHandle(long handle);

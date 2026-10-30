@@ -96,6 +96,7 @@ yghv_ctl.ps1 sys-auth [key <hexbytes>|key clear|mode off|monitor|enforce|reset|s
 yghv_ctl.ps1 sys-sentry [surface|reset|cpuid-view [0|1|2]|tsc [offset <hex>|freeze <cr3> [max_ms]|freeze thaw|probe]]
 yghv_ctl.ps1 sys-guard [arm|hidecore|add|del|verify|list|uncovered|why]
 yghv_ctl.ps1 exit-mask [quiet|full|events|host-insn|clear|explicit <m1hex> <m2hex>]
+yghv_ctl.ps1 mem-bench <pid> <hex_pattern> [start_hex] [end_hex] [budget]
 ```
 
 `protect` sets the target, enumerates committed pages of the real Java process,
