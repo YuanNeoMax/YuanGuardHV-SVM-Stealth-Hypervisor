@@ -32,6 +32,73 @@
 #define SVM_INTERCEPT_MISC2_VMRUN       (1UL << 0)
 
 /*
+ * 9.448: the REST of the Misc1 / Misc2 intercept bits, so the 206 main line can
+ * actually cover the same exit set vmexit.c covers (35 codes) instead of 12.
+ *
+ * WHY THEY ARE OPT-IN, NOT DEFAULT
+ *
+ * Arming HLT or PAUSE on a running Windows guest is not a neutral change: every
+ * idle core executes HLT, so each idle transition becomes an exit - and PAUSE
+ * fires on every spinlock contention path. This tree is already ~12x slower than
+ * the pre-9.445 build because 12 cores sit in guest VMRUN loops (measured: 2.88e8
+ * exits, 2.88e8 vmmcalls on one unload). Adding HLT/PAUSE to the armed set would
+ * multiply that again.
+ *
+ * So these bits are armed only when a caller asks (YghvSetExitMask, IOCTL 0x82A),
+ * and the default build keeps exactly the set it had before. The claim "35 exit
+ * codes implemented" then becomes MEASURED and SELECTABLE: arm the mask, run
+ * traffic, read the per-code counters, see which fired. A case whose bit is not
+ * armed can never fire, so the counters are what separate "the code exists" from
+ * "the code works".
+ *
+ * Bit numbering follows the AMD VMCB control area layout (APM vol 2, "VMCB
+ * Layout, Control Area"). Misc1 covers exit codes 0x60..0x7F, Misc2 0x80..0x8D.
+ * CR0/CR3/CR4/CR8 read+write are separate 16-bit fields (InterceptCrRead /
+ * InterceptCrWrite), not bits inside Misc1/2.
+ */
+#define SVM_INTERCEPT_MISC1_INTR        (1UL << 0)   /* 0x60 */
+#define SVM_INTERCEPT_MISC1_NMI         (1UL << 1)   /* 0x61 */
+#define SVM_INTERCEPT_MISC1_SMI         (1UL << 2)   /* 0x62 */
+#define SVM_INTERCEPT_MISC1_INIT        (1UL << 3)   /* 0x63 */
+#define SVM_INTERCEPT_MISC1_VINTR       (1UL << 4)   /* 0x64 */
+#define SVM_INTERCEPT_MISC1_CR0_SEL     (1UL << 5)   /* 0x65 */
+#define SVM_INTERCEPT_MISC1_IDTR_READ   (1UL << 6)   /* 0x66 */
+#define SVM_INTERCEPT_MISC1_GDTR_READ   (1UL << 7)   /* 0x67 */
+#define SVM_INTERCEPT_MISC1_LDTR_READ   (1UL << 8)   /* 0x68 */
+#define SVM_INTERCEPT_MISC1_TR_READ     (1UL << 9)   /* 0x69 */
+#define SVM_INTERCEPT_MISC1_IDTR_WRITE  (1UL << 10)  /* 0x6A */
+#define SVM_INTERCEPT_MISC1_GDTR_WRITE  (1UL << 11)  /* 0x6B */
+#define SVM_INTERCEPT_MISC1_LDTR_WRITE  (1UL << 12)  /* 0x6C */
+#define SVM_INTERCEPT_MISC1_TR_WRITE    (1UL << 13)  /* 0x6D */
+#define SVM_INTERCEPT_MISC1_RDPMC       (1UL << 15)  /* 0x6F */
+#define SVM_INTERCEPT_MISC1_PUSHF       (1UL << 16)  /* 0x70 */
+#define SVM_INTERCEPT_MISC1_POPF        (1UL << 17)  /* 0x71 */
+#define SVM_INTERCEPT_MISC1_RSM         (1UL << 19)  /* 0x73 */
+#define SVM_INTERCEPT_MISC1_IRET        (1UL << 20)  /* 0x74 */
+#define SVM_INTERCEPT_MISC1_SWINT       (1UL << 21)  /* 0x75 */
+#define SVM_INTERCEPT_MISC1_INVD        (1UL << 22)  /* 0x76 */
+#define SVM_INTERCEPT_MISC1_PAUSE       (1UL << 23)  /* 0x77 */
+#define SVM_INTERCEPT_MISC1_HLT         (1UL << 24)  /* 0x78 */
+#define SVM_INTERCEPT_MISC1_INVLPG      (1UL << 25)  /* 0x79 */
+#define SVM_INTERCEPT_MISC1_INVLPGA     (1UL << 26)  /* 0x7A */
+#define SVM_INTERCEPT_MISC1_IOIO        (1UL << 27)  /* 0x7B */
+#define SVM_INTERCEPT_MISC1_TASKSR      (1UL << 29)  /* 0x7D */
+#define SVM_INTERCEPT_MISC1_FERR        (1UL << 30)  /* 0x7E */
+#define SVM_INTERCEPT_MISC1_SHUTDOWN    (1UL << 31)  /* 0x7F */
+
+#define SVM_INTERCEPT_MISC2_VMLOAD      (1UL << 2)   /* 0x82 */
+#define SVM_INTERCEPT_MISC2_VMSAVE      (1UL << 3)   /* 0x83 */
+#define SVM_INTERCEPT_MISC2_STGI        (1UL << 4)   /* 0x84 */
+#define SVM_INTERCEPT_MISC2_CLGI        (1UL << 5)   /* 0x85 */
+#define SVM_INTERCEPT_MISC2_SKINIT      (1UL << 6)   /* 0x86 */
+#define SVM_INTERCEPT_MISC2_ICEBP       (1UL << 8)   /* 0x88 */
+#define SVM_INTERCEPT_MISC2_WBINVD      (1UL << 9)   /* 0x89 */
+#define SVM_INTERCEPT_MISC2_MONITOR     (1UL << 10)  /* 0x8A */
+#define SVM_INTERCEPT_MISC2_MWAIT       (1UL << 11)  /* 0x8B */
+#define SVM_INTERCEPT_MISC2_MWAIT_COND  (1UL << 12)  /* 0x8C */
+#define SVM_INTERCEPT_MISC2_XSETBV      (1UL << 13)  /* 0x8D */
+
+/*
  * 9.433: THE BIT NUMBER WAS WRONG. VMMCALL IS BIT 1, NOT BIT 2.
  *
  * Checked against the authoritative table (FreeBSD bhyve's amd/svm.h, VMCB

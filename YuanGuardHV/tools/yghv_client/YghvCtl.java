@@ -78,6 +78,10 @@ public class YghvCtl {
     /* Tier 7.4/7.5/7.6: exit timing, escape attempts, attack surface. */
     private static final int FN_SENTRY = 0x828;
     private static final int FN_AUTH   = 0x829;
+    /* 9.448: exit-coverage control and measurement. The 206 handler covers 35
+     * exit codes; which of them are armed decides which can fire, so this is
+     * the only way to turn "35 codes implemented" into a measurement. */
+    private static final int FN_EXITMASK = 0x82A;
 
     private static native long openHandle();
     private static native void closeHandle(long handle);

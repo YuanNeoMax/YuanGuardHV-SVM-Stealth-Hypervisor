@@ -241,6 +241,35 @@ typedef struct {
    Output: [0] status 1=ok, [1] previous spa, [2] new spa */
 #define IOCTL_YGHV_NPT_REMAP \
     YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x81E, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
+
+/*
+ * 9.448: exit-coverage control and measurement.
+ *
+ * The 206 handler covers 35 exit codes; which of them are ARMED decides which can
+ * ever fire. This IOCTL is the only way to change that set, and the only way to
+ * read back which fired.
+ *
+ * Zero-length input -> read 4 qwords:
+ *     [0] armed Misc1 mask
+ *     [1] armed Misc2 mask
+ *     [2] distinct exit codes observed so far (of 0x60..0x8D)
+ *     [3] total exits counted (g_S206Exits)
+ *
+ * 16-byte input {ULONG op, pad, ULONG m1, ULONG m2}:
+ *     op 0 = read back (same as zero-length)
+ *     op 1 = set the extra Misc1/Misc2 intercept bits (OR'd into every VMCB)
+ *     op 2 = clear the extra bits (back to the pre-9.448 set)
+ *     op 3 = arm "quiet"  (HLT + PAUSE only: the two that prove idle exits work)
+ *     op 4 = arm "full"   (every Misc1/Misc2 bit this tree defines)
+ *
+ * WHY NOT ARMED BY DEFAULT: HLT fires on every idle transition and PAUSE on every
+ * spinlock contention path, so arming them turns idle time into exits. This tree
+ * is already ~12x slower than the pre-9.445 build (12 cores sit in guest VMRUN
+ * loops), so the default build keeps exactly the set it had.
+ */
+#define IOCTL_YGHV_EXITMASK \
+    YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x82A, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
+#define YGHV_EXITMASK_OUT_QWORDS 5
 typedef struct {
     ULONG_PTR gpa;
     ULONG_PTR spa;

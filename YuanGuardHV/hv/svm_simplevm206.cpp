@@ -220,8 +220,24 @@ extern "C" void yghv_s206_flush_deny_log(void) {
     if (g_S206VrIdx == 0)
         yghv_trace("s206 vr-log empty");
     else {
-        yghv_trace_u64("s206 vr count", (UINT64)g_S206VrIdx);
-        for (ULONG q = 0; q * 2 < g_S206VrIdx; q++) {
+        /*
+         * 9.448c: THIS LOOP HAD NO ARRAY-BOUND GUARD AT ALL.
+         *
+         * `q * 2 < g_S206VrIdx` was the only condition, so a corrupted or
+         * over-counted index walked off the end of g_S206VrLog with no second
+         * check. Bounding it by sizeof() - rather than by a number that happens
+         * to match today - is what keeps the next resizing from reintroducing the
+         * 0x1E this step exists to fix.
+         */
+        const ULONG entries = InterlockedCompareExchange(
+            (volatile LONG *)&g_S206VrIdx, 0, 0);
+        const ULONG slots = (ULONG)(sizeof(g_S206VrLog) / sizeof(g_S206VrLog[0]));
+        ULONG q, qmax;
+
+        yghv_trace_u64("s206 vr count", (UINT64)entries);
+        qmax = (entries / 2 < slots / 2) ? entries / 2 : slots / 2;
+
+        for (q = 0; q < qmax; q++) {
             yghv_trace_u64("s206 vr gpa", g_S206VrLog[q * 2]);
             yghv_trace_u64("s206 vr verdict", g_S206VrLog[q * 2 + 1]);
         }
@@ -231,8 +247,15 @@ extern "C" void yghv_s206_flush_deny_log(void) {
     if (g_S206DbgIdx == 0)
         yghv_trace("s206 dbg-log empty");
     else {
-        yghv_trace_u64("s206 dbg count", (UINT64)g_S206DbgIdx);
-        for (ULONG q = 0; q * 4 < g_S206DbgIdx; q++) {
+        const ULONG entries = InterlockedCompareExchange(
+            (volatile LONG *)&g_S206DbgIdx, 0, 0);
+        const ULONG slots = (ULONG)(sizeof(g_S206DbgLog) / sizeof(g_S206DbgLog[0]));
+        ULONG q, qmax;
+
+        yghv_trace_u64("s206 dbg count", (UINT64)entries);
+        qmax = (entries / 4 < slots / 4) ? entries / 4 : slots / 4;
+
+        for (q = 0; q < qmax; q++) {
             yghv_trace_u64("s206 dbg rip", g_S206DbgLog[q * 4]);
             yghv_trace_u64("s206 dbg rearm", g_S206DbgLog[q * 4 + 1]);
             yghv_trace_u64("s206 dbg rflags", g_S206DbgLog[q * 4 + 2]);
@@ -244,14 +267,42 @@ extern "C" void yghv_s206_flush_deny_log(void) {
         yghv_trace("s206 deny-log empty");
         return;
     }
-    yghv_trace_u64("s206 deny count", (UINT64)g_S206DenyIdx);
-    for (ULONG q = 0; q * 6 < g_S206DenyIdx && q < 32; q++) {
-        yghv_trace_u64("s206 deny cr3", g_S206DenyLog[q * 6]);
-        yghv_trace_u64("s206 deny gpa", g_S206DenyLog[q * 6 + 1]);
-        yghv_trace_u64("s206 deny cpl", g_S206DenyLog[q * 6 + 2]);
-        yghv_trace_u64("s206 deny gva", g_S206DenyLog[q * 6 + 3]);
-        yghv_trace_u64("s206 deny rip", g_S206DenyLog[q * 6 + 4]);
-        yghv_trace_u64("s206 deny aux", g_S206DenyLog[q * 6 + 5]);
+    /*
+     * 9.448c: SNAPSHOT THE INDEX ONCE, AND BOUND IT BY THE ARRAY, NOT BY A
+     * CONSTANT THAT HAPPENS TO MATCH IT TODAY.
+     *
+     * Two separate defects lived in the loop that follows:
+     *
+     *  1. `q * 6 < g_S206DenyIdx` re-reads a volatile that other cores are
+     *     still incrementing, so the bound moves while the loop runs.
+     *  2. `q < 32` was the real guard, and 32 is only right because 32*6 = 192
+     *     equals the array size. Change the array and the guard is silently
+     *     wrong - the kind of coupling a size expression removes.
+     *
+     * The crash this step fixes was NOT in this loop (the guard held), but this
+     * loop is where the corrupt index became a faulting address, so it is the
+     * one place a reader will look first. Making it depend on sizeof() means the
+     * next person to resize the ring cannot reintroduce the fault here.
+     */
+    {
+        const ULONG entries = InterlockedCompareExchange(
+            (volatile LONG *)&g_S206DenyIdx, 0, 0);
+        const ULONG slots = (ULONG)(sizeof(g_S206DenyLog) / sizeof(g_S206DenyLog[0]));
+        ULONG q, qmax;
+
+        yghv_trace_u64("s206 deny count", (UINT64)entries);
+
+        /* A torn/over-counted index must still not walk past the array. */
+        qmax = (entries / 6 < slots / 6) ? entries / 6 : slots / 6;
+
+        for (q = 0; q < qmax; q++) {
+            yghv_trace_u64("s206 deny cr3", g_S206DenyLog[q * 6]);
+            yghv_trace_u64("s206 deny gpa", g_S206DenyLog[q * 6 + 1]);
+            yghv_trace_u64("s206 deny cpl", g_S206DenyLog[q * 6 + 2]);
+            yghv_trace_u64("s206 deny gva", g_S206DenyLog[q * 6 + 3]);
+            yghv_trace_u64("s206 deny rip", g_S206DenyLog[q * 6 + 4]);
+            yghv_trace_u64("s206 deny aux", g_S206DenyLog[q * 6 + 5]);
+        }
     }
     g_S206DenyIdx = 0;
 }
@@ -842,6 +893,397 @@ static volatile LONG   g_BpInt3Intercept = 0;
  * mean the intercept bit is still not taking effect - a different fix from
  * "the bit works and the guest left". */
 static volatile LONG64 g_S206Vmmcalls = 0;
+
+/*
+ * 9.448: A PER-EXIT-CODE COUNTER TABLE, so "35 exit codes implemented" stops
+ * being a claim about source text and becomes a reading.
+ *
+ * THE WINDOW IS 0x40..0x8D, NOT 0x60..0x8D, AND THAT IS A CORRECTION.
+ *
+ * The first version counted only 0x60..0x8D, which is the range the Misc1/Misc2
+ * intercept bits address. Measured on the first run: `total exits = 803,776,070`
+ * but `distinct observed = 0`. The counter was not broken - the window was. The
+ * exits actually happening on a live Windows guest are CPUID (0x72, in range) and
+ * #DB/#BP (0x41/0x43, EXCEPTION_BASE 0x40 + vector), plus NPF (0x400, its own
+ * ring). The exception codes start at 0x40 and fell outside the window entirely,
+ * so the one measurement that mattered read zero while 800 million exits
+ * demonstrably happened.
+ *
+ * That is the same mistake 9.440 recorded in another form: a counter that cannot
+ * observe the event it claims to count reads as "nothing happened".
+ */
+#define S206_EXITCODE_LO 0x40
+#define S206_EXITCODE_HI 0x8d
+static volatile LONG64 g_S206ExitByCode[S206_EXITCODE_HI - S206_EXITCODE_LO + 1] = { 0 };
+
+static __forceinline void S206ExitCount(UINT64 code)
+{
+    if (code >= S206_EXITCODE_LO && code <= S206_EXITCODE_HI)
+    {
+        InterlockedIncrement64(&g_S206ExitByCode[code - S206_EXITCODE_LO]);
+    }
+}
+
+extern "C" LONG64 yghv_s206_exit_count_of(UINT64 code)
+{
+    if (code < S206_EXITCODE_LO || code > S206_EXITCODE_HI)
+        return -1;
+    return InterlockedCompareExchange64(
+        &g_S206ExitByCode[code - S206_EXITCODE_LO], 0, 0);
+}
+
+/*
+ * 9.448: THE CALLER-SELECTED EXTRA INTERCEPT BITS.
+ *
+ * These are OR'd into every VMCB at prepare time. Empty by default, which is what
+ * keeps the build's behaviour identical to the pre-9.448 set - an armed HLT turns
+ * every idle transition into an exit, and on a 12-core guest that is a real cost,
+ * not a theoretical one.
+ *
+ * The "quiet" preset arms exactly HLT and PAUSE: the two instructions whose exits
+ * prove that idle-time interception works at all. The "full" preset arms everything
+ * this tree defines in Misc1/Misc2, which is what makes the 35-code claim
+ * measurable in one run instead of by argument.
+ */
+static volatile LONG g_S206ExtraMisc1 = 0;
+static volatile LONG g_S206ExtraMisc2 = 0;
+
+/*
+ * The set of bits this IOCTL is allowed to own. It is NOT "all bits": the
+ * default-armed bits (CPUID bit18, MSR_PROT bit28, SHUTDOWN bit31, VMRUN Misc2
+ * bit0, VMMCALL Misc2 bit1) must stay armed no matter what a caller asks for,
+ * because the guest stub needs VMMCALL to ever return and SHUTDOWN is how a
+ * triple fault becomes observable.
+ *
+ * Declared before use by yghv_s206_apply_extra_intercepts below.
+ */
+#define S206_MISC1_EXTRA_MASK \
+    (SVM_INTERCEPT_MISC1_INTR | SVM_INTERCEPT_MISC1_NMI | SVM_INTERCEPT_MISC1_SMI | \
+     SVM_INTERCEPT_MISC1_INIT | SVM_INTERCEPT_MISC1_VINTR | SVM_INTERCEPT_MISC1_CR0_SEL | \
+     SVM_INTERCEPT_MISC1_IDTR_READ | SVM_INTERCEPT_MISC1_GDTR_READ | \
+     SVM_INTERCEPT_MISC1_LDTR_READ | SVM_INTERCEPT_MISC1_TR_READ | \
+     SVM_INTERCEPT_MISC1_IDTR_WRITE | SVM_INTERCEPT_MISC1_GDTR_WRITE | \
+     SVM_INTERCEPT_MISC1_LDTR_WRITE | SVM_INTERCEPT_MISC1_TR_WRITE | \
+     SVM_INTERCEPT_MISC1_RDPMC | SVM_INTERCEPT_MISC1_PUSHF | SVM_INTERCEPT_MISC1_POPF | \
+     SVM_INTERCEPT_MISC1_RSM | SVM_INTERCEPT_MISC1_IRET | SVM_INTERCEPT_MISC1_SWINT | \
+     SVM_INTERCEPT_MISC1_INVD | SVM_INTERCEPT_MISC1_PAUSE | SVM_INTERCEPT_MISC1_HLT | \
+     SVM_INTERCEPT_MISC1_INVLPG | SVM_INTERCEPT_MISC1_INVLPGA | SVM_INTERCEPT_MISC1_IOIO | \
+     SVM_INTERCEPT_MISC1_TASKSR | SVM_INTERCEPT_MISC1_FERR)
+#define S206_MISC2_EXTRA_MASK \
+    (SVM_INTERCEPT_MISC2_VMLOAD | SVM_INTERCEPT_MISC2_VMSAVE | SVM_INTERCEPT_MISC2_STGI | \
+     SVM_INTERCEPT_MISC2_CLGI | SVM_INTERCEPT_MISC2_SKINIT | SVM_INTERCEPT_MISC2_ICEBP | \
+     SVM_INTERCEPT_MISC2_WBINVD | SVM_INTERCEPT_MISC2_MONITOR | SVM_INTERCEPT_MISC2_MWAIT | \
+     SVM_INTERCEPT_MISC2_MWAIT_COND | SVM_INTERCEPT_MISC2_XSETBV)
+
+/*
+ * 9.448b: THE REGISTER OF LIVE VPDs, SO A MASK CHANGE CAN REACH THE RUNNING VMCBs.
+ *
+ * 9.448 shipped "takes effect on the next load" and MEASURED it: set quiet,
+ * reload, read back -> 0x00000000. The mask was a static, the static is reset by
+ * the unload, and prepare runs before any of it can be re-armed. So "next load"
+ * was not slow, it was unreachable, and the command's own output was the only
+ * thing that said otherwise.
+ *
+ * The fix is not to persist the static - it is to STOP WAITING. Each core's VPD
+ * is already registered here by its own thread (it is the only place that knows
+ * the mapping, since the thread owns the frame), so a mask change can walk the
+ * list and rewrite the live VMCB control area directly.
+ *
+ * IMPLEMENTATION NOTE: this crosses cores, and VMCB control area is ordinary
+ * memory that only the owning core writes during an exit. The intercept word is
+ * 4-byte aligned, so a 4-byte store is atomic; the guest cannot be inside an
+ * exit that already read the old value at the moment we store the new one, and an
+ * exit either sees the old mask or the new one - never a torn mix. That is the
+ * whole safety argument, and it is why only the two intercept words are touched
+ * here and nothing else in the VMCB.
+ */
+#define SVM206_MAX_VPD 64
+static PVIRTUAL_PROCESSOR_DATA g_S206LiveVpd[SVM206_MAX_VPD] = { 0 };
+
+extern "C" VOID yghv_s206_register_vpd(PVOID vpData)
+{
+    for (UINT32 i = 0; i < SVM206_MAX_VPD; i++)
+    {
+        if (InterlockedCompareExchangePointer(
+                (PVOID volatile *)&g_S206LiveVpd[i], vpData, NULL) == NULL)
+        {
+            return;
+        }
+        if (g_S206LiveVpd[i] == (PVIRTUAL_PROCESSOR_DATA)vpData)
+            return;
+    }
+}
+
+extern "C" VOID yghv_s206_unregister_vpd(PVOID vpData)
+{
+    for (UINT32 i = 0; i < SVM206_MAX_VPD; i++)
+    {
+        if (g_S206LiveVpd[i] == (PVIRTUAL_PROCESSOR_DATA)vpData)
+            InterlockedExchangePointer((PVOID volatile *)&g_S206LiveVpd[i], NULL);
+    }
+}
+
+/*
+ * Apply the CURRENT extra-mask to every live VMCB right now.
+ *
+ * Returns how many VMCBs were touched. Zero is a meaningful answer: it means no
+ * core is virtualized yet, so the mask is only in the statics and will be folded
+ * in by the next prepare - which is the pre-9.448b behaviour, now distinguishable
+ * from success.
+ */
+extern "C" LONG yghv_s206_apply_extra_intercepts(VOID)
+{
+    LONG applied = 0;
+    UINT32 m1 = (UINT32)InterlockedCompareExchange(&g_S206ExtraMisc1, 0, 0);
+    UINT32 m2 = (UINT32)InterlockedCompareExchange(&g_S206ExtraMisc2, 0, 0);
+
+    for (UINT32 i = 0; i < SVM206_MAX_VPD; i++)
+    {
+        PVIRTUAL_PROCESSOR_DATA vp = g_S206LiveVpd[i];
+
+        if (vp == NULL)
+            continue;
+
+        /*
+         * SET, NOT OR. The caller's mask is the whole truth for the extra bits:
+         * clear must be able to take a bit back out, and OR-ing only ever adds.
+         * The default bits (CPUID, MSR_PROT, SHUTDOWN, VMRUN, VMMCALL) are
+         * separate and are not in these two words, so replacing them cannot
+         * disarm anything the build needs.
+         */
+        vp->GuestVmcb.ControlArea.InterceptMisc1 =
+            (UINT32)((vp->GuestVmcb.ControlArea.InterceptMisc1 & ~S206_MISC1_EXTRA_MASK) | m1);
+        vp->GuestVmcb.ControlArea.InterceptMisc2 =
+            (UINT32)((vp->GuestVmcb.ControlArea.InterceptMisc2 & ~S206_MISC2_EXTRA_MASK) | m2);
+
+        /*
+         * 9.448e: AND INVALIDATE THE CACHED VMCB - the step that explains TWO
+         * reboots.
+         *
+         * VmcbClean is how the processor knows whether the control area it holds
+         * internally is still valid. Write an intercept word without clearing it
+         * and the CPU keeps USING THE OLD MASK: the new bits never take effect
+         * until something else happens to dirty the VMCB. The tree already knows
+         * this - every other site that rewrites an intercept sets VmcbClean = 0
+         * for exactly this reason (9.285, 9.297, 9.369h).
+         *
+         * Measured shape of getting it wrong: `quiet` (HLT+PAUSE) worked, because
+         * those bits are rarely exercised so a stale mask changes nothing visible.
+         * `full` rebooted twice within seconds, because it arms bits that fire
+         * constantly - and with a half-applied mask the handler ran against a
+         * VMCB whose armed set and whose clean flag disagreed.
+         *
+         * A single byte store, so no cross-core atomicity issue of its own; the
+         * pair (intercept words, then this) is ordered by the fact that only the
+         * owning core reads them, and it reads them at its next VMRUN.
+         */
+        vp->GuestVmcb.ControlArea.VmcbClean = 0;
+
+        applied += 1;
+    }
+    return applied;
+}
+
+extern "C" VOID yghv_s206_set_extra_intercepts(UINT32 m1, UINT32 m2)
+{
+    InterlockedExchange(&g_S206ExtraMisc1, (LONG)m1);
+    InterlockedExchange(&g_S206ExtraMisc2, (LONG)m2);
+
+    /*
+     * 9.448b: APPLY NOW, not "on the next load".
+     *
+     * Measured: the first version stored only, and the reload that was supposed
+     * to pick it up read back 0x00000000 because the unload reset the static.
+     * A setting that cannot take effect is worse than no setting, because the
+     * command still prints a success-looking mask.
+     *
+     * Applying returns the count of live VMCBs touched; the IOCTL reports it so
+     * "it did not reach anything" is visible instead of implied.
+     */
+    (void)yghv_s206_apply_extra_intercepts();
+}
+
+/*
+ * Read back the mask AS IT IS ARMED IN THE LIVE VMCBs, falling back to the
+ * statics when no core is virtualized. A caller comparing this against what it
+ * set is then comparing against reality, not against its own request echoed
+ * back - which is the failure mode this whole step exists to remove.
+ */
+extern "C" VOID yghv_s206_get_extra_intercepts(UINT32 *m1, UINT32 *m2)
+{
+    UINT32 rm1 = 0, rm2 = 0;
+
+    for (UINT32 i = 0; i < SVM206_MAX_VPD; i++)
+    {
+        PVIRTUAL_PROCESSOR_DATA vp = g_S206LiveVpd[i];
+
+        if (vp == NULL)
+            continue;
+        rm1 = (UINT32)(vp->GuestVmcb.ControlArea.InterceptMisc1 & S206_MISC1_EXTRA_MASK);
+        rm2 = (UINT32)(vp->GuestVmcb.ControlArea.InterceptMisc2 & S206_MISC2_EXTRA_MASK);
+        break;
+    }
+
+    if (rm1 == 0 && rm2 == 0)
+    {
+        rm1 = (UINT32)InterlockedCompareExchange(&g_S206ExtraMisc1, 0, 0);
+        rm2 = (UINT32)InterlockedCompareExchange(&g_S206ExtraMisc2, 0, 0);
+    }
+
+    if (m1) *m1 = rm1;
+    if (m2) *m2 = rm2;
+}
+
+/* The two presets, named so the IOCTL does not hand-assemble bits. */
+#define S206_MISC1_QUIET (SVM_INTERCEPT_MISC1_HLT | SVM_INTERCEPT_MISC1_PAUSE)
+#define S206_MISC2_QUIET (0u)
+/*
+ * 9.448d: `full` DELIBERATELY EXCLUDES THE EVENT-DELIVERY BITS.
+ *
+ * The first version armed all of them and the machine rebooted: the `quiet`
+ * preset succeeded at 04:12:32, `full` followed and the system restarted at
+ * 04:14:44 with no dump ("此次重启没有生成转储").
+ *
+ * The cause is not a ring race (that was 9.448c and it is fixed). It is the
+ * SIX bits that do not describe an instruction boundary at all:
+ *
+ *     INTR  0x60   a physical interrupt arrived
+ *     NMI   0x61   a non-maskable interrupt arrived
+ *     SMI   0x62   the CPU entered system management mode
+ *     INIT  0x63   an INIT was signalled
+ *     VINTR 0x64   the virtual interrupt fired
+ *     RSM   0x73   the CPU resumed from SMM
+ *
+ * Arming any of these means every hardware event becomes an exit and must be
+ * RE-DELIVERED correctly, by vector, by type, with the right error code, at the
+ * right RIP, without double-delivery. My handler writes ExitIntInfo into EventInj
+ * when the slot is free - which is a plausible-looking pass-through that I
+ * cannot prove correct. On a machine where these arrive thousands of times a
+ * second, "plausible" is not good enough, and 9.447's own rule is that an
+ * unverified mechanism must not ship as if it were verified.
+ *
+ * So `full` covers the instruction-boundary bits (which have a defined handler)
+ * and the event bits move to a SEPARATE preset that has to be asked for by name.
+ * A caller that wants them is asking for an experiment, and the command should
+ * say so rather than fold them into "full".
+ */
+/*
+ * 9.448f: `full` IS NOW THE SET THAT HAS EARNED ITS PLACE.
+ *
+ * Three reboots, three different defects, each hidden behind the previous one:
+ *
+ *   04:14  the ring race                -> fixed (9.448c)
+ *   04:25  VmcbClean not cleared        -> fixed (9.448e)
+ *   04:32  side-effecting instructions  -> this step
+ *
+ * The third is the one that matters most, because it was not a bug in my code -
+ * it was a bug in my idea of what an intercept means. INVLPG/INVLPGA/INVD/WBINVD
+ * are not observations, they are REQUESTS: the guest asks the CPU to invalidate
+ * something so its future accesses are correct. Counting the exit and moving on
+ * grants the count and denies the request.
+ *
+ * `full` now contains only bits for which either a correct handler exists or the
+ * instruction is harmless to skip:
+ *
+ *   HLT / PAUSE          true no-ops for a stub guest; proven by `quiet`
+ *   INVD / WBINVD        flushed on the guest's behalf (TlbControl, see the case)
+ *   INVLPG / INVLPGA     same
+ *   RDPMC                a read the guest performs; nothing to undo
+ *   MONITOR / MWAIT      hints, not commands; the stub never waits on them
+ *   XSETBV / ICEBP       state the host does not depend on
+ *
+ * WHAT IS STILL NOT IN `full`, AND WHY (all reachable by name):
+ *   INTR/NMI/SMI/INIT/VINTR/RSM   event re-delivery, unproven  -> `events`
+ *   VMLOAD/VMSAVE/STGI/CLGI/SKINIT the HOST executes these     -> `host-insn`
+ *   IDTR/GDTR/LDTR/TR read+write   VMSAVE moves these registers
+ *   TASKSR / FERR_FREEZE           same, via the task register
+ *   PUSHF/POPF/IRET/SWINT          intervening in control transfer is a real
+ *                                  behaviour change, not an observation
+ *
+ * That last group is the honest boundary of this step: they are HANDLED (the cases
+ * exist and are counted) but not ARMED, and "handled but not armed" is the exact
+ * distinction 9.447 taught this tree to stop blurring.
+ */
+#define S206_MISC1_FULL \
+    (SVM_INTERCEPT_MISC1_PAUSE | SVM_INTERCEPT_MISC1_HLT | \
+     SVM_INTERCEPT_MISC1_INVD | \
+     SVM_INTERCEPT_MISC1_INVLPG | SVM_INTERCEPT_MISC1_INVLPGA | \
+     SVM_INTERCEPT_MISC1_RDPMC)
+
+/* The experimental set: hardware events, re-delivered through EventInj.
+ * Ask for this by name. Never reached by `full`. */
+#define S206_MISC1_EVENTS \
+    (SVM_INTERCEPT_MISC1_INTR | SVM_INTERCEPT_MISC1_NMI | SVM_INTERCEPT_MISC1_SMI | \
+     SVM_INTERCEPT_MISC1_INIT | SVM_INTERCEPT_MISC1_VINTR | SVM_INTERCEPT_MISC1_RSM)
+/*
+ * 9.448d: MISC2'S `full` DROPS VMLOAD / VMSAVE / STGI / CLGI / SKINIT.
+ *
+ * These are not guest instructions here - THEY ARE OURS. SvPrepareForVirtualization
+ * calls __svm_vmsave twice per core, and the exit path uses STGI/CLGI. Arming their
+ * intercept bits makes the hypervisor trap ITSELF: the host-side VMSAVE inside
+ * prepare raises a VMEXIT while the VMCB is being built, the handler runs against
+ * a half-initialised VMCB, and the machine dies before any of it can be logged.
+ *
+ * That is the second cause of the 04:14 reboot (the first was the event bits, see
+ * S206_MISC1_EVENTS). Both were invisible in source review because the case exists
+ * and looks handled; what was wrong is that the instruction belongs to the host,
+ * not the guest.
+ *
+ * The rule this step establishes: an intercept bit may only be armed for an
+ * instruction the GUEST executes. VMLOAD/VMSAVE/STGI/CLGI/SKINIT are host
+ * operations in this tree, so they stay off, and their cases remain in the handler
+ * for the day a real guest runs them - the case is not proof, the counter is.
+ */
+#define S206_MISC2_FULL \
+    (SVM_INTERCEPT_MISC2_ICEBP | \
+     SVM_INTERCEPT_MISC2_WBINVD | SVM_INTERCEPT_MISC2_MONITOR | SVM_INTERCEPT_MISC2_MWAIT | \
+     SVM_INTERCEPT_MISC2_MWAIT_COND | SVM_INTERCEPT_MISC2_XSETBV)
+
+/* Host-owned instructions. Ask by name; never part of `full`. */
+#define S206_MISC2_HOST_INSN \
+    (SVM_INTERCEPT_MISC2_VMLOAD | SVM_INTERCEPT_MISC2_VMSAVE | SVM_INTERCEPT_MISC2_STGI | \
+     SVM_INTERCEPT_MISC2_CLGI | SVM_INTERCEPT_MISC2_SKINIT)
+
+extern "C" UINT32 yghv_s206_preset_quiet_m1(VOID) { return S206_MISC1_QUIET; }
+extern "C" UINT32 yghv_s206_preset_quiet_m2(VOID) { return S206_MISC2_QUIET; }
+extern "C" UINT32 yghv_s206_preset_full_m1(VOID) { return S206_MISC1_FULL; }
+extern "C" UINT32 yghv_s206_preset_full_m2(VOID) { return S206_MISC2_FULL; }
+
+/*
+ * 9.448d: the two sets `full` deliberately excludes now have their own preset.
+ *
+ * `events` re-delivers hardware interrupts through EventInj - plausible, unproven,
+ * and known to reboot the machine on the first attempt, so it must be asked for by
+ * name rather than folded into a preset that sounds safe.
+ * `host-insn` arms instructions THIS TREE ITSELF executes (VMSAVE inside prepare,
+ * STGI/CLGI on the exit path); arming them traps the hypervisor and is a
+ * self-inflicted crash, not a feature. Present so the exclusion is testable rather
+ * than merely asserted.
+ */
+extern "C" UINT32 yghv_s206_preset_events_m1(VOID) { return S206_MISC1_EVENTS; }
+extern "C" UINT32 yghv_s206_preset_events_m2(VOID) { return 0u; }
+extern "C" UINT32 yghv_s206_preset_host_m1(VOID) { return 0u; }
+extern "C" UINT32 yghv_s206_preset_host_m2(VOID) { return S206_MISC2_HOST_INSN; }
+
+/*
+ * 9.448: HOW MANY DISTINCT EXIT CODES HAVE ACTUALLY FIRED.
+ *
+ * This is the number that replaces the documentation claim. 35 codes are
+ * HANDLED; how many have been OBSERVED is a different number, and it is the one
+ * a reader should trust. Reported alongside the armed mask so "we cover 35"
+ * always arrives with "and here is how many we saw".
+ */
+extern "C" LONG yghv_s206_exit_codes_observed(VOID)
+{
+    LONG n = 0;
+
+    for (UINT32 i = 0; i <= (S206_EXITCODE_HI - S206_EXITCODE_LO); i++)
+    {
+        if (InterlockedCompareExchange64(&g_S206ExitByCode[i], 0, 0) != 0)
+            n += 1;
+    }
+    return n;
+}
 
 /*
  * 9.441: AN UNCONDITIONAL VMEXIT COUNTER - THE ONE INSTRUMENT THIS TREE LACKED.
@@ -2292,6 +2734,20 @@ SvHandleVmExit (
      */
     InterlockedIncrement64(&g_S206Exits);
 
+    /*
+     * 9.448: AND THE PER-CODE COUNT, HERE, FOR THE SAME REASON.
+     *
+     * Counting inside each case would have been 35 separate call sites, each
+     * able to be forgotten, and a case that falls through would be counted
+     * twice. Counting once at the entry - before any switch - makes the table a
+     * census of exits, not a tally of which branches happened to be instrumented.
+     *
+     * Measured reason this matters: the first version instrumented only the 25
+     * NEW cases, so the codes the default build actually produces (CPUID, #DB)
+     * would have read zero while the total counter read 800 million.
+     */
+    S206ExitCount(VpData->GuestVmcb.ControlArea.ExitCode);
+
     guestContext.VpRegs = GuestRegisters;
     guestContext.ExitVm = FALSE;
 
@@ -2567,12 +3023,22 @@ tsc_policy_done:;
              * mystery needs this: DENY telemetry was empty, so either the NPF
              * never reached the handler (NPT TLB staleness?) or it exited
              * through the NONE path (find_page miss). Both now leave evidence. */
-            if (writeFault && g_S206NpfIdx < 32) {
-                g_S206NpfLog[g_S206NpfIdx * 3] = curCr3;
-                g_S206NpfLog[g_S206NpfIdx * 3 + 1] = gpa;
-                g_S206NpfLog[g_S206NpfIdx * 3 + 2] =
-                    VpData->GuestVmcb.StateSaveArea.Cpl;
-                g_S206NpfIdx++;
+            /*
+             * 9.448c: ATOMIC RESERVATION, same shape as the deny / vr rings.
+             * `g_S206NpfIdx < 32` then write then `++` lets two cores share a
+             * slot and advance the index twice; the write is idempotent but the
+             * index is not.
+             */
+            if (writeFault) {
+                ULONG slot = (ULONG)InterlockedIncrement(
+                    (volatile LONG *)&g_S206NpfIdx) - 1;
+
+                if (slot < 32) {
+                    g_S206NpfLog[slot * 3] = curCr3;
+                    g_S206NpfLog[slot * 3 + 1] = gpa;
+                    g_S206NpfLog[slot * 3 + 2] =
+                        VpData->GuestVmcb.StateSaveArea.Cpl;
+                }
             }
 
             //
@@ -2834,13 +3300,26 @@ tsc_policy_done:;
 
                 /* 9.255: verdict telemetry — (gpa, vr | TF<<3). Island-safe
                  * memory only; flushed at unload. */
-                if (g_S206VrIdx + 2 <= 64) {
-                    g_S206VrLog[g_S206VrIdx] = gpa;
-                    g_S206VrLog[g_S206VrIdx + 1] =
-                        (UINT64)vr |
-                        ((VpData->GuestVmcb.StateSaveArea.Rflags &
-                          0x100ULL) << 3);
-                    g_S206VrIdx += 2;
+                /*
+                 * 9.448c: ATOMIC RESERVATION, same defect as the deny ring.
+                 *
+                 * Check-then-write-then-increment is not atomic: two cores can
+                 * reserve the same slot pair, and both then increment, so the
+                 * index advances by 4 for 2 slots written - and g_S206VrIdx is
+                 * exactly the value the crash dump showed being used as an array
+                 * index (yghv_pa+0x2501b, reading g_S206DenyLog).
+                 */
+                {
+                    ULONG slot = (ULONG)InterlockedAdd(
+                        (volatile LONG *)&g_S206VrIdx, 2) - 2;
+
+                    if (slot + 2 <= 64) {
+                        g_S206VrLog[slot] = gpa;
+                        g_S206VrLog[slot + 1] =
+                            (UINT64)vr |
+                            ((VpData->GuestVmcb.StateSaveArea.Rflags &
+                              0x100ULL) << 3);
+                    }
                 }
 
                 if (vr == 1 /* YGHV_NPF_ALLOW */ ||
@@ -2967,17 +3446,49 @@ tsc_policy_done:;
                      * 0xDEAD0000|reason on fallback (11-14 = walk failed at
                      * PML4E/PDPTE/PDE/PTE); rip = faulting instruction;
                      * aux = raw failing PT entry (or large-page tag). */
-                    if (g_S206DenyIdx + 6 <= 192) {
-                        g_S206DenyLog[g_S206DenyIdx] = curCr3;
-                        g_S206DenyLog[g_S206DenyIdx + 1] = gpa;
-                        g_S206DenyLog[g_S206DenyIdx + 2] =
-                            VpData->GuestVmcb.StateSaveArea.Cpl;
-                        g_S206DenyLog[g_S206DenyIdx + 3] =
-                            haveGva ? gva : (0xDEAD0000ULL | dReason);
-                        g_S206DenyLog[g_S206DenyIdx + 4] =
-                            VpData->GuestVmcb.StateSaveArea.Rip;
-                        g_S206DenyLog[g_S206DenyIdx + 5] = dAux;
-                        g_S206DenyIdx += 6;
+                    /*
+                     * 9.448c: RESERVE THE SLOT ATOMICALLY, THEN FILL IT.
+                     *
+                     * The old code checked `g_S206DenyIdx + 6 <= 192`, wrote six
+                     * slots, and only THEN did `g_S206DenyIdx += 6`. Two cores
+                     * taking an NPF at the same time both passed the check with
+                     * the same index, both wrote the same six slots (last writer
+                     * wins), and both incremented - so the index advanced by 12
+                     * for six slots of data, and the ring silently overflowed its
+                     * own arithmetic.
+                     *
+                     * Measured consequence (the crash this fix is for): 0x1E
+                     * C0000005 at yghv_pa+0x2501b, reading g_S206DenyLog with an
+                     * index taken from g_S206VrIdx. Diagnostic habits blamed the
+                     * reader; the writer was the one that could corrupt the index
+                     * for a store that never happened.
+                     *
+                     * Now the RESERVATION is the atomic step: one core gets a
+                     * private, already-bounded range or none at all. Fill happens
+                     * inside that range, so no two cores can share slots.
+                     */
+                    {
+                        ULONG slot = (ULONG)InterlockedAdd(
+                            (volatile LONG *)&g_S206DenyIdx, 6) - 6;
+
+                        if (slot + 6 <= 192) {
+                            g_S206DenyLog[slot] = curCr3;
+                            g_S206DenyLog[slot + 1] = gpa;
+                            g_S206DenyLog[slot + 2] =
+                                VpData->GuestVmcb.StateSaveArea.Cpl;
+                            g_S206DenyLog[slot + 3] =
+                                haveGva ? gva : (0xDEAD0000ULL | dReason);
+                            g_S206DenyLog[slot + 4] =
+                                VpData->GuestVmcb.StateSaveArea.Rip;
+                            g_S206DenyLog[slot + 5] = dAux;
+                        }
+                        /*
+                         * Over the bound, the reservation is still consumed: the
+                         * index must not be rolled back, or two cores that both
+                         * overflowed would fight over the same tail slot forever.
+                         * An over-counted index is a readable, bounded fact; a
+                         * torn one is a crash.
+                         */
                     }
                     break;
                 }
@@ -3221,16 +3732,21 @@ tsc_policy_done:;
              * anything consumes the slot; proves whether the ALLOW aftermath
              * reached here and with which RIP/TF state. 9.258: DR6 added
              * (BS vs B0-B3 bits identify the #DB source). */
-            if (g_S206DbgIdx + 4 <= 128) {
-                g_S206DbgLog[g_S206DbgIdx] =
-                    VpData->GuestVmcb.StateSaveArea.Rip;
-                g_S206DbgLog[g_S206DbgIdx + 1] =
-                    VpData->GuestVmcb.ControlArea.GuestPaOfGhcb;
-                g_S206DbgLog[g_S206DbgIdx + 2] =
-                    VpData->GuestVmcb.StateSaveArea.Rflags;
-                g_S206DbgLog[g_S206DbgIdx + 3] =
-                    VpData->GuestVmcb.StateSaveArea.Dr6;
-                g_S206DbgIdx += 4;
+            /* 9.448c: atomic reservation — see the deny ring note. */
+            {
+                ULONG slot = (ULONG)InterlockedAdd(
+                    (volatile LONG *)&g_S206DbgIdx, 4) - 4;
+
+                if (slot + 4 <= 128) {
+                    g_S206DbgLog[slot] =
+                        VpData->GuestVmcb.StateSaveArea.Rip;
+                    g_S206DbgLog[slot + 1] =
+                        VpData->GuestVmcb.ControlArea.GuestPaOfGhcb;
+                    g_S206DbgLog[slot + 2] =
+                        VpData->GuestVmcb.StateSaveArea.Rflags;
+                    g_S206DbgLog[slot + 3] =
+                        VpData->GuestVmcb.StateSaveArea.Dr6;
+                }
             }
             VpData->GuestVmcb.ControlArea.TlbControl = 1;
             if (VpData->GuestVmcb.ControlArea.GuestPaOfGhcb != 0) {
@@ -3512,6 +4028,135 @@ tsc_policy_done:;
         (void)yghv_fail_degrade(0 /* informational */, VMEXIT_SHUTDOWN,
                                 VpData->GuestVmcb.StateSaveArea.Rip,
                                 VpData->HostStackLayout.Padding1);
+        break;
+
+    /*
+     * 9.448: THE OTHER 23 EXIT CODES vmexit.c HANDLES, SO THE 206 MAIN LINE
+     * COVERS THE SAME SET.
+     *
+     * Before this block the 206 handler had 12 cases and vmexit.c had 35; the
+     * planning docs said "35 exit codes implemented" and that was true only of
+     * the old resident path. This block closes the gap.
+     *
+     * TWO KINDS OF CASE, AND ONLY TWO
+     *
+     * 1. INSTRUCTION-BOUNDARY EXITS. These are "the guest executed an instruction
+     *    we chose to watch, nothing about it needs interpreting": HLT, PAUSE,
+     *    INVD, INVLPG, INVLPGA, WBINVD, MONITOR, MWAIT, MWAIT_COND, XSETBV,
+     *    IRET, SWINT, RSM, PUSHF, POPF, TASKSR, FERR_FREEZE, RDPMC, VMLOAD,
+     *    VMSAVE, STGI, CLGI, SKINIT, ICEBP. The handling is identical: count it,
+     *    advance RIP past the instruction (otherwise the guest re-executes it
+     *    forever - the exact 9.416 failure shape), continue the loop.
+     *
+     * 2. STATE-CHANGING EXITS. INTR and NMI are not instruction boundaries: the
+     *    processor has already stored the interrupt in ExitIntInfo and expects a
+     *    re-injection or an STGI. Concluding "boundary, advance RIP" for them
+     *    would silently DROP the interrupt - Windows would stop seeing timer and
+     *    device interrupts. They are counted and re-injected as-is.
+     *
+     * WHAT IS NOT HERE, AND WHY IT IS HONEST TO SAY SO
+     *
+     * IOIO (0x7B) needs an IOPM (I/O permission bitmap) that this tree never
+     * builds, so arming it would fault every port access with no emulation
+     * behind it. CR0/CR3/CR4/CR8 READ and WRITE are already handled
+     * (VMEXIT_CR3_WRITE / VMEXIT_CR4_WRITE above). EXCEPTION_DF/GP/NP/SS/UD
+     * require exception interception, which 9.244 deliberately keeps OFF in the
+     * 206 baseline (guests' benign #GP probes would become 0xE2 within minutes).
+     * Those are documented as not-armed rather than stubbed into "worked".
+     */
+    /*
+     * 9.448f: THE FOUR INSTRUCTIONS THAT ARE NOT "NOTHING HAPPENED".
+     *
+     * Third reboot, and the first two diagnoses were both incomplete. VmcbClean
+     * (9.448e) was a real bug and is fixed. But the preset still rebooted, because
+     * these four are SIDE-EFFECTING:
+     *
+     *     INVLPG   0x79   invalidate one TLB entry
+     *     INVLPGA  0x7a   invalidate one TLB entry by ASID
+     *     INVD     0x76   invalidate the whole cache (no writeback)
+     *     WBINVD   0x89   write back and invalidate the whole cache
+     *
+     * The generic "boundary" handler advanced RIP and continued - which DROPS the
+     * invalidation. The guest then believes its TLB is fresh and keeps using a
+     * stale translation; a stale translation in a hypervisor that also rewrites
+     * NPT entries is not a corner case, it is memory corruption with a delay fuse.
+     * That is how a machine dies with 0x1E and no dump: the fault is somewhere
+     * else entirely, seconds later.
+     *
+     * The correct handling is not "skip" - it is to actually perform the flush on
+     * the guest's behalf. TlbControl is the architectural way to do that from the
+     * VMCB: writing 1 makes the next VMRUN flush this core's guest TLB, which is
+     * exactly what INVLPG/INVLPGA asked for. INVD/WBINVD have no VMCB equivalent;
+     * what they mean for us is "the guest will stop trusting its caches", and the
+     * honest response is to flush our TLB too and let the hardware caches be -
+     * this tree never relies on cache coherence for correctness, only on TLB
+     * state, so flushing the TLB is the part that matters.
+     */
+    case VMEXIT_INVLPG /* 0x79 */:
+    case VMEXIT_INVLPGA /* 0x7a */:
+    case VMEXIT_INVD /* 0x76 */:
+    case VMEXIT_WBINVD /* 0x89 */:
+        VpData->GuestVmcb.ControlArea.TlbControl = 1;
+        VpData->GuestVmcb.ControlArea.VmcbClean = 0;
+        VpData->GuestVmcb.StateSaveArea.Rip = VpData->GuestVmcb.ControlArea.NRip;
+        break;
+
+    case VMEXIT_HLT /* 0x78 */:
+    case VMEXIT_PAUSE /* 0x77 */:
+    case VMEXIT_MONITOR /* 0x8a */:
+    case VMEXIT_MWAIT /* 0x8b */:
+    case VMEXIT_MWAIT_CONDITIONAL /* 0x8c */:
+    case VMEXIT_XSETBV /* 0x8d */:
+    case VMEXIT_IRET /* 0x74 */:
+    case VMEXIT_SWINT /* 0x75 */:
+    case VMEXIT_RSM /* 0x73 */:
+    case VMEXIT_PUSHF /* 0x70 */:
+    case VMEXIT_POPF /* 0x71 */:
+    case VMEXIT_TASK_SWITCH /* 0x7d */:
+    case VMEXIT_FERR_FREEZE /* 0x7e */:
+    case VMEXIT_RDPMC /* 0x6f */:
+    case VMEXIT_VMLOAD /* 0x82 */:
+    case VMEXIT_VMSAVE /* 0x83 */:
+    case VMEXIT_STGI /* 0x84 */:
+    case VMEXIT_CLGI /* 0x85 */:
+    case VMEXIT_SKINIT /* 0x86 */:
+    case VMEXIT_ICEBP /* 0x88 */:
+        /*
+         * Advance RIP past the instruction. Without it the guest re-executes the
+         * same instruction immediately and the loop becomes an exit storm -
+         * measured once already as the 9.437 START_PENDING hang.
+         *
+         * The exit is already counted at the entry to this handler (9.448), so
+         * there is no counter here: one call site, not thirty-five.
+         */
+        VpData->GuestVmcb.StateSaveArea.Rip = VpData->GuestVmcb.ControlArea.NRip;
+        break;
+
+    case VMEXIT_INTR /* 0x60 */:
+    case VMEXIT_NMI /* 0x61 */:
+        /*
+         * NOT an instruction boundary. The event is pending in ExitIntInfo and
+         * the guest must receive it; advancing RIP here would drop it.
+         *
+         * 9.448 re-injects it verbatim: same vector, same type, same error code.
+         * That is the pass-through a hypervisor owes a guest it is not trying to
+         * modify. Dropping these would freeze Windows - timer and device
+         * interrupts would simply stop arriving.
+         */
+        {
+            UINT64 info = VpData->GuestVmcb.ControlArea.ExitIntInfo;
+
+            /*
+             * Re-inject only if the hardware says an event is valid, and only
+             * when the VMCB's injection slot is free. Writing EventInj while a
+             * previous event is still marked valid would corrupt it.
+             */
+            if ((info & (1ULL << 31)) != 0 &&
+                VpData->GuestVmcb.ControlArea.EventInj == 0)
+            {
+                VpData->GuestVmcb.ControlArea.EventInj = info;
+            }
+        }
         break;
     default:
         // 9.250c: an unhandled exit code must be OBSERVABLE (bugcheck with the
@@ -3897,6 +4542,19 @@ SvPrepareForVirtualization (
     _In_ const CONTEXT* ContextRecord
     )
 {
+    /*
+     * 9.448b: REGISTER THIS CORE'S VPD so a mask change can reach its live VMCB.
+     *
+     * Done here rather than in Sv206CoreThread because this is the one point that
+     * already holds VpData for this core, and it runs before any guest code does.
+     * Registration is idempotent (yghv_s206_register_vpd replaces an equal entry),
+     * so a repeated prepare cannot fill the table with duplicates.
+     */
+    {
+        extern void yghv_s206_register_vpd(PVOID vpData);
+        yghv_s206_register_vpd(VpData);
+    }
+
     DESCRIPTOR_TABLE_REGISTER gdtr, idtr;
     PHYSICAL_ADDRESS guestVmcbPa, hostVmcbPa, hostStateAreaPa, pml4BasePa, msrpmPa;
 
@@ -4073,6 +4731,28 @@ SvPrepareForVirtualization (
     //
     VpData->GuestVmcb.ControlArea.InterceptMisc1 |= SVM_INTERCEPT_MISC1_MSR_PROT;
     VpData->GuestVmcb.ControlArea.MsrpmBasePa = msrpmPa.QuadPart;
+
+    /*
+     * 9.448: fold in the caller-selected extra intercept bits.
+     *
+     * The 25 cases added in this step cover exit codes whose bits are NOT in the
+     * default set (HLT, PAUSE, MONITOR/MWAIT, WBINVD, VMLOAD/VMSAVE, STGI/CLGI,
+     * INTR/NMI...). A case with no armed bit can never fire, so this is where
+     * "we implement 35 exit codes" becomes testable: arm a bit, run traffic, and
+     * read yghv_s206_exit_count_of() to see whether it fired.
+     *
+     * 9.448b: CLEAR-THEN-SET, not OR. The VMCB control area outlives a driver
+     * reload (9.369h), so a bit armed by an earlier load survives into this one.
+     * OR-ing a new mask can therefore only ever add - `exit-mask clear` would
+     * silently do nothing. The extra-bit range is owned exclusively by this
+     * setting, so replacing it outright cannot disarm a default bit.
+     */
+    VpData->GuestVmcb.ControlArea.InterceptMisc1 =
+        (UINT32)((VpData->GuestVmcb.ControlArea.InterceptMisc1 & ~S206_MISC1_EXTRA_MASK) |
+                 (UINT32)g_S206ExtraMisc1);
+    VpData->GuestVmcb.ControlArea.InterceptMisc2 =
+        (UINT32)((VpData->GuestVmcb.ControlArea.InterceptMisc2 & ~S206_MISC2_EXTRA_MASK) |
+                 (UINT32)g_S206ExtraMisc2);
 
     /*
      * 9.366 (Tier 7.6): fill the attack-surface inventory HERE, where the mask

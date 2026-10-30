@@ -419,8 +419,51 @@ yghv_ctl.ps1 unload-trace   → page PA / last step / value
 | 6.1 | 启动期控制 | **需要重启，最后做且要确认** |
 | 其余 5.x / 6.x / 8.x | | 未做 |
 
-**注意**：`MEM_ENGINE_PLAN_TIER5/6/8_9.md` 开头都写「现成 VMEXIT 已实现 35 种」——
-**那是错的**。实际只有 5 组拦截武装、9 个 case。文档已在 9.367 标注修正。
+### 8.6 VMEXIT 覆盖：206 主线已补到 35 个（9.448）
+
+**`MEM_ENGINE_PLAN_TIER5/6/8_9.md` 开头写「现成 VMEXIT 已实现 35 种」——
+那句话原本只对 `vmexit.c`（旧 resident 路径）成立。** 206 主线只有 12 个 case。
+9.448 补齐了，现在两边都是 35 个。
+
+**怎么用（`exit-mask`，IOCTL 0x82A）**
+
+```powershell
+yghv_ctl.ps1 exit-mask              # 读回当前掩码 + 已观察到几个码 + 总退出数
+yghv_ctl.ps1 exit-mask quiet        # HLT + PAUSE（已验证安全）
+yghv_ctl.ps1 exit-mask full         # 可证明安全的那一组
+yghv_ctl.ps1 exit-mask events       # INTR/NMI 等事件重投递 —— 实验性
+yghv_ctl.ps1 exit-mask host-insn    # VMSAVE/STGI 等 —— host 自己执行，会自指崩
+yghv_ctl.ps1 exit-mask clear        # 回到默认（不武装额外位）
+```
+
+**立即生效，不需要重载**（输出会报 `applied: N live VMCB(s)`）。
+
+**两次实测**
+
+| 预设 | Misc1 | Misc2 | 观察到的码数 | 卸载 |
+|---|---|---|---|---|
+| `quiet` | `0x01800000` | `0` | 3 | `invmrun=0x0` |
+| `full` | `0x07C08000` | `0x00003F00` | 6 | `invmrun=0x0`，1,922,428,533 exits |
+
+**`full` 里面有什么、没有什么（这是可证明的边界，不要扩大）**
+
+`full` 只含：HLT / PAUSE / INVD / WBINVD / INVLPG / INVLPGA / RDPMC。
+
+`full` **不含**、但可以按名字单独启用：
+
+| 组 | 预设 | 为什么不进 full |
+|---|---|---|
+| INTR/NMI/SMI/INIT/VINTR/RSM | `events` | 事件重投递**未证明**；秒级千次，"看起来对"不够 |
+| VMLOAD/VMSAVE/STGI/CLGI/SKINIT | `host-insn` | **host 自己执行**（prepare 里两次 `__svm_vmsave`）→ 拦住自己 |
+| IDTR/GDTR/LDTR/TR 读写、TASKSR、FERR | `host-insn` | VMSAVE 会搬这些寄存器，同一条自指路 |
+| PUSHF/POPF/IRET/SWINT | — | 介入控制转移是**真行为改变**，不是观测 |
+
+**这条规则要记住**：一个拦截位只能为「**guest 会执行**」的指令武装。
+host 自己执行的指令武装起来就是自指，第一次开 `full` 会几秒内重启。
+
+**9.448 花了三次重启才走到这里**，三个根因都不同（ring 非原子递增 /
+改位后未置 `VmcbClean=0` / 把 INVLPG 这类**有副作用**的指令当成无事发生）。
+详见 `YUANMOD_HANDOFF_CURRENT.md` 9.448。
 
 ---
 

@@ -14633,3 +14633,124 @@ T6 sha tamper           True      T13 unload              True
 | `mmf-hold` 寿命 | 900s | **3600s** | 全流程 ~20 分钟，900s 不够 |
 
 **下次改 G25 之前先看这张表** —— 这四个数字都是被实测打脸后调过的。
+
+---
+
+#### 9.448 ★★★★★ 35 个 VMEXIT：三次重启，三个不同根因，最后全绿
+
+**任务**：`MEM_ENGINE_PLAN_TIER5/6/8_9.md` 都写「现成 VMEXIT 已实现 35 种」。
+核实后发现那句话只对 `vmexit.c`（旧 resident 路径）成立：
+
+| 文件 | 处理 case 数 |
+|---|---|
+| `svm_defs.h` | 定义 88 个 exit code |
+| `vmexit.c` | **35 个** ← 文档说的「35 种」指它 |
+| `svm_simplevm206.cpp` | **12 个** ← 206 主线 |
+
+本节把 206 主线补到 35 个。
+
+### 9.448.1 加了什么
+
+**25 个新 case**，分两类：
+
+1. **指令边界**（推进 RIP 即可）：HLT / PAUSE / INVD / INVLPG / INVLPGA /
+   WBINVD / MONITOR / MWAIT / MWAIT_CONDITIONAL / XSETBV / IRET / SWINT / RSM /
+   PUSHF / POPF / TASK_SWITCH / FERR_FREEZE / RDPMC / VMLOAD / VMSAVE / STGI /
+   CLGI / SKINIT / ICEBP
+2. **事件投递**（INTR / NMI）：重注入 `ExitIntInfo`，**不推进 RIP**
+
+**逐码计数器** `g_S206ExitByCode[]` + `IOCTL_YGHV_EXITMASK (0x82A)`：
+`exit-mask [quiet|full|events|host-insn|clear|explicit <m1> <m2>]`
+
+### 9.448.2 三次重启，三个不同根因
+
+| 次 | 时间 | 表面现象 | **真正根因** |
+|---|---|---|---|
+| 1 | 04:14 | quiet 成功，full 后重启 | `g_S206DenyIdx` 等四个 ring **非原子递增**（check→write→increment 让两核共享槽位） |
+| 2 | 04:25 | 收窄 full 后仍重启 | 改拦截位后**未置 `VmcbClean=0`**，CPU 继续用旧掩码 |
+| 3 | 04:32 | 只剩 1 次 IOCTL 就崩 | **INVLPG/INVLPGA/INVD/WBINVD 被当成"无事发生"放过了** |
+
+**第三个最有价值**——它不是代码 bug，是**对"拦截"的理解错误**：
+
+> 这四条不是观测点，是**请求**。guest 执行它们是要 CPU 让某个翻译失效，
+> 好让自己后续的访问是对的。数了退出、放过去，等于答应了计数、拒绝了请求。
+> 在一个还会改写 NPT 条目的 hypervisor 里，陈旧翻译不是边角情况，
+> 是**带延时引信的写坏内存** —— 机器会 0x1E 死在完全别的地方，几秒之后。
+
+修法：`TlbControl = 1` + `VmcbClean = 0`，在 guest 的立场上真的把 TLB 刷了。
+
+### 9.448.3 ring 竞态（第一次崩的根因）
+
+四个 ring（Deny / Npf / Vr / Dbg）原本都是：
+
+```c
+if (idx + N <= SIZE) { log[idx] = ...; idx += N; }   // 非原子
+```
+
+12 个核并发时两核同时通过检查、写同槽、各自递增 —— **索引为 6 个槽前进 12**，
+ring 静默溢出自己的算术。改成 `InterlockedAdd` 抢占一个已定界的私有区间。
+
+**flush 侧同时修了两处**：
+- `q * 6 < g_S206DenyIdx` 每轮重读 volatile（其它核还在递增，边界会动）→ 先快照
+- `q < 32` 只有因为 `32*6 == 192` 才正确 → 改用 `sizeof()`，改数组时不会失配
+
+**`g_S206VrIdx` 的 flush 原本完全没有数组上界**（崩溃转储里正是它被当作索引）。
+
+### 9.448.4 live 应用（0x82A 的核心修正）
+
+第一版把掩码存静态变量，说"下次加载生效"。**实测打脸**：设 quiet → 重载 → 读回 `0x00000000`
+（静态被卸载清掉了）。「下次加载」不是慢，是**走不到**。
+
+改为：每核 VPD 在自己 prepare 时登记进 `g_S206LiveVpd[]`，`set` 时直接重写
+12 个活跃 VMCB 的控制区，输出第 5 个 qword 报告**实际改了几个 VMCB**：
+
+```
+applied: 12 live VMCB(s) NOW - no reload needed
+```
+
+`-1` = 只读回；`0` = 没有核在虚拟化，只在静态里等下次 prepare。
+
+### 9.448.5 `full` 最终收窄（可证明边界）
+
+三次崩溃逼出来的结论：**一个拦截位只能为「guest 会执行」的指令武装**。
+
+`full` 现在只含：
+
+| 位 | 为什么可以 |
+|---|---|
+| HLT / PAUSE | stub guest 的真无操作（`quiet` 已验证） |
+| INVD / WBINVD / INVLPG / INVLPGA | 已在 guest 立场上真正刷 TLB |
+| RDPMC | guest 自己的一次读，无需撤销 |
+
+**明确排除，且都可用名字单独启用**：
+
+| 组 | 预设 | 为什么不进 full |
+|---|---|---|
+| INTR/NMI/SMI/INIT/VINTR/RSM | `events` | 事件重投递，**未证明**；秒级千次，"看起来对"不够 |
+| VMLOAD/VMSAVE/STGI/CLGI/SKINIT | `host-insn` | **host 自己执行**（prepare 里两次 `__svm_vmsave`）→ 自指 |
+| IDTR/GDTR/LDTR/TR 读写、TASKSR、FERR | `host-insn` | VMSAVE 会搬这些寄存器，同一条自指路 |
+| PUSHF/POPF/IRET/SWINT | — | 介入控制转移是**真行为改变**，不是观测 |
+
+**「已处理但未武装」正是 9.447 教你区分的那件事。**
+
+### 9.448.6 实测结果（第一次 full 存活）
+
+```
+quiet : Misc1=0x01800000  observed=3
+full  : Misc1=0x07C08000  Misc2=0x00003F00  observed=6
+applied: 12 live VMCB(s) NOW
+exits at unload = 0x7298f475 = 1,922,428,533
+invmrun at unload = 0x0
+stop 6.57s，无蓝屏，uptime 连续
+```
+
+### 9.448.7 顺带发现的计数器窗口错误
+
+第一版 `g_S206ExitByCode[]` 只统计 `0x60..0x8D`（Misc1/Misc2 的位范围）。
+实测 `total exits = 803,776,070` 但 **`distinct observed = 0`** —— 计数器没坏，**窗口错了**：
+Windows 上真正发生的是 CPUID (0x72) 和 #DB/#BP（从 `0x40` 起）。
+
+改窗口为 `0x40..0x8D` 并**在 `SvHandleVmExit` 入口统一计数**（而不是每个 case 各调一次——
+35 个调用点，漏一个就少一份数据，fall through 还会重复计数）。
+
+这是 9.440 那条「计数器观察不到它声称要数的事，就读成"什么都没发生"」的又一次重演。

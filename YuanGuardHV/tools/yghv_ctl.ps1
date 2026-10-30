@@ -2366,6 +2366,88 @@ try {
             $ours = [BitConverter]::ToUInt64($o2, 0)
             Write-Host ("npt-range: 0x{0:X} -> {1}" -f $pa, $(if($ours){'IS one of our NPT pages'}else{'not an NPT page'}))
         }
+        'exit-mask' {
+            # 9.448: exit-coverage control and measurement.
+            #
+            # The 206 handler covers 35 exit codes. Which of them are ARMED
+            # decides which can ever fire, and a case whose bit is not armed can
+            # never fire - so "the case exists" and "the case works" differ by
+            # exactly the counters this command reads.
+            #
+            # usage: exit-mask                     (read back)
+            #        exit-mask quiet                 (arm HLT + PAUSE)
+            #        exit-mask full                  (arm every defined bit)
+            #        exit-mask set <m1hex> <m2hex>   (arm an explicit mask)
+            #        exit-mask clear                 (back to the default set)
+            #
+            # THE MASK IS NOT LIVE: the bits are OR'd into each VMCB at prepare
+            # time, so a new mask takes effect on the next load. Said out loud
+            # rather than silently half-applied.
+            $op = 0; $m1 = [uint64]0; $m2 = [uint64]0; $ap = [int64]-1
+            # -not [string]::IsNullOrWhiteSpace, not just $null -eq: an explicit
+            # empty argument (``exit-mask ''``) must read back, not fall through
+            # to the "unknown option" throw.
+            if (-not [string]::IsNullOrWhiteSpace("$Arg1")) {
+                # Deliberately NOT a switch: the parity checker derives the
+                # command list from lines shaped like `'name' {`, so a switch
+                # whose cases look like commands would report those words as
+                # commands of this client. if/elseif cannot be misread that way.
+                $v = "$Arg1".ToLower()
+                if ($v -eq 'quiet') { $op = 3 }
+                elseif ($v -eq 'full') { $op = 4 }
+                elseif ($v -eq 'events') { $op = 5 }
+                elseif ($v -eq 'host-insn') { $op = 6 }
+                elseif ($v -eq 'clear') { $op = 2 }
+                elseif ($v -eq 'explicit') {
+                    $op = 1
+                    if ($null -eq $Arg2 -or $null -eq $Arg3) {
+                        throw 'exit-mask: explicit needs <m1hex> <m2hex>'
+                    }
+                    $m1 = [Convert]::ToUInt64(($Arg2 -replace '^0[xX]',''), 16)
+                    $m2 = [Convert]::ToUInt64(($Arg3 -replace '^0[xX]',''), 16)
+                }
+                else {
+                    throw 'exit-mask: use quiet|full|clear|explicit <m1> <m2>'
+                }
+            }
+
+            if ($op -ne 0) {
+                $req = New-Object byte[] 16
+                [BitConverter]::GetBytes([uint32]$op).CopyTo($req, 0)
+                [BitConverter]::GetBytes([uint32]$m1).CopyTo($req, 8)
+                [BitConverter]::GetBytes([uint32]$m2).CopyTo($req, 12)
+                # The driver's reply is 5 qwords (the 5th reports how many live
+                # VMCBs the change reached), and STATUS_BUFFER_TOO_SMALL (0x7A)
+                # is what a too-small OutputLength produces - not a silent
+                # truncation. 40 bytes on BOTH calls, not 32 on this one.
+                $rr = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x82A)) `
+                                       -InBytes $req -OutputLength 40
+                $ap = [BitConverter]::ToInt64($rr, 32)
+            }
+
+            $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x82A)) -OutputLength 40
+            $rm1 = [BitConverter]::ToUInt64($out, 0)
+            $rm2 = [BitConverter]::ToUInt64($out, 8)
+            $obs = [BitConverter]::ToUInt64($out, 16)
+            $tot = [BitConverter]::ToUInt64($out, 24)
+            if ($op -eq 0) { $ap = [BitConverter]::ToInt64($out, 32) }
+            Write-Host ("exit-mask: extra Misc1=0x{0:X8}  Misc2=0x{1:X8}" -f $rm1, $rm2)
+            if ($op -ne 0) {
+                if ($ap -lt 0) {
+                    Write-Host '  applied: (read-back only, nothing changed)'
+                } elseif ($ap -eq 0) {
+                    Write-Host '  applied: 0 live VMCBs - no core is virtualized, so this'
+                    Write-Host '           mask is only staged for the next prepare.'
+                } else {
+                    Write-Host ("  applied: {0} live VMCB(s) NOW - no reload needed" -f $ap)
+                }
+            }
+            Write-Host ("  distinct exit codes observed={0}  total exits={1}" -f $obs, $tot)
+            if ($rm1 -eq 0 -and $rm2 -eq 0) {
+                Write-Host '  no extra bits armed - 25 of the 35 handled codes cannot'
+                Write-Host '  fire this run. Use: exit-mask quiet (HLT+PAUSE) or full'
+            }
+        }
         'sys-auth' {
             # 9.371 (Tier 9.2): authenticated control commands.
             #

@@ -1177,6 +1177,101 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
         status = STATUS_INVALID_PARAMETER;
         break;
     }
+    case IOCTL_YGHV_EXITMASK: {
+        /*
+         * 9.448: exit-coverage control and measurement.
+         *
+         * The 206 handler now covers 35 exit codes. Which of them are ARMED
+         * decides which can ever fire, and until this IOCTL there was no way to
+         * change that set or to read back what fired. See the definition in
+         * control_ioctl.h for the wire layout.
+         */
+        extern void  yghv_s206_set_extra_intercepts(UINT32 m1, UINT32 m2);
+        extern void  yghv_s206_get_extra_intercepts(UINT32 *m1, UINT32 *m2);
+        extern LONG  yghv_s206_apply_extra_intercepts(void);
+        extern LONG  yghv_s206_exit_codes_observed(void);
+        extern LONG64 yghv_s206_exits_count(void);
+        extern UINT32 yghv_s206_preset_quiet_m1(void);
+        extern UINT32 yghv_s206_preset_quiet_m2(void);
+        extern UINT32 yghv_s206_preset_full_m1(void);
+        extern UINT32 yghv_s206_preset_full_m2(void);
+        extern UINT32 yghv_s206_preset_events_m1(void);
+        extern UINT32 yghv_s206_preset_events_m2(void);
+        extern UINT32 yghv_s206_preset_host_m1(void);
+        extern UINT32 yghv_s206_preset_host_m2(void);
+
+        ULONG op = 0;
+        ULONG m1 = 0, m2 = 0;
+        LONG applied = -1;   /* -1 = no set/clear happened this call */
+
+        if (in_len >= 16) {
+            UINT64 *in = (UINT64 *)buf;
+            op = (ULONG)in[0];
+            m1 = (ULONG)in[1];
+            m2 = (ULONG)in[2];
+        }
+
+        switch (op) {
+        case 1:   /* set explicit mask */
+            yghv_s206_set_extra_intercepts(m1, m2);
+            break;
+        case 2:   /* clear back to the default set */
+            yghv_s206_set_extra_intercepts(0, 0);
+            break;
+        case 3:   /* quiet preset: HLT + PAUSE */
+            yghv_s206_set_extra_intercepts(yghv_s206_preset_quiet_m1(),
+                                           yghv_s206_preset_quiet_m2());
+            break;
+        case 4:   /* full preset: every bit a GUEST can execute */
+            yghv_s206_set_extra_intercepts(yghv_s206_preset_full_m1(),
+                                           yghv_s206_preset_full_m2());
+            break;
+        case 5:   /* events preset: hardware event re-delivery. EXPERIMENTAL. */
+            yghv_s206_set_extra_intercepts(yghv_s206_preset_events_m1(),
+                                           yghv_s206_preset_events_m2());
+            break;
+        case 6:   /* host-insn preset: traps our own VMSAVE/STGI. Self-inflicted. */
+            yghv_s206_set_extra_intercepts(yghv_s206_preset_host_m1(),
+                                           yghv_s206_preset_host_m2());
+            break;
+        case 0:
+        default:
+            break;   /* read back only */
+        }
+
+        if (op >= 1 && op <= 6) {
+            applied = yghv_s206_apply_extra_intercepts();
+        }
+
+        if (out_len >= YGHV_EXITMASK_OUT_QWORDS * sizeof(UINT64)) {
+            UINT64 *out = (UINT64 *)buf;
+            UINT32 rm1 = 0, rm2 = 0;
+            yghv_s206_get_extra_intercepts(&rm1, &rm2);
+            out[0] = (UINT64)rm1;
+            out[1] = (UINT64)rm2;
+            out[2] = (UINT64)(INT64)yghv_s206_exit_codes_observed();
+            out[3] = (UINT64)yghv_s206_exits_count();
+            /*
+             * 9.448b: HOW MANY LIVE VMCBs THE CHANGE REACHED.
+             *
+             * -1 means this call was a read-back and changed nothing. 0 means a
+             * change was requested but no core is virtualized, so it is only in
+             * the statics for the next prepare. A positive number is the count of
+             * VMCB control areas rewritten. Reporting it is the difference between
+             * "the mask took effect" and "the mask was accepted" - the first
+             * version of this command reported the latter and called it the former.
+             */
+            out[4] = (UINT64)(INT64)applied;
+            info = 5 * sizeof(UINT64);
+            status = STATUS_SUCCESS;
+        } else {
+            /* The set/clear half-succeeded; the read-back did not fit. Reporting
+             * STATUS_BUFFER_TOO_SMALL keeps a caller from believing it read a
+             * mask it never received. */
+            status = STATUS_BUFFER_TOO_SMALL;
+        }
+        break;
+    }
     case IOCTL_YGHV_GUARD: {
         /* Tier 7.1/7.3: which pages are hidden from the guest, and whether
          * any of them changed since they were armed. */
