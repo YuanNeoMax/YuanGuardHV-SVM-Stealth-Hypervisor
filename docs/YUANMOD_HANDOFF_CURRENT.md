@@ -12819,3 +12819,103 @@ yghv_s206_vmrun_stop_request();
 
 **选项 1 是正确的方向**，而且它的验证很干净：如果 `g_VmrunStopped` 变成 12，
 就说明检查生效了；而它不调 C 函数，所以不会有序言问题。
+
+---
+
+#### 9.417 内联检查也没能避免双故障 —— 问题不在 call，在 VM-exit 帧本身
+
+**结果**
+
+```
+0x7F  P1=8  双故障
+SYMBOL_NAME: nt!KiDoubleFaultAbort+2d2
+PROCESS_NAME: wallpaperui.exe
+P4 = 0xfffff802`4c6e9180        <- 内核地址（崩溃地址本身）
+栈上一个物理量级值: 0x00000003`c4b5b000   <- 16GB 量级，与我们 NPT/VMCB 同类
+dump 里没有 yghv 模块 -> 驱动已完全卸载
+```
+
+**内联版和 call 版的崩溃特征完全相同**
+
+| 版本 | 调用方式 | 结果 |
+|---|---|---|
+| 9.413 | `call` + `r11` 保存 rax（且 rsp 位置错）| `0x139 MISSING_GSFRAME` |
+| 9.414 | `call`（rsp 位置正确）| `0x7F/8` 双故障 |
+| **9.416** | **零 call，4 条内联指令** | **`0x7F/8` 双故障，完全相同** |
+
+**所以"C 函数序言"不是根因。** 9.415 的结论（"序言期望 SEH 链"）只解释了我压歪栈
+那部分，而零 `call` 的版本照样双故障，说明**在 `SvLV10` 这个位置执行任何额外指令
+都可能危险** —— 或者，双故障的真正触发点根本不在我加的这 4 条指令上。
+
+**必须承认：我不知道 `0x7F/8` 的确切来源**
+
+`nt!KiDoubleFaultAbort+0x2d2` 说明 CPU 在处理一个异常时又遇到第二个异常。
+而栈上 `0x3c4b5b000`（16 GB 量级）说明**第二次异常来自访问那个地址** ——
+它是我们的 VMCB 或 NPT 页，已被释放。
+
+**所以形状还是那个**：驱动卸载完毕 → 某个执行体仍在跑 → 访问已释放的页。
+
+**我的 4 条内联指令没有改变这一点，因为它们不是"仍在跑"的那个执行体**
+
+`SvLV10` 的检查只在**该核下一轮进入循环时**才执行。而崩溃发生时，
+那个核可能：
+- 已经在 `Sv206LaunchVm` 之外（在别的代码里）
+- 或者根本没到达 `SvLV10`
+- 或者到达了但检查通过了（`g_VmrunStopRequested` 还是 0，因为请求还没发出）
+
+**关键：`step` 停在 10（NOTIFY_OFF）说明 `g_VmrunStopRequested` 可能从未被置位**
+
+`yghv_s206_vmrun_stop_request()` 在 `NOTIFY_OFF` **之后**才被调用。
+如果 `DriverUnload` 在 `NOTIFY_OFF` 之后就崩了，那么：
+**请求从未发出 → 内联检查永远读到 0 → 永远继续 → 循环照跑**
+
+**这才是完整解释**
+
+```
+DriverUnload:
+  START(1)                    写
+  PsSetCreateProcessNotifyRoutine(..., TRUE)
+  NOTIFY_OFF(10)              写
+  <----- 崩在这里 ----->
+  yghv_s206_vmrun_stop_request()   ← 从未执行
+```
+
+而 `PsSetCreateProcessNotifyRoutine(..., TRUE)` **注销一个回调**，这个调用本身会等待
+正在执行的回调完成。如果那个回调正在做与被卸载驱动相关的事，就可能站在
+**半卸载状态**里 → 双故障。
+
+**这与 9.258 的记录吻合**：那条注释说"unregister the target-exit watchdog BEFORE
+any teardown so no callback fires into a half-dismantled protect engine"。
+
+**但顺序是对的**（注销在最前），问题是**注销本身可能就是崩溃点**。
+
+**下一步：先确认崩溃是不是在 NOTIFY_OFF 与 stop_request 之间**
+
+`step=10` 是 `NOTIFY_OFF` 写入后立刻的下一个埋点之前的最后一条。而
+`mark(30) = STOP_REQUESTED` 在 `yghv_s206_vmrun_stop_request()` **之前**。
+
+所以如果 `step` 停在 10 且**没有 30**，说明崩在 10 和 30 之间 —— 那里只有
+**一个 `if` 块**（我的 stop-wait 代码）。而那个块的第一句就是
+`yghv_s206_vmrun_stop_request()`。
+
+**所以：崩在 `yghv_s206_vmrun_stop_request()` 本身？** 不可能，那是三条
+`InterlockedExchange`。
+
+**更可能：`step=10` 这个读数本身有问题**
+
+9.415 发现历史环里 `NOTIFY_OFF` 写了三次而 `START` 只一次。**如果 `DriverUnload`
+被调用了多次**（本树有 `d->DriverUnload` 被覆盖两次的历史），那么每次都是
+`START` 覆盖 order 1、`NOTIFY_OFF` 覆盖 order 2……三次调用会留下
+`order=1 START, order=2 NOTIFY_OFF`，第五次之后 order 3、4 才开始被填。
+
+**这意味着 `step=10` 不代表"停在 10"，只代表"最后写入的是 10"。**
+
+**结论：我不能再从 step 推断执行顺序了。** 历史环的 order 编码在多次调用下失效。
+
+**需要的改动：让 trace 变成"追加"而不是"环形覆盖"**
+
+`YGHV_UT_HIST = 4` 太小，而且 `(order-1) % 4` 会覆盖。改成：
+- 128 个 slot（一页能放下 128 × 32B = 4KB）
+- 而且**不取模**，写满就停（不再覆盖早期记录）
+
+**这样一次卸载的完整轨迹（约 20 个埋点）全部保留，多次调用也能分辨。**
