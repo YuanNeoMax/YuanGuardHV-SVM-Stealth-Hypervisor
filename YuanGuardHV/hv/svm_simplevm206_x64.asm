@@ -16,14 +16,6 @@ MACHINE_FRAME_SIZE          equ     28h
 
 extern SvHandleVmExit : proc
 
-; 9.444: the C half of the 206 entry (see Sv206EnterHypervisor). Declared here so
-; the entry trampoline can call it; the name is unmangled because it is extern "C".
-extern Sv206VirtualizeC : proc
-
-; 9.444: the exit stack pointer, recorded by Sv206EnterHypervisor before the loop
-; starts and moved into the per-core VMCB by SvPrepareForVirtualization.
-extern g_S206PendingExitRsp : qword
-
 ; 9.422: the in-vmrun counter. Bumped before vmrun, dropped immediately after
 ; vmsave. The stop-flag externs of 9.416 are gone: those variables are static
 ; again (9.419) because the inline check they served was proven useless (9.417).
@@ -89,6 +81,25 @@ POPAQ macro
 ;   @param[in]  HostRsp - A stack pointer for the hypervisor.
 ;
 Sv206LaunchVm proc frame
+        ;
+        ; 9.445: SAVE THE THREAD'S REAL RSP BEFORE SWITCHING AWAY FROM IT.
+        ;
+        ; This is the only place that has both facts at once: RSP is still the
+        ; thread's own stack, and RCX is the HostStackLayout pointer (which sits at
+        ; offset 0 of the VPD, so the VPD address is also the VMCB address).
+        ;
+        ; The saved value is what a stopped core returns to. Everything 9.443-9.444
+        ; tried to reconstruct by hand - the address where a `call` pushed its return
+        ; address, one or two frames up - is simply this register, captured before
+        ; anything touches it.
+        ;
+        ; Stored at VPD+0x6110 = GuestVmcb.ControlArea.HostExitRsp (the yghv-private
+        ; slot carved out of the VMCB's architectural hole). Note RCX points at
+        ; HostStackLayout, i.e. VPD+0x5FD0, so the VPD base is RCX-5FD0.
+        ;
+        mov     rax, rsp
+        mov     qword ptr [rcx - 5FD0h + 6110h], rax
+
         ;
         ; Update the current stack pointer with the host RSP. This protects
         ; values stored on stack for the hypervisor from being overwritten by
@@ -463,105 +474,46 @@ Sv206GuestStub endp
 ; This thunk must not call anything: it only moves RSP and returns.
 Sv206LeaveToHost proc
     ;
-    ; ARRIVE ON THE THREAD'S OWN STACK, THEN RETURN ONE FRAME.
+    ; ARRIVE ON THE THREAD'S REAL STACK AND END THE THREAD FROM ASM.
     ;
-    ; SvLV20 has already executed `mov rsp, rcx` with the value Sv206EnterHypervisor
-    ; captured, so RSP now points exactly at the return-address slot that
-    ; `call Sv206VirtualizeC` pushed. A single `ret` pops it and resumes
-    ; Sv206EnterHypervisor right after that call - on the thread's real stack, which
-    ; is the only stack a context switch can survive on.
+    ; SvLV20 has already done `mov rsp, rcx` with the value Sv206LaunchVm captured
+    ; before it switched stacks, so RSP is now the thread's own stack pointer as it
+    ; was at the call into Sv206LaunchVm - i.e. [rsp] is that call's return address
+    ; and everything above it is the live C frames (SvVirtualizeProcessor,
+    ; Sv206VirtualizeC, Sv206CoreThread).
     ;
-    ; 9.443 and the first 9.444 attempt both failed here for different reasons:
-    ;   9.443  handed SvLV20 a DRIVER-ALLOCATED stack; the scheduler faulted inside
-    ;          KiSwapContext (0x1E C0000005 / STACKPTR_ERROR).
-    ;   9.444a did a bare `ret` from the WRONG pointer (a function's own
-    ;          return-address slot instead of the call site), so it popped a saved
-    ;          register and jumped into it (0x0E at nt!KiStartSystemThread+0x34).
+    ; WHAT NOT TO DO, AND WHY (four machines)
     ;
-    ; This version is exact: the pointer was captured by the same function that made
-    ; the call, eight bytes below its own entry RSP, so [rsp] here is guaranteed to
-    ; be that call's return address.
+    ; 9.443-9.444 tried to `ret` or `jmp` into those C frames to unwind them by hand.
+    ; Every attempt broke a different ABI invariant:
+    ;   9.443   returned onto a driver-allocated stack  -> 0x1E, #GP in KiSwapContext
+    ;   9.444a  returned to a function's own cookie slot -> 0x0E at KiStartSystemThread
+    ;   9.444b  indexed the saved RSP wrongly           -> 0x50 at MiSystemFault
+    ;   9.444c  hand-unwound past a /GS frame           -> 0xF7 _report_gsfailure
     ;
-    ; Nothing else is needed. SVM is already off (the ExitVm path cleared
-    ; EFER.SVME) and interrupts are already enabled (it restored RFLAGS).
+    ; The lesson is not "compute the offset better". It is that a C function's frame
+    ; may only be left by ITS OWN epilogue: it owns the /GS cookie, the SEH chain and
+    ; the alignment. So this thunk does not touch those frames at all - it ends the
+    ; thread from here, on the correct stack, and lets the scheduler discard them.
     ;
-    ret
+    ; That is legal because we are on the thread's real stack with interrupts enabled
+    ; and SVM already off (the ExitVm path cleared EFER.SVME and restored RFLAGS).
+    ; PsTerminateSystemThread does not return, so no frame is ever unwound.
+    ;
+    ; The call is made through a pointer in the register block that SvHandleVmExit
+    ; set up (VpRegs->Rdx is free at this point), so this file needs no import of a
+    ; kernel API.
+    ;
+    mov     rcx, 0                  ; STATUS_SUCCESS
+    call    rax                     ; terminate the thread
+    ;
+    ; Not reached. If it ever is, park without touching anything.
+    ;
+Sv206LeavePark:
+    hlt
+    jmp     Sv206LeavePark
 Sv206LeaveToHost endp
 
 ;
-; ============================================================================
-; 9.444: THE ENTRY TRAMPOLINE - CAPTURE THE EXIT POINT, THEN ENTER THE LOOP.
-; ============================================================================
-;
-; Called as:  Sv206EnterHypervisor(SharedVpData)
-;   rcx = SharedVpData   (forwarded to the C wrapper)
-;
-; THE SLOT LIVES IN THE VMCB, NOT IN A GLOBAL ARRAY.
-;
-; An earlier revision kept a global table indexed by KeGetCurrentProcessorNumber().
-; That was wrong: the threads are pinned with KeSetSystemAffinityThread(1 << CoreIndex)
-; - a processor MASK - while KeGetCurrentProcessorNumber() returns a processor INDEX.
-; On this machine the two do not coincide, so SvHandleVmExit read the wrong slot and
-; handed SvLV20 a garbage stack. Measured: 0x50 PAGE_FAULT_IN_NONPAGED_AREA at
-; nt!MiSystemFault, faulting on what turned out to be string data.
-;
-; But this function runs BEFORE SvVirtualizeProcessor has created the VpData, so it
-; cannot address the VMCB yet. It therefore records the value into a single global
-; (g_S206PendingExitRsp) and SvPrepareForVirtualization - which runs later, on this
-; same core, and DOES have the VpData - moves it into ControlArea.HostExitRsp.
-;
-; That is safe because each core runs its own thread: there is exactly one
-; Sv206EnterHypervisor and one SvPrepareForVirtualization in flight per core, and
-; they are strictly ordered within it.
-;
-; The slot is written before the loop starts, because SvHandleVmExit reads it on the
-; very first VMMCALL.
-;
-; WHY THIS IS ASM AND NOT C
-;
-; The value stored must be the address where `call Sv206VirtualizeC` pushes its
-; return address - i.e. (RSP after alignment) - 8. Capturing that from C means
-; asking the compiler where its own stack pointer is at an arbitrary point, and the
-; optimiser is free to put anything in between. Measured cost of getting it wrong
-; once already: 0x0E at nt!KiStartSystemThread+0x34.
-;
-; Here the alignment and the capture are three instructions apart, so they cannot
-; drift.
-;
-; THE TWO-STEP RETURN, WHICH IS THE WHOLE TRICK
-;
-;   entry            RSP = S        [S]   = return address into Sv206CoreThread
-;   sub rsp, 8       RSP = S-8      (aligns the call, see below)
-;   exitRsp = S-16                  <-- where `call` will push
-;   call wrapper     RSP = S-16     [S-16] = return address into THIS function
-;   ... VMRUN loop runs, never returns normally ...
-;   SvLV20: mov rsp, S-16 ; jmp thunk
-;   thunk:  ret      pops [S-16] -> back into THIS function, RSP = S-8
-;   add rsp, 8       RSP = S
-;   ret              pops [S]    -> back into Sv206CoreThread, RSP = S+8
-;
-; Both returns land on the thread's own stack, and Sv206CoreThread's frame - its
-; locals and saved registers - is exactly as it left it. That is what makes
-; PsTerminateSystemThread legal at the end of it.
-;
-; THE ALIGNMENT
-;
-; On entry RSP is 8 mod 16 (the caller's `call` pushed 8). A callee expects the same
-; at ITS entry, so the call site must be 0 mod 16. Hence `sub rsp, 8` before the
-; call, and the matching `add rsp, 8` after it.
-;
-Sv206EnterHypervisor proc
-    sub     rsp, 8
-    ;
-    ; Record where the CALL below will push its return address. SvVirtualizeProcessor
-    ; has not created the VpData yet, so this goes to a global that
-    ; SvPrepareForVirtualization later moves into the VMCB (see the note above).
-    ;
-    lea     rax, [rsp - 8]
-    mov     qword ptr [g_S206PendingExitRsp], rax
-    call    Sv206VirtualizeC
-    add     rsp, 8
-    ret
-Sv206EnterHypervisor endp
 
         end
