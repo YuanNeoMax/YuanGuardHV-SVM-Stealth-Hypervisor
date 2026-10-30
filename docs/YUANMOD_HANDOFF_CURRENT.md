@@ -13003,3 +13003,90 @@ PA 记录本身是成功的（`pa_cln1` 文件存在），但**如果那个物�
 第二套循环不存在（9.395）、ack 是根因（9.378）、stop check 位置（9.413-9.416）。
 
 **未解决**：`Sv206LaunchVm` 循环在卸载后仍在运行 —— 需要内核调试器才能定位。
+
+---
+
+#### 9.421 ★★ 真正的崩溃指令是 `vmsave rax`，不是 `mov rax,[rsp]`
+
+**怎么确定的（纯代码，不需要 dump 含 .bss）**
+
+`svm_simplevm206_x64.asm` 桩的入口是确定的 5 条指令，按汇编长度推偏移：
+
+```
++0x000..+0x002  (3B)  mov rsp, rcx
++0x003..+0x006  (4B)  mov rax, [rsp]      ; RAX <= GuestVmcbPa
++0x007..+0x009  (3B)  vmload rax
++0x00A..+0x00C  (3B)  vmrun rax
++0x00D..+0x00F  (3B)  vmsave rax          <-- 崩溃在 +0x0D，就是这条
+```
+
+**我前四次（9.389/9.395/9.407/9.417）都说崩溃在 `mov rax,[rsp]`，那是错的。**
+`+0x0D` 落在 **`vmsave rax` 的起始字节**。
+
+**这一个修正解释了所有观察到的现象**
+
+| 观察 | 用 `vmsave` 解释 |
+|---|---|
+| `P3 = 8`（8 字节访问）| `vmsave` 写 VMCB 的状态保存区，一次 8 字节 |
+| `P2 = 0xE` 或 `0xC`（高 IRQL）| 它在 VM-exit 帧里执行，IRQL 取决于打断它的执行体 |
+| IRQL 会变（0xE→0xC）| 不是"某个 timer"，是**任何**打断 VM-exit 的执行体 |
+| `0x7F/8` 双故障（有时）| `vmsave` 写失败本身可能再触发异常 → 嵌套 |
+| 驱动已 unmap 仍崩 | `vmsave` 的目标页（VMCB 物理页）已随 `svm_core_cleanup` 释放 |
+
+**真正的竞态是**
+
+```
+核 A: vmrun rax        <- 在 guest 里执行，可能很久
+核 B (DriverUnload): svm_core_cleanup() -> 释放 g_vcpus[A] 的 vmcb 页
+核 A: vmrun 返回, 执行 vmsave rax   <- 写已释放的页 -> 0xD1
+```
+
+**`vmsave` 是 `vmrun` 返回后的第一条指令**，所以它不可能被任何"下一轮循环"的检查挡住。
+**我 9.396/9.414/9.416 三次把检查放在循环回跳处，全都晚了一步** —— 因为破坏发生在
+`vmsave`，而它在 `SvLV10` 的那个检查点**之前**。
+
+**这就是为什么三次改 stop 检查都不改变崩溃点**：它们都改在 `vmsave` 之后的位置。
+而 `vmsave` 在 `vmrun` 之后立即执行，中间没有任何可插入检查的窗口。
+
+**修法方向（第一次是真正对症的）**
+
+问题不是"停不掉循环"，而是**"释放 VpData 时那个核还在 vmrun 里"**。
+所以正确的约束是：
+
+> `svm_core_cleanup`（释放 VMCB）必须在**每一个核都已经从 `vmrun` 返回**之后才能执行。
+
+而"从 vmrun 返回"这件事，只有那个核自己知道。**所以需要一个每核标志：
+"这个核不在 vmrun 里"**，由 ASM 桩在 `vmrun` 前设置、`vmsave` 后清除。
+
+但 9.417 已经证明 ASM 桩里加指令有风险 —— **不过这次的目标不同**：
+之前加的是"检查并跳转"（改变控制流），现在只需要**两个 store**（不改变控制流）：
+
+```asm
+SvLV10:
+    mov dword ptr [g_InVmrun], 1     ; 标记：本核进入 vmrun
+    mov rax, [rsp]
+    vmload rax
+    vmrun rax
+    mov dword ptr [g_InVmrun], 0     ; 标记：已返回
+    vmsave rax
+```
+
+**但这个标志必须是"每核一个"**（否则核 A 清除会误导核 B）。用 `g_percore_invmrun[core_id]`。
+
+而 `DriverUnload` 在 `svm_core_cleanup` 之前，等待**所有核的该标志为 0**。
+
+**为什么这次可能有不同的结果**
+
+前三次改的是"停止时机"（要求循环退出）。
+这次改的是"等待条件"（确认所有核都出了 vmrun）—— **约束在了正确的对象上**：
+不是让循环停，而是确保释放发生在循环之外。
+
+**风险仍然存在**：在 ASM 桩里加两条 `mov` 也是改动 hottest path。
+但这两条是**纯 store，无分支、无 call、不触碰 rsp/rcx/rbx**，与 9.416 那四条
+（含条件跳转和 lock 指令）性质不同。而且**如果它错了，会立刻在加载阶段暴露**
+（不像改卸载逻辑那样，要等 25 次重启才知道）。
+
+**先做一件事：确认 `g_InVmrun` 这种 per-core 数组在 ASM 里怎么寻址**
+
+需要 `core_id`。而桩里没有直接的方法拿 core id —— 但 `[rsp + 0xfe0]` 就是 `Self`
+（VpData 指针），从 VpData 能拿到 core 索引。
