@@ -11777,3 +11777,114 @@ xxd read.txt
 > 当一条路径**既不可观测又不可重复验证**时，正确的动作是**停止修改它并建立观测能力**，
 > 而不是继续修改。判据：如果每次修改都需要一次重启，且重启后无法确定修改是否生效，
 > 那么这条路径上的工作还没有开始 —— 观测能力才是第一项任务。
+
+---
+
+#### 9.395 上游对比完成：本树有两套虚拟化，卸载只停了一套
+
+**先说结论：ack 修复无效，而且我从上游对比里找到了真正的结构差异。**
+
+**上游 `tandasat/SimpleSvm`（已抓源码，2008 行）**
+
+```c
+SvDriverUnload(DriverObject) {
+    ExUnregisterCallback(g_PowerCallbackRegistration);
+    SvDevirtualizeAllProcessors();
+}                                   // <- 就这两件事，然后返回
+```
+
+**而且上游的 `SvHandleCpuid` / `ExitVm` / `SvDevirtualizeProcessor` /
+`SvExecuteOnEachProcessor` 与本树逐行相同**（我核对过 1367-1445、530-560、820-870、
+1275-1365 四处）。包括那个 `VpRegs->Rcx = StateSaveArea.Rsp` —— 也就是说
+**上游的 ack 也从未被写过，`SvDevirtualizeAllProcessors` 在上游同样是空操作。**
+
+**上游为什么没崩：它卸载后什么都不做。**
+
+反虚拟化是空操作，但它**不接着做 `npt_cleanup` / `svm_core_cleanup`**，
+所以没有被释放的内存交给仍然在跑的核去使用。
+
+**本树的结构差异（这是根因，不是推测）**
+
+main.c 的实际流程：
+
+```
+DriverEntry
+  -> svm_core_init()                    /* 5069：启动 resident 线程并虚拟化 */
+  -> npt_identity_map_range(0, 512GB)
+  -> yghv_control_device_init(d)
+  -> Sv206Entry(d, r)                   /* 5277：verbatim upstream entry */
+       -> SvVirtualizeProcessor 每核
+            -> Sv206LaunchVm            /* 3818：进入 VMRUN 循环，永不返回 */
+```
+
+注释自己写着 *"Residents are not started"* —— 意思是 `Sv206Entry` 这条路**不启动
+resident 线程**，但它上面的 `svm_core_init()` **已经启动过了。**
+
+**所以这台机器上有两套虚拟化在同一批核上：**
+
+| 套 | 谁启动 | 谁停止 | `wait_all_stopped` 等它吗 |
+|---|---|---|---|
+| 1 | `svm_core_init` 的 resident 线程 | `svm_core_stop_all_residents` | **是** |
+| 2 | `Sv206Entry` → `Sv206LaunchVm` 的 VMRUN 循环 | 只有 `ExitVm`（CPUID 后门） | **否** |
+
+`DriverUnload` 的顺序（4893-4929）：`Sv206CoopUnload` → 各 join →
+`stop_all_residents` → `wait_all_stopped` → `npt_cleanup` → `svm_core_cleanup`。
+
+**它停了第 1 套，然后释放了第 2 套正在使用的内存。**
+
+`Sv206CoopUnload` 理论上应该停第 2 套，但它内部的 `SvDevirtualizeAllProcessors`
+因为 ack 缺陷是空操作 —— 而**这个 ack 缺陷在上游同样存在**，说明它从来就不是
+"本树引入的 bug"，而是 vendored 代码自带的、上游因为不做后续 teardown 而从未暴露的问题。
+
+**这解释了全部 15 次 B 类崩溃**
+
+```
+Sv206LaunchVm+0xD  ->  mov rax,[rsp] 读 VpData->HostStackLayout
+故障地址两个相邻页  ->  VpData 所在页 + 内核栈
+Unloaded modules   ->  yghv_tr.sys 已卸载，崩溃地址在其范围内
+```
+
+**VMRUN 循环还在跑，而它的 VpData / NPT 已经被释放。**
+
+**为什么 ack 修了两次都没用**
+
+- 9.378 写在 `registers[2]` → 被 `VpRegs` 覆盖，无效
+- 9.383 写在 `VpRegs->Rcx` → **位置对了**，但即使 ack 生效，
+  `SvDevirtualizeProcessor` 里 `SvFreePageAlingedPhysicalMemory(vpData)` 之后
+  `SvExecuteOnEachProcessor` 会切到**下一个核**继续——而**当前核的 VMRUN 循环
+  已经由 `ExitVm` 返回了**，这本身是对的。
+
+  所以 ack 生效应该有用。**但第 22 次测的正是这个版本，仍然崩。**
+
+  剩下的解释只有一个：**`Sv206CoopUnload` 遍历的核，与 `Sv206LaunchVm` 循环所在的核，
+  不是同一批** —— 因为 `SvExecuteOnEachProcessor` 只把**当前线程**绑到目标核上执行
+  回调，而 VMRUN 循环在**另一个执行体**（`SvVirtualizeProcessor` 所在的调用栈）里。
+  绑到核 i 执行 `__cpuidex`，触发的是**当前线程**的 CPUID，**不是那个 VMRUN 循环的**。
+
+**这才是 ack 修不动的真正原因**
+
+`SvDevirtualizeProcessor` 的 `__cpuidex` 在**控制线程**里执行。它要停止的是一个
+**不同的执行体**（VMRUN 循环）。CPUID 后门只能让"调用它的那个执行体"退出 guest ——
+而那个执行体就是控制线程自己，它本来就不在 guest 里。
+
+> **要停止一个 VMRUN 循环，必须让那个循环本身执行到 `ExitVm` 的判断点。**
+> 而做到这一点的唯一办法是让它的 guest 执行一条被拦截的指令 —— 例如 CPUID，
+> 且那条 CPUID 的 `ECX` 要等于 `CPUID_UNLOAD_SIMPLE_SVM`。
+
+本树的 `Sv206Entry` 里有 CPUID 心跳机制（`g_vmmcall_auth_cookie`、stop flag），
+**那才是应该用来停第 2 套的东西**，而 `DriverUnload` 没有触发它。
+
+**下一步（有了明确方向，不是我猜的）**
+
+`DriverUnload` 在 `Sv206CoopUnload` 之前，必须先让 VMRUN 循环退出：
+
+1. 设置一个**每个 VMRUN 循环都能看到的 stop flag**（本树已有
+   `g_os_guest_stop_requested` 这类机制，但它只被 OS-as-guest 那套检查）
+2. 等**每个核的循环实际返回**（不是等 resident 线程）
+3. **然后**才 `Sv206CoopUnload` / `npt_cleanup`
+
+**这条我仍然无法用实验验证**（卸载不给观测机会），所以按 9.394 的规则：
+**先记录，不盲改。**
+
+**但至少现在方向是确定的**：不是 ack、不是 NPT、不是对齐、不是 AVIC timer ——
+**是"停第 2 套虚拟化"这件事从来没有被实现过。**
