@@ -783,6 +783,44 @@ static volatile LONG   g_VmrunStopRequested = 0;
  * session lost 15 machines to confusing the two. */
 static volatile LONG   g_VmrunStopped;
 
+/*
+ * 9.411: the ASM loop calls this once per iteration (see SvLV10 in
+ * svm_simplevm206_x64.asm). It must be callable with GIF clear and no locks,
+ * which is why it is a plain interlocked read. Returns 1 when the loop should
+ * leave; the ASM side then jumps to SvLV20, the same exit the handler uses.
+ *
+ * Note it also COUNTS the exit, so g_VmrunStopped becomes a real measurement of
+ * "how many loops left" instead of a value only one path ever wrote.
+ */
+extern "C" int Sv206VmrunShouldExit(VOID)
+{
+    if (InterlockedCompareExchange(&g_VmrunStopRequested, 0, 0) == 0)
+        return 0;
+
+    /*
+     * 9.412: THE REQUEST IS NOT CLEARED HERE, AND THAT TOOK A SECOND LOOK.
+     *
+     * The first version of this function consumed the flag:
+     *
+     *     InterlockedExchange(&g_VmrunStopRequested, 0);
+     *
+     * That is exactly the shape that produced one stopped loop out of twelve in
+     * the 9.400 readout: the first core to reach the check would clear the request,
+     * and the other eleven then saw 0 and kept running. A "stop" that only stops
+     * whoever arrives first is not a stop signal - it is a race with a winner.
+     *
+     * So the request stays set for the whole teardown. The per-core counter is
+     * what records progress, and the waiter already compares it against the core
+     * count. Clearing happens only in yghv_s206_vmrun_stop_clear(), which runs at
+     * a point (fresh load) where no loop exists.
+     *
+     * Double counting from one core is handled on the ASM side: it jumps to
+     * SvLV20 after the first 1, so this is called at most once per core per exit.
+     */
+    InterlockedIncrement(&g_VmrunStopped);
+    return 1;
+}
+
 extern "C" void yghv_s206_vmrun_stop_request(VOID)
 {
     InterlockedExchange(&g_VmrunStopRequested, 1);
