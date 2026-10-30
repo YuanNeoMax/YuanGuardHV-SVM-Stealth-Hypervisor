@@ -422,4 +422,50 @@ Sv206GuestParked:
     ud2
 Sv206GuestStub endp
 
+;
+; ============================================================================
+; 9.444: LEAVING THE GUEST ON THE THREAD'S OWN STACK.
+; ============================================================================
+;
+; 9.443 pointed SvLV20 at a C function (Sv206GuestExited) and the machine died with
+; 0x1E C0000005 / STACKPTR_ERROR. The stack showed the #GP inside KiSwapContext,
+; reached from PsTerminateSystemThread. The cause is structural, not a bug in that
+; function:
+;
+;   SvLV20 does `mov rsp, rcx`, and 9.443 gave it &VpData->HostStackLayout - a
+;   stack THIS DRIVER allocated. A context switch saves RSP into the KTHREAD and
+;   restores it later; from a foreign stack the scheduler's frame lands where it
+;   cannot survive, and the switch faults.
+;
+; So the exit must land on the thread's REAL stack. That stack is still intact:
+; Sv206CoreThread called SvVirtualizeProcessor, which called Sv206LaunchVm, and all
+; those frames are sitting on it. The VMRUN loop never unwound them, but they are
+; still there - one `ret` away.
+;
+; This thunk is the exit target. The ExitVm path hands SvLV20:
+;   rcx = the thread RSP saved by Sv206CoreThread immediately before its call
+;   rbx = Sv206LeaveToHost
+;
+; SvLV20 then does `mov rsp, rcx; mov ecx,'SSVM'; jmp rbx`, landing here on the real
+; stack, with interrupts already enabled (the ExitVm path restored RFLAGS) and SVM
+; already disabled. All that is left is to unwind the frames the VMRUN loop left
+; behind and return to Sv206CoreThread, which terminates the thread from a context
+; where every kernel API is legal.
+;
+; This thunk must not call anything: it only moves RSP and returns.
+Sv206LeaveToHost proc
+    ;
+    ; RSP is the value Sv206CoreThread saved immediately before it called
+    ; SvVirtualizeProcessor, so [rsp] is that call's return address.
+    ;
+    ; Returning there resumes Sv206CoreThread normally. SvVirtualizeProcessor's own
+    ; frame is abandoned along with the VMRUN loop - deliberately, because that
+    ; frame can never be completed (Sv206LaunchVm is "should never return to here").
+    ;
+    ; We are on the real stack, so a plain `ret` is safe and no kernel API is
+    ; needed here at all.
+    ;
+    ret
+Sv206LeaveToHost endp
+
         end
