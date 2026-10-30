@@ -4975,55 +4975,74 @@ void DriverUnload(struct _DRIVER_OBJECT *d) {
         yghv_ut_mark_val(45 + 1, (uint64_t)active);
 
         /*
-         * 9.441: THE CORE WALK IS RESTORED AS THE DEFAULT, AND HERE IS WHY
-         * 9.399/9.406 WERE WRONG TO SKIP IT.
+         * 9.441/9.442: WHY THE WALK IS BACK AS THE DEFAULT - AND WHAT IT IS NOT.
          *
-         * What the dumps actually said (and 9.399/9.406 read correctly):
+         * What the old dumps said (9.399/9.406 read them correctly):
          *   - the last stamp was COOP_UNLOAD, so Sv206CoopUnload never returned;
-         *   - the bugcheck was 0x7F double fault, at
+         *   - the bugcheck was 0x7F double fault at
          *     SvDevirtualizeAllProcessors+0xC0, i.e. inside the walk.
          *
-         * What they concluded: "pinning to a core and running CPUID there is
-         * unsafe by construction, so skip the walk."
+         * Their conclusion - "pinning to a core and running CPUID there is unsafe,
+         * so skip the walk" - was wrong for a reason they could not see at the
+         * time: the walk was not the broken part, the EXIT it triggered was.
+         * Every core that took a CPUID exit went through SvLV20, whose first
+         * instruction is `mov rsp, rcx`, and RCX held 'SSVM' because of 9.383.
+         * A double fault inside the walk is exactly what an exit path with a
+         * garbage stack pointer looks like from outside. 9.441 reverted it.
          *
-         * THE CONCLUSION DOES NOT FOLLOW, because the walk is not what was broken
-         * - the EXIT it triggers was. Every core that took a CPUID exit went
-         * through SvLV20, and SvLV20's first instruction is `mov rsp, rcx`, where
-         * RCX held 'SSVM' because of 9.383. A double fault at the walk is exactly
-         * what an exit path with a garbage stack pointer looks like from the
-         * outside: the walk pins the thread, CPUID traps, the handler takes the
-         * ExitVm branch, and `mov rsp, 0x4D565353` faults before anything can be
-         * logged. 9.441 reverted that assignment.
+         * But 9.442 has to be honest about the other half: the walk does NOT stop
+         * a running VMRUN loop, and never could. SvDevirtualizeProcessor runs
+         * `__cpuidex` on the unload thread, which is not in guest mode, so the
+         * CPUID is not intercepted and the live loops never see it. 213,601 exits
+         * with 12 loops still cycling is the measurement that proves it.
          *
-         * There is also a structural reason the walk must be the default: it is
-         * the ONLY mechanism that reaches a running VMRUN loop with register
-         * clobbering that is legal. SvDevirtualizeProcessor runs __cpuidex, so the
-         * guest is inside an instruction that declares RAX/RBX/RCX/RDX clobbered -
-         * exactly the four registers SvLV20 uses to hand back the resume state.
-         * A stop flag set from SvHandleVmExit has no such licence: it would have
-         * to overwrite RCX/RBX at an arbitrary instruction boundary, in arbitrary
-         * Windows code with live registers. That is a silent-corruption trade, not
-         * a fix, and it is why the flag path was never going to work.
-         *
-         * So: ask every core to leave, then wait for the count to reach zero. The
-         * stop-flag request above is kept because it is cheap and harmless, but it
-         * is no longer load-bearing - with no writer to g_VmrunStopped it can only
-         * ever time out (9.440), and timing out here is fine as long as the walk
-         * runs afterwards.
+         * So the walk is here for what it actually does - freeing each core's VPD
+         * and letting each core clear EFER.SVME in the legal window - and the
+         * stopping is done by the flag above plus the wait below. Skipping the
+         * walk (as 9.399/9.406 did) leaked every VPD on every unload, which is
+         * why it must run unconditionally even though it is not the stop.
          */
         yghv_ut_mark_val(47, stopped >= (int)active ? 1 : 0);
 
         /*
-         * 9.441: THE WALK RUNS UNCONDITIONALLY.
+         * 9.442: THE WALK'S JOB IS NOT TO STOP THE LOOPS - IT NEVER COULD.
+         *
+         * 9.441 restored this walk as the default on the theory that it is the
+         * only way to reach a running VMRUN loop. The first measurement killed
+         * that theory:
+         *
+         *   SvDevirtualizeProcessor runs `__cpuidex(CPUID_UNLOAD_SIMPLE_SVM)` on
+         *   the UNLOAD THREAD. That thread is not in guest mode - its VMRUN loop
+         *   was abandoned long ago. So the CPUID is NOT intercepted, SvHandleVmExit
+         *   never sees it, and the 12 live loops do not notice anything. The walk
+         *   cannot stop them, by construction, and never could.
+         *
+         * What the walk DOES do is real and still needed: it frees each core's
+         * VPD and lets each core clear EFER.SVME in the one legal window. That is
+         * teardown, not stopping.
+         *
+         * The loops are stopped by the flag above, which SvHandleVmExit now checks
+         * on every exit (9.442), plus the wait below. Order matters: flag, walk,
+         * wait. The walk runs before the wait so that VPDs are freed while the
+         * cores are still leaving, not after they have gone quiet.
+         */
+        yghv_ut_mark_val(47, stopped >= (int)active ? 1 : 0);
+
+        /*
+         * 9.442: THE WALK RUNS UNCONDITIONALLY, BUT IT IS NO LONGER THE STOP.
          *
          * The two branches this replaces both keyed on counters that 9.440 proved
          * are identically zero in this build:
-         *   `stopped == 0`                  - g_VmrunStopped has no writer;
+         *   `stopped == 0`                  - g_VmrunStopped had no writer;
          *   `resident_threads_at_entry == 0` - 206-B never starts residents.
-         * So `if (stopped == 0 && resident_threads_at_entry == 0)` was taken every
-         * single time, and the walk - the only thing that can stop a loop - was
-         * skipped every single time. That is the shape of a bug that looks like a
-         * considered decision.
+         * So the walk was skipped every single time - which mattered, because the
+         * walk frees the VPDs. Skipping it leaked every VPD on every unload.
+         *
+         * (g_VmrunStopped now has a writer again: SvHandleVmExit increments it
+         * when it takes the stop flag. So `stopped` is a real reading from this
+         * version on - but it is read ABOVE, before the flag has had time to be
+         * seen, so it will legitimately read 0 here. The number that matters is
+         * slot 56/57 below.)
          *
          * The callback release happens first and unconditionally: it has nothing
          * to do with cores, and skipping it would leave a registration pointing
@@ -5046,19 +5065,38 @@ void DriverUnload(struct _DRIVER_OBJECT *d) {
         yghv_ut_mark_val(48, (uint64_t)(ULONG)stopped);
 
         /*
-         * 9.441: NOW WAIT - ON THE COUNTER THAT IS ACTUALLY WRITTEN.
+         * 9.442: WAIT FOR THE LOOPS TO LEAVE - AND THIS WAIT IS NOW THE WHOLE FIX.
          *
-         * The walk above asked every core to leave. This is where we find out
-         * whether it worked, and it is the FIRST time in this tree that the wait
-         * has been on a counter with a writer: g_inVmrunCount is `lock inc`'d
-         * before vmrun and `lock dec`'d after vmsave, unconditionally, in the ASM
-         * stub (artifact-confirmed at Sv206LaunchVm+0x0A and +0x18).
+         * What the first run of the exit counter measured (9.441):
          *
-         * If it reaches zero, every core has left the stub and the teardown below
-         * can free the VMCB/NPT safely. If it does not, the guard further down
-         * still refuses to free them - leaking rather than handing freed pages to
-         * a live core. What changed is that the number now MOVES when the fix
-         * works, so success and failure are distinguishable for the first time.
+         *     s206 exits at unload  = 213,601
+         *     s206 vmmcall at unload = 0
+         *     s206 invmrun at unload = 12
+         *
+         * 213,601 exits means the loops are NOT stuck - they cycle constantly.
+         * `invmrun == 12` is therefore not "12 cores trapped", it is "12 cores
+         * happened to be between `lock inc` and `lock dec` when we looked". A
+         * counter read during a live loop gives a live value.
+         *
+         * That reframes the bug completely. The cores are healthy; what is missing
+         * is that NOTHING TELLS THEM TO STOP. DriverUnload returns, the OS unmaps
+         * the image, and the next `vmsave` in each loop executes a code page that
+         * no longer belongs to it - which is exactly the PAGED_IP / 0xD1 at
+         * Sv206LaunchVm+0x14 this machine has produced repeatedly.
+         *
+         * The stop flag is requested above and SvHandleVmExit now checks it on
+         * every exit (9.442). So this wait is where the loops are given time to
+         * reach their next exit and take the ExitVm branch. The wait is BEFORE any
+         * teardown and, critically, BEFORE DriverUnload returns - the unmap happens
+         * after the function, so a core still inside the stub at that point cannot
+         * be saved by anything later in this function.
+         *
+         * The spin budget is generous on purpose: a core that is inside a long
+         * guest run takes one exit to notice, and one exit is bounded by whatever
+         * the guest is doing. Timing out here does not make things worse than they
+         * already were (the guard below still refuses to free VMCB/NPT), but it
+         * does mean the image is about to be unmapped under a live core, so the
+         * trace records it either way.
          */
         {
             extern int yghv_s206_invmrun_count(void);
@@ -5067,7 +5105,13 @@ void DriverUnload(struct _DRIVER_OBJECT *d) {
             int inside = yghv_s206_invmrun_count();
 
             yghv_ut_mark_val(55, (uint64_t)inside);
-            while (inside != 0 && waited < 2000) {
+            /*
+             * `inside == 12` is expected on the FIRST read even with a perfect
+             * stop: it takes one exit per core to notice the flag, and the read
+             * happens immediately. So the loop condition is "not zero", and the
+             * interesting number is how long it took.
+             */
+            while (inside != 0 && waited < 20000) {
                 volatile ULONG spin;
                 for (spin = 0; spin < 200000UL; spin++) { }
                 waited += 1;

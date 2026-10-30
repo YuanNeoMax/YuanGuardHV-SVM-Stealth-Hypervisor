@@ -14059,3 +14059,312 @@ SvLV20:
 4. **真正缺的是一个无条件的 VMEXIT 计数器。** 在这棵树上，
    「有没有 VMEXIT」这个最基本的问题，目前**没有任何仪表能回答**。
    这是比修任何 bug 都优先的事 —— 符合本项目第 13 节那句「先建观测，再改代码」。
+
+---
+
+#### 9.441 ★★★★★ 三处改动一条主线：9.399/9.406 把被 9.383 污染的读数当成了「机制无效」
+
+**这一节是 9.440 的直接后果。9.440 说「有三个读数不是测量」，9.441 说「其中一个读数
+导致了一条被误删的机制」。**
+
+### 9.441.1 改动清单
+
+| # | 文件 | 改动 | 性质 |
+|---|---|---|---|
+| 1 | `svm_simplevm206.cpp` | `VpRegs->Rcx` 回滚为 `StateSaveArea.Rsp` | **修栈损坏** |
+| 2 | `main.c` | 反虚拟化遍历恢复为**无条件默认** | **恢复被误删的机制** |
+| 3 | `main.c` + cpp | 等待改等 `g_inVmrunCount`；新增 `g_S206Exits` | **补仪表** |
+
+### 9.441.2 改动 1：`rsp = 0x4D565353`
+
+9.383 把 ExitVm 出口的 `VpRegs->Rcx` 从 guest RSP 改成 `'SSVM'`，
+为的是让 `SvDevirtualizeProcessor` 的 `registers[2] != 'SSVM'` 通过。
+
+**但 ASM 的顺序是这样的**（`svm_simplevm206_x64.asm`）：
+
+```asm
+        test al, al
+        POPAQ                  ; pop rcx —— 从 GuestRegisters 恢复 RCX
+        jnz SvLV20
+SvLV20:
+        mov rsp, rcx           ; <-- RSP = 0x4D565353
+        mov ecx, 'SSVM'        ; <-- 然后 ECX 才拿到 magic
+        jmp rbx
+```
+
+`POPAQ` 在分支**之前**，所以 `mov rsp, rcx` 拿到的正是 9.383 写进去的值。
+`0x4D565353` 在 x64 上不是规范地址（bit47 与 bit48-63 不符），
+**下一条碰栈的指令立刻 `#GP`**，而 `jmp rbx` 跳进的内核代码第一件事就是碰栈。
+
+**而且这一行是冗余的**：`SvLV20` 自己就有 `mov ecx,'SSVM'`；
+CPUID leaf 自己也写 `registers[2] = 'SSVM'`（9.378）。
+9.383 的注释「RSP is not lost: SvDevirtualizeProcessor only reads EAX:EDX」
+对**那个被调用方**成立，但 `mov rsp, rcx` 发生在 `SvLV20` 里、`jmp rbx` 之前，
+与它无关。**9.383 论证了一个不相关的事实，并因此把栈指针交给了垃圾。**
+
+**产物验证**
+
+```
+改前: 14002 40AD: mov qword ptr [r14+70h], 5353564Dh   ; Rcx = 'SSVM'
+改后: 14002 4096: mov rax, qword ptr [rbx+000065D8h]   ; StateSaveArea.Rsp
+      14002 409D: mov qword ptr [r14+70h], rax
+```
+
+### 9.441.3 改动 2：遍历不是坏的那一环，它触发的出口才是
+
+**9.399/9.406 读了什么（读得对）**
+
+```
+最后一次戳 = COOP_UNLOAD        （Sv206CoopUnload 没返回）
+BUGCHECK    = 0x7F double fault
+崩溃地址    = SvDevirtualizeAllProcessors+0xC0
+```
+
+**它们得出的结论（不成立）**：「pin 到核上跑 CPUID 本身不安全，所以跳过遍历」。
+
+**为什么不成立**：遍历不坏，**它触发的出口坏**。每次 CPUID 退出都走 `SvLV20`，
+而 `SvLV20` 第一句 `mov rsp, rcx` 拿的是 `'SSVM'`。
+**「遍历处双故障」正是「出口栈指针是垃圾」从外面看到的样子**：
+遍历 pin 线程 → CPUID 陷入 → handler 走 ExitVm 分支 → `mov rsp, 0x4D565353`
+→ 在能记录任何东西之前就炸了。
+
+**还有一个结构性的理由，遍历必须是默认**
+
+它是**唯一**能以**合法寄存器覆盖范围**到达运行中 VMRUN 循环的机制：
+`SvDevirtualizeProcessor` 跑 `__cpuidex`，guest 正处在一条**声明
+RAX/RBX/RCX/RDX 被破坏**的指令里 —— 恰好是 `SvLV20` 用来交还恢复状态的那四个寄存器。
+
+**从 `SvHandleVmExit` 设 stop flag 没有这种许可**：它得在**任意指令边界**
+覆盖 RCX/RBX，而那是不确定的 Windows 代码、寄存器还是活的。
+那是**静默损坏**，不是修复。**所以 flag 路径从一开始就不可能对。**
+
+**原判据为什么每次都跳过遍历**
+
+```c
+if (stopped == 0 && resident_threads_at_entry == 0) { /* skip walk */ }
+```
+
+9.440 证明这两个条件**都是恒真的**：
+- `stopped == 0` —— `g_VmrunStopped` 无写入者（唯一递增点零调用者）；
+- `resident_threads_at_entry == 0` —— 206-B 不启动 resident。
+
+**所以这个分支每次都进，遍历每次都跳过。** 这是一个「看起来像深思熟虑的决定」的 bug。
+
+### 9.441.4 改动 3：等待等错了计数器，以及补上唯一的 exit 仪表
+
+**等待等错了**
+
+原等待等 `g_VmrunStopped` 达到核数。该计数器**没有写入者** ⇒ 每次都空转满
+2000 次再落空，**看起来完全像「循环拒绝停止」**。
+改为遍历之后等 `g_inVmrunCount` 归零（`lock inc` 在 vmrun 前、`lock dec` 在
+vmsave 后，无条件、产物确认在 `Sv206LaunchVm+0x0A` / `+0x18`）。
+
+**顺序也反过来了，这是实质**：先发 stop flag（便宜、无害），**再跑遍历**，
+**最后等**。因为遍历才是起作用的那一环，等待要测量它的效果。
+
+**补上唯一的 exit 仪表**
+
+```c
+/* SvHandleVmExit 的第一条语句，任何分支之前 */
+InterlockedIncrement64(&g_S206Exits);
+```
+
+这是本树第一个能回答「到底有没有 VMEXIT」的仪表（9.440 指出此前三个读数
+分别是恒等式或错位仪表）。三种读数对应三种完全不同的修法，见 8.2。
+
+卸载时在**发 stop 请求之前** dump 三个数（之后 dump 会混淆「有退出」和「stop 生效」）：
+
+```
+s206 exits at unload
+s206 vmmcall at unload
+s206 invmrun at unload
+```
+
+### 9.441.5 构建与产物验证
+
+```
+ALL SOURCE CHECKS PASS
+ALL MAP CHECKS PASS
+[YuanGuardHV] Build SUCCESS: bin\yuanguard_hv.sys
+```
+
+产物验证（`dumpbin /disasm:nobytes`，不信源码信产物）：
+
+```
+1) [r14+70h] ← SSVM 已消失；Rcx 现从 [rbx+65D8h] 取
+2) SvLV20 顺序: pop rcx -> mov rsp,rcx -> mov ecx,SSVM -> jmp rbx   （正确）
+3) g_S206Exits 在 SvHandleVmExit 入口无条件 lock inc
+4) Sv206CoopUnload 调用点前无任何条件跳转（遍历已无条件）
+   1400016C7: call 1400020600   ; mark(0x14) = COOP_UNLOAD
+   1400016CC: call 1400023150   ; Sv206CoopUnload  <-- 无条件
+```
+
+### 9.441.6 这一步还没被实机证明
+
+**三处改动都是「让机制恢复到能工作的状态」，不是「证明问题已解决」。**
+实机验证顺序（重启后）：
+
+```powershell
+sc.exe query yghvpa          # 应为 STOPPED（重启清掉 START_PENDING）
+sc.exe start yghvpa          # 加载：9.437 那次在这里挂死
+sc.exe query yghvpa          # 应为 RUNNING
+sc.exe stop yghvpa           # 卸载：29 次崩溃在这里
+```
+
+**三种结果分别意味着**
+
+| 现象 | 含义 | 下一步 |
+|---|---|---|
+| `start` 挂死 | guest 仍然不产生可用的退出 | 查 `g_S206Exits`（若为 0 则 9.434 成立）|
+| `start` 成功、`stop` 崩 | 出口修好了但仍有其它问题 | 读 `s206 exits at unload` + unload-trace |
+| `start`+`stop` 都成功 | **9.383 的栈损坏就是卸载崩溃的根因** | 跑 G25 13/13 回归 |
+
+---
+
+#### 9.442 ★★★★★ exit 计数器第一次运行，推翻了 9.434 的核心结论，并暴露出真正的根因
+
+**9.441 的改动已实机跑通：加载成功，卸载蓝屏。两个结果都有价值。**
+
+### 9.442.1 实机结果
+
+```
+23:10:53  sc start yghvpa   -> RUNNING，耗时 58ms          ← 9.437 的 START_PENDING 挂死已消失
+23:12:31  sc stop  yghvpa   -> 0xD1 DRIVER_IRQL_NOT_LESS_OR_EQUAL
+           Arg1 = fffff805d32b4b94   (指令地址)
+           Arg2 = 0x0C               (IRQL 12)
+           Arg3 = 0x8                (8 字节)
+           SYMBOL_NAME = yghv_pa+24b94
+           FAILURE_BUCKET = AV_CODE_AV_STACKPTR_ERROR_PAGED_IP_yghv_pa!unknown_function
+```
+
+**崩溃指令**（`dumpbin` 产物反汇编，`Sv206LaunchVm` 从 `0x24b80` 起）：
+
+```asm
+0000000140024B80: mov  rsp, rcx          ; +0x00  切到 host 栈
+0000000140024B83: mov  rax, [rsp]        ; +0x03  rax = GuestVmcbPa
+0000000140024B87: vmload rax             ; +0x07
+0000000140024B8A: lock inc [g_inVmrunCount] ; +0x0A
+0000000140024B91: vmrun  rax             ; +0x11
+0000000140024B94: vmsave rax             ; +0x14  <-- 崩溃在这里
+0000000140024B97: lock dec [g_inVmrunCount] ; +0x17  <-- 从未执行
+```
+
+**`vmsave` 的 `rax` = `0x00000290afd000`**（dump 寄存器），是一个物理地址。
+崩溃在 `vmsave` 对它的嵌套页表遍历里，而 `PAGED_IP` 说明**驱动代码页已失效**。
+
+### 9.442.2 三个读数，三个结论
+
+9.441 新加的 exit 计数器第一次给出答案：
+
+```
+s206 exits at unload  = 0x34261 = 213,601
+s206 vmmcall at unload = 0
+s206 invmrun at unload = 12
+```
+
+| 读数 | 9.434 的说法 | **实测** |
+|---|---|---|
+| exits | 「永不产生 #VMEXIT」 | **213,601 次** —— 9.434 的核心结论是错的 |
+| vmmcall | 「guest 靠 vmmcall 退出」 | **0 次** —— 排除了整个 trampoline 假设族 |
+| invmrun | 「12 核卡死在 vmrun」 | 12，但**不是卡死**，见下 |
+
+**`vmmcall = 0` 是决定性的**：拦截位武装着（9.432/9.433），21 万次退出里一次 vmmcall
+都没有 —— 因为 guest 执行的是**真实内核代码**，内核不发 `vmmcall`。
+
+### 9.442.3 ★ 真正的根因：guest 是「调用者续行」导致 12 个 vmrun 帧永久悬挂
+
+**这是本项目最关键的发现，它把之前所有观察串起来了。**
+
+`SvVirtualizeProcessor` 的结构是：
+
+```c
+RtlCaptureContext(contextRecord);          // 抓 RIP/RSP
+...
+SvPrepareForVirtualization(vpData, ..., contextRecord);
+    // 其中：StateSaveArea.Rip = ContextRecord->Rip   <-- guest 入口 = 本函数续行
+Sv206LaunchVm(&vpData->HostStackLayout.GuestVmcbPa);
+    // "This function should never return to here."
+```
+
+**guest 入口是 `SvVirtualizeProcessor` 自己的续行**，所以：
+
+```
+vmrun 启动
+  -> guest 从 SvVirtualizeProcessor 的续行开始执行（以 guest 身份）
+  -> 跑完 SvDebugPrint / status = STATUS_SUCCESS
+  -> 执行 Exit 标签的 ExFreePoolWithTag
+  -> 执行 return status            <-- 以 guest 身份返回！
+  -> 控制流回到 SvExecuteOnEachProcessor 的 for 循环
+  -> 线程被 pin 到下一个核
+  -> 再次调用 SvVirtualizeProcessor -> 再次 vmrun
+  -> 但上一次的 vmrun 帧还挂在栈上，lock dec 从未执行
+```
+
+**12 核走完 = 12 个永久悬挂的 vmrun 帧。** 每核的 `vpData` 独立分配，
+所以 12 个 `HostStackLayout` 各自持有一个永不返回的帧 —— 栈不增长，但帧全在。
+
+**这解释了一切**：
+
+| 观察 | 解释 |
+|---|---|
+| `invmrun = 12` | 12 个核各有一个悬挂帧，`lock inc` 执行了、`lock dec` 永不执行 |
+| `exits = 213601` | 当前正在最内层 `vmrun` 里那个核在正常退出（guest 跑内核代码，CPUID/CR3/NPF 都在拦） |
+| 加载 58ms 成功 | `SvExecuteOnEachProcessor` 确实走完了 12 核（每核的 guest 都 return 了）|
+| 卸载必崩 | 12 个悬挂帧在 unmap 后执行 `vmsave`，代码页已失效 -> `PAGED_IP` |
+| 9.413/9.414/9.416 三次 0x139/0x7F | 在已经坏掉的栈/帧上再加栈操作 |
+
+**9.434 的推理错在哪**：它说「这行之后没有拦截指令」——对**这个函数剩下的三行**成立，
+但那三行 `return` 之后进入的是 `SvExecuteOnEachProcessor` 和整个内核，
+VMEXIT 一直在发生。**它把「函数剩余部分」当成了「guest 的全部生命周期」。**
+
+### 9.442.4 为什么 stop flag 救不了它（这一条否掉了一整族修法）
+
+`SvLV20` 的语义**不是「返回宿主」**，而是**「把控制权交还 guest 并关掉 SVM」**：
+
+```asm
+SvLV20:
+        mov rsp, rcx     ; RCX = StateSaveArea.Rsp = GUEST 的栈
+        mov ecx, 'SSVM'
+        jmp rbx          ; RBX = ControlArea.NRip = GUEST 的下一条指令
+```
+
+对 `CPUID_UNLOAD` 这是**正确**的：guest 正停在 `__cpuidex` 里，NRip 是它的下一条，
+跳回去正好完成指令，寄存器覆盖也合法（CPUID 声明 RAX/RBX/RCX/RDX 被破坏）。
+
+**对 stop flag 这是错的**：guest 停在**任意指令边界**、寄存器都是活的，
+`jmp rbx` 会让它带着被破坏的 RCX/RBX、在 SVM 已关闭的状态下从函数中间继续跑。
+**那是静默损坏任意 Windows 线程。**
+
+**所以「在 `SvHandleVmExit` 里看到标志就 ExitVm」这条路走不通。**
+9.441 曾短暂采用它，9.442 撤回并记录了理由。
+
+### 9.442.5 真正的修法：guest 不能是「调用者续行」
+
+根因是**语义冲突**，不是某一行代码：
+
+> **「透明虚拟化」要求 guest = 调用者续行，于是 `SvVirtualizeProcessor` 会以 guest
+> 身份 return，控制流继续往前走 —— 而「常驻 VMRUN 循环」要求控制流停在循环里。**
+
+这两个要求不能同时满足。上游 SimpleSvm 没暴露这个矛盾，因为它的设计是
+**「虚拟化建好就通过 CPUID_UNLOAD 撤掉」**，从没打算常驻。
+
+**可选方案（需要用户拍板，不是代码能推出来的）**
+
+| 方案 | 做法 | 代价 |
+|---|---|---|
+| **(A) 接受上游语义：不做常驻** | 虚拟化 12 核后立即通过 `CPUID_UNLOAD` 逐核退出，`Sv206Entry` 只验证"能建起来" | 206 主线名不副实；但卸载**必定**干净，且这是上游验证过的路径 |
+| **(B) 真正的常驻：guest 必须是专用循环** | `StateSaveArea.Rip` 指向一个专用 guest 桩（不是 trampoline 心跳，而是**只在收到停止指令时才退出**的循环），并且 `SvExecuteOnEachProcessor` 改成**每核一个独立线程**（不是同线程逐核），这样 12 个循环各自拥有自己的线程和栈 | 改动大；9.436 的失败说明"换成测试 guest"本身不难，难的是**配套的退出协议** |
+| **(C) 保持现状但让悬挂帧无害** | 卸载时**不 unmap 驱动**（把驱动钉在内存里），让 12 个悬挂帧永远不被执行 | 泄漏整个驱动映像；不是干净卸载，只是把崩溃推迟 |
+
+**推荐 (A) 作为下一步**：它是唯一**已被上游验证**、且能让"加载/卸载都干净"成立的路径。
+等 (A) 跑通、G25 13/13 回归通过之后，再决定要不要为常驻做 (B) 的大改。
+
+**9.442.6 已确认仍然正确的改动（保留）**
+
+| 改动 | 状态 |
+|---|---|
+| `Rcx` 回滚为 `StateSaveArea.Rsp`（9.441） | **保留** —— 修掉 `rsp = 0x4D565353`，加载从挂死变 58ms 成功 |
+| `g_S206Exits` 无条件 exit 计数器（9.441） | **保留** —— 本轮全部结论都来自它 |
+| 反虚拟化遍历恢复为无条件（9.441） | **保留** —— 它负责释放 VPD，跳过会泄漏；但它**不是**停止机制 |
+| 等待改等 `g_inVmrunCount`（9.441） | 保留，但**它永远等不到 0**（悬挂帧不 dec），所以只是记录用 |
+| stop flag 在 `SvHandleVmExit` 里设 `ExitVm`（9.442 短暂采用） | **已撤回** —— `SvLV20` 是「回 guest」不是「回宿主」 |

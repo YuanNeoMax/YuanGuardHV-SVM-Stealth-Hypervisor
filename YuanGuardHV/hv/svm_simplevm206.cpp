@@ -2244,34 +2244,42 @@ SvHandleVmExit (
     (void)0;
 
     /*
-     * 9.441: THIS STAYS EMPTY, AND NOW THERE IS A REASON THAT IS NOT A GAP.
+     * 9.442: THE STOP FLAG CANNOT BE TAKEN HERE. ExitVm DOES NOT MEAN "RETURN TO
+     * THE HOST" - IT MEANS "HAND CONTROL BACK TO THE GUEST AND TURN SVM OFF".
      *
-     * 9.419 removed the ASM loop's stop check and left this handler empty because
-     * three attempts (9.413/9.414/9.416) had all died. Its reasoning was "a
-     * zero-call inline version crashed identically, so the check is not the cause
-     * and adding it buys nothing".
+     * This is the fact that condemns the whole stop-flag family, and it took the
+     * exit counter to see it. Read SvLV20 for what it is:
      *
-     * The observation was right; the conclusion was wrong. All three attempts took
-     * the exit and then died in SvLV20's `mov rsp, rcx`, where RCX held 'SSVM'
-     * because of 9.383 (see the note at the Rcx assignment below). 9.383 landed
-     * BEFORE 9.413, so all three experiments ran on a machine whose exit path was
-     * already broken: they were not measuring the check, they were measuring the
-     * rsp bug.
+     *     mov rsp, rcx        ; RCX = StateSaveArea.Rsp, i.e. the GUEST's stack
+     *     mov ecx, 'SSVM'
+     *     jmp rbx             ; RBX = ControlArea.NRip, i.e. the GUEST's next insn
      *
-     * A STOP FLAG SET FROM HERE WOULD BE THE WRONG FIX ANYWAY, and that is the
-     * part 9.396/9.397 got wrong. Exiting through this path means SvLV20 does
-     * `mov rsp, rcx; mov ecx,'SSVM'; jmp rbx` - it needs RCX and RBX, so the
-     * handler must overwrite two guest registers at an ARBITRARY instruction
-     * boundary. For the CPUID-unload path that is safe by construction (the guest
-     * is inside `__cpuidex`, which declares RAX/RBX/RCX/RDX clobbered). For a
-     * stop flag it is not: the interrupted thread is arbitrary Windows code with
-     * live registers, and silently corrupting them is how you trade a known crash
-     * for an unknown one.
+     * So the ExitVm path does not unwind to the caller of Sv206LaunchVm - it
+     * RESumes the guest, having cleared EFER.SVME first. Sv206LaunchVm is marked
+     * "should never return to here", and it doesn't.
      *
-     * So the loop is NOT stopped from here. It is stopped the way upstream stops
-     * it: SvDevirtualizeAllProcessors runs __cpuidex on each core, the CPUID traps,
-     * the CPUID_UNLOAD leaf sets ExitVm, and the core leaves with register
-     * clobbering that CPUID itself documents. See 9.441 in main.c.
+     * For CPUID_UNLOAD that is exactly right: the guest is sitting inside
+     * __cpuidex, NRip is the instruction after it, and jumping there completes the
+     * instruction so the caller of __cpuidex continues normally - now on bare
+     * metal. The register clobbering (RAX/RBX/RCX/RDX) is legal because CPUID
+     * declares those clobbered.
+     *
+     * For a stop flag it is WRONG, and no amount of care in this handler fixes it:
+     * the guest is at an ARBITRARY instruction boundary with live registers, and
+     * jmp rbx would resume it mid-function with RCX/RBX destroyed and SVM already
+     * off. That is silent corruption of whatever Windows thread was running.
+     *
+     * Measured state that closes the question (9.441's first run):
+     *     exits = 213,601   the loops cycle normally; nothing is stuck
+     *     vmmcall = 0       the guest is real kernel code, not a trampoline
+     *     invmrun = 12      a live snapshot of a healthy 12-core loop
+     *
+     * So the loops are healthy and the flag has nowhere safe to act. What must
+     * change is not this handler but WHO OWNS THE STACK: the only way to leave the
+     * loop safely is for the loop to be abandoned deliberately, on a core that is
+     * about to execute nothing but our own code. That is a design change, not a
+     * patch, and it is recorded in 9.442 of the handoff doc rather than guessed at
+     * here.
      */
     (void)0;
 
