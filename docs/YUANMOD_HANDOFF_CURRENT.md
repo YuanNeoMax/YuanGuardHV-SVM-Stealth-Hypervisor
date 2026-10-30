@@ -13657,3 +13657,98 @@ guest RIP = SvVirtualizeProcessor 的续行（不是 trampoline）
 选 (b) → 那么 `SvPrepareForVirtualization` 必须显式设置 `Rip = svm_trampoline_test_guest`。
 
 **这一次不是猜 —— `StateSaveArea.Rip = ContextRecord->Rip` 这行代码就是答案本身。**
+
+---
+
+#### 9.437 设 guest 入口为 trampoline 后，**加载阶段就挂住了**
+
+**现场**
+
+```
+yghvpa: STATE 2 = START_PENDING     （卡在 sc start，不是 sc stop）
+sc.exe stop: 1052 "该服务此刻不可控制"
+flow_g1 文件存在但内容为空          （脚本的 sc start 从未返回）
+机器未重启，20 分钟无 bugcheck
+```
+
+**这是"加载挂死"，比之前所有的"卸载崩溃"都更糟**
+
+之前 29 次都是：加载成功 → 卸载崩溃。这次是**加载就挂住**。
+
+`DriverEntry` 在 `Sv206Entry` 里**同步**做虚拟化（`SvVirtualizeAllProcessors`），
+所以 guest 一旦不返回，**启动路径本身就不返回** —— SCM 看到的就是 `START_PENDING` 永驻。
+
+**为什么这次挂住**
+
+guest RIP 现在指向 `svm_trampoline_test_guest`：
+
+```asm
+svm_trampoline_test_guest:
+    mov rax, 1
+    vmmcall          <- 必须被拦截才能返回
+    jmp svm_trampoline_test_guest
+```
+
+而我同时做了两件事：武装 VMMCALL（bit1）+ 补 `case VMEXIT_VMMCALL`。
+
+**如果这两件都对了，`vmmcall` 会 trap → `SvHandleVmExit` → 我的 case 记录并 `break`
+→ 循环继续 → guest 再次 `vmmcall` → 无限 VMEXIT 风暴。**
+
+**这才是挂住的真正原因**：不是"没生效"，而是**生效了但造成了每轮一次 VMEXIT 的忙循环**，
+而 `Sv206Entry` 同步等它返回 —— 它永远不返回。
+
+**用户态测得的行为正好符合**：`START_PENDING`（`SvVirtualizeAllProcessors` 的
+`SvExecuteOnEachProcessor` 在第一个核上就再也没回来）。
+
+**这解释了为什么 `case VMEXIT_VMMCALL: break;` 是错的**
+
+`break` 只跳出 switch，然后 `SvHandleVmExit` 返回 `guestContext.ExitVm`（FALSE），
+ASM 侧 `test al,al` → 非零？不 → `jmp SvLV10` → 再次 `vmrun` → guest 再次 `vmmcall`。
+**每轮循环一次 VMEXIT，永不停止。** 而 `SvVirtualizeProcessor` 期待的是"某次退出时
+`ExitVm=TRUE`"，那需要 `CPUID_UNLOAD_SIMPLE_SVM`。
+
+**所以正确的 case 行为应该是：让 `ExitVm = TRUE`，终止这个核的 guest。**
+
+因为 `Sv206Entry` 的目的是"虚拟化建立起来并返回"，不是"让 guest 永远跑"。
+上游 SimpleSvm 的 `SvDriverEntry` 就是这样：`SvVirtualizeAllProcessors` 会返回，
+因为 guest 的 `vmmcall` 会让 `ExitVm` 置真、`vmrun` 返回、`Sv206LaunchVm` 走到 `SvLV20`、
+回到 `SvVirtualizeProcessor` 的 `Exit` 标签、`status = STATUS_SUCCESS`。
+
+**所以 9.435 的 case 应该改成终止而不是继续**
+
+```c
+case VMEXIT_VMMCALL:
+    InterlockedIncrement64(&g_S206Vmmcalls);
+    guestContext.ExitVm = TRUE;   /* 不是 break —— 让它走 SvLV20 真正退出 */
+    break;
+```
+
+**但这里有一个必须承认的后果**
+
+如果每个核的 guest 都在第一次 `vmmcall` 就退出，那么 `SvVirtualizeAllProcessors` 返回后
+**没有任何核在虚拟化状态下运行** —— 也就是 206 主线"虚拟化机器"这个目的没有达成。
+
+**而 `g_inVmrunCount` 会归零**（因为 `vmsave` 执行了），卸载也就不会崩。
+
+**这两个结果是矛盾的**：要么"虚拟化真的在跑"（则卸载时必须处理活 guest），
+要么"虚拟化建好就撤"（则 206 主线名不副实）。
+
+**这就是 9.434 留下的那个设计问题，现在变成了必须回答的**：
+**206 主线到底想让 guest 做什么？**
+
+- 如果它想"透明虚拟化整个 OS"（上游语义），那 guest 不该是 trampoline，
+  而该是**调用者续行** —— 也就是我 9.436 改掉的那个东西。
+- 如果它只想"验证虚拟化能建起来"，那 trampoline + `ExitVm=TRUE` 是对的，
+  但那样就没有"常驻虚拟化"。
+
+**所以 9.436 的改动方向错了。** 它把一个"透明虚拟化"的语义硬换成了"测试 guest"，
+而 `Sv206Entry` 的其余部分（`SvVirtualizeAllProcessors` 同步返回、`npt` 全铺）
+都是按"透明虚拟化"写的。
+
+**结论：回滚 9.436，保留 9.435 的 case 但改成 `ExitVm = TRUE`**
+
+回滚理由：`Rip = ContextRecord->Rip` 是上游语义的一部分，改它等于换设计。
+保留 case 的理由：万一将来真的用 trampoline，这个 case 是必需的，且它现在无害
+（没有 trampoline guest 就不会有 `VMEXIT_VMMCALL`）。
+
+**机器需要重启才能清掉 `START_PENDING` 的服务。**
