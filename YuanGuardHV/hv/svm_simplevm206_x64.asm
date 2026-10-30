@@ -498,17 +498,27 @@ Sv206LeaveToHost proc
     ;
     ; That is legal because we are on the thread's real stack with interrupts enabled
     ; and SVM already off (the ExitVm path cleared EFER.SVME and restored RFLAGS).
-    ; PsTerminateSystemThread does not return, so no frame is ever unwound.
     ;
-    ; The call is made through a pointer in the register block that SvHandleVmExit
-    ; set up (VpRegs->Rdx is free at this point), so this file needs no import of a
-    ; kernel API.
+    ; 9.445's first version missed one detail and cost a fifth machine: 0x1E C0000005
+    ; faulting at THIS thunk's own `hlt`. A bare `call rax` pushes its return address
+    ; at [rsp-8], which is the slot just below the stack pointer Sv206LaunchVm's
+    ; caller expects untouched - and if the terminate routine ever returns, execution
+    ; walks into whatever that push displaced.
     ;
-    mov     rcx, 0                  ; STATUS_SUCCESS
-    call    rax                     ; terminate the thread
+    ; So the call is made BELOW the saved pointer, on a frame with the shadow space
+    ; the x64 ABI guarantees: `sub rsp,28h` = 0x20 shadow + 8 alignment. Nothing at or
+    ; above the original RSP is written.
     ;
-    ; Not reached. If it ever is, park without touching anything.
+    ; Rax holds PsTerminateSystemThread, placed there by SvHandleVmExit, so this file
+    ; needs no kernel import.
     ;
+    sub     rsp, 28h
+    xor     ecx, ecx                ; STATUS_SUCCESS
+    call    rax                     ; terminate the thread - does not return
+    ;
+    ; Not reached. If it ever is, restore and park without touching anything.
+    ;
+    add     rsp, 28h
 Sv206LeavePark:
     hlt
     jmp     Sv206LeavePark

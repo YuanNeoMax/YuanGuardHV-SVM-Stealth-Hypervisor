@@ -3693,15 +3693,26 @@ tsc_policy_done:;
              *
              * Sv206LeaveToHost then ends the thread from ASM on that stack, WITHOUT
              * unwinding any C frame - because a C frame may only be left by its own
-             * epilogue (it owns the /GS cookie and the SEH chain). Rdx carries the
-             * terminate routine so the thunk needs no kernel import.
+             * epilogue (it owns the /GS cookie and the SEH chain).
+             *
+             * RAX carries the terminate routine, not RDX: the thunk ends with
+             * `call rax`. The first version put it in RDX and the thunk called
+             * whatever the guest had left in RAX - measured as 0x1E C0000005
+             * faulting at yghv_pa+0x2501b, the instruction right after that call.
+             *
+             * These writes land in the PUSHAQ block, and SvLV20's POPAQ restores from
+             * it before `mov rsp,rcx; jmp rbx`, so this is exactly what the thunk
+             * sees:
+             *   Rcx (slot +0x70) = the thread's real stack
+             *   Rax (slot +0x78) = PsTerminateSystemThread
+             *   Rbx (slot +0x60) = Sv206LeaveToHost
              */
             UINT64 threadRsp = VpData->GuestVmcb.ControlArea.HostExitRsp;
 
             if (threadRsp != 0)
             {
                 guestContext.VpRegs->Rcx = threadRsp;
-                guestContext.VpRegs->Rdx =
+                guestContext.VpRegs->Rax =
                     reinterpret_cast<UINT64>(&PsTerminateSystemThread);
                 guestContext.VpRegs->Rbx =
                     reinterpret_cast<UINT64>(&Sv206LeaveToHost);
