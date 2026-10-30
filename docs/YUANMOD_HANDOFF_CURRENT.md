@@ -13558,3 +13558,102 @@ VpData->GuestVmcb.ControlArea.InterceptMisc2 |= SVM_INTERCEPT_MISC2_VMMCALL;
 
 **如果它错了，会在加载阶段立刻暴露**（`g_S206VrLog` 应该有记录），
 而不是等 29 次重启。
+
+---
+
+#### 9.434 ★★★★★ guest 根本不是 trampoline —— RIP 指向 `SvVirtualizeProcessor` 自己的续行
+
+**决定性读法（`SvPrepareForVirtualization` 第 337 行附近）**
+
+```c
+VpData->GuestVmcb.StateSaveArea.Rip = ContextRecord->Rip;
+```
+
+`ContextRecord` 是 `SvVirtualizeProcessor` 里 `RtlCaptureContext(contextRecord)` 抓的，
+**抓的是那个函数当下的 RIP** —— 也就是 `SvVirtualizeProcessor` 自己执行到哪了。
+
+而它在 `RtlCaptureContext` 之后做的是：
+
+```c
+if (SvIsSimpleSvmHypervisorInstalled() == FALSE) {
+    SvPrepareForVirtualization(vpData, sharedVpData, contextRecord);
+    Sv206LaunchVm(&vpData->HostStackLayout.GuestVmcbPa);   // 从此"不返回"
+    SV_DEBUG_BREAK();
+    KeBugCheck(MANUALLY_INITIATED_CRASH);                  // <- 若返回，到这里
+}
+```
+
+**所以 guest 的入口是 `SvVirtualizeProcessor` 自己捕获的那一点，不是 `svm_trampoline_test_guest`。**
+
+那段代码是 `SvVirtualizeProcessor` 的**函数体续行**，它包含 `SV_DEBUG_BREAK()` 和
+`KeBugCheck` —— **没有任何 `vmmcall`**。
+
+**这才是 `g_inVmrunCount = 12` 的最终解释**
+
+```
+guest RIP = SvVirtualizeProcessor 的续行（不是 trampoline）
+  -> 那段代码不执行 vmmcall
+  -> 也不执行任何被拦截的指令
+  -> vmrun 永不返回
+  -> lock dec 永不执行
+  -> g_inVmrunCount = 12，永远
+```
+
+**而 `svm_trampoline_test_guest` 那三条指令（`mov rax,1; vmmcall; jmp`），
+在 206 主线上从未被用作 guest 入口。**
+
+它属于**另一条路径**（`svm_core.c` 的 `svm_prepare_vcpu` + `svm_vmrun_trampoline`），
+那条路径本树也走，但 `g_resident_thread_count` 为 0 说明它没启动。
+
+**所以今晚的 29 次崩溃，根本原因是：206 主线的 guest 入口是"函数自己的续行"，
+而那段代码没有任何退出点。**
+
+**这解释了一切，且比 9.431 的解释更根本**
+
+| 之前以为 | 实际 |
+|---|---|
+| guest 是 trampoline，靠 vmmcall 退出（9.431）| guest 是 `SvVirtualizeProcessor` 的续行 |
+| 缺 VMMCALL 拦截（9.432/9.433）| 加不加都一样，因为 guest 不执行 vmmcall |
+| `g_S206VrLog = 0` | 没有 VMEXIT，续行代码不触发任何拦截 |
+
+**9.432/9.433 的两次改动为什么没有效果，现在有了确定答案**
+
+不是位号错（虽然 bit2 确实错了，9.433 的修正是对的），
+而是**那条被拦截的指令从来不在 guest 的执行流里**。
+
+**这意味着 206 主线这个设计本身不成立**
+
+把"调用者自己的续行"当作 guest 入口，等于让虚拟化后的 CPU 去执行
+**hypervisor 自己的代码**，而那段代码期待的是 host 环境（栈、GDT、CR3 都是 host 的）。
+它要么立刻三重故障、要么陷入某个不返回的循环。
+
+**而 29 次崩溃的所有表现，都是这个设计的后果。**
+
+**真正要改的是"guest 入口应该是什么"**
+
+上游 SimpleSvm 同样用 `RtlCaptureContext`，但它**没有"永不返回"的问题**——
+因为它的设计是：捕获点之后的代码**就是**那个要继续执行的正常代码，
+`vmrun` 返回时从那里继续，这是**透明的虚拟化**（guest == host 自己）。
+
+本树把它当"启动一个 guest"用 —— **两件事被混为一谈。**
+
+**这一条我不能再往下推了**，因为它涉及"206 主线到底想做什么"这个设计意图，
+而那需要作者的决定，不是一次改动。
+
+**今晚这里是能到达的最深处**
+
+从"卸载顺序错"一路挖到"guest 入口是 hypervisor 自己的续行代码"——
+每一步都被后一步推翻，而每一步都有实测数据支撑（29 次重启、3 份可读 dump、
+带快照的进度页）。
+
+**下次开工的起点**
+
+不是改卸载、不是改拦截位，而是回答：
+**206 主线的 guest 入口应该是什么？** 是
+(a) 透明虚拟化（guest = 调用者续行，上游语义），还是
+(b) 一个真正的测试 guest（`svm_trampoline_test_guest`）？
+
+选 (a) → 那么 `vmrun` 返回是正常路径，需要检查"返回后为什么没继续"。
+选 (b) → 那么 `SvPrepareForVirtualization` 必须显式设置 `Rip = svm_trampoline_test_guest`。
+
+**这一次不是猜 —— `StateSaveArea.Rip = ContextRecord->Rip` 这行代码就是答案本身。**
