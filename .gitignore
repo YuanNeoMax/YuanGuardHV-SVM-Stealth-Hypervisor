@@ -44,3 +44,6 @@ thirdparty/
 
 # clang-cl 编译 svm_simplevm_port.S 生成的中间汇编（与 svm_trampoline.asm 同类）
 YuanGuardHV/svm_simplevm_port.asm
+
+# commit message scratch files (should never be committed)
+/.git-msg-*.txt
