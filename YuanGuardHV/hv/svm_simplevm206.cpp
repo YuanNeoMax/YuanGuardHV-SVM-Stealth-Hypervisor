@@ -19,16 +19,73 @@
 #include <ntifs.h>
 #include <stdarg.h>
 
-/*
- * 9.439: THE 9.436 DECLARATION IS GONE WITH THE CHANGE IT SERVED.
+/* 9.443: the 206 guest stub, defined in svm_simplevm206_x64.asm.
  *
- * 9.436 declared svm_trampoline_test_guest here so SvPrepareForVirtualization
- * could point the guest's RIP at it. That change is reverted (see the note at
- * the RIP assignment): 206's guest is the CALLER'S OWN CONTINUATION, which is
- * the upstream semantic the rest of Sv206Entry is written against. An extern
- * declaration for a symbol nothing references is dead weight that reads as
- * intent, so it goes with the code.
+ * Declared at file scope because extern "C" cannot be spelled inside a block.
+ * This is the guest the 206 line runs: a loop whose only intercepted instruction
+ * is `vmmcall`, so the handler gets a vote on every iteration and can end the
+ * guest at a point we chose. See the long note at the stub itself. */
+extern "C" void Sv206GuestStub(VOID);
+
+/*
+ * 9.443: per-core VMRUN threads.
+ *
+ * Each core gets its own system thread (see Sv206CoreThread). These hold the thread
+ * handles and the started/exited counts, so DriverUnload can report how many were
+ * started and wait for how many have genuinely left the guest.
+ *
+ * SVM206_MAX_THREADS is generous: this machine has 12 cores, and the array costs
+ * 64 * 8 = 512 bytes. Sizing it to the hardware would make the driver's behaviour
+ * depend on the build machine, which is exactly the kind of assumption this tree
+ * has already paid for.
+ *
+ * Declared HERE, at the top, because Sv206GuestExited (defined a few lines below)
+ * is the redirect target that SvHandleVmExit points SvLV20 at, and it needs both
+ * the limit and the counter.
  */
+#define SVM206_MAX_THREADS 64
+static HANDLE g_S206CoreThreads[SVM206_MAX_THREADS] = { 0 };
+static volatile LONG g_S206CoresStarted = 0;
+static volatile LONG g_S206CoresExited = 0;
+
+/*
+ * 9.443: WHERE A CORE GOES WHEN ITS GUEST IS TOLD TO STOP.
+ *
+ * SvLV20 exits the guest with `mov rsp, rcx; jmp rbx`, and the ExitVm path points
+ * both at this function and at this core's host stack. So we arrive here:
+ *
+ *   - on a real, mapped host stack (VpData->HostStackLayout);
+ *   - with NO return address (it was a `jmp`, not a `call`);
+ *   - on the core that has just stopped being a hypervisor.
+ *
+ * Because there is no return address, this must never return - there is nowhere to
+ * return to. It ends the thread instead, which is exactly the point: the VMRUN frame
+ * suspended below us is abandoned deliberately, and the thread that owns it dies
+ * here, so nothing of this driver is left executing when DriverUnload returns and
+ * the image is unmapped.
+ *
+ * A stub that merely parked (cli/hlt) would not achieve that: it would leave the
+ * core executing driver code after unmap, which is the PAGED_IP crash moved from
+ * `vmsave` to `hlt`, not removed.
+ */
+extern "C" DECLSPEC_NORETURN void Sv206GuestExited(VOID);
+
+extern "C" DECLSPEC_NORETURN void Sv206GuestExited(VOID)
+{
+    /*
+     * Reached on the core's own host stack, after SvLV20 has left the guest for
+     * good. Nothing here may touch guest state: the guest is finished, and the VMCB
+     * may be freed by the time this runs on a later core.
+     *
+     * Interrupts are enabled (the ExitVm path restored the prepare-time RFLAGS), so
+     * this is an ordinary kernel context and PsTerminateSystemThread is legal.
+     */
+    InterlockedIncrement(&g_S206CoresExited);
+    PsTerminateSystemThread(STATUS_SUCCESS);
+
+    /* PsTerminateSystemThread does not return; keep the compiler satisfied. */
+    for (;;) { }
+}
 
 //
 // 9.246 step206-B seams (both gated; with the gates OFF this file is the
@@ -833,6 +890,16 @@ static volatile LONG64 g_S206Vmmcalls = 0;
  */
 extern "C" { volatile LONG64 g_S206Exits = 0; }
 
+extern "C" LONG yghv_s206_cores_started(VOID)
+{
+    return InterlockedCompareExchange(&g_S206CoresStarted, 0, 0);
+}
+
+extern "C" LONG yghv_s206_cores_exited(VOID)
+{
+    return InterlockedCompareExchange(&g_S206CoresExited, 0, 0);
+}
+
 extern "C" { volatile LONG g_VmrunStopRequested = 0; }
 /* How many VMRUN loops have taken the exit. The waiter needs a NUMBER, not a
  * flag: "I asked them to stop" and "they stopped" are different facts, and this
@@ -856,25 +923,46 @@ extern "C" { volatile LONG g_VmrunStopped = 0; }
  */
 extern "C" int Sv206VmrunShouldExit(VOID)
 {
-    if (InterlockedCompareExchange(&g_VmrunStopRequested, 0, 0) == 0)
-        return 0;
-
-    InterlockedIncrement(&g_VmrunStopped);
-    return 1;
+    /*
+     * 9.443: THIS NO LONGER INCREMENTS THE COUNTER, AND THAT FIXES A REAL BUG.
+     *
+     * It used to do `InterlockedIncrement(&g_VmrunStopped)` on every call. Now that
+     * the stub ticks on every iteration, that would increment once per tick - so
+     * `g_VmrunStopped` would race past the core count in microseconds and the unload
+     * waiter would conclude "all cores stopped" while eleven of them were still
+     * running. A counter that measures ticks is not a counter of cores.
+     *
+     * The core count is incremented exactly once per core, in Sv206GuestExited, which
+     * a core reaches only after SvLV20 has taken it out of the guest permanently.
+     * That is the number DriverUnload actually needs.
+     */
+    return (InterlockedCompareExchange(&g_VmrunStopRequested, 0, 0) != 0) ? 1 : 0;
 }
 
 /*
- * 9.441: THE ABOVE IS STILL UNCALLED, AND NOW THAT IS FINE.
+ * 9.443: THE ABOVE IS NOW THE DESIGN'S CENTREPIECE, NOT DEAD CODE.
  *
- * 9.419 deleted the ASM loop's check (see the note in svm_simplevm206_x64.asm),
- * so this function has had no caller since - which is why g_VmrunStopped was
- * identically zero and DriverUnload's wait could only time out (9.440).
+ * History, because it matters: 9.419 deleted the ASM loop's check and left this
+ * function with no callers, so g_VmrunStopped was identically zero and the unload
+ * wait could only time out (9.440). 9.442 then established why the loop cannot
+ * simply be asked to stop from inside SvHandleVmExit: SvLV20's `jmp rbx` RESUMES
+ * THE GUEST at an arbitrary instruction boundary with SVM already off, which is
+ * silent corruption for any thread that was not sitting inside __cpuidex.
  *
- * The stop check now lives in SvHandleVmExit, in C, where the stack is real.
- * This function is kept because it is the correct semantic for a caller that
- * runs INSIDE the ASM frame, and because deleting it would remove the only
- * written statement of what that semantic is. It is not called; it is not
- * counted on.
+ * The way out is the one this function always described: the guest must be code
+ * that WE wrote and that WE can stop at a point of our choosing. 9.443 makes that
+ * true - the 206 guest becomes a dedicated stub whose loop reads this flag and
+ * ends in a vmmcall when it is set. Then:
+ *
+ *   - the stop point is inside our own stub, where no Windows register is live;
+ *   - the exit is a vmmcall, an intercepted instruction, so SvLV20's resume lands
+ *     on OUR next instruction rather than someone's mid-function PC;
+ *   - each core runs its own thread, so the VMRUN frame that never returns
+ *     belongs to that thread and is never unmapped out from under a live core.
+ *
+ * This predicate is what those loops consult. It is reached through a vmmcall the
+ * handler answers, NOT from the ASM frame - which is why the call-site constraint
+ * that killed 9.413/9.414/9.416 no longer applies.
  */
 
 /*
@@ -944,7 +1032,20 @@ extern "C" LONG yghv_s206_cpuid_view_for_trace(VOID)
 
 extern "C" int yghv_s206_vmrun_stopped_count(VOID)
 {
-    return (int)InterlockedCompareExchange(&g_VmrunStopped, 0, 0);
+    /*
+     * 9.443: THIS NOW REPORTS CORES THAT ACTUALLY LEFT, NOT TICKS.
+     *
+     * It used to read g_VmrunStopped, which Sv206VmrunShouldExit incremented on
+     * every call. With the stub ticking per iteration that would have counted
+     * heartbeats, so the unload waiter would see "12 cores stopped" after twelve
+     * ticks - microseconds - while every core was still in its VMRUN loop. The
+     * waiter would then free the VMCB and NPT out from under twelve live cores.
+     *
+     * g_S206CoresExited is incremented once per core, in Sv206GuestExited, after
+     * SvLV20 has taken that core out of the guest for good. That is the only number
+     * that means what the caller thinks it means.
+     */
+    return (int)InterlockedCompareExchange(&g_S206CoresExited, 0, 0);
 }
 
 /* 9.441: the exit counter's read-only door, for the pre-teardown snapshot and
@@ -3383,33 +3484,37 @@ tsc_policy_done:;
         }
         break;
     /*
-     * 9.439: VMMCALL TERMINATES THIS CORE'S GUEST — IT DOES NOT LOOP.
+     * 9.443: THE STOP PROTOCOL, AT THE ONE PLACE IT IS SAFE.
      *
-     * 9.435 recorded the exit and let the loop continue, on the reading that the
-     * trampoline's `mov rax,1 / vmmcall / jmp` was a heartbeat. It is a heartbeat,
-     * and that is exactly why continuing is wrong: a heartbeat that returns FALSE
-     * from SvHandleVmExit makes the ASM `jmp SvLV10`, vmrun again, and take the
-     * same exit immediately. Measured consequence (9.437): `sc start` never
-     * returned, the service sat in START_PENDING, and one core spun in a VMEXIT
-     * storm forever. Sv206Entry is synchronous — it cannot return while a core is
-     * doing that.
+     * The guest is Sv206GuestStub (see the ASM), a loop of `pause x4 / mov rax,1 /
+     * vmmcall`. Every iteration therefore lands here, and this case is where the
+     * decision is made:
      *
-     * The exit path this sets is the SAME one CPUID_UNLOAD uses: __svm_vmload,
-     * __svm_stgi, clear EFER.SVME, SvLV20. One exit path, not two — which is the
-     * property the whole 9.39x family was trying to get.
+     *   stop not requested  ->  count the tick, return FALSE, SvLV10 runs the
+     *                           guest again. The stub loops.
+     *   stop requested      ->  set ExitVm. SvLV20 then does
+     *                           `mov rsp,rcx; mov ecx,'SSVM'; jmp rbx` with
+     *                           RBX = NRip, which is INSIDE OUR STUB. The guest
+     *                           continues at Sv206GuestTick with EFER.SVME already
+     *                           cleared, parks on the halt loop, and this core is
+     *                           done being a hypervisor.
      *
-     * WITH THE GUEST BACK TO THE CALLER'S CONTINUATION (9.439 reverting 9.436)
-     * THIS CASE IS INERT IN PRACTICE: Windows' kernel does not issue vmmcall, so
-     * nothing reaches it. It is kept because it is the correct semantic for the
-     * armed bit, and because leaving a trapped instruction with no case is how
-     * the `default:` bugcheck 0xE2 gets manufactured.
+     * WHY THIS IS SAFE HERE AND WAS NOT SAFE FROM AN ARBITRARY EXIT (9.442):
+     * SvLV20 consumes RCX and RBX to resume the guest. When the guest is our stub,
+     * the registers it destroys are the stub's own - nothing of Windows is live,
+     * because the stub never called into anything. 9.442's objection applied to
+     * resuming an arbitrary kernel thread mid-function, which is exactly what the
+     * old caller-continuation guest was.
      *
-     * The counter stays: g_S206Vmmcalls at zero proves the bit never fired, which
-     * is a different fact from "the bit fired and the core left".
+     * g_VmrunStopped is incremented here so the unload waiter has a number that
+     * actually moves. It counts CORES THAT HAVE LEFT, not ticks.
      */
     case VMEXIT_VMMCALL /* 0x81 */:
         InterlockedIncrement64(&g_S206Vmmcalls);
-        guestContext.ExitVm = TRUE;
+        if (Sv206VmrunShouldExit() != 0)
+        {
+            guestContext.ExitVm = TRUE;
+        }
         break;
     case VMEXIT_SHUTDOWN /* 0x7f */:
         //
@@ -3545,6 +3650,45 @@ tsc_policy_done:;
          */
         guestContext.VpRegs->Rcx = VpData->GuestVmcb.StateSaveArea.Rsp;
         guestContext.VpRegs->Rdx = reinterpret_cast<UINT64>(VpData) >> 32;
+
+        /*
+         * 9.443: FOR THE 206 STUB GUEST, THE EXIT IS TO THE HOST, NOT TO THE GUEST.
+         *
+         * SvLV20 does exactly two things with what we leave in the register block:
+         *
+         *     mov rsp, rcx
+         *     jmp rbx
+         *
+         * For CPUID_UNLOAD the correct values are "the guest's stack" and "the
+         * guest's next instruction", because the guest is inside __cpuidex and must
+         * finish that instruction on bare metal. That is the path above.
+         *
+         * Our 206 guest is different in kind: it is a stub WE own, it was never
+         * doing anything on behalf of a Windows thread, and the only sane thing to
+         * do with it after the stop flag is to LEAVE - not to resume it. So this
+         * branch hands SvLV20 a HOST stack and a HOST continuation instead:
+         *
+         *     rcx = &VpData->HostStackLayout  (this core's own host stack, the same
+         *           one Sv206LaunchVm switched to, so it is mapped and stable)
+         *     rbx = Sv206GuestExited          (noreturn C: ends the thread)
+         *
+         * The consequence is the one 9.442 said was missing: the core stops
+         * executing driver code entirely before DriverUnload returns, so the image
+         * can be unmapped without anything of ours left running on it. A stub that
+         * merely parked (cli/hlt) would only have moved the PAGED_IP crash from
+         * `vmsave` to `hlt`.
+         *
+         * Which path is taken is decided by the exit code: only a VMMCALL from our
+         * stub reaches here with the stop flag set, and the CPUID_UNLOAD leaf is a
+         * separate case that keeps the guest-resume semantics.
+         */
+        if (VpData->GuestVmcb.ControlArea.ExitCode == VMEXIT_VMMCALL)
+        {
+            guestContext.VpRegs->Rcx =
+                reinterpret_cast<UINT64>(&VpData->HostStackLayout);
+            guestContext.VpRegs->Rbx =
+                reinterpret_cast<UINT64>(&Sv206GuestExited);
+        }
 
         //
         // Load guest state (currently host state is loaded).
@@ -4055,43 +4199,39 @@ SvPrepareForVirtualization (
     VpData->GuestVmcb.StateSaveArea.Rflags = ContextRecord->EFlags;
     VpData->GuestVmcb.StateSaveArea.Rsp = ContextRecord->Rsp;
     /*
-     * 9.439: REVERTED 9.436. THE GUEST IS THE CALLER'S CONTINUATION, AS UPSTREAM.
+     * 9.443: THE GUEST IS OUR OWN STUB - NOT THE CALLER'S CONTINUATION.
      *
-     * 9.436 pointed this at svm_trampoline_test_guest. Measured result: `sc start`
-     * never returned — the service sat in START_PENDING for the rest of the
-     * session. The reason is visible in the loop, not in the guest:
+     * 9.434 correctly identified this line as the crux: it used to be
+     * `ContextRecord->Rip`, which is SvVirtualizeProcessor's own continuation.
+     * 9.436 then tried to fix that by pointing it at the old test trampoline, and
+     * the machine stopped booting (9.437: START_PENDING forever) because that
+     * trampoline was a pure `mov rax,1 / vmmcall / jmp` heartbeat and 9.435's
+     * handler answered it with `break` - an infinite VMEXIT storm inside a
+     * synchronous SvVirtualizeAllProcessors.
      *
-     *   guest executes `mov rax,1 / vmmcall`  ->  #VMEXIT
-     *   case VMEXIT_VMMCALL (9.435)          ->  InterlockedIncrement, break
-     *   SvHandleVmExit returns ExitVm=FALSE  ->  ASM `jmp SvLV10`  ->  vmrun
+     * 9.439 reverted to the caller's continuation, which made loading work again
+     * (58 ms, measured) but left the real defect in place, and 9.442 finally named
+     * it: a caller-continuation guest EXECUTES THE FUNCTION'S `return`. Control
+     * flows back to SvExecuteOnEachProcessor, the thread moves to the next core,
+     * and another vmrun starts - leaving the previous frame suspended forever with
+     * its `lock dec` unexecuted. Twelve cores, twelve suspended frames, and after
+     * DriverUnload unmaps the image their `vmsave` runs on dead code: the 0xD1 /
+     * PAGED_IP at Sv206LaunchVm+0x14.
      *
-     * vmmcall is a HEARTBEAT: it never asks to leave. So the loop is an infinite
-     * VMEXIT storm, SvVirtualizeAllProcessors never returns, and Sv206Entry —
-     * which is synchronous — never returns either. "The guest can finally exit"
-     * became "the guest exits ten million times a second". That is a hang, and a
-     * hang is worse than the crash it replaced because it is unobservable.
+     * The guest is therefore a stub we own (Sv206GuestStub). Its loop is
+     * `pause x4 / mov rax,1 / vmmcall`, so:
+     *   - every iteration is an intercepted instruction, giving the handler a vote;
+     *   - the handler ends the guest by setting ExitVm, and SvLV20 resumes us at
+     *     OUR next instruction - not at some Windows thread's mid-function PC;
+     *   - the stub never touches the stack, so RSP below is never dereferenced and
+     *     a host stack pointer is safe to hand it.
      *
-     * The deeper point is the one 9.434 left open and 9.436 answered by accident:
-     * EVERYTHING ELSE IN Sv206Entry IS WRITTEN FOR TRANSPARENT VIRTUALISATION.
-     * SvVirtualizeAllProcessors returns synchronously, SvDevirtualizeProcessor
-     * asks the CALLER's own CPUID to leave guest mode, and the ExitVm path hands
-     * back the guest's RSP so `mov rsp, rcx` resumes the caller. A test guest that
-     * never returns cannot satisfy any of that. So the guest stays the caller's
-     * continuation — the upstream semantic — and the "why does vmrun not return"
-     * question is answered on its own terms, not by replacing the guest.
-     *
-     * That question, restated honestly: with the caller's continuation as guest,
-     * the very next thing that code does is execute real kernel instructions as a
-     * guest, so a #VMEXIT does arrive (CPUID, CR3 write, MSR, NPF). The 9.434
-     * claim "there is no intercepted instruction after this point" describes the
-     * three lines of THIS function; it does not describe the kernel code those
-     * lines return into. What 9.410 measured (g_S206VrLog empty, count stuck at
-     * 12) is therefore still unexplained, and it is now the open question rather
-     * than something this line pretends to have fixed.
-     *
-     * Rollback target: f7e1e8c's predecessor of 3690dba, i.e. exactly this line.
+     * This is what makes "stop on purpose" possible at all, and it is why the
+     * stop flag no longer has to be set from an arbitrary exit (which 9.442 showed
+     * was corruption, not a fix).
      */
-    VpData->GuestVmcb.StateSaveArea.Rip = ContextRecord->Rip;
+    VpData->GuestVmcb.StateSaveArea.Rip =
+        reinterpret_cast<UINT64>(&Sv206GuestStub);
     VpData->GuestVmcb.StateSaveArea.GPat = __readmsr(IA32_MSR_PAT);
 
     //
@@ -4941,6 +5081,63 @@ Exit:
     return svmSupported;
 }
 
+/* ==========================================================================
+ * 9.443: ONE SYSTEM THREAD PER CORE, BECAUSE THE VMRUN FRAME MUST OWN ITS STACK.
+ * ==========================================================================
+ *
+ * WHY THE OLD MODEL CANNOT WORK ANY MORE
+ *
+ * 9.442 established that a guest which is the caller's continuation EXECUTES THE
+ * FUNCTION'S `return`, so control flows back out of SvVirtualizeProcessor and
+ * SvExecuteOnEachProcessor advances to the next core - while the vmrun frame stays
+ * suspended forever. With the guest replaced by our own stub (9.443) that failure
+ * mode is gone, but a second one appears immediately: Sv206LaunchVm no longer
+ * returns AT ALL. So SvExecuteOnEachProcessor, a plain for-loop on ONE thread,
+ * would block on the first core and never virtualise the other eleven.
+ *
+ * The fix is the model the rest of this tree already uses for residents
+ * (yghv_os_guest_thread in main.c): one system thread per core, each pinned with
+ * KeSetSystemAffinityThread, each calling SvVirtualizeProcessor on its own. Then:
+ *
+ *   - every core's VMRUN frame is suspended on ITS OWN thread stack;
+ *   - no thread is shared between cores, so advancing to "the next core" cannot
+ *     strand a frame belonging to a thread that has moved on;
+ *   - when the stop flag is seen, that core's SvHandleVmExit sets ExitVm, SvLV20
+ *     resumes the stub, the stub parks, and the thread is free to terminate;
+ *   - Sv206Entry returns as soon as all threads have been CREATED, which is what
+ *     "the hypervisor is up" means for this design.
+ *
+ * DriverUnload sets the stop flag and waits for g_VmrunStopped to reach the core
+ * count - a number that now actually moves (see the VMMCALL case). If the wait
+ * times out the VMCB/NPT guard still refuses to free, so a stuck core leaks rather
+ * than being handed freed pages.
+ */
+typedef struct _SV206_CORE_THREAD_CONTEXT
+{
+    PSHARED_VIRTUAL_PROCESSOR_DATA SharedVpData;
+    ULONG CoreIndex;
+    volatile LONG Status;
+} SV206_CORE_THREAD_CONTEXT, *PSV206_CORE_THREAD_CONTEXT;
+
+static VOID Sv206CoreThread(PVOID Context)
+{
+    PSV206_CORE_THREAD_CONTEXT ctx =
+        static_cast<PSV206_CORE_THREAD_CONTEXT>(Context);
+
+    KeSetSystemAffinityThread((KAFFINITY)(1ULL << ctx->CoreIndex));
+
+    /*
+     * This call does not return in the normal case: Sv206LaunchVm is marked "should
+     * never return to here" and the only way out is the ExitVm path, which resumes
+     * the guest stub rather than returning to the caller. It CAN return on the
+     * early-out path (hypervisor already installed), and it returns an error if
+     * allocation fails, so the assignment is kept and the thread always terminates.
+     */
+    ctx->Status = (LONG)SvVirtualizeProcessor(ctx->SharedVpData);
+
+    PsTerminateSystemThread(STATUS_SUCCESS);
+}
+
 /*!
     @brief      Virtualizes all processors on the system.
 
@@ -5015,20 +5212,90 @@ SvVirtualizeAllProcessors (
     SvBuildMsrPermissionsMap(sharedVpData->MsrPermissionsMap);
 
     //
-    // Execute SvVirtualizeProcessor on and virtualize each processor one-by-one.
-    // How many processors were successfully virtualized is stored in the third
-    // parameter.
+    // 9.443: ONE THREAD PER CORE. See the note at Sv206CoreThread for why the old
+    // SvExecuteOnEachProcessor(SvVirtualizeProcessor, ...) cannot work once the
+    // guest is a stub: that guest never returns, so a single-threaded for-loop
+    // would stop at core 0 and leave the rest unvirtualised.
     //
-    // STATUS_SUCCESS is returned if all processor are successfully virtualized.
-    // When any error occurs while virtualizing processors, this function does
-    // not attempt to virtualize the rest of processor. Therefore, only part of
-    // processors on the system may have been virtualized on error. In this case,
-    // it is a caller's responsibility to clean-up (de-virtualize) such
-    // processors.
+    // Threads are CREATED here and not joined: each one lives inside its own VMRUN
+    // loop for as long as the hypervisor is up. DriverUnload stops them by setting
+    // g_VmrunStopRequested and waiting on g_VmrunStopped.
     //
-    status = SvExecuteOnEachProcessor(SvVirtualizeProcessor,
-                                      sharedVpData,
-                                      &numOfProcessorsCompleted);
+    {
+        ULONG numOfProcessors = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
+        ULONG created = 0;
+
+        if (numOfProcessors > SVM206_MAX_THREADS)
+        {
+            numOfProcessors = SVM206_MAX_THREADS;
+        }
+
+        for (ULONG i = 0; i < numOfProcessors; i++)
+        {
+            PROCESSOR_NUMBER processorNumber;
+            HANDLE threadHandle = nullptr;
+            NTSTATUS st;
+
+            st = KeGetProcessorNumberFromIndex(i, &processorNumber);
+            if (!NT_SUCCESS(st))
+            {
+                status = st;
+                goto Exit;
+            }
+
+            /*
+             * The context has to outlive the thread's use of it, and the thread
+             * never returns in the normal case - so it is allocated, not stacked.
+             * One small nonpaged block per core, leaked only if the thread never
+             * exits, which is the same lifetime as the VMRUN loop itself.
+             */
+            PSV206_CORE_THREAD_CONTEXT ctx =
+                static_cast<PSV206_CORE_THREAD_CONTEXT>(
+                    ExAllocatePoolWithTag(NonPagedPool,
+                                          sizeof(SV206_CORE_THREAD_CONTEXT),
+                                          '2CvS'));
+            if (ctx == nullptr)
+            {
+                status = STATUS_INSUFFICIENT_RESOURCES;
+                goto Exit;
+            }
+            RtlZeroMemory(ctx, sizeof(*ctx));
+            ctx->SharedVpData = sharedVpData;
+            ctx->CoreIndex = i;
+            ctx->Status = (LONG)STATUS_PENDING;
+
+            st = PsCreateSystemThread(&threadHandle,
+                                      THREAD_ALL_ACCESS,
+                                      nullptr,
+                                      nullptr,
+                                      nullptr,
+                                      Sv206CoreThread,
+                                      ctx);
+            if (!NT_SUCCESS(st))
+            {
+                ExFreePoolWithTag(ctx, '2CvS');
+                status = st;
+                goto Exit;
+            }
+
+            /*
+             * The handle is kept so DriverUnload can wait on the thread object if
+             * it ever needs to; the counter g_VmrunStopped is the primary signal.
+             */
+            g_S206CoreThreads[i] = threadHandle;
+
+            created += 1;
+            InterlockedIncrement(&g_S206CoresStarted);
+        }
+
+        numOfProcessorsCompleted = created;
+        if (created == 0)
+        {
+            status = STATUS_UNSUCCESSFUL;
+            goto Exit;
+        }
+        status = STATUS_SUCCESS;
+    }
 
 Exit:
     if (!NT_SUCCESS(status))

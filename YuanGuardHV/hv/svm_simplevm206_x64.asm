@@ -336,4 +336,90 @@ SvInvlpgaByVa proc
     ret
 SvInvlpgaByVa endp
 
+;
+; ============================================================================
+; 9.443: THE 206 GUEST STUB — A GUEST WE OWN AND CAN STOP ON PURPOSE.
+; ============================================================================
+;
+; WHY THIS EXISTS (9.442)
+;
+; The 206 guest used to be `StateSaveArea.Rip = ContextRecord->Rip`, i.e. the
+; continuation of SvVirtualizeProcessor itself. That is the upstream "transparent
+; virtualisation" semantic, and it has a consequence that took this session a very
+; long time to see: the guest RUNS TO THE END OF THAT FUNCTION and executes its
+; `return`. Control then flows back into SvExecuteOnEachProcessor's for-loop, the
+; thread is pinned to the next core, and a NEW vmrun starts - while the previous
+; vmrun frame is still on the stack and its `lock dec` never runs. Twelve cores
+; means twelve permanently suspended vmrun frames. When DriverUnload returns and
+; the OS unmaps the image, those frames execute `vmsave` on a dead code page:
+; exactly the 0xD1 / PAGED_IP at Sv206LaunchVm+0x14 this machine kept producing.
+;
+; The measurement that proves the diagnosis (9.441's exit counter):
+;     exits = 213,601      the loops cycle normally - nothing is stuck
+;     vmmcall = 0          the guest is real kernel code, not a stub
+;     invmrun = 12         a live snapshot of twelve healthy, nested loops
+;
+; WHY A STUB FIXES IT
+;
+; The loop can only be left safely at a point we control. SvLV20 resumes the guest
+; with `mov rsp, rcx; mov ecx,'SSVM'; jmp rbx`, so whatever RIP the guest had is
+; where execution continues, with RCX and RBX consumed. That is harmless if the
+; RIP is inside code we wrote (it simply continues our loop) and catastrophic if it
+; is mid-function in an arbitrary Windows thread. A stub makes it harmless.
+;
+; THE PROTOCOL
+;
+;   guest:  vmmcall                        ; "tick"
+;   host :  SvHandleVmExit -> VMEXIT_VMMCALL
+;             if (stop requested)  ExitVm = TRUE   -> SvLV20 -> resume at +next
+;             else                 (continue)       -> SvLV10 -> vmrun again
+;
+; When ExitVm is set, SvLV20 resumes the guest at NRip with EFER.SVME already
+; cleared. The guest then falls out of the loop and executes `ret`-like idle code
+; that must never be reached by a live core - so the loop's exit path parks on a
+; `hlt` guarded by `cli`, and the owning thread terminates from the host side.
+;
+; RSP: the stub never touches the stack. It is given the host stack pointer by
+; SvPrepareForVirtualization (StateSaveArea.Rsp = ContextRecord->Rsp), and since
+; it neither pushes nor calls, that value is never dereferenced. That is the one
+; property that makes a stub safe to enter on a stack that belongs to the host.
+;
+Sv206GuestStub proc
+    ; A short spin between ticks keeps this from being a pure VMEXIT storm. Each
+    ; iteration still exits, so the stop flag is observed within one spin, but the
+    ; exit rate is bounded rather than maximal.
+Sv206GuestTick:
+    pause
+    pause
+    pause
+    pause
+    mov     rax, 1              ; YGHV_CMD_HEARTBEAT - "I am alive, check the flag"
+    vmmcall                     ; <-- the ONLY intercepted instruction in the loop
+    jmp     Sv206GuestTick
+
+    ; Reached only when the handler set ExitVm and SvLV20 resumed us here with
+    ; SVM already disabled.
+    ;
+    ; THIS MUST NOT PARK, AND THE REASON IS THE WHOLE POINT OF 9.443.
+    ;
+    ; Parking (cli/hlt) would leave this core executing code from the driver image
+    ; after DriverUnload returns - which is the PAGED_IP crash this design exists to
+    ; remove, just moved from `vmsave` to `hlt`. A stub that parks has not solved
+    ; anything; it has only renamed the fault.
+    ;
+    ; Instead the ExitVm path hands us a HOST stack pointer and a HOST continuation
+    ; address (SvHandleVmExit sets VpRegs->Rcx and VpRegs->Rbx for that purpose).
+    ; SvLV20 then does `mov rsp, rcx; jmp rbx`, so control leaves the guest for good
+    ; and lands in C code running on this core's own host stack. That continuation
+    ; terminates the thread, so nothing of ours is left executing when the image is
+    ; unmapped.
+    ;
+    ; This label is therefore unreachable by design. It is kept as a `ud2` so that
+    ; if the protocol is ever broken, the failure is an immediate, attributable
+    ; exception at a known address rather than a silent fall through into whatever
+    ; bytes happen to follow.
+Sv206GuestParked:
+    ud2
+Sv206GuestStub endp
+
         end

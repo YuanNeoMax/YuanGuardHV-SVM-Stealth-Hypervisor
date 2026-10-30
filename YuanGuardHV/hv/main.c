@@ -4966,12 +4966,19 @@ void DriverUnload(struct _DRIVER_OBJECT *d) {
         int stopped;
 
         yghv_s206_vmrun_stop_request();
-        stopped = yghv_s206_vmrun_stopped_count();
 
-        /* Record BOTH numbers: how many loops left by flag, and how many cores
-         * there are. With the flag path dead these will read 0 / 12, which is the
-         * honest report that the flag is not what stops anything. */
-        yghv_ut_mark_val(45 + 0, (uint64_t)stopped);
+        /*
+         * 9.443: `stopped` IS READ AFTER THE WAIT BELOW, NOT HERE.
+         *
+         * It used to be read immediately after the request, which under the new
+         * protocol would always be 0: each core only increments g_S206CoresExited
+         * when its guest stub reaches Sv206GuestExited, and that takes one vmmcall
+         * tick per core. Reading it before giving the cores that tick would report
+         * "0 of 12 stopped" on a perfectly healthy unload and make the trace
+         * unreadable.
+         */
+        stopped = 0;
+
         yghv_ut_mark_val(45 + 1, (uint64_t)active);
 
         /*
@@ -5038,11 +5045,11 @@ void DriverUnload(struct _DRIVER_OBJECT *d) {
          * So the walk was skipped every single time - which mattered, because the
          * walk frees the VPDs. Skipping it leaked every VPD on every unload.
          *
-         * (g_VmrunStopped now has a writer again: SvHandleVmExit increments it
-         * when it takes the stop flag. So `stopped` is a real reading from this
-         * version on - but it is read ABOVE, before the flag has had time to be
-         * seen, so it will legitimately read 0 here. The number that matters is
-         * slot 56/57 below.)
+         * (9.443: g_S206CoresExited now has exactly one writer - Sv206GuestExited -
+         * and it is incremented once per core after SvLV20 has taken that core out
+         * of the guest for good. So it is a real reading, and it is read AFTER the
+         * wait below. An earlier version of this comment said it would read 0 here;
+         * that was true only while it was being read too early.)
          *
          * The callback release happens first and unconditionally: it has nothing
          * to do with cores, and skipping it would leave a registration pointing
@@ -5057,68 +5064,44 @@ void DriverUnload(struct _DRIVER_OBJECT *d) {
         { extern void Sv206CoopUnload(void); Sv206CoopUnload(); }
         yghv_ut_mark(YGHV_UT_COOP_UNLOAD + 5);
         yghv_ut_mark_val(22, 1);   /* 22/1 = walk ran (was: 22/0 = skipped) */
-        /*
-         * `stopped` is reported, not trusted. With the walk now doing the work,
-         * this number going to zero is the OBSERVATION that the fix worked - not
-         * the condition for trying.
-         */
-        yghv_ut_mark_val(48, (uint64_t)(ULONG)stopped);
 
         /*
-         * 9.442: WAIT FOR THE LOOPS TO LEAVE - AND THIS WAIT IS NOW THE WHOLE FIX.
+         * 9.443: WAIT FOR CORES THAT ACTUALLY LEFT - NOT FOR A FRAME COUNT.
          *
-         * What the first run of the exit counter measured (9.441):
+         * 9.442 waited on g_inVmrunCount, which can never reach zero by design: the
+         * VMRUN frame a core abandons when its guest exits stays suspended on that
+         * thread's stack forever, so `lock dec` never runs for it. Waiting on it was
+         * guaranteed to burn the whole budget on every single unload.
          *
-         *     s206 exits at unload  = 213,601
-         *     s206 vmmcall at unload = 0
-         *     s206 invmrun at unload = 12
+         * g_S206CoresExited is the number that means what this function needs: how
+         * many cores have reached Sv206GuestExited, i.e. have left the guest for
+         * good and are no longer executing anything of ours. When it equals the
+         * active core count, nothing of this driver is running anywhere, and the
+         * image can be unmapped without a PAGED_IP.
          *
-         * 213,601 exits means the loops are NOT stuck - they cycle constantly.
-         * `invmrun == 12` is therefore not "12 cores trapped", it is "12 cores
-         * happened to be between `lock inc` and `lock dec` when we looked". A
-         * counter read during a live loop gives a live value.
-         *
-         * That reframes the bug completely. The cores are healthy; what is missing
-         * is that NOTHING TELLS THEM TO STOP. DriverUnload returns, the OS unmaps
-         * the image, and the next `vmsave` in each loop executes a code page that
-         * no longer belongs to it - which is exactly the PAGED_IP / 0xD1 at
-         * Sv206LaunchVm+0x14 this machine has produced repeatedly.
-         *
-         * The stop flag is requested above and SvHandleVmExit now checks it on
-         * every exit (9.442). So this wait is where the loops are given time to
-         * reach their next exit and take the ExitVm branch. The wait is BEFORE any
-         * teardown and, critically, BEFORE DriverUnload returns - the unmap happens
-         * after the function, so a core still inside the stub at that point cannot
-         * be saved by anything later in this function.
-         *
-         * The spin budget is generous on purpose: a core that is inside a long
-         * guest run takes one exit to notice, and one exit is bounded by whatever
-         * the guest is doing. Timing out here does not make things worse than they
-         * already were (the guard below still refuses to free VMCB/NPT), but it
-         * does mean the image is about to be unmapped under a live core, so the
-         * trace records it either way.
+         * The wait is BEFORE DriverUnload returns because the unmap happens after
+         * the function: a core still in the stub at that point cannot be saved by
+         * anything later in this function.
          */
         {
+            extern int yghv_s206_vmrun_stopped_count(void);
             extern int yghv_s206_invmrun_count(void);
 
             ULONG waited = 0;
-            int inside = yghv_s206_invmrun_count();
 
-            yghv_ut_mark_val(55, (uint64_t)inside);
-            /*
-             * `inside == 12` is expected on the FIRST read even with a perfect
-             * stop: it takes one exit per core to notice the flag, and the read
-             * happens immediately. So the loop condition is "not zero", and the
-             * interesting number is how long it took.
-             */
-            while (inside != 0 && waited < 20000) {
+            yghv_ut_mark_val(55, (uint64_t)yghv_s206_invmrun_count());
+
+            stopped = yghv_s206_vmrun_stopped_count();
+            while ((ULONG)stopped < active && waited < 20000) {
                 volatile ULONG spin;
                 for (spin = 0; spin < 200000UL; spin++) { }
                 waited += 1;
-                inside = yghv_s206_invmrun_count();
+                stopped = yghv_s206_vmrun_stopped_count();
             }
-            yghv_ut_mark_val(56, (uint64_t)inside);
+
+            yghv_ut_mark_val(56, (uint64_t)(ULONG)stopped);
             yghv_ut_mark_val(57, (uint64_t)waited);
+            yghv_ut_mark_val(48, (uint64_t)(ULONG)stopped);
         }
     }
     /* The mark after it is the one that matters: if the dump's last stamp is
