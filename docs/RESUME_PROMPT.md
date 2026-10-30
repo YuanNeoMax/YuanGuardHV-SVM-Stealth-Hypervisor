@@ -1,457 +1,421 @@
-# YuanGuardHV 新窗口恢复提示词
+# YuanGuardHV 新窗口恢复提示词（2026-10-30 重写）
 
-> 更新时间: 2026-10-18 23:55（9.366 四项收口后）
-> 仓库根: `D:\yuanguard` | 分支: `main`
-> 用 `git rev-list --count @{u}..HEAD` 查当前领先提交数，`git log --oneline -3` 查 HEAD —— 不要写死。
-> 本文件用于在新会话中无缝接管。**先读完本文件再动手。**
+> **本文件是唯一入口。** 读完第 0、1、3、4 节就能接手。
+> 完整历史在 `docs/YUANMOD_HANDOFF_CURRENT.md`（13754 行，按 9.3xx 编号），
+> 只在需要溯源某条结论时去查，**不要从头读**。
 
 ---
 
 ## 0. 一句话现状
 
-AMD-V SVM/NPT 隐形 Hypervisor 已完成 **Tier 7 全功能（13/13 PASS）**，
-`g_bp`/`g_frame`/`g_view_pages` 三张表**可以隐藏**（含热路径在隐藏下存活），
-隐藏路径 10 分钟 soak **STABLE**。
+**裸机 SVM/NPT hypervisor：能加载、能虚拟化、能隐藏页、能跑 13/13 回归；
+但「卸载」这条路有 29 次崩溃，根因已定位到设计层面，尚未解决。**
 
-9.366 之后：**Tier 7.4/7.5/7.6 的 wiring 已接通**（escape 与 attack-surface 不再恒为 0）、
-**诱饵语义首次被真正验证**（`mmf-read`：guest cpl=3 读隐藏页得 `0x0`）、
-**10 个模块状态区页精确化**（新增 `page_layout_check` 规则 4）、
-**位置式指针表改为构建失败**。当前镜像 `206zB_pageexact`（md5 每次构建都变，**比 .map**）。
+| 能做什么 | 状态 |
+|---|---|
+| 加载驱动 | **可以**（最后一次改动前已验证多次）|
+| 虚拟化 12 核 + NPT | **可以**（`g_npt.pml4_pa` 有效、12 个 VCPU 全建好）|
+| 隐藏页 / decoy / 13 项回归 | **可以**（G25 13/13）|
+| Tier 9.1 无设备 CPUID 通道 | **可以**（设备可移除，门铃可达）|
+| Tier 9.2 控制通道认证 | **可以**（G41 13/13）|
+| **卸载驱动** | **会崩或挂死**（见第 4 节）|
 
-> **所有者的 1 分钟多核 soak 是 DECOY 路径的**（`probes=0` 是机制正确，不是没跑）。
-> 详见 9.366.7 —— 不要把那条判词读成"ALLOW 循环在 4 核下存活"。
+**当前代码状态：不可用于加载。** 最后一次改动（`3690dba`）把 guest 入口设为
+trampoline，导致 `sc start` 就卡在 `START_PENDING`。**必须先回滚它**（见第 3 节）。
 
 ---
 
-## 1. 用户铁律（必须遵守，违反即失败）
+## 1. 用户铁律（违反即失败）
 
-| # | 铁律 |
-|---|---|
-| 1 | **改变机器状态的命令必须先获明确确认**（驱动加载/停止、`sc`、压测、重启）。只读操作可直接执行。 |
-| 2 | **只修用户报告过的问题**，不擅自扩大修复范围。 |
-| 3 | **每个修改与决策写入 `docs/YUANMOD_HANDOFF_CURRENT.md`**，编号 9.3xx。 |
-| 4 | 构建 + BSOD 取证可直接做，无需确认。 |
-| 5 | **禁止 `python -c` 编辑 .h/.c** —— 用 edit 工具。 |
-| 6 | **未经明确指示不得推 GitHub。** |
-
-用户偏好：「自主规划解决」——能自主判断的可逆步骤直接做，别逐步问。
+1. **会改变机器状态的命令必须先得到明确确认**：`sc create/start/stop/delete`、
+   加载/卸载驱动、压力测试、重启、改启动链、推 GitHub。
+   *只读操作可以直接执行*。
+2. **只修用户报告过的问题**，不擅自扩大修复范围。
+3. **每次改动/决策都写进 `docs/YUANMOD_HANDOFF_CURRENT.md`**，编号 9.3xx。
+4. **构建和蓝屏取证不需要确认**。
+5. **绝不推送 GitHub**（全部本地提交）。
+6. **不要用 `python -c` 改 .h/.c**，用 edit 工具。
+7. **蓝屏后自动取证 → 定位 → 修复 → 重跑，不中断**。
+8. **优先级**：重启类最后、压测最后、按蓝屏风险从小到大做；
+   高风险（会崩/会重启）先确认。
 
 ---
 
 ## 2. 环境
 
 ```
-机器       Ryzen 5 5500 (Zen3 Cezanne, Family 19h Model 50h), 12 逻辑核
-           Win10 Pro Workstation 19045, 16 GB, 裸机
-           testsigning=Yes, nointegritychecks=Yes, debug=No, SecureBoot=off
-           HypervisorPresent=False, IOMMU 不在 ACPI, 无 TPM
-交互式 kd  不可用；本地符号 kd 可用
+工作目录      D:\yuanguard
+驱动源码      D:\yuanguard\YuanGuardHV\hv\
+测试脚本      D:\aaaaaavm\
+客户端        D:\yuanguard\YuanGuardHV\tools\yghv_ctl.ps1
+构建          cd YuanGuardHV && set YGHV_BAREMETAL_STEP=206 && set YGHV_206B_COEXIST=1
+              && set YGHV_206B_GNPT=1 && build.bat
+带符号构建    ... && set YGHV_NO_DEVICE=1 && build.bat   （Tier 9.1 用）
+调试器        "C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\kd.exe"
+              必须用 -y "C:\symbols"（本地符号），srv* 会 Could not write to pipe
+dump 配置     CrashDumpEnabled=2, CrashDumpType 已删除, AlwaysKeepMemoryDump=1
+              → C:\Windows\MEMORY.DMP（2-3 GB，含物理内存）
+机器          12 核 AMD，16 GB RAM，Win10 19045
 ```
 
-**构建**：
-```bat
-set YGHV_BAREMETAL_STEP=206
-set YGHV_206B_COEXIST=1
-set YGHV_206B_GNPT=1
-cd /d D:\yuanguard\YuanGuardHV && build.bat
-```
-
-> **⚠ 每次构建 md5 都会变 —— 这不是回归。**
-> `build.bat` 每次重新签名，PE 头里的 `TimeDateStamp`（0xE8）、`CheckSum`（0x138）、
-> debug directory、证书表指针、PKCS#7 签名都会变，共约 323 字节，**全部在元数据区**。
-> 实测：同一份代码两次构建，**代码段 0x400..0x24E54 差异字节 = 0**。
-> 比对是否同一份代码要**比 .map** 或**比代码段**，不要比文件 md5。
-> `206zA_why` 归档的 `86DF8BBE` 是那一次签名的产物，重建会得到不同的值。
-
-编译器 `clang-cl`，`CFLAGS=/nologo /O2 /kernel /GR- /EHs-c- /Zl /GS-`
-另有 `-Werror=return-type -Werror=implicit-function-declaration`（**不是全部警告**，内核内建产生 208 个）。
-
-**build.bat 执行顺序（重要）**：
-```
-1. run_source_checks.ps1   编译前（只读源码）
-2. 编译 + 链接
-3. run_map_checks.ps1      链接后（读 .map）
-4. 签名
-```
-> 9.358 修的结构性缺陷：map 级检查原来在编译**之前**跑，一直在验证**上一次构建**。
+**构建成功的判据不是 md5**（每次重签都变）。看 7 个静态检查全绿 + `Build SUCCESS`。
 
 ---
 
-## 3. 当前验证矩阵（镜像 `206zB_pageexact`）
+## 3. 当前代码状态与第一件事
 
 ```
-G25  Tier 7 全功能          13/13 ALL PASS   ← T7/T9/T10 已重写
-G26  bp-after-hide           3/3  PASS
-G29  arm→hide→trigger        PASS (hid 3, hide_fail=0, drain saw NPF)
-G30  诱饵语义 + 7.4/7.6 接线 ALL PASS        ← 新增，决定性
-G31  hidecore 归因           hid 3 / hide_fail=0    ← 新增，诊断
-G32  多核隐藏 soak 1 分钟    STABLE (4 worker, 1209 写, hidden 11/11)
-G28  隐藏路径 10 分钟 soak   STABLE（9.365 的结论，本轮未复跑）
-静态检查                     7 个 PASS
+HEAD = f7e1e8c   (docs only)
+      3690dba    fix(9.435-9.436)  ← 这一笔是错的，需要回滚
+      48742f2    docs(9.434)
+      e8629ca    fix(9.433)  VMMCALL bit1
+      6152887    fix(9.432)  武装 VMMCALL
 ```
 
-| 测试 | 脚本 | 用途 |
-|---|---|---|
-| G25 | `D:\aaaaaavm\g25_tier7.ps1` | Tier 7 全功能 13 项 |
-| G26 | `D:\aaaaaavm\g26_bphang.ps1` | bp 在 hidecore 前后 |
-| G28 | `D:\aaaaaavm\g28_hidesoak.ps1` | 隐藏路径 10 分钟 soak（`-Minutes N`）|
-| G29 | `D:\aaaaaavm\g29_border.ps1` | **决定性**：arm→hide→trigger |
+**`3690dba` 做了三件事，其中一件错：**
 
-**跑测试前必做**（否则会被旧驱动污染，曾导致假失败）：
-```powershell
-Get-Process powershell,pwsh | Where-Object { $_.Id -ne $PID } | ForEach-Object {
-  $c=(Get-CimInstance Win32_Process -Filter "ProcessId=$($_.Id)" -EA SilentlyContinue).CommandLine
-  if($c -match 'mmf-hold|g2[0-9]_|yghvg'){ Stop-Process -Id $_.Id -Force -EA SilentlyContinue }
-}
-foreach($n in @('yghvg28','yghvg29','yghvg26','yghvg25','yghvgt')){
-  & sc.exe stop $n 2>&1 | Out-Null; Start-Sleep -Seconds 2
-  & sc.exe delete $n 2>&1 | Out-Null
-}
-Get-ChildItem 'C:\' -Filter 'yghv*' | ForEach-Object { Remove-Item $_.FullName -Force -EA SilentlyContinue }
-```
-
----
-
-## 4. 核心架构约束（违反会崩溃或挂起）
-
-### 4.1 OS-as-guest 决定什么能隐藏
-
-只有跑在 **VMRUN 循环 / VMEXIT 处理器**里的代码在 **HOST 模式**（不查 NPT）。
-普通驱动线程（IOCTL、系统 worker）在 **GUEST 模式** → guest VA → guest 页表 → GPA → NPT → SPA。
-
-> **隐藏一页 = 从 NPT 移除 = 从 guest 模式的驱动线程也移除。**
-
-### 4.2 两种隐藏机制，不可互换
-
-| 机制 | 值 | 行为 | 适用 |
-|---|---|---|---|
-| `YGHV_HIDE_UNMAP` | 0 | 清 PRESENT；我方下次访问 fault，ALLOW 循环服务**真实帧** | **我们自己的表** |
-| `YGHV_HIDE_DECOY` | 1 | 叶子指向诱饵帧；页仍 present，读返回**零** | **外来页** |
-| `YGHV_HIDE_AUTO` | 2 | 由 `yghv_guard_mode_for()` 决定 | 内部调用唯一该传的值 |
-
-**机制不匹配 ⇒ 页变成零页 ⇒ 表读成空、写被丢弃、功能静默失效**（9.350）。
-
-### 4.3 地址类型纪律（三次栽在同一处）
-
-- `mem-write` 收 **VA**
-- `pa-io` 收 **PA**
-- **来自 `MmGetPhysicalAddress` 的是物理的；`&something` 永远不是。**
-- 两侧都是 `uint64_t`，**类型系统救不了** —— 这是命名规则。
-- 每个比较点必须**显式翻译一次并命名哪一侧是哪一侧**。
-- per-VMEXIT 路径上 VA 侧常量**解析一次并缓存**。
-
-### 4.4 岛内约束（`protect.c` 9.249）
-
-`IRQL = DISPATCH`、`GIF=0`、**禁止阻塞**：
-- 无锁、无 LOG/trace、无分配
-- 门控函数（`KeAreAllApcsDisabled()`）在此返回 **看似合理的 0**，无法与"无事可做"区分
-- 岛内安全版本命名 `*_bare`
-
-### 4.5 返回 0 无法区分"拒绝"与"无事可做"
-
-必须用计数器交叉验证。`hide_fail` 位掩码：
-```
-0x10 早退（ALLOW 循环未武装，正确的拒绝）  1 split 失败  2 perm 失败
-3 页是guard状态  4 无guard条目  5 已隐藏  0x20 循环未跑
-```
-`hash_fail` 承载 `state_why` 位掩码：
-```
-0x01 某个具名 guard 对象占这一页（9.366 起，不再是"在某两个地址之间"）
-0x02 code_start  0x04 code_size  0x08 decoy_pa
-0x10 decoy_va  0x20 npt  0x40 protect
-```
-**要单页归因，不要重建加载**：`sys-guard why <hex_pa>`（IOCTL 0x826 op 7）一次问清
-三套判定，只读、不做隐藏。9.366 靠它一次定位"frame-table 页被拒"。
-
-### 4.6 ★ 页归属判定必须是**对象清单**，不能是数值区间
-
-`yghv_guard_state_page()` 曾经用 `[g_guard 的物理地址, g_guard_count 的物理地址]`
-这个**数值区间**表示"guard 自己的状态"。链接器排 RVA，内存管理器排物理页 ——
-`.map` 上只占两页的区间，运行时能覆盖一大片无关的活分配。
-
-实测（9.366）：frame-table 的物理页恰好排进区间 → hidecore 只隐藏 2/3，
-`hide_fail=3` + `hash_fail=1`，而 bp/view 两页在区间外、正常隐藏。
-
-**现在的形式**：每个对象 `yghv_guard_state_add(&X, sizeof(X))` 登记一次，
-判定是"有没有已登记的对象占这一页"。新增状态必须登记，否则它可被隐藏。
-
-### 4.7 ★ 岛内读取的状态区必须页精确，且不与他模块共页
-
-不是"隐藏目标"才需要页精确。VMEXIT 处理器每次故障**读**的那些模块状态
-（watch 环、view 选择、fail 计数、sentry 计数、protect 表）同样需要：
-一个页上有两套机制的热状态，隐藏它就会连带移除"决定怎么处理故障"的东西。
-
-`page_layout_check` **规则 4** 检查这条（按 `.map` 的 obj 文件判定跨模块）。
-
-### 4.8 ★ 两种隐藏机制产生**两种可观测结果**，测试必须按机制判定
-
-外来页由 `yghv_guard_mode_for()` 按**归属**分类，只有 guard 状态与三张表是
-"我们的"，其余一律 **DECOY**。
-
-```
-DECOY  叶子仍 present，指向零页  → guest 读 0x0，写入被丢弃，**不发 #NPF**
-                                  → probes / escapes 都不会动（正确行为）
-UNMAP  清 present                → 每次访问 #NPF → 处理器运行 → probes 增长
-```
-
-**把"必须增长"写成断言，等于断言本次走了 UNMAP。** 9.366 在这上面栽了两次
-（G30 的 probes、G25 的 T9）。修法：先判机制，再要求与该机制相符的后续。
-
----
-
-## 5. 关键文件
-
-| 文件 | 说明 |
+| 改动 | 判断 |
 |---|---|
-| `YuanGuardHV\hv\yghv_guard.c` | Tier 7.1/7.3；`state_page`/`state_why`/`state_add`/`target_page`/`do_hide`/`hide_core`/`arm_core` |
-| `YuanGuardHV\hv\mem_bp.c` | 断点；**热/冷分离**（`g_bp_region`/`g_hot`/`g_ring_region`）|
-| `YuanGuardHV\hv\mem_frame.c` | **页精确** `g_frame_region` |
-| `YuanGuardHV\hv\mem_view.c` | **页精确** `g_view_region` + `g_view_hot` |
-| `YuanGuardHV\hv\mem_watch.c` | **页精确** `g_watch_region`/`g_watch_hot`/`g_watch_ring` |
-| `YuanGuardHV\hv\yghv_sentry.c` | 7.4/7.5/7.6；**页精确** `g_sentry_hot`/`g_sentry_surface`；`surface_arm_intercepts` |
-| `YuanGuardHV\hv\yghv_fail.c` | 7.2/7.7；**页精确** `g_fail`（环索引是 struct 字段，不是旁边的变量）|
-| `YuanGuardHV\hv\mem_time.c` / `mem_cache.c` | **页精确** `g_time_region` / `g_cache_region` |
-| `YuanGuardHV\hv\mem_engine.c` | **具名初始化器**（`.read = ` / `.write = `）|
-| `YuanGuardHV\hv\npt_core.c` | `npt_split_2mb_to_4kb` / `npt_set_page_perm` / `npt_exclude_pa` |
-| `YuanGuardHV\hv\protect.c` | `yghv_protect_page_is_npt()` (PA-correct)；2MB→4KB 分裂 |
-| `YuanGuardHV\hv\svm_simplevm206.cpp` (3377 行) | **自有 include 方案**；guard 分支 L1389；#DB re-hide L1941/1945 |
-| `YuanGuardHV\hv\common\control_ioctl.h` | IOCTL 0x800–0x828 |
-| `YuanGuardHV\tools\yghv_ctl.ps1` | PS 命令 56（9.366 新增 `mmf-read`、`sys-guard why`）|
-| `YuanGuardHV\tools\yghv_client\YghvCtl.java` | Java FN_ 18 |
+| 9.432/9.433 武装 `SVM_INTERCEPT_MISC2_VMMCALL = (1UL << 1)` | **保留**（位号已按 bhyve 表核对）|
+| 9.435 加 `case VMEXIT_VMMCALL`（当前是 `break;`）| **保留但改**：改成 `guestContext.ExitVm = TRUE;` |
+| 9.436 把 guest 入口设为 `svm_trampoline_test_guest` | **回滚** —— 它把「透明虚拟化」换成了「测试 guest」，见第 4 节 |
 
-**静态检查**（`YuanGuardHV\tests\`）：
-```
-run_source_checks.ps1 → ioctl_parity / command_parity / safety_checks / irql_contract_check
-run_map_checks.ps1    → page_layout_check
-```
-- `irql_contract_check`：岛内可达集 + 指针表目标 + **位置式表 = 构建失败**（9.366）
-- `page_layout_check`：隐藏表页独占 + 页对齐 + **规则 4：岛内读取区域页对齐且不跨模块共页**
-  —— 解析到 0 个拒绝符号时**直接 throw**，否则空清单会让每一页都显得合法
+**新窗口第一件事：回滚 9.436 的 guest 入口改动，保留 VMMCALL 位与 case。**
 
-**接口计数**（build 报告）：`C=41 PowerShell=41 Java=41`（IOCTL），`PowerShell=56 Java=18`（命令）
+回滚后 RIP 恢复为 `ContextRecord->Rip` —— 那是上游 SimpleSvm 的语义（透明虚拟化）。
 
-**9.366 新增的两个原语**：
-- `sys-guard why <hex_pa>` —— 只读归因（IOCTL `0x826` op 7），一次问清 `state_why` /
-  `target_page` / guard slot / hidden / hide_mode。定位"哪个表的页被拒"靠它，不靠重建加载。
-- `mmf-read <path>` —— guest 侧读（`mmf-write` 的另一半）。判诱饵必须用它：`mem-read`
-  走驱动、由 ALLOW 循环服务，两种机制下都返回一个 value 字符串。
+**第二件事：机器需要重启**，因为 `yghvpa` 服务卡在 `START_PENDING`（`sc stop` 返回 1052
+"该服务此刻不可控制"）。重启前确认工作树干净。
 
 ---
 
-## 6. 已完成的方法论（这些是资产，别重犯）
+## 4. 核心结论：卸载为什么崩（29 次崩溃的最终归因）
 
-### 6.1 一个正确的修复会暴露出寄生缺陷
-9.361 收紧 `state_page` 跨度（本身正确）→ 撤掉意外覆盖 → 露出 `target_page`/`state_page`
-的 VA/PA 混淆。**当改动让东西不再工作，先问：是改动弄坏了它，还是揭开了它。**
+### 4.1 完整的因果链（每一环都有实测数据）
 
-### 6.2 页精确 ≠ 页对齐
-`DECLSPEC_ALIGN(4096)` **只对齐起点不规定尺寸**。4 字节计数器留 4092 字节空隙，
-链接器拿冷符号填满。修法唯一可靠：**union + 页大小字节数组 + 编译期断言**
+```
+DriverEntry
+  └─ svm_core_init()                     12 个 VCPU + VMCB + hsave 全部建好（已证：dump 逐字段）
+  └─ Sv206Entry()
+       └─ SvVirtualizeAllProcessors()
+            └─ 每核 SvVirtualizeProcessor
+                 └─ SvPrepareForVirtualization
+                      └─ StateSaveArea.Rip = ContextRecord->Rip   ★ 关键
+                 └─ Sv206LaunchVm()
+                      └─ vmrun  ← guest 从此执行「SvVirtualizeProcessor 自己的续行代码」
+```
+
+**★ 核心事实（9.434）：guest 的入口不是任何测试 guest，而是
+`SvVirtualizeProcessor` 自己捕获的 RIP。** 那行代码就在
+`SvPrepareForVirtualization` 里：
+
 ```c
-typedef union { T entries[N]; uint8_t page[4096]; } region_t;
-DECLSPEC_ALIGN(4096) static region_t g_region;
-typedef char assert_exact[(sizeof(region_t) == 4096) ? 1 : -1];
+VpData->GuestVmcb.StateSaveArea.Rip = ContextRecord->Rip;
 ```
 
-### 6.3 断言最有用的时候，是它抓出"用来修设计错误的代码"里的错误
-第一次写 hot/cold 断言：把标量和命中环放一个 struct → 构建失败（环 6144 字节 = 一页半）。
+而 `ContextRecord` 是几行之前 `RtlCaptureContext` 抓的 —— 抓的是那个函数当下的位置。
+它之后是 `Sv206LaunchVm()` / `SV_DEBUG_BREAK()` / `KeBugCheck()` —— **没有任何被拦截指令**。
 
-### 6.4 检查必须读它判定的那个产物
-- 静态检查曾跑在编译**之前**，验证上一次构建（9.358）
-- 检查的**提取正则**也曾与代码格式脱节（报 `none parsed` 而代码在拒绝七页）
+**后果链**：
 
-### 6.5 位置式 ≠ 具名
-位置式初始化器把成员语义和位置绑死，重排字段静默交换 `read`/`write`。
-**改具名，验证方式是"字段对调后仍精确指名"。**
-
-### 6.6 ★ 测试断言了自己的假设（**七次记录在案**）
-1. soak 偏移越界 → `STATUS_INVALID_PARAMETER`（把测试的错当成驱动缺陷）
-2. 负向测试注入到 `hide_core` —— 但它**不在岛内**，正确的检查看起来失灵
-3. T12 无条件要求 `add OK`，而正确行为是 `REFUSED`（注册表已隐藏）
-4. soak 无条件要求 `bp add OK`，同上 —— 报 14 failures / FAILED，
-   而实际 hidden 3/3、probes 前进、零 hang
-5. G30 的诱饵检查调 `hidecore`（隐藏我们自己的三张表）然后读 guest 的 section ——
-   **没有任何机制被要求隐藏那一页**，于是读到种子值、报 NOT HIDDEN（9.366）
-6. G30 无条件要求 `probes` 增长，而 DECOY 模式**不产生 fault** —— 不增长是机制正确
-7. G25 的 T9 无条件要求 `escapes>0`，而它在 T7 之前跑，那个位置的正确输出就是 0
-
-**共同点**：断言写的是"我以为会发生的"，而不是"契约允许的"。
-
-**修法模板**：接受两种合法结果，各自要求正确的后续。
 ```
-已武装   → 触发必须落地 且 drain 必须看到 NPF
-被拒绝   → 触发仍必须落地（没武装就没东西会空转）
+guest 执行 SvVirtualizeProcessor 的续行代码
+  → 不执行 CPUID、不执行 vmmcall、不碰 CR3
+  → 永不产生 #VMEXIT
+  → vmrun 永不返回
+  → vmsave 不执行 → lock dec 不执行 → g_inVmrunCount = 12（永远，已实测）
+  → SvHandleVmExit 一次不跑（g_S206VrLog 整场为空，已实测）
+  → stop flag 检查点（在循环回边）永不执行（snap_vmrun_stopped=0，已实测）
+  → DriverUnload 走完 14 步（step=120 DONE，已实测）但等不到计数归零
+  → 返回后操作系统 unmap 驱动镜像
+  → 卡在 vmrun 里的核执行已失效的代码页
+  → FAILURE_BUCKET = AV_CODE_AV_STACKPTR_ERROR_PAGED_IP
 ```
 
-> 写负向测试前先确认：**注入点确实在检查的作用域内**。
-> 写正向断言前先问：**这个操作在当前状态下有几种合法结局**。
-> **问机制前先确定本次走的是哪条机制** —— 一个只对 UNMAP 成立的断言，
-> 在 DECOY 下报的是测试的错。
->
-> ★ **别把机制名和 PASS/FAIL 存在同一个槽里**。PowerShell 里
-> `$true -eq 'UNMAP (hole)'` 是 **TRUE**（字符串被转成布尔），
-> 于是判词说 DECOY、下游逻辑无条件走 UNMAP。9.366 实测。
+### 4.2 崩溃点的三次修正（前两次都错了）
 
-### 6.7 让"什么都没做"说出是哪扇门
-`hid 0` 有三种成因，第一版报成一样，排查两次奔向 NPT 才想到早退。
-**一个能说出"走了哪扇门"的计数器，价值高于三次重建加载。**
+| 版本 | 我说崩溃在 | 实际 |
+|---|---|---|
+| 9.389/9.395/9.407 | `mov rax,[rsp]`（读 `VpData->HostStackLayout`）| ✗ |
+| 9.421 | `vmsave rax`（写已释放的 VMCB）| ✗ |
+| **9.427** | — | **`vmrun rax` 本身，且 `PAGED_IP`（代码页已失效）** |
 
-### 6.8 写错的机制比不写更糟
-9.355 断言"热路径付嵌套 VMEXIT"，被 `probes=0` 推翻。
-**当注释里的机制被计数器反驳，改注释为实测事实并标注未确认假设。**
+按 ASM 桩布局算偏移（含 `lock inc/dec`）：
 
----
+```
++0x00 mov rsp, rcx      +0x03 mov rax,[rsp]   +0x07 vmload rax
++0x0A lock inc           +0x12 vmrun rax  ← 崩溃在 +0x14（操作数 D8）
++0x15 vmsave rax         +0x18 lock dec
+```
 
-## 7. PowerShell 陷阱（我踩过，把文件截断过两次）
+**`FAILURE_BUCKET: ..._PAGED_IP_`** 是这个结论的判词：不是「访问了错误的**数据**」，
+而是「执行了已失效的**代码**」。
 
-- **`@()` 是固定大小数组，`.Add()` 会失败** → 用 `New-Object 'System.Collections.Generic.List[string]'` + `AddRange`，或**直接用 edit 工具**
-- `Write-Host ("...{0}..." -f x)` 里含 `->` 或 `{}` 会被当脚本块解析 → 用变量拼接
-- 单引号字符串里的 `'`（如 `table's`）会提前终止字符串 → 改双引号 + `''`
-- `-match 'KeAreAllApcsDisabled\(\)'` 在特定上下文会被当泛型 token → 用 `[(]`
-- 批处理 `.bat` **必须纯 ASCII**（em dash 在 CJK 代码页下吞字符，曾让 `%WDK_ROOT%` 变空）
-- 每个 `powershell -File` 是**新进程** → 扫描+遍历必须在同一次调用内完成
-- `Start-Job` 子进程随父进程死；用**有界 `Start-Job` + `Wait-Job -Timeout`** 检测挂起
-- ★ **.ps1 必须带 UTF-8 BOM 或纯 ASCII**。PowerShell 5.1 对无 BOM 的 .ps1 按 GBK
-  解码，里面的 em dash 会让解析器在**完全无关的行**上报"缺少参数"。9.366 在这上面
-  浪费两轮，症状（报错行号离真因很远）极具误导性
-- ★ **每条命令都新开 powershell 进程的 soak 不是 soak**。g32 第一版 1 分钟只跑到
-  2 轮 —— 6 次进程创建。把写动作放进 worker 自己的进程里，故障才真的并发
-- 诊断脚本也要**卸载驱动**。g26/g29 跑完不卸载，调用方等一个永不退出的进程，
-  下一个测试对着一个没人停的驱动跑（正是 runbook 警告的旧驱动污染）
+### 4.3 29 次崩溃的分类
 
----
-
-## 8. 剩余未做项（诚实清单）
-
-> 9.366 收口了原来的 1-5 项。9.367 又更正了三份 Tier 规划的事实前提，见下。
-
-**★ 规划文件的前提错误（9.367 已更正并加注）**
-
-`MEM_ENGINE_PLAN_TIER5/6/8_9.md` 开篇都写「现成 VMEXIT 已实现 35 种，扩展即可」。
-实测：拦截位只开了 5 组（CPUID / MSR / CR3+CR4 / #DB / SHUTDOWN / VMRUN / NPF），
-`SvHandleVmExit` 只有 **9 个 case**。35 是 AMD 的退出码数量，不是本实现的数量。
-三份文件顶部已加 `9.367 CORRECTION` 注记 —— **按风险排序前先读 9.367.1**。
-
-**★ 结构限制**：本项目的 VMCB 结构体在 `0x014` 处直接是
-`Reserved1[0x03c-0x014]`，**没有 `InterceptMisc3`**。所以位 41/42/43/45
-（WBINVD / MONITOR / MWAIT / XSETBV）做不了，除非先加字段。
-位 14（RDTSC）/ 23-25（PAUSE/HLT/INVLPG）在 Misc1，位 32/33/39 在 Misc2，都可以。
-
-**★ INT3 模式没有热路径证据**：`InterceptException` 只设了 bit 1（#DB），
-#BP 是 bit 3 **没设**。`case VMEXIT_EXCEPTION_BP` 那条链
-（#BP → 恢复原字节 → TF → #DB → 重写 0xCC）只会在 guest 自己执行 INT3 时到达，
-那时 find 返回 0、走反射。g18 的 B1-B3 验证的是**写字节/恢复字节**，
-靶页注释自己写着「never executed」—— 0xCC 从未触发。**热路径至今零证据。**
-（这是第七次「断言测的是 A，被读成 B」。）
-
-1. **没有多核 UNMAP soak** —— `g32` 只覆盖 DECOY。ALLOW 循环的并发行为仍只有
-   G29/G26 的单次决定性验证，缺 30 分钟尺度。
-2. **INT3 热路径未验证** —— 见上。补证需要开 `InterceptException bit 3`，
-   并先确认 #BP 反射路径不误伤 guest 自己的 INT3（历史：#GP 拦截曾导致 0xE2）。
-3. **`g_protect` 只做了页对齐，没做页精确** —— union 化会改变 `extern` 声明形状。
-4. **`surface_arm_intercepts` 的清单是手写的** —— 9 个名字需手工同步；
-   从掩码反推要 sentry 认识 VMCB 形状，这个耦合是有意保留的。
-5. **位置式的宏构造形式绕得过检查** —— `#define TABLE(x) { ... }` 检查器看不见。
-6. **`escapes` 只在真正拒绝时才非零** —— 判断接线是否活着看 `sys-sentry surface`
-   的条目，不是 escapes。
-7. **Tier 5（9 项）/ Tier 6（5 项）/ Tier 8（5 项）/ Tier 9（5 项）** —— 全部未开始；
-   但 Tier 5.1 的 TSC 平移部分**零拦截成本可做**（`VMCB.TscOffset` 字段已在）。
-8. **本地提交未推送** —— 9.366 = `3d6a784`；用 `git rev-list --count @{u}..HEAD` 查领先数。
-
----
-
-## 9. 下一步建议（按价值排序）
-
-> 排序原则：**先纠正前提 → 再补验证尺度 → 再补"已被误认为做过"的 → 最后才是新能力**。
-> 一个错了的验证会在后续每一项上重复付代价；新能力建在错的前提上会连着错。
-
-| 优先级 | 任务 | 理由 | 风险 |
+| 类 | 次数 | 崩溃码 | 已修？ |
 |---|---|---|---|
-| **已完成** | 更正三份 Tier 规划的前提 | 9.367；纯文档 | 无 |
-| **高** | 多核 UNMAP soak（30 分钟）| 唯一还缺的**尺度** | 低 |
-| **高** | INT3 热路径补证（开 #BP 位 + 可执行靶页）| 现在的验证只覆盖写字节 | **中** |
-| 中 | Tier 5.1 TSC 平移（`TscOffset`）| 零拦截成本、字段已在 | 低 |
-| 中 | Tier 5.1 非线性伪造（RDTSC + RDTSCP 拦截）| 两个拦截位都在已声明字段里 | 中 |
-| 中 | Tier 5.4 硬件视图伪造（CPUID 扩展）| CPUID 已拦截且在用 | 低 |
-| 中 | Tier 5.6 执行轨迹导出 | 记录侧已有，缺导出与容量 | 低中 |
-| 低 | Tier 6.5 反-反虚拟化闭环 | 依赖 TSC + CPUID 的结果，必须在其后 | 中 |
-| 低 | 技术债（`g_protect` union / 清单派生 / 推送）| 可随时插队；推送需明确指示 | 低 |
+| 值/位置类 | 7 | hang / `0x101` / `0x3B` / `0x139`×3 / 6008 | **是**（各有提交与测试）|
+| EFER 类 | 3 | `0x1E` — IPI 里清 `EFER.SVME`（APM 明文 undefined）| **是**（9.380，已证生效）|
+| 卸载顺序类 | 5 | `0xD1` / `0x7F` | 否 |
+| 硬复位 | 4 | 无 dump 无 bugcheck | 否 |
+| 本会话新引入 | 3 | `0x101`（无界等待）、`START_PENDING`（guest 入口）| 需回滚 |
+| 第三方 | 1 | `usbwifi` | 无关 |
+
+### 4.4 已证伪的 8 个推断（别再重走）
+
+| 推断 | 证伪依据 |
+|---|---|
+| `npt_cleanup` 提前释放活表（9.381）| `npt-range` 工具：NPT 在 `0xC7B...`，故障地址全不在 |
+| VPD 页对齐是根因（9.386）| 改真页对齐后崩溃不变 |
+| AVIC timer 是元凶（9.388）| 加了 cancel+drain 后崩溃不变 |
+| ack 从未被写是根因（9.378/9.383）| ack 早在 ASM 桩 `SvLV20` 里就有（`mov ecx,'SSVM'`）|
+| 有第二套 VMRUN 循环在跑（9.395）| `g_S206VrLog=0`、`resident=0`、`s203=0` |
+| stop check 位置错（9.413/9.414/9.416，三次）| 零 call 的内联版照样 `0x7F/8`，崩溃点不动 |
+| `vmsave` 写已释放 VMCB（9.421）| `PAGED_IP` —— 是代码页失效不是数据 |
+| guest 是 trampoline、缺 VMMCALL 位（9.431）| 加位加 case 后反而**加载挂死**（9.437）|
+
+**注意最后一行**：9.431 的「guest 是 trampoline」是**从 `svm_trampoline.asm` 的存在
+推断的**，而 9.434 读了赋值语句本身才发现不是。**「有个文件存在」不等于「它被用了」。**
 
 ---
 
-## 10. 新窗口第一件事
+## 5. 架构约束（违反会崩或挂）
+
+来自 9.3xx 的实测，**每条都是踩出来的**：
+
+### 5.1 VMCB 位是 per-core，且跨驱动重载存活
+`prepare` 每核只跑一次。运行中改某核的拦截位必须用
+`SvExecuteOnEachProcessor`（已在 `SvTscApplyOnCore` 里验证）。
+**且 `prepare` 必须显式清零任何我们可能设过的位** —— 「这次不设置」≠「清除」。
+
+### 5.2 `SvExecuteOnEachProcessor` 不是通用原语
+它只保证当前线程绑到目标核，**不保证那个核不在 VMRUN 里、不保证没有 guest 正在碰
+要改的状态**。TSC 位用它成功了（没有东西在用）；`#BP` 位用它两次 `0x139`。
+
+### 5.3 VM-exit 帧里不要调用 C 函数
+`SvLV10` / `SvLV20` 这类 ASM 桩的栈布局是按「不碰 guest 状态」设计的。
+在里面 `call` 一个 C 函数会因序言（`__chkstk` / SEH frame）失败：
+- 9.413 → `0x139 MISSING_GSFRAME`
+- 9.414 → `0x7F` 双故障
+- 9.416 → **零 call 的内联版也 `0x7F`** ⇒ 连纯内联都不能随便加
+
+### 5.4 `KeIpiGenericCall` 只保证到达，不保证上下文
+回调里 `wrmsr` 在 GIF=0 的核上会被拒（`0x1E`）。
+合法清 `EFER.SVME` 只有一个窗口：`ExitVm` 路径里
+`vmload` → `stgi` → `wrmsr`。
+
+### 5.5 `NT_ASSERT` 在 free build 里是空的
+任何「只靠 `NT_ASSERT` 支撑」的前置条件（对齐、范围、互斥）在 release 驱动里
+**等于不存在**。判据：去掉 assert 后代码会算错地址 ⇒ 它必须是运行时检查。
+
+### 5.6 页表遍历用 `mem_pte.c`，不是 `protect.c`
+`protect.c` 的 `yghv_pt_read` 用 `MmGetVirtualForPhysical`（本项目自己标记为
+*not reliable for arbitrary physical pages*）。`mem_pte.c` 用 `MmCopyMemory(PHYSICAL)`，
+注释明确 *safe at DISPATCH_LEVEL and takes no locks*。**两套并存，选错一次赔一台机器。**
+
+### 5.7 观测点必须满足三个条件
+1. 只有那个过程会写（不被被观测的过程改写）
+2. 单调（写进去不会被清零）
+3. 在要观测的事件之前已有值
+
+不满足就会出现「双义值」：卸载过程中的读数天然会被卸载本身改写
+（`g_PowerCallbackRegistration` 被清成 NULL、`g_resident_thread_count` 被清成 0）。
+
+### 5.8 跨崩溃存活的存储不能属于会被卸载的模块
+静态变量、模块 `.bss`、模块内分配的页 —— 驱动 unmap 后**都不再属于你**。
+本树为此踩了两次（9.390 的静态页、9.391）。
+
+---
+
+## 6. 可用的观测手段（都验证过）
+
+### 6.1 卸载进度页（`yghv_ut_mark`）
+`hv/yghv_unload_trace.c` —— 加载时 `MmAllocateContiguousMemory` 分配，
+**故意永不释放**（4 KB/次加载的泄漏，换一份能活过卸载的记录）。
+120 槽不取模历史环 + 独立快照区。
+
+埋点：`1 START / 10 NOTIFY_OFF / 20 COOP_UNLOAD / 21 skip-walk / 25 COOP+5 /
+30 STOP_REQ / 40 JOIN_GUEST / 45 stopped / 46 active / 47 cond / 50 JOIN_203 /
+51 in-vmrun / 52 waited / 53 skipped / 55-57 最终等待 / 80 CTRL / 90 PROTECT /
+100 NPT / 110 CORE / 120 DONE`
+
+**读法**（PA 必须**卸载前**记录，见 6.2）：
+
+```
+kd -z C:\Windows\MEMORY.DMP -y "C:\symbols" -c "!dd <PA> L40; q"
+```
+
+**.bss 不可达时怎么办**：kernel dump 只保存内核可达的页，驱动 `.bss` 时有时无。
+用 6.2 的 PA 定位进度页（它在池里，通常可达）。
+
+### 6.2 PA 记录流程（`t_paflow.ps1`）
+```powershell
+pwsh -File D:\aaaaaavm\t_paflow.ps1 -Image <sys> -Label <tag>
+```
+它做三件事：加载 → **用 `unload-trace` 读出 PA 写进 `pa_<tag>_<stamp>.txt`** →
+`sc stop`。崩溃后拿那个 PA 去 dump 里查。
+
+**必须这么做**：PA 每次加载都变，事后算不出来。
+
+### 6.3 `npt-range`
+```
+yghv_ctl.ps1 npt-range            → 页数 + 最低/最高 PA
+yghv_ctl.ps1 npt-range <hexpa>    → 该地址是不是我们的 NPT 页
+```
+**用途**：把「这地址像不像 NPT」从推断变成算术。它已经证伪了一个错了三次的假设。
+
+### 6.4 `unload-trace`
+```
+yghv_ctl.ps1 unload-trace   → page PA / last step / value
+```
+
+### 6.5 dump 分析的三条硬规矩
+1. **必须 `-y "C:\symbols"`**（本地）。`srv*` 会 `Could not write to pipe`，
+   `!analyze` 完全失效（实测 248631 行错误、0 个结果字段）。
+2. **`.map` 的 RVA 用 map 里 `00000001400xxxxx` 那一列**，不是 `0003:000xxxxx`
+   段内偏移。用错读到的全是 0。
+3. **映射前先看相邻符号间隔**：6-16 字节的是 import thunk 表，不是函数体。
+
+---
+
+## 7. PowerShell / 构建陷阱
+
+1. **脚本必须 UTF-8 with BOM 或纯 ASCII**。没有 BOM 的中文会让 PS 5.1 报
+   「缺少 `}`」这种远离真因的错误。
+2. **单引号字符串里不要放 em dash（`—`）**，会破坏引号配对。
+3. **`throw '...<hex>...'` 里的 `<` 会被当成重定向**。
+4. **`[uint32]$negativeInt` 会 InvalidCast**，用
+   `[BitConverter]::ToUInt32([BitConverter]::GetBytes($v),0)`。
+5. **`0x...u` 后缀是 C 语法**，PowerShell 没有。
+6. **空串参数不会以空串到达**：`f('')` 收到的是 `$null`。需要显式 token（如 `key clear`）。
+7. **`0xDEADBEEF` 在 PS 里是负数**，用 `[uint32]3735928559`。
+8. **`git refs/heads/main` 会被重启中断写成全 NUL**。修复：
+   `tail -1 .git/logs/HEAD | awk '{print $2}'` → 写回 `.git/refs/heads/main`。
+9. **测试脚本自己会造假象**：断言必须能区分它声称要测的机制。
+   本树有 7 个「测试断言了自己的假设」的案例。
+
+---
+
+## 8. 剩余工作清单（诚实版）
+
+### 8.1 必须马上做（不做则代码不可用）
+1. **回滚 9.436**（guest 入口改动）→ 恢复 `Rip = ContextRecord->Rip`
+2. **把 `case VMEXIT_VMMCALL` 改成 `ExitVm = TRUE`**（不是 `break`）
+3. **重启机器**清 `START_PENDING`
+
+### 8.2 卸载问题的下一步（需要设计决定）
+9.434 留下一个必须回答的问题：
+
+> **206 主线想让 guest 做什么？**
+>
+> **(a) 透明虚拟化**（上游语义）：guest = 调用者自己的续行。
+>   则 `vmrun` 返回是正常路径 —— 需要查「返回后为什么没继续」。
+> **(b) 真实 guest**：必须显式设 `Rip = svm_trampoline_test_guest`。
+>   但那样「虚拟化建好就撤」，206 主线名不副实。
+
+**这个决定需要用户拍板，不是代码能推出来的。**
+
+### 8.3 原清单（Tier 5/6/8/9，共 30 项）
+| Tier | 项 | 状态 |
+|---|---|---|
+| 5.1 TSC | offset 平移 / freeze | offset **成立**；freeze **已禁用**（无法证明释放）|
+| 5.4 CPUID 视图 | 三档 | **完成**（`016aa31`）|
+| 5.6 轨迹导出 | | **完成**（`9e1b2bc`）|
+| 9.1 无设备通道 | | **完成**（设备可移除，门铃可达）|
+| 9.2 通道认证 | HMAC + 序号 | **完成**（G41 13/13）|
+| 9.3/9.4/9.5 | 冗余/远程/隐蔽 | 未做（9.4 建议跳过并写原因）|
+| 6.4 | 跨 VM 操纵 | **跳过**（需写原因）|
+| 6.1 | 启动期控制 | **需要重启，最后做且要确认** |
+| 其余 5.x / 6.x / 8.x | | 未做 |
+
+**注意**：`MEM_ENGINE_PLAN_TIER5/6/8_9.md` 开头都写「现成 VMEXIT 已实现 35 种」——
+**那是错的**。实际只有 5 组拦截武装、9 个 case。文档已在 9.367 标注修正。
+
+---
+
+## 9. 关键文件
+
+| 文件 | 作用 |
+|---|---|
+| `hv/svm_simplevm206.cpp` | 206 主线：VMCB 准备、`SvHandleVmExit`、CPUID |
+| `hv/svm_simplevm206_x64.asm` | VMRUN 桩（`SvLV10` 循环 / `SvLV20` 出口）。**改这里极度危险** |
+| `hv/svm_simplevm206.hpp` | VMCB 结构 + 拦截位定义 |
+| `hv/svm_core.c` | 旧 resident 机制（`g_resident_thread_count=0` ⇒ 未启用）|
+| `hv/svm_trampoline.S` / `svm_trampoline.asm` | 测试 guest（三条指令）。**当前未被用作 guest 入口** |
+| `hv/npt_core.c` | NPT。`npt_cleanup` 的 `pt_reg` 已修失效复用（9.381）|
+| `hv/mem_pte.c` vs `hv/protect.c` | **两套页表遍历**，用前者 |
+| `hv/yghv_unload_trace.c` | 卸载进度页（第 6.1 节）|
+| `tools/yghv_ctl.ps1` | 客户端，63 条命令。有 `unload-trace` / `npt-range` / `sys-auth` |
+| `tests/` | 7 个静态检查脚本，`build.bat` 自动跑 |
+
+---
+
+## 10. 新窗口的第一个动作（照着做）
 
 ```powershell
-cd D:\yuanguard
-git log --oneline -3            # HEAD 应含 9.366 的 feat 提交
-git status --porcelain          # 应为空
-cd D:\yuanguard\YuanGuardHV
-$env:YGHV_BAREMETAL_STEP=206; $env:YGHV_206B_COEXIST=1; $env:YGHV_206B_GNPT=1
-.\build.bat                      # 应 7 个 PASS + Build SUCCESS
+# 1. 确认状态
+cd D:\yuanguard && git log --oneline -3 && git status --porcelain
+sc.exe query yghvpa      # 若 START_PENDING → 需重启
+
+# 2. 回滚 9.436 的 guest 入口（只改那一个 #if 块）
+#    恢复 VpData->GuestVmcb.StateSaveArea.Rip = ContextRecord->Rip
+
+# 3. 把 case VMEXIT_VMMCALL 的 break 改成 guestContext.ExitVm = TRUE;
+
+# 4. 构建验证
+cd YuanGuardHV && set YGHV_BAREMETAL_STEP=206 && set YGHV_206B_COEXIST=1 `
+  && set YGHV_206B_GNPT=1 && build.bat    # 必须 7/7 全绿
+
+# 5. 重启（清 START_PENDING），然后才谈下一步
 ```
-确认构建成功（**7 个** PASS + Build SUCCESS）。
-**不要用 md5 校验** —— 每次构建都会因重新签名而变（见第 2 节的说明）。
 
-然后读：
-1. `docs/YUANMOD_HANDOFF_CURRENT.md` **9.366**（上一轮四项收口）与 **9.367**（下一步规划 + 三处事实更正）
-2. `docs/KERNEL_API_CHECKLIST.md` §27（VA/PA）、§28（页精确/具名）—— **最易重犯**
-3. 本文件第 4 节（架构约束，4.6-4.8 是 9.366 新增的）
-
-**动手前先问用户要做什么。不要自动开始剩余项。**
+**在第 10 节完成之前，不要动卸载路径的任何代码。**
+29 次崩溃里 8 次是因为「在不可观测的路径上改代码」。
 
 ---
 
-## 11. 累积已验证历史（全部在实机跑过，零崩溃）
+## 11. 累积已验证历史（实机跑过）
 
-```
-Phase 1                 6/6
-Phase 2-5 W1-W8        10/10
-Phase 7  C1-C6          7/7
-Phase 4b D1-D6          6/6
-Phase 6  E1-E6          6/6
-Tier 4.1 / 4.3          9/9 / 9/9
-Tier 4.2 / 4.4 / 4.5    8/8 / 7/7 / 7/7
-Tier 4.6                4/4
-Tier 7.2 / 7.7          8/8
-Tier 7.1 / 7.3          9/9
-Tier 7 全功能          13/13   ★ 9.366 复跑仍全绿
-G30 诱饵语义 + 接线     ALL PASS  ★ 9.366
-G32 多核隐藏 soak 1min  STABLE    ★ 9.366（DECOY 路径，判词已限定）
-```
+| 测试 | 内容 | 结果 |
+|---|---|---|
+| G25 | 13 项回归（arm/hide/decoy/sha/health/unload） | **13/13** |
+| G33 | snapshot 非破坏 + drain 消费 | ALL PASS |
+| G39 | TSC 逐核武装与释放 | ALL PASS |
+| G40 | 逐核 walk 可达性（12/12 核） | ALL PASS |
+| G41 | 控制通道认证 | 13/13 |
+| G43 | 无设备 CPUID 通道 | 部分（设备可移除已验证）|
+| G18/G28/G29/G30/G31 | hide/decoy/border/why | 见各 9.3xx |
 
-> **INT3 热路径不在这份清单里** —— B1-B3 验的是写/恢复字节，不是命中（9.367.3）。
-
-**近期镜像归档**（`D:\aaaaaavm\`）：
-
-| 镜像 | 说明 |
-|---|---|
-| `206z9_pageexact` | frame/view 页精确 |
-| `206zA_why` | 含 state_why 诊断 |
-| **`206zB_pageexact`** | **当前**：7.4/7.5/7.6 接线 + 诱饵重写 + 10 处页精确 + 位置式强制具名 |
-
-> md5 不再是镜像身份。**比 `.map` 或代码段 0x400..0x24E54**。
+**回归基线镜像**：`206zR_va`（`db7547ab`）—— 那是最后一次 G25 13/13 全绿的版本。
 
 ---
 
-## 12. 目录结构速查
+## 12. 加速查证（别重复劳动）
 
-```
-D:\yuanguard\
-├─ docs\
-│  ├─ YUANMOD_HANDOFF_CURRENT.md   9337 行，章节到 9.365  ← 权威交接记录
-│  ├─ KERNEL_API_CHECKLIST.md       873 行，28 章         ← 内核 API 红线
-│  └─ RESUME_PROMPT.md                                    ← 本文件
-├─ YuanGuardHV\
-│  ├─ hv\           驱动源码（.c/.cpp/.h）
-│  ├─ hv\common\    共享头（control_ioctl.h / mem_bp.h / yghv_guard.h ...）
-│  ├─ tests\        6 个静态检查 .ps1
-│  ├─ tools\        yghv_ctl.ps1 (55 命令) + yghv_client (Java 18)
-│  ├─ bin\          构建产物 yuanguard_hv.sys + .map
-│  └─ build.bat     clang-cl + link
-└─
+```powershell
+# 当前所有 yghv 服务
+sc.exe query yghvpa; sc.exe query yghvfin
 
-D:\aaaaaavm\                       测试脚本与镜像归档
-├─ g20..g29_*.ps1                测试脚本（g25/g26/g28/g29 是当前主力）
-├─ yuanguard_hv_step206*.sys     130+ 历史镜像
-└─ doc_93xx.md                   章节草稿（已并入 HANDOFF）
+# 蓝屏事件
+Get-WinEvent -FilterHashtable @{LogName='System';Id=6008,1001} -MaxEvents 3
+
+# dump 是否存在及时间
+ls C:\Windows\MEMORY.DMP
+
+# 从 dump 读进度页（PA 来自 pa_*.txt）
+kd -z C:\Windows\MEMORY.DMP -y "C:\symbols" -c "!dd 0xC7BD5000 L40; q"
+
+# 从 dump 读某个全局变量（RVA 用 map 里 14000xxxxx 那列 + 模块基址）
+kd -z C:\Windows\MEMORY.DMP -y "C:\symbols" -c "dq <addr> L1; q"
 ```
+
+---
+
+## 13. 一句话给新会话
+
+**这个项目的难点不是写代码，是「在没有观测能力的路径上，任何改动都不可验证」。**
+今晚 29 次重启里，真正修好的根因有 8 个，而**证伪自己的推断有 8 个** ——
+后者花的代价和前者一样多。
+
+**所以：先建观测，再改代码。**
