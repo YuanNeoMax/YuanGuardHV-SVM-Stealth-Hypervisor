@@ -129,35 +129,22 @@ SvLV10: ;
         ; same RIP each iteration, so that check never fired (9.410: stopped=0).
         ;
         ;
-        ; 9.416: THE CHECK, INLINE - NO C CALL.
+        ; 9.419: THE INLINE CHECK IS GONE - 9.417 PROVED IT DOES NOT HELP.
         ;
-        ; Same invariants as the 9.414 attempt (rsp at HostRsp, rcx must survive,
-        ; rax not yet loaded) - but the work is done with three instructions
-        ; instead of a call, because a call into C in this frame is what killed
-        ; the machine twice:
-        ;   0x139 MISSING_GSFRAME_STACKPTR   (9.413: also had a broken rsp/r11)
-        ;   0x7F/8 double fault              (9.414: rsp correct, prolog still not)
+        ; Three versions were tried at this point:
+        ;   9.413  call into C, rsp in the wrong place       -> 0x139
+        ;   9.414  call into C, rsp correct                  -> 0x7F/8 double fault
+        ;   9.416  four inline instructions, no call at all  -> 0x7F/8, identical
         ;
-        ; `lock cmp` is not an instruction. `cmpxchg` is, and it is what the
-        ; intrinsic compiles to: cmpxchg mem, 0 with eax=0 leaves eax untouched
-        ; when the memory is already 0, and loads the memory value otherwise.
-        ; Only the ZERO case means "no request", so the test is on ZF.
+        ; The third is what settles it: if a C function's prolog were the cause,
+        ; removing the call would have fixed it. It did not. So the check itself
+        ; is not what breaks the machine, and adding it here buys nothing while
+        ; costing four instructions on the hottest path in the driver.
         ;
-        ; The counter bump is `lock inc`, exactly what InterlockedIncrement
-        ; emits. Neither instruction touches rsp, rcx or rbx.
-        ;
-        xor eax, eax                        ; expected value for cmpxchg
-        lock cmpxchg dword ptr [g_VmrunStopRequested], eax
-        ; eax now holds the OLD value of the flag:
-        ;   0 -> nothing requested, continue into the guest
-        ;   1 -> stop requested, leave
-        test eax, eax
-        jnz SvLV10_stop                     ; non-zero = request present
-        jmp SvLV10_go                       ; zero = continue
-SvLV10_stop:
-        lock inc dword ptr [g_VmrunStopped]
-        jmp SvLV20                          ; leave via the same exit the handler uses
-SvLV10_go:
+        ; What the stop request actually needs is a decision about WHEN the loop
+        ; is allowed to be stopped at all - and that is not answerable from inside
+        ; the loop. Left out deliberately until the trace (now 120 slots) says
+        ; where DriverUnload really stops.
 
         mov rax, [rsp]  ; RAX <= VpData->HostStackLayout.GuestVmcbPa
         vmload rax      ; load previously saved guest state from VMCB
