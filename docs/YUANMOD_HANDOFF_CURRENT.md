@@ -12106,3 +12106,101 @@ stop flag 只在 `ExitCode == VMEXIT_CPUID` 时递增。如果没有任何 VMRUN
 > 用一个计数器推断"某个东西在运行"之前，先确认那个计数器**自己有写入路径被触发过**。
 > `g_VmrunStopped = 1` 让我相信"有 1 个循环在跑"，而 `g_S206VrLog = 0` 说明
 > 那个循环根本没记录过任何出口 —— 两个计数器互相矛盾，而我只看了其中一个。
+
+---
+
+#### 9.402 虚拟化到底成没成：查清了，答案是"建好了但没跑起来"
+
+**读到的完整数据（纯只读，全部来自 MEMORY.DMP）**
+
+```
+g_npt.pml4_pa             = 0x00000000c7b37000     NPT 建过，PA 页对齐
+g_npt.pml4_va             = 0xffffdb8049076000
+g_npt.total_mapped_pages  = 0x083f3800 (138,068,736)
+g_npt_alt_ready           = 1                      alt NPT 也建好了
+
+g_vcpus[0..3]             = ffff9a8353d76000, 53d78000, 53d7a000, 53d7c000
+                            12 个 VCPU 指针连续，非 NULL
+
+g_vcpu_count              = 12
+```
+
+`g_vcpus[0]` 逐字段：
+
+```
++0x00 vmcb          = ffffdb8048e7e000    VA 有效
++0x08 vmcb_pa       = 0x00000000c7bdf000  页对齐
++0x10 host_vmcb     = ffffdb8048e7f000    VA 有效
++0x18 host_vmcb_pa  = 0x00000000c7bde000  页对齐
++0x20 hsave         = ffffdb8048e84000    VA 有效
++0x28 hsave_pa      = 0x00000000c7bdd000  页对齐
+```
+
+VMCB 控制区：
+
+```
++0x000 InterceptCrRead  = 0x0000000000000000
++0x008 InterceptCrWrite = 0x0004000000000002
++0x00C InterceptMisc1   = 0x00040000    <- bit18 CPUID 已武装 ✓
++0x010 InterceptMisc2   = 0x00000003    <- bit32 VMRUN, bit33 VMLOAD/VMSAVE
++0x014 InterceptMisc3?  = 0x00000000
++0x010 InterceptException = 3           <- #DB(bit1) | #BP(bit3)
+```
+
+**结论：硬件层面的准备工作全部完成**
+
+- NPT 建好、512GB 恒等映射铺开、alt NPT 就绪
+- 12 个 VCPU 全部分配，VMCB / host VMCB / hsave 三对地址都有效且页对齐
+- **CPUID 拦截位（Misc1 bit18）确实武装了**
+
+**但执行体一个都没有跑起来**
+
+```
+g_resident_thread_count = 0
+g_s203_online           = 0
+g_S206VrLog             = 全 0    (206 VMRUN 日志一条没记)
+g_S206VrIdx             = 0
+g_VmrunStopped          = 1
+```
+
+**`InterceptMisc2` 的 bit32 = VMRUN 被拦截，是关键线索**
+
+`0x00000003` 低两位就是"VMRUN 和 VMLOAD/VMSAVE 都拦截"。这意味着：
+
+> 任何 guest 一旦执行 `VMRUN`，立刻 VMEXIT 回到宿主。
+
+这是**嵌套虚拟化场景的标准配置**（防止 guest 真的嵌套跑起来），但它也意味着：
+**`Sv206LaunchVm` 里的那条 `vmrun` 指令本身会被拦下**。
+
+所以那"一次" `g_VmrunStopped = 1` 是：某一个核执行到 `vmrun` →
+被 InterceptMisc2 bit32 拦下 → 产生一次 VMEXIT，ExitCode 恰好是 `VMEXIT_CPUID`
+（因为 CPUID 拦截也在同一批里）→ 我的 stop flag 检查命中 → 计数 +1，然后卡住。
+
+**其余 11 个核连那一次都没发生**，因为它们从未执行到 `vmrun`。
+
+**这解释了 22 次崩溃，而且推翻了我此前三个推断**
+
+| 我的推断 | 数据说 |
+|---|---|
+| "第二套 VMRUN 循环在跑，被释放了 VpData"（9.395）| **没有循环在跑**，`g_S206VrLog=0` |
+| "stop flag 够不到那个循环"（9.396）| 够到了，但**只有一个核走到 vmrun** |
+| "卸载顺序错了"（9.387）| 顺序没错，**根本没有东西需要停** |
+
+**真正的问题在更早的地方：`svm_core_init` 建好了 12 个 VCPU，但没有任何执行体
+拿它们去 VMRUN。** 而 `DriverUnload` 却在按"12 个都在跑"的假设做 teardown。
+
+**下一步（有了确定方向）**
+
+不是继续改卸载代码，而是先回答：**`svm_core_init` 之后，那 12 个 VCPU 本来应该由谁去 VMRUN？**
+
+在本树的 206 模式下，答案应该是 `Sv206Entry` → `SvVirtualizeProcessor` → `Sv206LaunchVm`。
+但 `g_S206VrLog = 0` 说明那条链路从未走通。所以：
+
+1. `Sv206Entry` 是否被调用到了？（`g_PowerCallbackRegistration` 非 NULL 就说明走到了）
+2. 如果走到了，`SvExecuteOnEachProcessor(SvVirtualizeProcessor)` 为何没让核进入 VMRUN？
+
+这两问都能从 dump 里读出来（`g_PowerCallbackRegistration` 的地址已在 map 里：
+`VA 0x14005efe0`）。
+
+**在回答这两个问题之前，我不再改卸载代码。** 22 次重启里至少 10 次是因为
+我在"卸载时状态是什么"这个前提上猜错了，而它现在可以从 dump 里直接读出来。
