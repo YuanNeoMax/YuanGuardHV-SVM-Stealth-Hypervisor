@@ -13373,3 +13373,101 @@ FAILURE_BUCKET: CLOCK_WATCHDOG_TIMEOUT_INTERRUPTS_DISABLED_nt!KiSystemCall64
 
 **下一步**：先读本次 dump 里的 `g_inVmrunCount`（如果 `.bss` 可达），
 再决定是撤掉无界还是改成有界。
+
+---
+
+#### 9.430 ★★★ `g_inVmrunCount = 12` —— 12/12 核全部卡在 vmrun，这是系统性错误
+
+**读到的值**
+
+```
+fffff806`602df018  00000000`0000000c     g_inVmrunCount = 12
+```
+
+**12，不是 1。**
+
+所以：**每个核都执行了 `lock inc`（进了 vmrun），没有一个执行 `lock dec`（`vmsave` 之后那条）。**
+
+**12 个核的 `vmrun` 全部没有返回。**
+
+**这不是竞态，是系统性的**
+
+竞态会是"偶尔 1-2 个核没退"。12/12 意味着**每一次 `vmrun` 都不返回**，从来如此。
+
+**`InterceptMisc2 = 0x03` 的读法需要重判**
+
+我 9.402 读到 VMCB `+0x010` = `0x00000003`，解读为 bit32=VMRUN + bit33=VMLOAD/VMSAVE 被拦截。
+
+**但若 VMRUN 真的被拦截，`vmrun` 会立刻 VMEXIT 返回，12 个核不可能全部卡住。**
+
+**所以那个解读错了，或者这个字段的语义与我想的不同。**
+
+**而真正的解释更简单，也更难修**
+
+`vmrun` 不返回的唯一可能是：**guest 正常执行普通指令，从不触发任何已武装的拦截**。
+
+已武装的拦截（9.402 读到的）：
+```
+InterceptMisc1 bit18 = CPUID
+InterceptException bit1 = #DB, bit3 = #BP
+InterceptCrRead bit1 = CR3 读,  InterceptCrWrite bit2 = CR3 写
+InterceptMisc2 bit0 = VMRUN, bit1 = VMLOAD/VMSAVE
+```
+
+**如果 guest 是一段死循环的普通指令（比如一个不带 CPUID、不碰 CR3 的循环），
+它就永远不会 VMEXIT，`vmrun` 就永远不返回。**
+
+**这与 9.402 的另一个读数正好吻合**：`g_S206VrLog = 0`（VMRUN 日志一条都没记）。
+日志是在 VMEXIT 时记的 —— **没有 VMEXIT，所以没有日志。** 两个读数终于一致了。
+
+**这也解释了为什么 `snap_vmrun_stopped = 0`**
+
+stop flag 的检查在循环回边，而回边只有在 VMEXIT 后才走到。**没有 VMEXIT，检查永不执行。**
+
+**完整真相（这是今晚最终的因果链）**
+
+```
+Sv206Entry -> SvVirtualizeAllProcessors -> SvVirtualizeProcessor(每核)
+  -> Sv206LaunchVm(vpData)  -> mov rax,[rsp] / vmload / lock inc
+     -> vmrun  <- guest 开始执行
+        guest = svm_trampoline_test_guest（上游的测试 guest）
+        它执行普通指令的循环，不触发任何已武装的拦截
+        -> 永不 VMEXIT -> vmrun 永不返回 -> lock dec 永不执行
+           -> g_inVmrunCount = 12（且永远）
+           -> SvHandleVmExit 一次都不跑（所以 g_S206VrLog 空）
+           -> stop flag 的检查点一次都不跑（所以 stopped=0）
+```
+
+**而 `DriverUnload` 在同一台机器上正常执行**（它是一个系统线程，不在 guest 里）。
+
+于是：`DriverUnload` 走完 14 步 → 等 `g_inVmrunCount` 归零 → **它永远不会归零**
+→ 9.428 的无界等待挂死 → `0x101` watchdog。
+
+**问题从"卸载顺序"变成了"guest 从不退出"**
+
+这是一个完全不同层次的问题，而且它解释了今晚所有的观察：
+
+| 观察 | 现在有解释 |
+|---|---|
+| `g_S206VrLog = 0` | 没有 VMEXIT，日志条件不成立 |
+| `snap_vmrun_stopped = 0` | 检查点在回边，回边永不执行 |
+| `g_inVmrunCount = 12` | 每次 vmrun 都不返回 |
+| 卸载 14 步走完（`step=120`）| `DriverUnload` 是系统线程，不在 guest 里 |
+| `PAGED_IP` 崩溃 | 驱动 unmap 后，卡在 vmrun 里的核执行已失效的代码 |
+| 三种 stop-check 改动都不生效 | 它们都依赖"有 VMEXIT"这个前提 |
+
+**所以真正的修法不在卸载，在 guest**
+
+要么：
+1. **让 guest 产生 VMEXIT** —— 上游的 `svm_trampoline_test_guest` 是为"短暂测试"设计的，
+   它的设计前提是"跑一下然后主动退出"。本树把它当常驻 guest 用，前提不成立。
+2. **不要启动这个 guest** —— 如果 206 模式不需要常驻 guest，`Sv206LaunchVm` 根本不该被调用。
+
+**第 2 条最可能是正确的**：这个 guest 是上游的**测试桩**，用来验证"虚拟化能建起来"。
+本树把它当成"我要一直虚拟化"的手段 —— **这是对上游代码的误用。**
+
+**验证这个判断的快速方法**
+
+`svm_trampoline_test_guest` 的代码在 `svm_core.c` 或 ASM 里，看它是不是"跑一下就走"。
+
+**这次不再改代码。先读那个 guest 的源码。**
