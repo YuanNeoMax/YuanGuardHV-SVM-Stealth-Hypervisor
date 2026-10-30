@@ -12558,3 +12558,81 @@ PA_RECORDED 0xC7BD6000
 **只差一次"走 bugcheck 而不是硬复位"的卸载。** 重跑同一流程即可 —— 概率上 5/6 会拿到。
 
 不做任何代码改动，再跑一次。
+
+---
+
+#### 9.410 ★ 决定性：卸载 14 步全部走完 —— 崩溃发生在卸载之后，不是其中
+
+**这次终于拿到了有 dump 的卸载，且 PA 记录有效**
+
+```
+pa_pa2_20261030_201338.txt:  image_md5=9F0F0B25  pa=0xC7BD1000
+dump: 20:14, MEMORY.DMP
+```
+
+**进度页历史环按 seq 排序（`!dd 0xC7BD1000`）**
+
+```
+seq=15  step=90   YGHV_UT_PROTECT_CLEANUP
+seq=16  step=100  YGHV_UT_NPT_CLEANUP
+seq=17  step=110  YGHV_UT_CORE_CLEANUP
+seq=18  step=120  YGHV_UT_DONE          <-- 走完了
+```
+
+**`DriverUnload` 的 14 个埋点全部执行，最后一步是 `DONE(120)`。**
+
+快照区（`0xC7BD10A0`）：
+
+```
+snap_resident_threads = 0
+snap_power_cb         = 1     Sv206Entry 走过虚拟化
+snap_vcpu_count       = 12
+snap_s203_online      = 0
+snap_vmrun_stopped    = 0
+snap_cpuid_view       = 0
+```
+
+**★ 这推翻了我 9.407 的判断**
+
+我说过「一个核仍在循环里，`Sv206LaunchVm` 的 VpData 已经不归它了，而这正是卸载崩溃的原因」。
+
+数据说：**卸载本身走完了**。`svm_core_cleanup` 在 `step=110` 执行、`DONE` 在 120，
+都在崩溃之前。所以崩溃是**卸载完成之后**的事。
+
+崩溃这一侧：
+
+```
+0xD1  P2=0xE (CLOCK_LEVEL)  P3=8
+yghv_pa+0x24a2d = Sv206LaunchVm + 0xD
+PROCESS_NAME: powershell.exe
+```
+
+**所以 Shape 是：驱动卸载完毕 → 某个核仍在 `Sv206LaunchVm` 的 VMRUN 循环里 →
+它的 `VpData` 已被 `svm_core_cleanup` 释放 → 循环再读 `HostStackLayout` 时撞上已释放的页。**
+
+**这解释了为什么之前所有"改卸载顺序"的尝试都无效**
+
+我改的是**顺序**（先停谁、后停谁、跳不跳过 walk）。而真正的缺陷是：
+**卸载完成之后还有执行体活着。** 顺序再正确，也挡不住"已经卸载了但代码还在跑"。
+
+**这个缺陷的形状，与 9.387 那条规则正好对应**
+
+> 卸载路径被杀掉之后，任何留在上面的执行体都是 use-after-unmap。
+
+而 9.390 的进度页第一次给出了它的**准确证据**：`step=120`。
+
+**下一步（方向确定，且可验证）**
+
+要在 `DONE` **之前**确保没有任何执行体还在 `Sv206LaunchVm` 循环里。
+而 `snap_vmrun_stopped = 0` 说明**我的 stop flag 一个都没停掉** ——
+那个循环从未检查过 `g_VmrunStopRequested`。
+
+**为什么？** 因为 `Sv206LaunchVm` 是一个 ASM 桩，它在 `vmrun` 和 `vmsave` 之间
+**不经过 `SvHandleVmExit` 的那个检查点**（检查点只在 `SvHandleVmExit` 里，
+而那需要一次 VMEXIT 才会被调用）。
+
+**所以 stop flag 的检查位置错了**：它应该在**每次 `vmsave` 之后、循环回跳之前**，
+即 ASM 桩里，而不是 C 的退出处理器里。
+
+**修法**：在 `svm_simplevm206_x64.asm` 的 `SvLV10` 回跳处加一条检查。
+这是第一次有一个**能被 `step` 验证**的修法（如果修对，`DONE` 之后不应再崩）。
