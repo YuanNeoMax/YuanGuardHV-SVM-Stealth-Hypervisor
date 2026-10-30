@@ -17,6 +17,13 @@ static yghv_resident_ctx_t *g_resident_ctx[SVM_MAX_CORES];
 static KEVENT g_ready_events[SVM_MAX_CORES];
 static ULONG g_resident_thread_count;
 
+/* 9.404: read-only accessor for the pre-teardown snapshot. The counter itself is
+ * zeroed by svm_core_stop_all_residents, so a post-crash read cannot tell "never
+ * started" from "started then cleared" - the snapshot is what can. */
+ULONG_PTR svm_core_resident_threads_for_trace(void) {
+    return (ULONG_PTR)g_resident_thread_count;
+}
+
 static VOID yghv_resident_thread(PVOID context) {
     yghv_resident_ctx_t *ctx = (yghv_resident_ctx_t *)context;
     uint32_t core = ctx->core;

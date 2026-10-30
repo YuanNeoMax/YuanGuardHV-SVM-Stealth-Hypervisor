@@ -54,6 +54,31 @@ typedef struct {
     volatile LONG64 value;        /* latest value, for a quick read */
     volatile LONG64 tsc;          /* when, so two steps can be ordered in time */
     yghv_ut_slot_t hist[YGHV_UT_HIST];
+
+    /*
+     * 9.404: A SNAPSHOT AREA THAT THE TEARDOWN CANNOT REWRITE.
+     *
+     * 9.403 recorded that six of eight readouts were USELESS because the value
+     * meant two different things: "never started" and "started, then zeroed by
+     * the very unload we are observing". g_PowerCallbackRegistration and
+     * g_resident_thread_count both suffer from this - the teardown writes NULL
+     * and 0 over the evidence before the machine dies.
+     *
+     * The fix is not to read differently; it is to WRITE FIRST. These fields are
+     * filled at YGHV_UT_START, before any teardown runs, and nothing else ever
+     * touches them. A dump then carries BOTH the pre-teardown truth and the
+     * post-teardown leftovers, and comparing them answers "was it ever set".
+     *
+     * Deliberately NOT part of the history ring: a ring is written on every
+     * stamp, so by the fifth stamp the snapshot would be gone - the same class of
+     * mistake (one slot, many writers) that made the earlier readouts ambiguous.
+     */
+    volatile LONG64 snap_resident_threads;   /* g_resident_thread_count at entry */
+    volatile LONG64 snap_power_cb;           /* g_PowerCallbackRegistration != 0 */
+    volatile LONG64 snap_vcpu_count;         /* g_vcpu_count at entry */
+    volatile LONG64 snap_s203_online;        /* g_s203_online at entry */
+    volatile LONG64 snap_vmrun_stopped;      /* the stop counter at entry */
+    volatile LONG64 snap_cpuid_view;         /* g_CpuidView at entry */
 } yghv_ut_state_t;
 
 typedef union {
@@ -113,6 +138,27 @@ int yghv_ut_init(void) {
     InterlockedExchange64(&g_ut_pa,
                           (LONG64)MmGetPhysicalAddress(g_ut_page).QuadPart);
     return 1;
+}
+
+/*
+ * 9.404: capture what the teardown is about to destroy. Called ONCE, at entry,
+ * before any field has been cleared. Each source is a plain read, so this is
+ * safe anywhere DriverUnload runs (PASSIVE).
+ */
+void yghv_ut_snapshot_pre_unload(UINT64 resident_threads, UINT64 power_cb_present,
+                                 UINT64 vcpu_count, UINT64 s203_online,
+                                 UINT64 vmrun_stopped, UINT64 cpuid_view) {
+    volatile yghv_ut_state_t *st = UT_STATE;
+
+    if (!st)
+        return;
+
+    st->snap_resident_threads = (LONG64)resident_threads;
+    st->snap_power_cb         = (LONG64)power_cb_present;
+    st->snap_vcpu_count       = (LONG64)vcpu_count;
+    st->snap_s203_online      = (LONG64)s203_online;
+    st->snap_vmrun_stopped    = (LONG64)vmrun_stopped;
+    st->snap_cpuid_view       = (LONG64)cpuid_view;
 }
 
 void yghv_ut_mark_val(uint32_t step, uint64_t value) {

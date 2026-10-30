@@ -4887,6 +4887,39 @@ void DriverUnload(struct _DRIVER_OBJECT *d) {
      * get before something freed memory a live core was still using.
      */
     yghv_ut_mark(YGHV_UT_START);
+
+    /*
+     * 9.404: SNAPSHOT BEFORE ANYTHING IS CLEARED.
+     *
+     * Every source below is destroyed by this function: g_resident_thread_count
+     * goes to 0 in svm_core_stop_all_residents, g_PowerCallbackRegistration goes
+     * to NULL in Sv206CoopUnload. Reading them after a crash therefore cannot
+     * distinguish "never set" from "set, then cleared here" - which is why the
+     * 9.401/9.402 readouts were ambiguous despite being correct.
+     *
+     * These six values are captured now, into a page that nothing else writes.
+     * A later dump shows both: these (pre-teardown) and the globals (post). The
+     * comparison is the measurement.
+     *
+     * externs instead of includes: these live in modules that pull kernel headers
+     * in a different order, and main.c is the one place that can see them all.
+     */
+    {
+        extern ULONG g_vcpu_count;
+        extern volatile LONG g_s203_online;
+        extern ULONG_PTR yghv_s206_power_cb_for_trace(void);
+        extern ULONG_PTR svm_core_resident_threads_for_trace(void);
+        extern ULONG_PTR yghv_s206_vmrun_stopped_for_trace(void);
+        extern LONG yghv_s206_cpuid_view_for_trace(void);
+
+        yghv_ut_snapshot_pre_unload(
+            (UINT64)svm_core_resident_threads_for_trace(),
+            (UINT64)yghv_s206_power_cb_for_trace(),
+            (UINT64)g_vcpu_count,
+            (UINT64)g_s203_online,
+            (UINT64)yghv_s206_vmrun_stopped_for_trace(),
+            (UINT64)yghv_s206_cpuid_view_for_trace());
+    }
 #if YGHV_BAREMETAL_STEP == 206 && defined(YGHV_206B_COEXIST)
     /* 9.258: unregister the target-exit watchdog BEFORE any teardown so no
      * callback fires into a half-dismantled protect engine. */

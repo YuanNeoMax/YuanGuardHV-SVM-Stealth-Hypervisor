@@ -803,6 +803,17 @@ extern "C" void yghv_s206_vmrun_stop_clear(VOID)
 }
 
 /* How many loops have left. Compared against the core count by the waiter. */
+/* 9.404: read-only accessors for the pre-teardown snapshot. */
+extern "C" ULONG_PTR yghv_s206_vmrun_stopped_for_trace(VOID)
+{
+    return (ULONG_PTR)InterlockedCompareExchange(&g_VmrunStopped, 0, 0);
+}
+
+extern "C" LONG yghv_s206_cpuid_view_for_trace(VOID)
+{
+    return InterlockedCompareExchange(&g_CpuidView, 0, 0);
+}
+
 extern "C" int yghv_s206_vmrun_stopped_count(VOID)
 {
     return (int)InterlockedCompareExchange(&g_VmrunStopped, 0, 0);
@@ -1045,6 +1056,13 @@ extern "C" int yghv_s206_tsc_wanted(VOID)
 // A power state callback handle.
 //
 static PVOID g_PowerCallbackRegistration;
+
+/* 9.404: the registration is static, so the pre-teardown snapshot cannot reach it
+ * by link. This is the read-only door. */
+extern "C" ULONG_PTR yghv_s206_power_cb_for_trace(VOID)
+{
+    return (ULONG_PTR)(g_PowerCallbackRegistration ? 1 : 0);
+}
 
 /*!
     @brief      Sends a message to the kernel debugger.

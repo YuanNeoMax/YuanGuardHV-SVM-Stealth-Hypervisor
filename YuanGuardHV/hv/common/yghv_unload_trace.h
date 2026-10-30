@@ -81,6 +81,15 @@
  * Returns 1 on success; the page is deliberately NEVER freed. */
 int yghv_ut_init(void);
 
+/*
+ * 9.404: capture the pre-teardown truth, ONCE, before anything clears it.
+ * See the note on the snapshot fields in yghv_unload_trace.c: reading these
+ * AFTER the unload is meaningless because the unload writes over them.
+ */
+void yghv_ut_snapshot_pre_unload(UINT64 resident_threads, UINT64 power_cb_present,
+                                 UINT64 vcpu_count, UINT64 s203_online,
+                                 UINT64 vmrun_stopped, UINT64 cpuid_view);
+
 void yghv_ut_mark(uint32_t step);
 
 /*
