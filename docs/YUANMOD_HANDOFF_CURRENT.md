@@ -12267,3 +12267,90 @@ g_resident_thread_count     = 0
 
 **但今天不做了** —— 22 次重启，而这一整晚在同一件事上反复读同一批双义值。
 先把方法学的结论写下来（就是这一节），下次开工时从"加快照"开始，而不是再读一轮。
+
+---
+
+#### 9.405 快照解决了双义问题：六个值全部读出，真相确定
+
+**这次 dump（2.8 GB，模块基址 `fffff806cccc0000`）**
+
+```
+0x7F  P1=8 (双故障)   SYMBOL yghv_sn+0x21cc0 = SvDevirtualizeAllProcessors+0xC0
+P3 = 0x5353564D ('MVSS')
+```
+
+**进度页 `PA 0xC7BE4000`（经 `g_ut_page` 得来）**
+
+历史环四项，解析后按 order 排序：
+
+```
+order=3  step=0x2D(45)  value=0      <- "停了多少循环"
+order=4  step=0x2E(46)  value=12     <- "活动核数"
+order=5  step=0x2F(47)  value=0      <- "stopped >= active ? 1 : 0" -> 0
+order=6  step=0x14(20)  value=0      <- COOP_UNLOAD，之后什么都没写
+```
+
+快照区（**在 `YGHV_UT_START` 处写，任何 teardown 之前**）：
+
+```
++0x0A0 snap_resident_threads = 0
++0x0A8 snap_power_cb         = 1     ★ 回调存在
++0x0B0 snap_vcpu_count       = 12
++0x0B8 snap_s203_online      = 0
++0x0C0 snap_vmrun_stopped    = 0     ★ 卸载开始时 0
++0x0C8 snap_cpuid_view       = 0
+```
+
+**这三个对比，把 9.401-9.403 的双义值全部解开了**
+
+| 字段 | 快照时（teardown 前）| 崩溃后 | 结论 |
+|---|---|---|---|
+| `power_cb` | **1** | NULL | **`Sv206Entry` 走到底了**，注册过回调。之前读的 NULL 是 `Sv206CoopUnload` 清的 |
+| `resident_threads` | **0** | 0 | **从未启动**。之前的 0 不是被清零，本来是 0 |
+| `vmrun_stopped` | **0** | 1 | 卸载开始时 0 个退出；崩前变成 1 |
+
+**所以完整链条是**
+
+```
+卸载开始：12 个 VCPU、0 resident 线程、0 s203 线程、回调存在（= Sv206Entry 走到虚拟化）
+  -> 请求 stop，等到 0 个响应（step45 value=0）
+  -> 但 12 个核里实际有 1 个在崩前退出了（stopped 0 -> 1）
+  -> 0 < 12，走 Sv206CoopUnload
+  -> SvDevirtualizeAllProcessors 里 0x7F/8 双故障
+```
+
+**`snap_power_cb = 1` 是这一轮最关键的新事实**
+
+它证明 `Sv206Entry` 走到底了。而那个函数在注册回调之后**紧接着就是
+`SvVirtualizeAllProcessors`** —— 所以 VMRUN 循环**确实被启动过**。
+
+那 `g_S206VrLog = 0` 怎么解释？**因为 VMRUN 日志只在 VMEXIT 时记录，
+而循环刚起来、还没产生任何出口就被卸载打断了。**
+
+**这与 `InterceptMisc2 bit32`（VMRUN 被拦截）完全吻合**
+
+guest 执行 `vmrun` → 被 InterceptMisc2 bit32 拦下 → 产生一次 VMEXIT。
+那"一次"就是 `stopped` 从 0 变成 1 的来源。
+
+**所以现在的结论不再有歧义**
+
+- 循环**确实在跑**（`Sv206Entry` 走到了虚拟化）
+- 但**每次 VMRUN 都被拦截**（`InterceptMisc2 bit32`）
+- 于是那 12 个"guest"根本不执行，只是反复被拦
+- 卸载时 `Sv206CoopUnload` 去遍历核、在每个核上执行 `__cpuidex`，
+  而那些核正处在"vmrun 被拦下"的 VMEXIT 处理里 —— **双故障**
+
+**下一步的修法方向（第一次有真正的因果链）**
+
+那个 `InterceptMisc2 bit32`（拦截 VMRUN）在 206 模式下是**不该有的**。
+它来自 vendored 上游的嵌套虚拟化配置，但本树是**裸机**运行，没有 L0 在上面，
+拦住 `vmrun` 只会让 VMRUN 循环永远起不来 —— 而卸载路径假设它们起来了。
+
+要么：
+1. **清掉 `InterceptMisc2 bit32`**，让 VMRUN 真正执行（循环正常起来，卸载就能正常停）
+2. 或者：**承认 VMRUN 起不来时，`Sv206CoopUnload` 是多余的**，在
+   `snap_vmrun_stopped == 0 && resident == 0` 时直接跳过整个遍历
+
+第 2 条更安全，而且**现在有快照数据可以支撑这个判断**（不需要再猜）。
+
+**这就是快照的价值**：它让 `DriverUnload` 能基于**事实**而不是假设决定走哪条路径。
