@@ -8,28 +8,32 @@
 
 ## 0. 一句话现状
 
-**裸机 SVM/NPT hypervisor：加载、虚拟化、隐藏页、卸载 —— 全部跑通。
-卸载路径在 29 次崩溃后于 9.445 首次干净成功，三轮连续无蓝屏，`invmrun` 归零。**
+**裸机 SVM/NPT hypervisor：加载、虚拟化、隐藏页、保护、卸载 —— 全链路闭环。
+卸载路径在 29 次崩溃后于 9.445 首次干净成功；G25 17 项在 9.447 全绿。**
 
 | 能做什么 | 状态 |
 |---|---|
 | 加载驱动 | **可以**（`sc start` → RUNNING，0.8–6.5 秒）|
 | 虚拟化 12 核 + NPT | **可以**（`g_npt.pml4_pa` 有效、12 个 VCPU 全建好）|
-| 隐藏页 / decoy / 13 项回归 | **可以**（G25 13/13，但未在 9.445 版本重跑）|
+| 隐藏页 / decoy / 全功能回归 | **可以**（**G25 17 项 ALL PASS**，9.447 实测两次）|
 | Tier 9.1 无设备 CPUID 通道 | **可以**（设备可移除，门铃可达）|
 | Tier 9.2 控制通道认证 | **可以**（G41 13/13）|
 | **卸载驱动** | **可以**（`sc stop` → STOPPED，2.6–3.2 秒，`WIN32_EXIT_CODE=0`）|
 
-**当前代码状态：可用。** `9.445` 修好了卸载路径，三轮连续验证：
+**已知代价**：比 9.445 之前的版本慢约 12 倍（12 个核持续在 guest 里跑循环）。见 8.4。
+
+**当前代码状态：可用，且已回归验证。**
 
 ```
 s206 exits at unload   = 288,352,654     （2.88 亿次 VMEXIT，说明循环正常在跑）
 s206 vmmcall at unload = 287,973,382     （vmmcall 拦截正常）
 s206 invmrun at unload = 0               ← 归零：12 个核全部干净离开 VMRUN
 WIN32_EXIT_CODE        = 0
+
+G25 (17 项):  OVERALL: ALL PASS          ← 9.447 实测两次
 ```
 
-**下一步待办**：在本版本上重跑 G25 13/13 回归（见第 8.1 节）。
+**下一步待办**：无阻塞项。可选方向见第 8.3（清死代码）和第 8.4（降性能开销）。
 
 ---
 
@@ -119,8 +123,8 @@ s206 vmmcall at unload = 0x11285c06 = 287,973,382
 s206 invmrun at unload = 0x0          ← 归零
 ```
 
-**第一件事：在本版本上重跑 G25 13/13 回归**，确认卸载修好之后保护功能没被破坏。
-回归基线镜像曾是 `206zR_va`（`db7547ab`），那是最后一次 G25 全绿的版本。
+**G25 17 项已在 9.447 跑通两次（`OVERALL: ALL PASS`）** —— 卸载修好之后，
+保护功能也确认完好。见第 11 节。跑 G25 前必读 8.2 的四个超时值。
 
 ---
 
@@ -366,18 +370,22 @@ yghv_ctl.ps1 unload-trace   → page PA / last step / value
 4. ~~加无条件 exit 计数器~~ —— 9.441（这个仪表带来了后面全部结论）
 5. ~~卸载路径修好~~ —— 9.445b，三轮连续验证通过
 
-### 8.2 下一步：在本版本上重跑 G25 13/13 回归
+### 8.2 G25 回归：已全绿（9.447 完成）
 
-卸载修好之后，**保护功能是否还完好尚未验证**。这是唯一剩下的「必须做」。
+**在 9.445b 上跑了两次，`OVERALL: ALL PASS`。** 见第 11 节。
 
-```powershell
-# 加载后按 G25 的流程跑 13 项：arm / hide / decoy / sha / health / unload
-# 基线镜像曾是 206zR_va (db7547ab)，最后一次全绿
-```
+**跑 G25 时的四个超时（都被实测打脸后调过，别改回去）**
 
-**如果 G25 有项失败**：优先怀疑 9.443 引入的每核线程模型改变了核的归属
-（每个 VMCB 现在绑在一个专属线程上，而不再由 `SvExecuteOnEachProcessor` 轮转）。
-这不一定是 bug，但任何依赖「某个核上发生过什么」的检查都需要重新审视。
+| 项 | 值 | 为什么 |
+|---|---|---|
+| 各命令 `-TimeoutSec` | **150 / 180** | 实测单命令 40–50 秒（9.445b 比旧版慢 12 倍）|
+| `HangTimeoutSec` | **240** | 同上 |
+| `mmf-hold` 寿命 | **3600 秒** | 全流程 ~20 分钟，原来的 900 秒会让目标进程在 T12 前退出 |
+| `$img` | 可切换 | 做新旧对照 |
+
+**`mmf-hold` 那条尤其要记住**：目标进程到期退出后，`mem-read` 返回
+`FAILED status=0x00000000`、`mem-pte` 返回 `NOT MAPPED` —— 看起来完全像驱动回归，
+实际上是测试工具超时。9.446 就误判过一次（见 9.447）。
 
 ### 8.3 已知的三处死代码 / 假判据（不影响功能，影响读数可信度）
 
@@ -388,7 +396,17 @@ yghv_ctl.ps1 unload-trace   → page PA / last step / value
    但这个判据的注释还留着旧结论。
 3. `g_S206VrLog` 的注释 —— 它不是 exit 日志，是 NPF 写裁决日志。
 
-### 8.4 原清单（Tier 5/6/8/9，共 30 项）
+### 8.4 已知的性能代价（不是缺陷，但要知道）
+
+9.445b 比 9.445 之前的版本慢约 **12 倍**（T1：4 秒 → 42 秒）。
+原因是 9.443 的每核线程模型让 **12 个核持续在 guest 里跑 VMRUN 循环**
+（实测 `exits` / `vmmcall` 各 2.88 亿次）。
+
+这是「常驻虚拟化」的固有开销。**如果将来需要降下来**，方向是让 guest 桩
+在没有工作时 `hlt` 而不是空转 —— 但那要先解决「`hlt` 之后如何被唤醒」，
+不是一个可以顺手改的东西。
+
+### 8.5 原清单（Tier 5/6/8/9，共 30 项）
 | Tier | 项 | 状态 |
 |---|---|---|
 | 5.1 TSC | offset 平移 / freeze | offset **成立**；freeze **已禁用**（无法证明释放）|
@@ -450,7 +468,19 @@ Get-Content C:\Windows\yghv_progress.log | Select-String "invmrun at unload"
 **判据只有一条：`invmrun at unload = 0x0`。**
 非 0 说明还有核没离开 VMRUN，驱动 unmap 后必崩。
 
-**下一步是 G25 13/13 回归**（见 8.2）—— 卸载修好之后，保护功能尚未验证。
+**第 5 步（可选）：跑 G25 全功能回归**
+
+```powershell
+# 会装独立服务 yghvg25，与 yghvpa 不冲突；约 20 分钟
+# 跑之前确认 D:\aaaaaavm\g25_tier7.ps1 里这四个数是对的（见 8.2）
+powershell -NoProfile -ExecutionPolicy Bypass -File D:\aaaaaavm\g25_tier7.ps1
+Get-Content D:\aaaaaavm\g25_result.txt | Select-String "OVERALL"
+#   期望 OVERALL: ALL PASS
+```
+
+**注意 `mmf-hold` 的 3600 秒寿命**：如果它到期退出，T12 会以
+`mem-read: FAILED status=0` / `mem-pte: NOT MAPPED` 失败 —— 看起来像驱动回归，
+实际是测试工具超时。9.446 误判过一次（见 9.447）。
 
 ---
 
@@ -458,8 +488,8 @@ Get-Content C:\Windows\yghv_progress.log | Select-String "invmrun at unload"
 
 | 测试 | 内容 | 结果 |
 |---|---|---|
+| **G25** | **17 项全功能回归，在 9.445b 上跑了两次** | **`OVERALL: ALL PASS`** |
 | **9.445b** | **加载 → 运行 → 卸载，三轮连续** | **全部通过，无蓝屏** |
-| G25 | 13 项回归（arm/hide/decoy/sha/health/unload） | **13/13**（旧版本，未在 9.445 重跑）|
 | G33 | snapshot 非破坏 + drain 消费 | ALL PASS |
 | G39 | TSC 逐核武装与释放 | ALL PASS |
 | G40 | 逐核 walk 可达性（12/12 核） | ALL PASS |
@@ -467,7 +497,16 @@ Get-Content C:\Windows\yghv_progress.log | Select-String "invmrun at unload"
 | G43 | 无设备 CPUID 通道 | 部分（设备可移除已验证）|
 | G18/G28/G29/G30/G31 | hide/decoy/border/why | 见各 9.3xx |
 
-**9.445b 的三轮明细**
+**G25 的 17 项（9.445b 实测）**
+
+```
+T1 sha256 selftest   T2 arm        T2b clean verify  T3 hidecore
+T4 alive after hide  T4b hidden    T5 uncovered      T6 sha tamper
+T7 decoy mechanism   T8 exit timing T9 escape        T10 surface
+T11 health           T12 regression T13 unload       T7 mechanism name
+```
+
+**9.445b 的三轮加载/卸载**
 
 | 轮 | start | stop | `invmrun` |
 |---|---|---|---|
@@ -477,8 +516,13 @@ Get-Content C:\Windows\yghv_progress.log | Select-String "invmrun at unload"
 
 第一轮 `exits = 288,352,654`、`vmmcall = 287,973,382`、`WIN32_EXIT_CODE = 0`。
 
-**回归基线镜像**：`206zR_va`（`db7547ab`）—— 那是最后一次 G25 13/13 全绿的版本，
-但**不含 9.439–9.445 的卸载修复**。当前的可用镜像是 9.445b 构建（见第 3 节）。
+**性能代价（9.447 实测）**：9.445b 比 `zAV_final` 慢约 **12 倍**
+（T1 从 4 秒变 42 秒），因为 12 个核全在 guest 里跑 VMRUN 循环。
+G25 因此从 ~2 分钟变成 ~20 分钟，**所有测试超时必须按新量级设置**（见 8.2）。
+
+**回归基线镜像**：`zAV_final`（`yuanguard_hv_step206zAV_final_20261018.sys`）
+是 9.445 之前的最后一个可用版本 —— 但它的 `sc stop` 会挂死（T13 FAIL）。
+**当前可用镜像是 9.445b 构建**（见第 3 节）。
 
 ---
 
@@ -590,3 +634,29 @@ Get-Content C:\Windows\yghv_progress.log | Select-String "invmrun at unload"
 
 > **所以：当修复方案需要「算偏移手工跳转」时，那是设计错了的信号，不是偏移算错了。**
 > 正确的退出不是「重建栈」，而是「在正确的栈上做一次合法调用」。
+
+---
+
+**9.447 追加最后一条，关于「怎么判断 A 是不是由 B 引起的」**：
+
+**换了一个变量，结果就变了 —— 这不能推出"是它造成的"。**
+
+9.446 用两个镜像跑 G25，看到失败项正好互换（旧版 T13 挂、新版 T12 挂），
+就写下了「9.445 用 T13 的修复换来 T12 的回归」。
+
+**它漏掉了第二个变量：运行时长。** 9.445 比旧版慢 12 倍，于是
+`mmf-hold` 创建的目标进程在 T12 之前就到期退出了。T12 读一个已经不存在的进程，
+当然失败。真正的判据不是「哪个镜像」，而是**「target 创建到 T12 之间隔了多少秒」**：
+
+```
+baseline  102s  PASS
+run1      808s  PASS
+run2      948s  FAIL   <- 超过 mmf-hold 的 900 秒
+run3      913s  PASS   <- 仍然超 900，但把寿命改成 3600 秒
+```
+
+**判据换到时间这一列，结论立刻反转。** 和 4.6「把恒等式当测量」是同一个病：
+都以为自己抓住了一个因果，其实只抓住了一个恰好同时变动的量。
+
+> **做对照实验时，先列出所有会变的量。** 只盯着你以为的那个，
+> 另外那个就会替它背锅 —— 而且背得很有说服力。
