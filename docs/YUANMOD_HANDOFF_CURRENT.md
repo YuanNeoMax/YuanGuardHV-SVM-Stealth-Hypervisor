@@ -12354,3 +12354,72 @@ guest 执行 `vmrun` → 被 InterceptMisc2 bit32 拦下 → 产生一次 VMEXIT
 第 2 条更安全，而且**现在有快照数据可以支撑这个判断**（不需要再猜）。
 
 **这就是快照的价值**：它让 `DriverUnload` 能基于**事实**而不是假设决定走哪条路径。
+
+---
+
+#### 9.407 方向 2 生效了：崩溃点从 SvDevirtualizeAllProcessors 移到了别处
+
+**本次蓝屏（20:00 dump）**
+
+```
+BUGCHECK_CODE:  d1
+BUGCHECK_P1:    fffff804754b4a2d
+BUGCHECK_P2:    0000000000000002      <- IRQL 2 = DISPATCH_LEVEL
+BUGCHECK_P3:    0000000000000008      <- 8-byte access
+PROCESS_NAME:   DeepSeek Harness.exe  <- 用户态进程，不是 System
+SYMBOL_NAME:    yghv_sk+24a2d
+```
+
+映射：`+0x24a2d` = **`Sv206LaunchVm + 0xD`**。
+
+**这是一个真实的进展，不是又一次失败**
+
+| | 之前（5 次）| 本次 |
+|---|---|---|
+| 崩溃码 | `0x7F` `P1=8`（双故障）| **`0xD1` `P2=2`（普通 IRQL 违规）** |
+| 崩溃点 | `SvDevirtualizeAllProcessors+0xC0` | **`Sv206LaunchVm+0xD`** |
+| 进程 | System | DeepSeek Harness.exe |
+
+`0x7F` 是"处理错误时又错了"，`0xD1` 是"访问了错误地址" —— **后者是本树最早那批
+`0xD1` 的同一类**，而不是双故障。而且崩溃点**离开了那个反复出事的 walk**。
+
+**9.406 的判断是对的**
+
+`stopped == 0 && resident_threads_at_entry == 0` → 跳过 `Sv206CoopUnload` 的遍历。
+从崩溃点变化可以确认**这段代码确实没有执行**（否则还会崩在 `+0xC0`）。
+
+**但卸载仍然没有完成，只是卡在了更后面**
+
+`Sv206LaunchVm+0xD` 是那条 `mov rax, [rsp]` —— 读 `VpData->HostStackLayout.GuestVmcbPa`。
+在 `0xD1 / IRQL 2` 下访问它，说明**那个 `VpData` 或它的栈已经没有映射**。
+
+**为什么会出现这个访问**
+
+`Sv206LaunchVm` 只在 `SvVirtualizeProcessor` 里被调用（3818 行），而那是在
+**加载期**。卸载期不应该执行它。
+
+**唯一可能：这不是卸载路径，而是另一个核仍在 `Sv206LaunchVm` 的循环里。**
+
+而 `PROCESS_NAME = DeepSeek Harness.exe` 说明了更多：那个核当时正在执行 Harness 的
+用户态代码 —— 也就是说**它是一个真实在跑的 guest**，不是"vmrun 被拦下"的状态。
+
+**这推翻了我 9.405 的一个结论**
+
+我在 9.405 说"每次 VMRUN 都被 `InterceptMisc2 bit32` 拦下，12 个 guest 从不执行"。
+本次崩溃说明**至少有一个核真的进了 guest 并执行了用户态代码**
+（Harness 的进程上下文），所以 VMRUN **确实成功过**。
+
+那 `InterceptMisc2 = 0x03` 的读法需要重新检查：`bit32` 是 VMRUN 拦截，
+但 VMCB 的那个字段我读的是 `+0x010 InterceptMisc2` —— 需要确认 `InterceptMisc2`
+在 VMCB 里的**实际偏移**是 `+0x010` 还是 `+0x014`（APM 里 Misc2 在 `+0x010`，
+Misc3 在 `+0x014`，本树结构没有 Misc3，这一点 9.367 记过）。
+
+**下一步（用已经验证过的方法）**
+
+1. 重新确认 `InterceptMisc2` 的偏移与值（读 VMCB `+0x010` 和 `+0x014` 各 8 字节，
+   以及 `+0x008` 的 CrWrite）
+2. 如果 VMRUN 真的成功过，那 9.405 的"guest 从不执行"就是错的，需要按
+   "有真实 guest 在跑"重新设计停止机制
+
+这次 dump 的 `g_ut_page` 物理页没被保存（`????????`），所以读不到历史环。
+但**崩溃点本身的位移已经足够说明 9.406 生效**。
