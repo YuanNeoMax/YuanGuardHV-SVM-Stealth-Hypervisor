@@ -38,7 +38,23 @@
  * how many expected, where next, where after" - and 4 * 40 bytes stays trivially
  * inside the page.
  */
-#define YGHV_UT_HIST 4
+/*
+ * 9.418: 128 SLOTS, AND NO WRAP-AROUND.
+ *
+ * 9.417 found that the 4-slot ring had made the readout meaningless: DriverUnload
+ * runs more than once in this tree (d->DriverUnload is set twice historically),
+ * and each run overwrote order 1 and 2, so "step = 10" meant "the last thing
+ * written was 10", not "execution stopped at 10".
+ *
+ * 120 slots of 32 bytes, plus the 32-byte header and the 48-byte snapshot area,
+ * comes to 3920 bytes - inside one page with room to grow. That is more than the
+ * ~20 marks a single unload writes. So the index does NOT wrap: once full, writes
+ * stop. That keeps
+ * the FIRST marks of the first run instead of the last marks of the last one -
+ * which is what a post-mortem needs, because the first failure is the one that
+ * explains the rest.
+ */
+#define YGHV_UT_HIST 120
 
 typedef struct {
     volatile LONG64 seq_order;    /* which stamp this is (1-based) */
@@ -179,11 +195,28 @@ void yghv_ut_mark_val(uint32_t step, uint64_t value) {
     /* Slot first, then the quick-read fields: if the machine dies mid-stamp, the
      * history (which is what a dump reader walks) is the more complete of the two. */
     {
-        yghv_ut_slot_t *slot = (yghv_ut_slot_t *)&st->hist[(order - 1) % YGHV_UT_HIST];
-        slot->step = (LONG)step;
-        slot->value = (LONG64)value;
-        slot->tsc = (LONG64)__rdtsc();
-        slot->seq_order = order;
+        /*
+         * 9.418: index by order directly, capped - no wrap. A slot used by an
+         * earlier run is never reused, so a second unload cannot erase the
+         * evidence of the first.
+         *
+         * When the table is full the SLOT write stops, but the quick-read fields
+         * below still update - they are the "latest state", and a reader who
+         * wants the early history reads hist[], while a reader who wants the last
+         * mark reads step/value. Returning here would freeze both.
+         */
+        yghv_ut_slot_t *slot = NULL;
+
+        if (order <= YGHV_UT_HIST)
+            slot = (yghv_ut_slot_t *)&st->hist[order - 1];
+
+        if (slot)
+        {
+            slot->step = (LONG)step;
+            slot->value = (LONG64)value;
+            slot->tsc = (LONG64)__rdtsc();
+            slot->seq_order = order;
+        }
     }
 
     st->value = (LONG64)value;
