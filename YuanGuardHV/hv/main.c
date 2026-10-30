@@ -5126,6 +5126,50 @@ void DriverUnload(struct _DRIVER_OBJECT *d) {
     g_resident_workload_page = NULL;
     yghv_ut_mark(YGHV_UT_NPT_CLEANUP);
     npt_cleanup(&g_npt);
+    /*
+     * 9.423: DO NOT FREE A VMCB WHILE ANY CORE IS INSIDE vmrun.
+     *
+     * 9.421 pinned the crash instruction: `vmsave rax` at Sv206LaunchVm+0xD, the
+     * FIRST instruction after vmrun returns. It writes guest state back into the
+     * VMCB at that physical address. svm_core_cleanup frees those VMCBs, so a core
+     * that returns from vmrun one instruction too late writes freed memory at
+     * DISPATCH_LEVEL - which is the 0xD1 seen five times, and the 0x7F double
+     * fault when the write faults again during the fault.
+     *
+     * A check on the loop's back-edge cannot help: vmsave runs BEFORE it. What can
+     * help is asking the counter the ASM keeps - bumped before vmrun, dropped
+     * immediately after vmsave - and waiting for it to reach zero.
+     *
+     * Bounded, and the bound matters: the VMRUN loop leaves guest mode whenever an
+     * interruptible exit happens, so a core cannot stay inside forever on a live
+     * machine. If the count does not reach zero the teardown proceeds anyway and
+     * RECORDS the residue - hanging here would trade a 1-in-5 crash for a certain
+     * hang on unload, which is worse.
+     */
+    {
+        extern int yghv_s206_invmrun_count(void);
+        ULONG waited = 0;
+        int inside = 0;
+
+        for (;;) {
+            inside = yghv_s206_invmrun_count();
+            if (inside == 0)
+                break;
+            if (waited >= 3000)
+                break;
+            {
+                volatile ULONG spin;
+                for (spin = 0; spin < 200000UL; spin++) { }
+            }
+            waited += 1;
+        }
+        /* 51 = cores still inside vmrun when teardown proceeded; 52 = milliseconds
+         * waited. A dump showing 51 non-zero says the wait timed out, which is a
+         * completely different bug from "the counter never moved". */
+        yghv_ut_mark_val(51, (uint64_t)inside);
+        yghv_ut_mark_val(52, (uint64_t)waited);
+    }
+
     yghv_ut_mark(YGHV_UT_CORE_CLEANUP);
     svm_core_cleanup();
     yghv_ut_mark(YGHV_UT_DONE);

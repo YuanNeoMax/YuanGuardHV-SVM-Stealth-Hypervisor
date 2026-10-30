@@ -820,6 +820,40 @@ extern "C" int Sv206VmrunShouldExit(VOID)
     return 1;
 }
 
+/*
+ * 9.422: A GLOBAL COUNT OF CORES THAT ARE INSIDE vmrun RIGHT NOW.
+ *
+ * 9.421 established the real crash instruction: `vmsave rax` at Sv206LaunchVm+0xD,
+ * the first instruction after vmrun returns. It writes the guest state back into
+ * the VMCB whose physical address is in rax - and if svm_core_cleanup has already
+ * freed that VMCB, the write faults at DISPATCH (0xD1, 8 bytes).
+ *
+ * The race is therefore not "the loop would not stop". It is:
+ *
+ *     core A: inside vmrun, guest running
+ *     core B: DriverUnload -> svm_core_cleanup frees A's VMCB
+ *     core A: vmrun returns, executes vmsave -> writes freed memory
+ *
+ * No check placed on the loop's back-edge can help, because vmsave runs BEFORE the
+ * back-edge. What is needed is the other side of the constraint: the teardown must
+ * know whether anyone is still inside vmrun.
+ *
+ * Not per-core: VIRTUAL_PROCESSOR_DATA has no core index (HostStackLayout carries
+ * GuestVmcbPa/HostVmcbPa/Self/Padding1/Reserved1 only), so the ASM cannot index a
+ * per-core array. A global count needs no index and answers the only question
+ * DriverUnload has: "is anybody inside".
+ *
+ * The ASM does `lock inc` before vmrun and `lock dec` after it - two stores with
+ * no branch, no call, touching neither rsp nor rcx, so they are safe in this frame
+ * in a way the 9.416 conditional check was not.
+ */
+extern "C" { volatile LONG g_inVmrunCount = 0; }
+
+extern "C" int yghv_s206_invmrun_count(VOID)
+{
+    return (int)InterlockedCompareExchange(&g_inVmrunCount, 0, 0);
+}
+
 extern "C" void yghv_s206_vmrun_stop_request(VOID)
 {
     InterlockedExchange(&g_VmrunStopRequested, 1);

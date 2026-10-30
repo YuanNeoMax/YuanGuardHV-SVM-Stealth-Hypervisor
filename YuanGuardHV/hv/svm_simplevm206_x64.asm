@@ -15,13 +15,11 @@ MACHINE_FRAME_SIZE          equ     28h
 .code
 
 extern SvHandleVmExit : proc
-; 9.414: the per-iteration stop check (implemented in svm_simplevm206.cpp).
-; Called from SvLV10 where the stack invariants allow a call - see the note there.
-; 9.416: the stop flag and the counter, read and bumped INLINE from SvLV10.
-; No C call: a C prolog expects a valid SEH chain and the VM-exit frame has none
-; (9.413/9.414 produced 0x139 and 0x7F double fault proving that).
-extern g_VmrunStopRequested : dword
-extern g_VmrunStopped : dword
+
+; 9.422: the in-vmrun counter. Bumped before vmrun, dropped immediately after
+; vmsave. The stop-flag externs of 9.416 are gone: those variables are static
+; again (9.419) because the inline check they served was proven useless (9.417).
+extern g_inVmrunCount : dword
 
 ;
 ;   @brief      Saves all general purpose registers to the stack.
@@ -150,6 +148,23 @@ SvLV10: ;
         vmload rax      ; load previously saved guest state from VMCB
 
         ;
+        ; 9.422: MARK THIS CORE AS BEING INSIDE vmrun.
+        ;
+        ; 9.421 found the real crash instruction: `vmsave rax` at +0x0D, the first
+        ; instruction after vmrun returns. It writes guest state back into the VMCB
+        ; at that physical address, and svm_core_cleanup may already have freed it.
+        ;
+        ; No check on the loop's back-edge can prevent that, because vmsave runs
+        ; BEFORE the back-edge. The constraint belongs on the teardown side, and
+        ; the teardown needs to know whether anybody is inside vmrun - which is
+        ; this counter.
+        ;
+        ; Two stores, no branch, no call, rsp/rcx untouched: safe here in a way the
+        ; conditional check of 9.416 was not (that one produced 0x139 and 0x7F).
+        ;
+        lock inc dword ptr [g_inVmrunCount]
+
+        ;
         ; Start the guest. The VMRUN instruction resumes execution of the guest
         ; with state described in VMCB (specified by RAX by its physical address)
         ; until #VMEXI is triggered. On #VMEXIT, the VMRUN instruction completes
@@ -181,6 +196,22 @@ SvLV10: ;
         ; state-save, so it has the same value as before and not guest's one.
         ;
         vmsave rax      ; Save current guest state to VMCB
+
+        ;
+        ; 9.422: DROP THE MARK IMMEDIATELY AFTER vmsave - never before it.
+        ;
+        ; The counter answers "is anybody about to touch a VMCB". vmsave IS that
+        ; touch. Clearing the mark before vmsave would tell the teardown "clear to
+        ; free" while the write is still in flight, which is exactly the race this
+        ; exists to prevent. So the decrement goes after vmsave, with no instruction
+        ; in between.
+        ;
+        ; The increment above sits after vmload and before vmrun for the symmetric
+        ; reason: if vmload faulted (VMCB already gone) the count is never incremented
+        ; and therefore never needs decrementing. A counter that can leak to a
+        ; permanent 1 would make the wait below time out every single unload.
+        ;
+        lock dec dword ptr [g_inVmrunCount]
 
         ;
         ; Optionally, allocate the trap frame so that Windbg can display stack
