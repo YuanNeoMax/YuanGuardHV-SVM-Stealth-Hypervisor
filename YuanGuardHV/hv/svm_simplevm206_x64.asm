@@ -15,8 +15,6 @@ MACHINE_FRAME_SIZE          equ     28h
 .code
 
 extern SvHandleVmExit : proc
-; 9.411: the per-iteration stop check, implemented in svm_simplevm206.cpp.
-extern Sv206VmrunShouldExit : proc
 
 ;
 ;   @brief      Saves all general purpose registers to the stack.
@@ -213,30 +211,6 @@ SvLV10: ;
         ; the loop. Otherwise, continue the loop and resume the guest.
         ;
         jnz SvLV20                  ; if (ExitVm != 0) jmp SvLV20
-
-        ;
-        ; 9.411: ASK THE STOP FLAG ON EVERY ITERATION, NOT ONLY INSIDE THE HANDLER.
-        ;
-        ; Measured (9.410): DriverUnload ran all 14 steps and reached DONE(120),
-        ; yet a core was still executing this loop afterwards, reading
-        ; HostStackLayout from a VpData that svm_core_cleanup had already freed.
-        ; snap_vmrun_stopped was 0 - the flag checked inside SvHandleVmExit never
-        ; fired, because that C code only runs on a #VMEXIT and this guest was
-        ; being restarted from the same RIP each iteration.
-        ;
-        ; So the check moves into the loop itself: after every vmsave /* handler,
-        ; before jumping back to SvLV10. One call, PASSIVE-safe (the handler just
-        ; ran and GIF is clear), and it cannot be skipped by any exit shape.
-        ;
-        ; RSP is already restored to the VpData layout at this point, and RAX holds
-        ; the handler's return, so it is saved across the call.
-        ;
-        mov r11, rax                        ; preserve the handler's return
-        call Sv206VmrunShouldExit           ; returns 1 when the stop flag is set
-        test al, al
-        mov rax, r11
-        jnz SvLV20                          ; requested: leave through the same exit
-
         add rsp, KTRAP_FRAME_SIZE   ; else, restore RSP and
         jmp SvLV10                  ; jmp SvLV10
 
