@@ -11968,3 +11968,67 @@ if (stopped < active) {
 
 预期：如果 `stopped == active`，会走 `else` 分支，`step` 应该越过 21 和 100；
 如果仍崩在 20/25，说明遍历本身有问题而不只是时机。
+
+---
+
+#### 9.400 从 dump 读出了确切数字：stop flag 只停掉 1 个核，而系统有 12 个
+
+**读法（第二次用同一条路径，已可复用）**
+
+`.map` 给出符号的 **VA**（不是 `.bss` 段内偏移），减去 image base `0x140000000` 得 RVA，
+加 dump 里的模块基址得运行时地址。**这个换算我前一次搞错过**：把 `0x33fd4`
+（`.bss` 段内偏移）当成 RVA 用了，读到的当然全是 0。正确做法是**直接用 map 里
+`000000014005efd4` 那一列**。
+
+模块基址 `fffff80597e90000`：
+
+```
+g_VmrunStopRequested  VA 0x14005efd4  RVA 0x5efd4  -> fffff80597eeefd4
+g_VmrunStopped        VA 0x14005efd8  RVA 0x5efd8  -> fffff80597eeefd8
+g_vcpu_count          VA 0x14002f470  RVA 0x2f470  -> fffff80597ebf470
+g_ut_page             VA 0x14005b000  RVA 0x5b000  -> fffff80597eeb000
+```
+
+**读到的值**
+
+```
+fffff805`97eeefd4  00000001`00000001     <- 低32=StopRequested=1, 高32=Stopped=1
+fffff805`97ebf470  00000000`0000000c     <- g_vcpu_count = 12
+
+进度页 (PA 0xC7BE0000, 经 g_ut_page 得来):
+  seq=6  step=20 (COOP_UNLOAD)  value=0
+  hist[0]: order=5  step=0x2F(47)  value=0    <- "stopped >= active ? 1 : 0" 算出了 0
+```
+
+**这就是全部答案**
+
+```
+stopped = 1, active = 12   ->   stopped < active   ->   走 if (stopped < active) 分支
+  ->  Sv206CoopUnload()  ->  SvDevirtualizeAllProcessors  ->  0x7F/8 双故障
+```
+
+崩溃点 `yghv_fin2+0x21c20` = `SvDevirtualizeAllProcessors+0xC0`，
+`P3 = 0x5353564D` = `'MVSS'`（那个 tag 值漏进了双故障参数）。
+
+**所以 9.399 的条件分支是对的，只是条件判断为假**
+
+**`g_VmrunStopped = 1` 而系统有 12 个核，这才是真正的问题**
+
+`g_VmrunStopped` 只在 `ExitCode == VMEXIT_CPUID` 时递增。**只有 1 个核产生过 CPUID
+出口，另外 11 个核从未产生。** 这有两种解释，都需要单独验证：
+
+1. **CPUID 拦截没有对全核武装** —— 那就和 B2 那次的教训一致：`prepare` 每核只跑一次，
+   而 206 主线的核是在 `Sv206Entry` 里才虚拟化的，可能错过了 prepare 里的位设置
+2. **那些核的 guest 从不执行 CPUID** —— 但 206 主线的 guest 心跳本身就是 CPUID，
+   所以这个解释站不住
+
+**第 1 条更可能，而且它有一个现成的验证方式**：`g_CpuidView` 和
+`yghv_s206_tsc_apply_all` 的计数器都在同一个 map 里，可以读出来看每核武装有没有发生过。
+
+**下一步（有明确假设，可验证）**
+
+先读 `?g_TscCoreHits@@3_JC`（`VA 0x14005efb0`）和 `?g_TscCoreMisses@@3_JC`
+（`VA 0x14005efb8`）—— 那是 9.370 的逐核遍历里"到达/未到达"的计数。
+如果 hits 远小于 12，说明**逐核遍历本身在那个时刻就不完整**，问题不在 stop flag。
+
+这一步是只读的，不需要加载驱动，不需要改代码。
