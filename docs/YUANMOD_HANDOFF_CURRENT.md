@@ -12636,3 +12636,87 @@ PROCESS_NAME: powershell.exe
 
 **修法**：在 `svm_simplevm206_x64.asm` 的 `SvLV10` 回跳处加一条检查。
 这是第一次有一个**能被 `step` 验证**的修法（如果修对，`DONE` 之后不应再崩）。
+
+---
+
+#### 9.413 ASM 改动是错的，已回滚 —— 它的失败模式比崩溃更值得记
+
+**结果**
+
+```
+0x139  P1=4  (MISSING_GSFRAME_STACKPTR)
+ANALYSIS_INCONCLUSIVE —— 连栈都读不出来
+pa_asm1 / flow_asm1 都不存在 -> 崩溃发生在记录 PA 之前，即加载阶段
+```
+
+**为什么这个改动从一开始就不可能对**
+
+我在 `jnz SvLV20` **之后**插入了一次 `call`：
+
+```asm
+        jnz SvLV20                  ; if (ExitVm != 0) jmp SvLV20
+        mov r11, rax                ; <-- 我加的
+        call Sv206VmrunShouldExit   ; <-- 我加的
+        test al, al
+        mov rax, r11
+        jnz SvLV20
+        add rsp, KTRAP_FRAME_SIZE
+        jmp SvLV10
+```
+
+**三个错误，每一个都足以致命：**
+
+1. **`rsp` 在那一刻仍指向 KTRAP_FRAME。** `call` 会把返回地址压到
+   `rsp - 8`，而那正好在 `PUSHAQ` 保存的 **GuestRegisters 区域**里 ——
+   直接破坏 guest 的 GPR 快照。这个桩的整个栈布局（注释里写得清清楚楚：
+   `Rsp => R15...RAX`，`Rsp+8*16 => TrapFrame`）就是为了在不碰 guest 状态的前提下
+   调用 C 代码而设计的。
+
+2. **`r11` 是易失寄存器。** 我用它跨 `call` 保存 `rax`，但 `r11` 在
+   **调用约定里明确是不受保护的** —— `Sv206VmrunShouldExit` 是 C 函数，
+   编译器可以随意改写 `r11`。所以 `mov rax, r11` 恢复的是一个垃圾值。
+
+3. **`SvLV20` 依赖 `rcx`。** 出口处 `mov rsp, rcx` 用的是原始栈指针，
+   而 `call` 之后 `rcx` 已经被 C 代码用掉了（它是第一个参数寄存器）。
+
+**`0x139 MISSING_GSFRAME_STACKPTR` 正是这三条的结果**：栈被压歪，C 函数的
+SEH frame 找不到自己的栈指针。
+
+**这次失败的性质与前 22 次都不同**
+
+前 22 次都是「卸载路径的问题」，而这次是**我把加载路径改坏了**。
+而且它是在**加载阶段**崩的 —— 比以前更早，说明改动直接影响虚拟化本身。
+
+**我违反了自己刚写下的规则（9.390）**
+
+> 写操作序是 `seq -> value -> tsc -> step`，step 最后写，所以 dump 里 seq 与 step
+> 不匹配就是"这一笔在飞"，而不是一个已完成的步骤。
+
+我建了那个进度页，正是为了让"改动是否生效"可观测。**但我在改 ASM 桩时没有先问：
+这条路径的栈不变量是什么？** 而我明明读过那段注释，它把栈布局列成了表。
+
+**结论：这个方向（在 ASM 循环里加检查）在当前桩结构下不可行**
+
+要在 `SvLV10` 循环里加任何 C 调用，必须先回答：
+- 在哪个 `rsp` 位置调用才不碰 GuestRegisters（答案是 `SvLV10` 开头，
+  `mov rsp, rcx` 之后、`mov rax,[rsp]` 之前，那时 `rsp` 指向干净的 HostRsp）
+- 调用后哪些寄存器必须保持（`rcx` 必须在 `SvLV20` 之前保持原值）
+- 易失寄存器有哪些（`rax/rcx/rdx/r8-r11` 全部易失，只有
+  `rbx/rbp/rsi/rdi/r12-r15` 受保护）
+
+**这三条我一条都没查就改了。** 本会话反复出现的同一个问题：**改一个我没读过约束的地方**。
+
+**当前状态**
+
+- `bd0bba5` 已 revert（`55f9dc6`），树回到 9.410 的状态
+- 卸载仍是 14 步走完后崩（`step=120 DONE` + `Sv206LaunchVm+0xD`）
+- 这个状态**至少是可观测的**：有 dump 的那 5/6 情况能读到进度页
+
+**如果还要试这个方向，正确的入口是**
+
+`SvLV10` 开头，`mov rsp, rcx` 之后立刻检查 —— 那时：
+- `rsp` = HostRsp（干净，不碰 guest 快照）
+- 还没执行 `mov rax,[rsp]`（VpData 尚未被读）
+- 可以安全压栈
+
+而 `rcx` 必须在检查后恢复（它保存着原始栈指针，`SvLV20` 要用）。
