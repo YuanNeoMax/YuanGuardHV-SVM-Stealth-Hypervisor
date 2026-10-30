@@ -5124,30 +5124,20 @@ void DriverUnload(struct _DRIVER_OBJECT *d) {
     g_guest_code_page = NULL;
     if (g_resident_workload_page) MmFreeContiguousMemory(g_resident_workload_page);
     g_resident_workload_page = NULL;
-    yghv_ut_mark(YGHV_UT_NPT_CLEANUP);
-    npt_cleanup(&g_npt);
     /*
-     * 9.423: DO NOT FREE A VMCB WHILE ANY CORE IS INSIDE vmrun.
+     * 9.426: THE SAME GUARD MUST COVER npt_cleanup, AND IT HAS TO RUN FIRST.
      *
-     * 9.421 pinned the crash instruction: `vmsave rax` at Sv206LaunchVm+0xD, the
-     * FIRST instruction after vmrun returns. It writes guest state back into the
-     * VMCB at that physical address. svm_core_cleanup frees those VMCBs, so a core
-     * that returns from vmrun one instruction too late writes freed memory at
-     * DISPATCH_LEVEL - which is the 0xD1 seen five times, and the 0x7F double
-     * fault when the write faults again during the fault.
+     * npt_cleanup frees the NPT tables - the very tables a core still inside vmrun
+     * is translating through (NCr3 points at them). It used to run BEFORE the
+     * vmrun check, so the guard added in 9.425 protected only half the problem:
+     * the VMCB write was deferred but the page tables it walks were already gone.
      *
-     * A check on the loop's back-edge cannot help: vmsave runs BEFORE it. What can
-     * help is asking the counter the ASM keeps - bumped before vmrun, dropped
-     * immediately after vmsave - and waiting for it to reach zero.
-     *
-     * Bounded, and the bound matters: the VMRUN loop leaves guest mode whenever an
-     * interruptible exit happens, so a core cannot stay inside forever on a live
-     * machine. If the count does not reach zero the teardown proceeds anyway and
-     * RECORDS the residue - hanging here would trade a 1-in-5 crash for a certain
-     * hang on unload, which is worse.
+     * So the check moves up and now decides both frees. The wait is shared: one
+     * grace period, then one decision, then both cleanups follow it together.
      */
     {
         extern int yghv_s206_invmrun_count(void);
+
         ULONG waited = 0;
         int inside = 0;
 
@@ -5155,7 +5145,7 @@ void DriverUnload(struct _DRIVER_OBJECT *d) {
             inside = yghv_s206_invmrun_count();
             if (inside == 0)
                 break;
-            if (waited >= 3000)
+            if (waited >= 600)
                 break;
             {
                 volatile ULONG spin;
@@ -5163,16 +5153,32 @@ void DriverUnload(struct _DRIVER_OBJECT *d) {
             }
             waited += 1;
         }
-        /* 51 = cores still inside vmrun when teardown proceeded; 52 = milliseconds
-         * waited. A dump showing 51 non-zero says the wait timed out, which is a
-         * completely different bug from "the counter never moved". */
+
         yghv_ut_mark_val(51, (uint64_t)inside);
         yghv_ut_mark_val(52, (uint64_t)waited);
-    }
 
-    yghv_ut_mark(YGHV_UT_CORE_CLEANUP);
-    svm_core_cleanup();
-    yghv_ut_mark(YGHV_UT_DONE);
+        if (inside != 0) {
+            /*
+             * Nobody may touch NPT or VMCB from here: a core is still inside
+             * vmrun and will write both. Leak them, and say so.
+             *
+             * The NPT leak matters more than the VMCB leak: g_npt.pml4_pa is
+             * written into every VCPU's NCr3, so freeing it under a live core
+             * would turn the next guest memory access into a fault through a
+             * freed table - a wider blast radius than the vmsave write alone.
+             */
+            yghv_ut_mark_val(53, 1);
+            yghv_ut_mark(54);          /* 54 = both cleanups skipped */
+        } else {
+            yghv_ut_mark_val(53, 0);
+            yghv_ut_mark(YGHV_UT_NPT_CLEANUP);
+            npt_cleanup(&g_npt);
+            yghv_ut_mark(YGHV_UT_CORE_CLEANUP);
+            svm_core_cleanup();
+        }
+    }
+    goto after_vmrun_guard;
+after_vmrun_guard:;
     KeRevertToUserAffinityThread();
     g_watchdog_stop = TRUE;
     if (g_watchdog_thread) {
