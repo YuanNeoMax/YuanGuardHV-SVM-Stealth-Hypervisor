@@ -1,7 +1,7 @@
-# YuanGuardHV 新窗口恢复提示词（2026-10-30 重写）
+# YuanGuardHV 新窗口恢复提示词（2026-10-30 重写，9.439 更新）
 
 > **本文件是唯一入口。** 读完第 0、1、3、4 节就能接手。
-> 完整历史在 `docs/YUANMOD_HANDOFF_CURRENT.md`（13754 行，按 9.3xx 编号），
+> 完整历史在 `docs/YUANMOD_HANDOFF_CURRENT.md`（13858 行，按 9.3xx 编号），
 > 只在需要溯源某条结论时去查，**不要从头读**。
 
 ---
@@ -20,8 +20,10 @@
 | Tier 9.2 控制通道认证 | **可以**（G41 13/13）|
 | **卸载驱动** | **会崩或挂死**（见第 4 节）|
 
-**当前代码状态：不可用于加载。** 最后一次改动（`3690dba`）把 guest 入口设为
-trampoline，导致 `sc start` 就卡在 `START_PENDING`。**必须先回滚它**（见第 3 节）。
+**当前代码状态：源码已回滚到可加载的语义，构建 7/7 全绿，尚未实机验证。**
+`9.439` 已回滚 9.436（guest 入口恢复 `ContextRecord->Rip`）、把
+`case VMEXIT_VMMCALL` 改成 `ExitVm = TRUE`，并在反汇编层面复核过产物。
+**待办：机器重启后 `sc start yghvpa` 验证加载不再挂死。**（见第 3 节）
 
 ---
 
@@ -65,27 +67,32 @@ dump 配置     CrashDumpEnabled=2, CrashDumpType 已删除, AlwaysKeepMemoryDum
 ## 3. 当前代码状态与第一件事
 
 ```
-HEAD = f7e1e8c   (docs only)
-      3690dba    fix(9.435-9.436)  ← 这一笔是错的，需要回滚
-      48742f2    docs(9.434)
-      e8629ca    fix(9.433)  VMMCALL bit1
-      6152887    fix(9.432)  武装 VMMCALL
+HEAD = 9.439 那一笔（源码回滚，未推送）
+       b3a4277    docs(9.438)  重构交接文档
+       f7e1e8c    docs(9.437)
+       3690dba    fix(9.435-9.436)  ← 已被 9.439 回滚
+       48742f2    docs(9.434)
+       e8629ca    fix(9.433)  VMMCALL bit1
+       6152887    fix(9.432)  武装 VMMCALL
 ```
 
-**`3690dba` 做了三件事，其中一件错：**
+**`3690dba` 做了三件事，其中一件错 —— 9.439 已处理完：**
 
-| 改动 | 判断 |
-|---|---|
-| 9.432/9.433 武装 `SVM_INTERCEPT_MISC2_VMMCALL = (1UL << 1)` | **保留**（位号已按 bhyve 表核对）|
-| 9.435 加 `case VMEXIT_VMMCALL`（当前是 `break;`）| **保留但改**：改成 `guestContext.ExitVm = TRUE;` |
-| 9.436 把 guest 入口设为 `svm_trampoline_test_guest` | **回滚** —— 它把「透明虚拟化」换成了「测试 guest」，见第 4 节 |
+| 改动 | 判断 | 9.439 实际做了什么 |
+|---|---|---|
+| 9.432/9.433 武装 `SVM_INTERCEPT_MISC2_VMMCALL = (1UL << 1)` | **保留**（位号已按 bhyve 表核对）| 未动 |
+| 9.435 加 `case VMEXIT_VMMCALL`（原来是 `break;`）| **保留但改** | 已改为 `InterlockedIncrement64; ExitVm = TRUE;` |
+| 9.436 把 guest 入口设为 `svm_trampoline_test_guest` | **回滚** | 已恢复 `StateSaveArea.Rip = ContextRecord->Rip`，并删掉只为它存在的 `extern` 声明 |
 
-**新窗口第一件事：回滚 9.436 的 guest 入口改动，保留 VMMCALL 位与 case。**
+**已构建验证：7 项静态检查全绿 + `Build SUCCESS`，并在 `dumpbin /disasm` 产物里
+确认了 `[r13+0xF8]`（ContextRecord->Rip）写入 VMCB，以及 VMMCALL case 的 `mov dil,1`；
+全二进制对 `svm_trampoline_test_guest` 的引用数为 0。**
 
-回滚后 RIP 恢复为 `ContextRecord->Rip` —— 那是上游 SimpleSvm 的语义（透明虚拟化）。
+**下一步（需要用户确认，因为会改机器状态）：重启**，清掉 `yghvpa` 的
+`START_PENDING`（`sc stop` 返回 1052 "该服务此刻不可控制"），
+重启后 `sc start yghvpa` 验证加载不再挂死。重启前确认工作树干净。
 
-**第二件事：机器需要重启**，因为 `yghvpa` 服务卡在 `START_PENDING`（`sc stop` 返回 1052
-"该服务此刻不可控制"）。重启前确认工作树干净。
+**在加载验证通过之前，不要动卸载路径的任何代码。**
 
 ---
 
@@ -115,6 +122,14 @@ VpData->GuestVmcb.StateSaveArea.Rip = ContextRecord->Rip;
 
 而 `ContextRecord` 是几行之前 `RtlCaptureContext` 抓的 —— 抓的是那个函数当下的位置。
 它之后是 `Sv206LaunchVm()` / `SV_DEBUG_BREAK()` / `KeBugCheck()` —— **没有任何被拦截指令**。
+
+> **⚠ 9.439 修正这一句的适用范围。** 「没有任何被拦截指令」描述的是
+> `SvVirtualizeProcessor` **剩下的那三行**，不是那三行 `return` 进去的内核代码。
+> guest 是调用者续行，它下一件事就是执行真实内核指令，CPUID / CR3 写 / MSR / NPF 都会来。
+> **所以下面这条后果链的起点（「永不产生 #VMEXIT」）从未被证明，只是被假设。**
+> 链上**实测到的**部分（`g_inVmrunCount = 12`、`g_S206VrLog` 为空、
+> `snap_vmrun_stopped = 0`、`step = 120 DONE`、`PAGED_IP` 桶）都是真的；
+> 把它们串起来的那一环是推断。9.439 已把 guest 恢复成续行，这一环现在是**待查**而非**已定**。
 
 **后果链**：
 
@@ -159,7 +174,7 @@ guest 执行 SvVirtualizeProcessor 的续行代码
 | EFER 类 | 3 | `0x1E` — IPI 里清 `EFER.SVME`（APM 明文 undefined）| **是**（9.380，已证生效）|
 | 卸载顺序类 | 5 | `0xD1` / `0x7F` | 否 |
 | 硬复位 | 4 | 无 dump 无 bugcheck | 否 |
-| 本会话新引入 | 3 | `0x101`（无界等待）、`START_PENDING`（guest 入口）| 需回滚 |
+| 本会话新引入 | 3 | `0x101`（无界等待）、`START_PENDING`（guest 入口）| **`START_PENDING` 已由 9.439 回滚** |
 | 第三方 | 1 | `usbwifi` | 无关 |
 
 ### 4.4 已证伪的 8 个推断（别再重走）
@@ -177,6 +192,12 @@ guest 执行 SvVirtualizeProcessor 的续行代码
 
 **注意最后一行**：9.431 的「guest 是 trampoline」是**从 `svm_trampoline.asm` 的存在
 推断的**，而 9.434 读了赋值语句本身才发现不是。**「有个文件存在」不等于「它被用了」。**
+
+**9.439 追加第 9 条证伪**：
+
+| 推断 | 证伪依据 |
+|---|---|
+| 换成测试 guest + 武装 VMMCALL，vmrun 就会正常返回（9.436）| **加载就挂死**（9.437 的 `START_PENDING`）。vmmcall 是心跳不是退出请求，`break` 让循环无限重进 vmrun。|
 
 ---
 
@@ -300,21 +321,28 @@ yghv_ctl.ps1 unload-trace   → page PA / last step / value
 ## 8. 剩余工作清单（诚实版）
 
 ### 8.1 必须马上做（不做则代码不可用）
-1. **回滚 9.436**（guest 入口改动）→ 恢复 `Rip = ContextRecord->Rip`
-2. **把 `case VMEXIT_VMMCALL` 改成 `ExitVm = TRUE`**（不是 `break`）
-3. **重启机器**清 `START_PENDING`
+1. ~~**回滚 9.436**（guest 入口改动）→ 恢复 `Rip = ContextRecord->Rip`~~ **已完成（9.439）**
+2. ~~**把 `case VMEXIT_VMMCALL` 改成 `ExitVm = TRUE`**（不是 `break`）~~ **已完成（9.439）**
+3. **重启机器**清 `START_PENDING` —— **待做，需用户确认**
+4. **重启后 `sc start yghvpa`** 验证加载不再挂死 —— **这是回滚生效的唯一证据**
 
-### 8.2 卸载问题的下一步（需要设计决定）
-9.434 留下一个必须回答的问题：
+### 8.2 卸载问题的下一步（9.439 后的新措辞）
+9.434 留下的问题被 9.436 用「换成测试 guest」回答了，而 9.437 证明那个答案会让加载挂死。
+9.439 已经回到 **(a) 透明虚拟化**，所以现在的问题不再是「guest 该是什么」，
+而是更具体的一条：
 
-> **206 主线想让 guest 做什么？**
->
-> **(a) 透明虚拟化**（上游语义）：guest = 调用者自己的续行。
->   则 `vmrun` 返回是正常路径 —— 需要查「返回后为什么没继续」。
-> **(b) 真实 guest**：必须显式设 `Rip = svm_trampoline_test_guest`。
->   但那样「虚拟化建好就撤」，206 主线名不副实。
+> **guest 是调用者续行，`SvVirtualizeProcessor` 之后执行的是真实内核代码，
+> CPUID / CR3 写 / MSR / NPF 都该来。为什么 `g_S206VrLog` 整场为空、
+> `g_inVmrunCount` 停在 12？**
 
-**这个决定需要用户拍板，不是代码能推出来的。**
+9.434 说「这行之后没有任何被拦截指令」——**那句话描述的是这个函数剩下的三行，
+不是那三行 return 进去的内核代码**。这是 9.434 推理的漏洞，也是现在唯一的开口。
+
+**候选根因（已发现，未修，按铁律等用户点名）**：9.383 把
+`guestContext.VpRegs->Rcx` 从 guest RSP 改成 `'SSVM'`，而 ASM `SvLV20` 第一句是
+`mov rsp, rcx` —— 栈指针被设成 `0x4D565353`。反汇编已确认该赋值进了产物
+（`14002 40AD: mov qword ptr [r14+70h],5353564Dh` / `14002 4C30: mov rsp,rcx`）。
+9.383 的注释「RSP 不丢」对被调用方成立，对 `SvLV20` 自己不成立。
 
 ### 8.3 原清单（Tier 5/6/8/9，共 30 项）
 | Tier | 项 | 状态 |
@@ -354,23 +382,26 @@ yghv_ctl.ps1 unload-trace   → page PA / last step / value
 ## 10. 新窗口的第一个动作（照着做）
 
 ```powershell
-# 1. 确认状态
+# 1. 确认状态（这一步永远是只读的，可以直接跑）
 cd D:\yuanguard && git log --oneline -3 && git status --porcelain
-sc.exe query yghvpa      # 若 START_PENDING → 需重启
+sc.exe query yghvpa      # 若 START_PENDING → 需重启（9.439 后仍是这个状态）
 
-# 2. 回滚 9.436 的 guest 入口（只改那一个 #if 块）
-#    恢复 VpData->GuestVmcb.StateSaveArea.Rip = ContextRecord->Rip
+# 2. 第 2、3、4 步已在 9.439 做完并构建验证过（见第 3 节），
+#    不要再改一遍 —— 改之前先 git log 看有没有 9.439 那一笔。
+#    复核方式（只读）：
+git log --oneline -3 -- YuanGuardHV/hv/svm_simplevm206.cpp
+grep -n "StateSaveArea.Rip = ContextRecord->Rip" YuanGuardHV/hv/svm_simplevm206.cpp
+grep -n -A2 "case VMEXIT_VMMCALL" YuanGuardHV/hv/svm_simplevm206.cpp   # 应见 ExitVm = TRUE
 
-# 3. 把 case VMEXIT_VMMCALL 的 break 改成 guestContext.ExitVm = TRUE;
-
-# 4. 构建验证
+# 3. 构建（改动后才需要；构建和蓝屏取证不需要确认）
 cd YuanGuardHV && set YGHV_BAREMETAL_STEP=206 && set YGHV_206B_COEXIST=1 `
   && set YGHV_206B_GNPT=1 && build.bat    # 必须 7/7 全绿
 
-# 5. 重启（清 START_PENDING），然后才谈下一步
+# 4. 重启（清 START_PENDING）—— 会改机器状态，需要用户明确确认
+#    重启后第一件事：sc start yghvpa，看它是否真的进入 RUNNING
 ```
 
-**在第 10 节完成之前，不要动卸载路径的任何代码。**
+**在「`sc start` 能进 RUNNING」这条被实测确认之前，不要动卸载路径的任何代码。**
 29 次崩溃里 8 次是因为「在不可观测的路径上改代码」。
 
 ---
@@ -408,7 +439,17 @@ kd -z C:\Windows\MEMORY.DMP -y "C:\symbols" -c "!dd 0xC7BD5000 L40; q"
 
 # 从 dump 读某个全局变量（RVA 用 map 里 14000xxxxx 那列 + 模块基址）
 kd -z C:\Windows\MEMORY.DMP -y "C:\symbols" -c "dq <addr> L1; q"
+
+# 9.439 新增：不信源码就信产物 —— 反汇编复核关键赋值
+dumpbin /disasm:nobytes YuanGuardHV\bin\yuanguard_hv.sys > dis.txt
+# 找 RIP 是否来自 ContextRecord（应见 [r13+0xF8]，且无 trampoline 引用）
+findstr /C:"000000F8h" dis.txt
+# 找 VMMCALL case 是否真的设了 ExitVm（应见 lock inc g_S206Vmmcalls 后紧跟 mov dil,1）
+findstr /C:"14005FFE0h" dis.txt
 ```
+
+**构建判据**：不是 md5（每次重签都变）。看 `ALL SOURCE CHECKS PASS` +
+`ALL MAP CHECKS PASS` + `Build SUCCESS` 三行。
 
 ---
 
@@ -419,3 +460,9 @@ kd -z C:\Windows\MEMORY.DMP -y "C:\symbols" -c "dq <addr> L1; q"
 后者花的代价和前者一样多。
 
 **所以：先建观测，再改代码。**
+
+**9.439 追加一条更狠的**：**读源码得出的结论，也要用产物复核一遍。**
+9.434 靠读一行赋值推翻了 9.431，那是对的；但 9.436 又靠读同一行推出了「换成测试 guest」，
+结果加载挂死。同一个动作，一次纠正了错误，一次制造了错误 —— 差别不在读没读源码，
+在**有没有问「改完之后谁会不满意」**。`SvVirtualizeAllProcessors` 是同步的，
+一个永不返回的 guest 必然让 `sc start` 挂住 —— 这一条在动手前就能推出来。

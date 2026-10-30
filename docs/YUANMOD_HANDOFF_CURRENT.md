@@ -13752,3 +13752,107 @@ case VMEXIT_VMMCALL:
 （没有 trampoline guest 就不会有 `VMEXIT_VMMCALL`）。
 
 **机器需要重启才能清掉 `START_PENDING` 的服务。**
+
+---
+
+#### 9.439 ★★★★★ 执行回滚：guest 入口恢复为调用者续行，VMMCALL 改为终止；构建 7/7 全绿
+
+**这一节做的是 RESUME_PROMPT 第 10 节那三步，不是新实验。**
+
+**改动（只碰 `svm_simplevm206.cpp`，两个位置）**
+
+| 位置 | 之前（3690dba） | 现在 | 理由 |
+|---|---|---|---|
+| `SvPrepareForVirtualization` 的 `StateSaveArea.Rip` | `&svm_trampoline_test_guest[0]`（206 门内） | `ContextRecord->Rip` | 回滚 9.436 |
+| `case VMEXIT_VMMCALL` | `InterlockedIncrement64; break;` | `InterlockedIncrement64; ExitVm = TRUE; break;` | 9.435 的 case 语义改对 |
+| 文件顶部 | `extern "C" const uint8_t svm_trampoline_test_guest[];` | 删除 | 已无引用 |
+
+**为什么 9.436 必须回滚 —— 不是"方向可疑"，是已测挂死**
+
+9.436 把 guest 换成 trampoline，而 9.435 的 case 是 `break`（继续循环）。两者合起来是：
+
+```
+guest: mov rax,1 / vmmcall        -> #VMEXIT
+case:  Inc 计数器; break          -> SvHandleVmExit 返回 ExitVm=FALSE
+ASM:   test al,al -> jz -> jmp SvLV10 -> vmrun    -> 再次 #VMEXIT
+```
+
+**vmmcall 是心跳，不是退出请求。** 所以这是一个每秒几十万次的 VMEXIT 风暴，
+`SvVirtualizeAllProcessors` 永不返回，`Sv206Entry` 同步等它，于是 `sc start` 永不返回
+—— 正是 9.437 测到的 `START_PENDING`。
+
+而 `Sv206Entry` 里其余每一处都是按"透明虚拟化"写的：`SvVirtualizeAllProcessors`
+同步返回、`SvDevirtualizeProcessor` 用**调用者自己的** CPUID 离开 guest、
+ExitVm 路径把 guest 的 RSP 交回给 `mov rsp, rcx`。**一个永不返回的测试 guest 与这三条全冲突。**
+所以 9.436 不是"另一个方向"，是与整棵树的语义矛盾。
+
+**case 改成 `ExitVm = TRUE` 后的语义**
+
+它走的是 CPUID_UNLOAD 的同一条出口：`__svm_vmload` → `__stgi` → 清 `EFER.SVME` → `SvLV20`。
+一条出口路径，不是两条 —— 这正是 9.39x 家族一直在争的那个性质。
+
+**并且它现在是惰性的**：guest 恢复成调用者续行后，Windows 内核不发 `vmmcall`，
+没有东西会到达这个 case。保留它的理由是语义正确 + 避免被拦下的指令掉进
+`default:` 造出 0xE2。`g_S206Vmmcalls` 保留：为 0 证明位没生效，非 0 证明位生效了。
+
+**构建（不是 md5 判据）**
+
+```
+[PASS] IOCTL parity: C=42 PowerShell=42 Java=42
+[PASS] IOCTL constants: device type=0x5947 METHOD=0 ACCESS=0 across C/PS/Java/JNI
+[PASS] Command parity: PowerShell=63 Java=18
+[PASS] Safety checks: pause-under-lock scope, STATUS_DEVICE_BUSY, 0x5AA naming, ...
+[PASS] IRQL contract: reachability-derived island set; no gate, no unpaired hide, ...
+[PASS] Page layout: no hidden table shares a page with guard state; ...
+ALL SOURCE CHECKS PASS / ALL MAP CHECKS PASS
+[YuanGuardHV] Build SUCCESS: bin\yuanguard_hv.sys
+SHA256 251c600e935da466e03f0f948eb6aa437eaf474db626908d52c6151941f333da
+```
+
+**二进制层面复核（不信源码，信产物）**
+
+用 `dumpbin /disasm` 反汇编新 `.sys`，两处都验到了：
+
+```
+; RIP 从 ContextRecord 取（r13 = ContextRecord，+0xF8 = Rip 字段），不是 trampoline
+14002 2B89:  mov  eax, dword ptr [r13+44h]        ; 别的字段
+14002 2BA2:  mov  rax, qword ptr [r13+000000F8h] ; <- ContextRecord->Rip
+14002 2BA9:  mov  qword ptr [r14+000006578h], rax ; -> StateSaveArea.Rip
+
+; VMMCALL case：计数 + ExitVm=TRUE（dil 是 guestContext.ExitVm 的低字节）
+14002 3B38:  lock inc qword ptr [14005FFE0h]      ; g_S206Vmmcalls
+14002 3B40:  mov  dil, 1                          ; ExitVm = TRUE
+14002 3B43:  jmp  14002 4065                      ; -> 出口
+
+; 全二进制里 svm_trampoline_test_guest 的引用数 = 0
+```
+
+**这一步没有解决卸载问题，也不要当成解决了**
+
+9.434 那个问题仍然开着，而且现在措辞更准了：
+
+> 9.434 说"这行之后没有任何被拦截指令"——那描述的是**这个函数剩下的三行**，
+> 不是那三行 return 进去的内核代码。guest 是调用者续行，它下一件事就是执行真实内核指令，
+> CPUID / CR3 写 / MSR / NPF 都会来。所以 `g_S206VrLog` 整场为空、`g_inVmrunCount` 停在 12
+> **仍然是未解释的**，只是不再是"因为 guest 选错了"。
+
+**另外，本轮读代码时发现一个独立缺陷（未修，只记录）**
+
+9.383 把 `guestContext.VpRegs->Rcx` 从 `VpData->GuestVmcb.StateSaveArea.Rsp` 改成了 `'SSVM'`，
+目的是让 `SvDevirtualizeProcessor` 的 `registers[2] != 'SSVM'` 检查通过。
+
+但 ASM 的 `SvLV20` 第一条就是 **`mov rsp, rcx`** —— 它把 `'SSVM'`（0x4D565353）
+当成栈指针用，随后 `mov ecx,'SSVM'` / `jmp rbx`。也就是说每次走 ExitVm 出口，
+**栈指针都被设成一个非规范/未映射的地址**。反汇编确认该赋值确实进了产物：
+
+```
+14002 40AD:  mov qword ptr [r14+70h], 5353564Dh   ; VpRegs->Rcx = 'SSVM'
+14002 4C30:  mov rsp, rcx                          ; SvLV20 第一句
+```
+
+9.383 的注释说"RSP 不丢，因为 SvDevirtualizeProcessor 只读 EAX:EDX"——
+那句话对**被调用方**成立，对 **SvLV20 自己**不成立。这是一个待验证的候选根因，
+按铁律「只修用户报告过的问题」，本轮不动它。
+
+**机器状态**：`yghvpa` 仍 `START_PENDING`，`sc stop` 返回 1052。**需要重启**才能清掉。
+重启后第一件事是 `sc start yghvpa` 验证加载不再挂死（这才能证明 9.436 的回滚生效）。

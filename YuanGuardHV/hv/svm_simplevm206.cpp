@@ -19,11 +19,16 @@
 #include <ntifs.h>
 #include <stdarg.h>
 
-/* 9.436: the test guest, exported by svm_trampoline.asm with a plain C name.
- * Declared at file scope (extern "C" cannot be spelled inside a block) so
- * SvPrepareForVirtualization can point the guest's RIP at it. */
-extern "C" const uint8_t svm_trampoline_test_guest[];
-
+/*
+ * 9.439: THE 9.436 DECLARATION IS GONE WITH THE CHANGE IT SERVED.
+ *
+ * 9.436 declared svm_trampoline_test_guest here so SvPrepareForVirtualization
+ * could point the guest's RIP at it. That change is reverted (see the note at
+ * the RIP assignment): 206's guest is the CALLER'S OWN CONTINUATION, which is
+ * the upstream semantic the rest of Sv206Entry is written against. An extern
+ * declaration for a symbol nothing references is dead weight that reads as
+ * intent, so it goes with the code.
+ */
 
 //
 // 9.246 step206-B seams (both gated; with the gates OFF this file is the
@@ -3275,28 +3280,33 @@ tsc_policy_done:;
         }
         break;
     /*
-     * 9.435: VMMCALL IS THE TEST GUEST'S ONLY WAY BACK — AND IT HAD NO CASE.
+     * 9.439: VMMCALL TERMINATES THIS CORE'S GUEST — IT DOES NOT LOOP.
      *
-     * 9.434 established that the guest entry was SvVirtualizeProcessor's own
-     * continuation, which never executes an intercepted instruction, so vmrun
-     * never returned and the in-vmrun counter stayed at 12 forever.
+     * 9.435 recorded the exit and let the loop continue, on the reading that the
+     * trampoline's `mov rax,1 / vmmcall / jmp` was a heartbeat. It is a heartbeat,
+     * and that is exactly why continuing is wrong: a heartbeat that returns FALSE
+     * from SvHandleVmExit makes the ASM `jmp SvLV10`, vmrun again, and take the
+     * same exit immediately. Measured consequence (9.437): `sc start` never
+     * returned, the service sat in START_PENDING, and one core spun in a VMEXIT
+     * storm forever. Sv206Entry is synchronous — it cannot return while a core is
+     * doing that.
      *
-     * Arming VMMCALL (9.432/9.433, bit 1 per bhyve's table) is only half of it:
-     * this handler had no case for VMEXIT_VMMCALL, so a trapped vmmcall would
-     * fall into `default`, call yghv_fail_degrade, and bugcheck 0xE2 - turning
-     * "the guest can finally exit" into a new failure mode.
+     * The exit path this sets is the SAME one CPUID_UNLOAD uses: __svm_vmload,
+     * __svm_stgi, clear EFER.SVME, SvLV20. One exit path, not two — which is the
+     * property the whole 9.39x family was trying to get.
      *
-     * What the trampoline guest does with vmmcall is a HEARTBEAT: mov rax,1 then
-     * vmmcall in a loop. So the case records the exit and lets the loop continue;
-     * it does not terminate the guest, because the guest is meant to keep running.
+     * WITH THE GUEST BACK TO THE CALLER'S CONTINUATION (9.439 reverting 9.436)
+     * THIS CASE IS INERT IN PRACTICE: Windows' kernel does not issue vmmcall, so
+     * nothing reaches it. It is kept because it is the correct semantic for the
+     * armed bit, and because leaving a trapped instruction with no case is how
+     * the `default:` bugcheck 0xE2 gets manufactured.
      *
-     * The counter exists so "did vmmcall ever trap" is answerable from a dump
-     * rather than inferred: g_S206Vmmcalls at zero would mean the bit is still not
-     * taking effect, which is a different fix from "the bit works but the guest
-     * left".
+     * The counter stays: g_S206Vmmcalls at zero proves the bit never fired, which
+     * is a different fact from "the bit fired and the core left".
      */
     case VMEXIT_VMMCALL /* 0x81 */:
         InterlockedIncrement64(&g_S206Vmmcalls);
+        guestContext.ExitVm = TRUE;
         break;
     case VMEXIT_SHUTDOWN /* 0x7f */:
         //
@@ -3906,38 +3916,43 @@ SvPrepareForVirtualization (
     VpData->GuestVmcb.StateSaveArea.Rflags = ContextRecord->EFlags;
     VpData->GuestVmcb.StateSaveArea.Rsp = ContextRecord->Rsp;
     /*
-     * 9.436: THE GUEST ENTRY IS THE TRAMPOLINE, EXPLICITLY - NOT THE CALLER'S RIP.
+     * 9.439: REVERTED 9.436. THE GUEST IS THE CALLER'S CONTINUATION, AS UPSTREAM.
      *
-     * 9.434 found this line assigning `ContextRecord->Rip`, which is the RIP of
-     * SvVirtualizeProcessor itself (captured moments earlier). So the "guest" was
-     * SvVirtualizeProcessor's own continuation: code that expects host state and
-     * contains SV_DEBUG_BREAK() / KeBugCheck and no intercepted instruction.
-     * Consequence measured across the whole session: vmrun never returned,
-     * SvHandleVmExit never ran (g_S206VrLog empty), the in-vmrun counter stayed at
-     * 12 forever, and every unload ended in 0xD1 / 0x7F PAGED_IP or 0x101.
+     * 9.436 pointed this at svm_trampoline_test_guest. Measured result: `sc start`
+     * never returned — the service sat in START_PENDING for the rest of the
+     * session. The reason is visible in the loop, not in the guest:
      *
-     * The trampoline is what a guest should be: three instructions that end in
-     * vmmcall, i.e. a guest that HANDS CONTROL BACK. With VMMCALL armed (9.433)
-     * and a case for it in the handler (9.435), the exit is now well defined.
+     *   guest executes `mov rax,1 / vmmcall`  ->  #VMEXIT
+     *   case VMEXIT_VMMCALL (9.435)          ->  InterlockedIncrement, break
+     *   SvHandleVmExit returns ExitVm=FALSE  ->  ASM `jmp SvLV10`  ->  vmrun
      *
-     * RSP is deliberately left as ContextRecord->Rsp: the trampoline uses no
-     * stack before its vmmcall, and pointing it at the host stack keeps the first
-     * exit's saved state consistent with what SvHandleVmExit expects.
+     * vmmcall is a HEARTBEAT: it never asks to leave. So the loop is an infinite
+     * VMEXIT storm, SvVirtualizeAllProcessors never returns, and Sv206Entry —
+     * which is synchronous — never returns either. "The guest can finally exit"
+     * became "the guest exits ten million times a second". That is a hang, and a
+     * hang is worse than the crash it replaced because it is unobservable.
      *
-     * Kept behind the 206 gate: other build steps rely on transparent
-     * virtualisation (guest == caller's own continuation), which is the upstream
-     * semantic this line used to implement.
+     * The deeper point is the one 9.434 left open and 9.436 answered by accident:
+     * EVERYTHING ELSE IN Sv206Entry IS WRITTEN FOR TRANSPARENT VIRTUALISATION.
+     * SvVirtualizeAllProcessors returns synchronously, SvDevirtualizeProcessor
+     * asks the CALLER's own CPUID to leave guest mode, and the ExitVm path hands
+     * back the guest's RSP so `mov rsp, rcx` resumes the caller. A test guest that
+     * never returns cannot satisfy any of that. So the guest stays the caller's
+     * continuation — the upstream semantic — and the "why does vmrun not return"
+     * question is answered on its own terms, not by replacing the guest.
+     *
+     * That question, restated honestly: with the caller's continuation as guest,
+     * the very next thing that code does is execute real kernel instructions as a
+     * guest, so a #VMEXIT does arrive (CPUID, CR3 write, MSR, NPF). The 9.434
+     * claim "there is no intercepted instruction after this point" describes the
+     * three lines of THIS function; it does not describe the kernel code those
+     * lines return into. What 9.410 measured (g_S206VrLog empty, count stuck at
+     * 12) is therefore still unexplained, and it is now the open question rather
+     * than something this line pretends to have fixed.
+     *
+     * Rollback target: f7e1e8c's predecessor of 3690dba, i.e. exactly this line.
      */
-#if YGHV_BAREMETAL_STEP == 206 && defined(YGHV_206B_COEXIST)
-    {
-        /* The declaration lives at file scope (see the 9.436 note there):
-         * extern "C" cannot be spelled inside a block. */
-        VpData->GuestVmcb.StateSaveArea.Rip =
-            (UINT64)(uintptr_t)&svm_trampoline_test_guest[0];
-    }
-#else
     VpData->GuestVmcb.StateSaveArea.Rip = ContextRecord->Rip;
-#endif
     VpData->GuestVmcb.StateSaveArea.GPat = __readmsr(IA32_MSR_PAT);
 
     //
