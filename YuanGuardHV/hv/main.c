@@ -4952,10 +4952,45 @@ void DriverUnload(struct _DRIVER_OBJECT *d) {
          * completely different bug from "the request was ignored". */
         yghv_ut_mark_val(45 + 0, (uint64_t)stopped);
         yghv_ut_mark_val(45 + 1, (uint64_t)active);
-    }
 
-    yghv_ut_mark(YGHV_UT_COOP_UNLOAD);
-    { extern void Sv206CoopUnload(void); Sv206CoopUnload(); }
+        /*
+         * 9.399: ONLY WALK THE CORES IF THE STOP FLAG DID NOT ALREADY WORK.
+         *
+         * The 22nd dump read: seq=5, step=20 (COOP_UNLOAD), and that was the last
+         * stamp - COOP_UNLOAD is written immediately BEFORE Sv206CoopUnload and
+         * the "+5" stamp after it never happened. So Sv206CoopUnload never
+         * returned, and the bugcheck was 0x7F double fault, not 0xD1.
+         *
+         * What was Sv206CoopUnload doing? ExUnregisterCallback (harmless) and then
+         * SvDevirtualizeAllProcessors, which walks every core with
+         * KeSetSystemGroupAffinityThread and runs __cpuidex on each one.
+         *
+         * By then the stop flag has ALREADY made each VMRUN loop leave through
+         * ExitVm - and that path clears EFER.SVME itself before returning. Pinning
+         * the thread to a core that is mid-teardown and executing CPUID there is
+         * how a double fault happens: the ambient state is inconsistent by
+         * construction.
+         *
+         * So the walk is kept ONLY as a fallback for the case it was written for -
+         * a core that ignored the stop request. If every loop reported in, there is
+         * nothing for it to do and real risk in doing it.
+         */
+        yghv_ut_mark_val(47, stopped >= (int)active ? 1 : 0);
+
+        if ((ULONG)stopped < active) {
+            /* Not every loop left within the timeout: fall back to the upstream
+             * backdoor walk, which is the only remaining lever. */
+            yghv_ut_mark(YGHV_UT_COOP_UNLOAD);
+            { extern void Sv206CoopUnload(void); Sv206CoopUnload(); }
+            yghv_ut_mark(YGHV_UT_COOP_UNLOAD + 5);
+        } else {
+            /* Every loop stopped through ExitVm. Only the callback needs undoing;
+             * the de-virtualize walk would be work on cores that already left. */
+            extern int yghv_s206_power_callback_release(void);
+            (void)yghv_s206_power_callback_release();
+            yghv_ut_mark(21);
+        }
+    }
     /* The mark after it is the one that matters: if the dump's last stamp is
      * COOP_UNLOAD and not this, the de-virtualize walk never returned. */
     yghv_ut_mark(YGHV_UT_COOP_UNLOAD + 5);

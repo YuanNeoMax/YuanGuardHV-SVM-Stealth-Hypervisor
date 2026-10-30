@@ -25,12 +25,35 @@
 
 #include "yghv_unload_trace.h"
 
+/*
+ * 9.398: A SHORT HISTORY, BECAUSE ONE VALUE SLOT LOSES THE ANSWER.
+ *
+ * The 22nd dump showed seq=5, step=20, value=0. Reading it was impossible for a
+ * reason that had nothing to do with the crash: the two stamps that carried the
+ * numbers I needed (45 = loops stopped, 46 = loops expected) had already been
+ * OVERWRITTEN by the stamp that recorded where it died. One value slot means the
+ * last writer wins, and the last writer is always the one that crashed.
+ *
+ * So the record keeps the last N stamps. Four is enough for "how many stopped,
+ * how many expected, where next, where after" - and 4 * 40 bytes stays trivially
+ * inside the page.
+ */
+#define YGHV_UT_HIST 4
+
+typedef struct {
+    volatile LONG64 seq_order;    /* which stamp this is (1-based) */
+    volatile LONG   step;
+    volatile LONG64 value;
+    volatile LONG64 tsc;
+} yghv_ut_slot_t;
+
 typedef struct {
     volatile LONG64 seq;          /* bumped on every stamp */
     volatile LONG   step;         /* the step, written after seq on purpose */
     volatile LONG   pad;
-    volatile LONG64 value;        /* step-specific number (cores joined, etc.) */
+    volatile LONG64 value;        /* latest value, for a quick read */
     volatile LONG64 tsc;          /* when, so two steps can be ordered in time */
+    yghv_ut_slot_t hist[YGHV_UT_HIST];
 } yghv_ut_state_t;
 
 typedef union {
@@ -100,11 +123,23 @@ void yghv_ut_mark_val(uint32_t step, uint64_t value) {
      * flight" rather than misreading it as a completed step.
      */
     volatile yghv_ut_state_t *st = UT_STATE;
+    LONG64 order;
 
     if (!st)
         return;                     /* not initialised: nothing to record into */
 
-    InterlockedIncrement64(&st->seq);
+    order = InterlockedIncrement64(&st->seq);
+
+    /* Slot first, then the quick-read fields: if the machine dies mid-stamp, the
+     * history (which is what a dump reader walks) is the more complete of the two. */
+    {
+        yghv_ut_slot_t *slot = (yghv_ut_slot_t *)&st->hist[(order - 1) % YGHV_UT_HIST];
+        slot->step = (LONG)step;
+        slot->value = (LONG64)value;
+        slot->tsc = (LONG64)__rdtsc();
+        slot->seq_order = order;
+    }
+
     st->value = (LONG64)value;
     st->tsc = (LONG64)__rdtsc();
     InterlockedExchange(&st->step, (LONG)step);

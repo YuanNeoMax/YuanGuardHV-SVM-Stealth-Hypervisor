@@ -4873,6 +4873,22 @@ SvDriverUnload (
                 ring-0 CPUID backdoor — after which yghv's DriverUnload
                 continues with its own teardown (control device, NPT, SVM).
  */
+/*
+ * 9.399: release the power callback WITHOUT walking the cores.
+ *
+ * DriverUnload needs this half even when the stop flag already stopped every
+ * VMRUN loop, because ExUnregisterCallback has nothing to do with the cores. The
+ * walk is the other half, and it is only safe when a core failed to stop.
+ */
+extern "C" int yghv_s206_power_callback_release(VOID)
+{
+    if (g_PowerCallbackRegistration != nullptr) {
+        ExUnregisterCallback(g_PowerCallbackRegistration);
+        g_PowerCallbackRegistration = nullptr;
+    }
+    return 1;
+}
+
 extern "C"
 VOID
 Sv206CoopUnload (
