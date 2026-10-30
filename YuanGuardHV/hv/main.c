@@ -4904,6 +4904,13 @@ void DriverUnload(struct _DRIVER_OBJECT *d) {
      * externs instead of includes: these live in modules that pull kernel headers
      * in a different order, and main.c is the one place that can see them all.
      */
+    /*
+     * 9.406: the locals are declared OUTSIDE the block on purpose. The decision
+     * further down ("was anything running when we entered?") has to be based on
+     * the value captured HERE, before any teardown cleared it - not on the global,
+     * which by then reads 0 either way.
+     */
+    ULONG_PTR resident_threads_at_entry = 0;
     {
         extern ULONG g_vcpu_count;
         extern volatile LONG g_s203_online;
@@ -4912,8 +4919,10 @@ void DriverUnload(struct _DRIVER_OBJECT *d) {
         extern ULONG_PTR yghv_s206_vmrun_stopped_for_trace(void);
         extern LONG yghv_s206_cpuid_view_for_trace(void);
 
+        resident_threads_at_entry = svm_core_resident_threads_for_trace();
+
         yghv_ut_snapshot_pre_unload(
-            (UINT64)svm_core_resident_threads_for_trace(),
+            (UINT64)resident_threads_at_entry,
             (UINT64)yghv_s206_power_cb_for_trace(),
             (UINT64)g_vcpu_count,
             (UINT64)g_s203_online,
@@ -5010,15 +5019,45 @@ void DriverUnload(struct _DRIVER_OBJECT *d) {
          */
         yghv_ut_mark_val(47, stopped >= (int)active ? 1 : 0);
 
-        if ((ULONG)stopped < active) {
-            /* Not every loop left within the timeout: fall back to the upstream
-             * backdoor walk, which is the only remaining lever. */
+        /*
+         * 9.406: ASK "IS ANYTHING RUNNING" BEFORE DECIDING WHETHER TO WALK.
+         *
+         * 9.405 read the pre-teardown snapshot out of the dump and it settled the
+         * question the earlier readouts could not:
+         *
+         *     snap_resident_threads = 0     never started (not "cleared here")
+         *     snap_vmrun_stopped    = 0     zero loops had left when we entered
+         *     snap_power_cb         = 1     Sv206Entry DID reach virtualisation
+         *
+         * And the VMCB showed InterceptMisc2 bit32 SET - VMRUN itself is
+         * intercepted. So the 12 "guests" never execute: every vmrun is immediately
+         * turned into a VMEXIT. That is why g_S206VrLog is empty and why only one
+         * core ever bumped the stop counter during the whole unload.
+         *
+         * The walk is what crashed, five times, always 0x7F/8 at
+         * SvDevirtualizeAllProcessors+0xC0: it pins the thread to each core and
+         * runs __cpuidex while that core is sitting inside a vmrun-intercepted
+         * VMEXIT. The ambient state is inconsistent by construction.
+         *
+         * So the decision is made from the SNAPSHOT, not from the stop counter:
+         * when nothing was running at entry and nothing answered the stop request,
+         * there is no core that needs de-virtualising, and the walk can only do
+         * harm. The callback still has to be undone - that is unrelated to cores.
+         */
+        if (stopped == 0 && resident_threads_at_entry == 0) {
+            extern int yghv_s206_power_callback_release(void);
+            (void)yghv_s206_power_callback_release();
+            yghv_ut_mark(21);
+            yghv_ut_mark_val(22, 0);   /* 22/0 = "walk skipped: nothing was running" */
+        } else if ((ULONG)stopped < active) {
+            /* Something was running and not everything left: the backdoor walk is
+             * the only remaining lever, and it is now the honest fallback rather
+             * than the default. */
             yghv_ut_mark(YGHV_UT_COOP_UNLOAD);
             { extern void Sv206CoopUnload(void); Sv206CoopUnload(); }
             yghv_ut_mark(YGHV_UT_COOP_UNLOAD + 5);
         } else {
-            /* Every loop stopped through ExitVm. Only the callback needs undoing;
-             * the de-virtualize walk would be work on cores that already left. */
+            /* Every loop stopped through ExitVm. Only the callback needs undoing. */
             extern int yghv_s206_power_callback_release(void);
             (void)yghv_s206_power_callback_release();
             yghv_ut_mark(21);
