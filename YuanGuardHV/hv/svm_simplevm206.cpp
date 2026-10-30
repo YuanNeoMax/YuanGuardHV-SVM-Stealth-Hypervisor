@@ -744,6 +744,70 @@ static volatile LONG   g_TscInterceptArmed = 0;      /* is the intercept bit set
  */
 static volatile LONG   g_BpInt3Intercept = 0;
 
+/*
+ * 9.396: A STOP FLAG THE VMRUN LOOP CAN ACTUALLY SEE.
+ *
+ * THE DEFECT THIS ADDRESSES (9.395, confirmed against tandasat/SimpleSvm)
+ *
+ * This tree virtualises in TWO places on the same cores:
+ *
+ *   svm_core_init()   -> resident threads            (wait_all_stopped waits for these)
+ *   Sv206Entry()      -> SvVirtualizeProcessor -> Sv206LaunchVm  (a VMRUN loop that
+ *                        never returns until ExitVm)
+ *
+ * DriverUnload stops the FIRST set (svm_core_stop_all_residents +
+ * svm_core_wait_all_stopped) and then frees npt_cleanup() / svm_core_cleanup()
+ * state that the SECOND set is still running on. The crash point
+ * Sv206LaunchVm+0xD is `mov rax,[rsp]` reading VpData->HostStackLayout - the loop
+ * is alive and its VpData is gone.
+ *
+ * WHY THE EXISTING MECHANISMS DO NOT WORK
+ *
+ *   SvDevirtualizeAllProcessors: its __cpuidex runs in the CONTROL thread. CPUID's
+ *     back door only makes the CALLER leave guest mode, and the caller is not in
+ *     guest mode - the VMRUN loop is in a different execution context entirely.
+ *     That is why writing the 'SSVM' ack (9.378, 9.383) changed nothing.
+ *
+ *   YGHV_CMD_STOP_INTERNAL: a VMMCALL, and the 206 guest does not issue VMMCALL.
+ *
+ * So the only lever that reaches the loop is a flag read ON EVERY VMEXIT, inside
+ * the exit handler the loop itself calls. That is this flag.
+ *
+ * The exit handler already decides "return to the host" through guestContext.ExitVm.
+ * Setting that from here means the loop takes the SAME path a CPUID_UNLOAD takes:
+ * __svm_vmload, __svm_stgi, clear EFER.SVME, return. One exit path, not two.
+ */
+static volatile LONG   g_VmrunStopRequested = 0;
+/* How many VMRUN loops have taken the exit. The waiter needs a NUMBER, not a
+ * flag: "I asked them to stop" and "they stopped" are different facts, and this
+ * session lost 15 machines to confusing the two. */
+static volatile LONG   g_VmrunStopped;
+
+extern "C" void yghv_s206_vmrun_stop_request(VOID)
+{
+    InterlockedExchange(&g_VmrunStopRequested, 1);
+}
+
+extern "C" int yghv_s206_vmrun_stop_pending(VOID)
+{
+    return (int)InterlockedCompareExchange(&g_VmrunStopRequested, 0, 0);
+}
+
+/* Cleared once a core has taken the exit, so a later load starts clean. */
+extern "C" void yghv_s206_to_stop_clear(VOID);
+
+extern "C" void yghv_s206_vmrun_stop_clear(VOID)
+{
+    InterlockedExchange(&g_VmrunStopRequested, 0);
+    InterlockedExchange(&g_VmrunStopped, 0);
+}
+
+/* How many loops have left. Compared against the core count by the waiter. */
+extern "C" int yghv_s206_vmrun_stopped_count(VOID)
+{
+    return (int)InterlockedCompareExchange(&g_VmrunStopped, 0, 0);
+}
+
 extern "C" int yghv_s206_bp_int3_intercept(UINT32 on)
 {
     InterlockedExchange(&g_BpInt3Intercept, on ? 1 : 0);
@@ -1979,6 +2043,32 @@ SvHandleVmExit (
 
     guestContext.VpRegs = GuestRegisters;
     guestContext.ExitVm = FALSE;
+
+    /*
+     * 9.396: THE STOP FLAG, CHECKED ON EVERY EXIT.
+     *
+     * This is the only point that reaches the VMRUN loop: the loop calls this
+     * handler for every interception, so a flag read here is a flag the loop
+     * cannot miss. The control thread cannot reach it any other way (see the note
+     * at g_VmrunStopRequested).
+     *
+     * ExitVm is set rather than a separate "break" flag so the loop unwinds
+     * through the EXISTING exit path - the one that does __svm_vmload, __svm_stgi
+     * and clears EFER.SVME. A second exit path would be a second thing to get
+     * right, and this tree has already paid for that kind of duplication.
+     */
+    if (InterlockedCompareExchange(&g_VmrunStopRequested, 0, 0) != 0)
+    {
+        /* Only the CPUID-shaped exit path knows how to leave cleanly; for any
+         * other exit code, setting ExitVm would hit the NT_ASSERT below
+         * (ExitCode == VMEXIT_CPUID). So the flag is recorded and acted on at the
+         * next CPUID exit - which arrives within one guest heartbeat. */
+        if (VpData->GuestVmcb.ControlArea.ExitCode == VMEXIT_CPUID)
+        {
+            guestContext.ExitVm = TRUE;
+            InterlockedIncrement(&g_VmrunStopped);
+        }
+    }
 
     //
     // Load some host state that are not loaded on #VMEXIT.

@@ -4895,6 +4895,65 @@ void DriverUnload(struct _DRIVER_OBJECT *d) {
     /* 9.246: devirtualize all cores (upstream CPUID-backdoor loop) + unregister
      * the vendored power callback BEFORE any yghv teardown frees the NPT the
      * host loops still translate through. */
+    /*
+     * 9.397: STOP THE VMRUN LOOPS BEFORE ANY TEARDOWN, AND WAIT FOR THE NUMBER.
+     *
+     * 9.395 established that this tree virtualises twice on the same cores and
+     * that DriverUnload stops only the resident set. The Sv206Entry VMRUN loop
+     * keeps running, and the teardown below frees the VpData and NPT it is still
+     * using - 15 bugchecks at Sv206LaunchVm+0xD.
+     *
+     * The loop can only be reached from inside the exit handler it calls, so the
+     * request is a flag (9.396) and the ACK is a counter. This waits for the
+     * COUNTER, not for the flag: 15 machines were lost to confusing "I asked" with
+     * "they stopped".
+     *
+     * The timeout is deliberate and short. If the loops do not leave, teardown
+     * proceeds anyway - the machine is being unloaded and hanging here forever
+     * would be worse than the crash it is trying to avoid. What the timeout buys
+     * is that a partial stop is VISIBLE (the unload-trace step records how many
+     * left) instead of silent.
+     */
+    {
+        extern void yghv_s206_vmrun_stop_request(void);
+        extern int  yghv_s206_vmrun_stopped_count(void);
+        extern void yghv_s206_to_stop_clear(void);
+
+        ULONG active = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
+        ULONG waited_ms = 0;
+        int stopped;
+
+        yghv_s206_vmrun_stop_request();
+
+        for (;;) {
+            stopped = yghv_s206_vmrun_stopped_count();
+            if ((ULONG)stopped >= active)
+                break;
+            if (waited_ms >= 2000)
+                break;
+            /*
+             * A plain bounded iteration, NOT __rdtsc.
+             *
+             * __rdtsc is the wrong clock here: this driver owns a TSC offset and
+             * can freeze the clock (Tier 5.1), so a loop that waits on rdtsc would
+             * hang if a freeze were ever left armed. A bounded count is immune to
+             * that and needs no import.
+             */
+            {
+                volatile ULONG spin;
+                for (spin = 0; spin < 200000UL; spin++) { }
+            }
+            waited_ms += 1;
+        }
+
+        /* Record BOTH numbers: how many loops left, and how long it took to stop
+         * waiting. A dump that shows 10 of 12 with a 2000 ms timeout says the
+         * request reaches the loops but two of them never took a CPUID exit - a
+         * completely different bug from "the request was ignored". */
+        yghv_ut_mark_val(45 + 0, (uint64_t)stopped);
+        yghv_ut_mark_val(45 + 1, (uint64_t)active);
+    }
+
     yghv_ut_mark(YGHV_UT_COOP_UNLOAD);
     { extern void Sv206CoopUnload(void); Sv206CoopUnload(); }
     /* The mark after it is the one that matters: if the dump's last stamp is
