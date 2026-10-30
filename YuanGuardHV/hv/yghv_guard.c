@@ -813,8 +813,36 @@ int yghv_guard_remove(uint64_t gpa) {
         return 0;
 
     if (g_guard[slot].hidden) {
-        (void)yghv_protect_npt_remap(g_guard[slot].gpa, g_guard[slot].gpa,
-                                     0, NULL);
+        /*
+         * 9.447: A FAILED REMAP MUST NOT BE SILENTLY DISCARDED.
+         *
+         * This call used to be `(void)yghv_protect_npt_remap(...)`: the result was
+         * thrown away, the entry was cleared anyway, and the page stayed hidden in
+         * the NPT with no guard entry left to describe it. Every later access then
+         * failed - and the failure looked like a defect in whatever ran next.
+         *
+         * Measured shape of that (G25, two runs, same machine, same script):
+         *   run A: T7 hides the guest page, `del` restores it, T12 reads it -> PASS
+         *   run B: same steps -> T12 `mem-read: FAILED status=0` and `mem-pte: NOT
+         *          MAPPED`, while T4 - which read the SAME pid and VA before T7 -
+         *          had succeeded
+         * The difference between the runs is which of npt_remap's early returns was
+         * taken, and nothing recorded it.
+         *
+         * npt_remap returns 0 for two reasons (protect.c: a raised IRQL, or a failed
+         * page-table write). Both are real, and both must leave the guard entry
+         * INTACT so the state stays describable and a retry remains possible.
+         */
+        if (!yghv_protect_npt_remap(g_guard[slot].gpa, g_guard[slot].gpa,
+                                    0, NULL)) {
+            /*
+             * Leave the entry alone: the page is still hidden, so the entry must
+             * still say so. Returning 0 tells the caller the removal did not happen,
+             * which is the truth - and makes it observable here instead of turning
+             * into an unexplained read failure several steps later.
+             */
+            return 0;
+        }
         InterlockedDecrement64(&g_g_hidden);
     }
     InterlockedExchange(&g_guard[slot].active, 0);
