@@ -783,6 +783,28 @@ static volatile LONG   g_VmrunStopRequested = 0;
  * session lost 15 machines to confusing the two. */
 static volatile LONG   g_VmrunStopped;
 
+/*
+ * 9.414: called once per VMRUN-loop iteration, from SvLV10 in
+ * svm_simplevm206_x64.asm. Only interlocked reads - no kernel API - so it is
+ * callable with GIF clear inside the VM-exit frame. That is the requirement that
+ * forced this into the ASM loop: the previous location (SvHandleVmExit) only runs
+ * on a #VMEXIT, and the guest restarts from the same RIP, so it never ran.
+ *
+ * Returns 1 when the loop should leave; the ASM then takes the normal SvLV20
+ * exit, the same one the handler uses, so there is still exactly one exit path.
+ *
+ * The request is NOT cleared here (9.412). Consuming it would mean the first core
+ * to arrive stops and the rest keep running - the "stopped=1 / active=12" shape.
+ */
+extern "C" int Sv206VmrunShouldExit(VOID)
+{
+    if (InterlockedCompareExchange(&g_VmrunStopRequested, 0, 0) == 0)
+        return 0;
+
+    InterlockedIncrement(&g_VmrunStopped);
+    return 1;
+}
+
 extern "C" void yghv_s206_vmrun_stop_request(VOID)
 {
     InterlockedExchange(&g_VmrunStopRequested, 1);
@@ -2075,18 +2097,23 @@ SvHandleVmExit (
      * and clears EFER.SVME. A second exit path would be a second thing to get
      * right, and this tree has already paid for that kind of duplication.
      */
-    if (InterlockedCompareExchange(&g_VmrunStopRequested, 0, 0) != 0)
-    {
-        /* Only the CPUID-shaped exit path knows how to leave cleanly; for any
-         * other exit code, setting ExitVm would hit the NT_ASSERT below
-         * (ExitCode == VMEXIT_CPUID). So the flag is recorded and acted on at the
-         * next CPUID exit - which arrives within one guest heartbeat. */
-        if (VpData->GuestVmcb.ControlArea.ExitCode == VMEXIT_CPUID)
-        {
-            guestContext.ExitVm = TRUE;
-            InterlockedIncrement(&g_VmrunStopped);
-        }
-    }
+    /*
+     * 9.414: THE STOP CHECK MOVED INTO THE ASM LOOP (SvLV10).
+     *
+     * It used to live here, inside the #VMEXIT handler. Measured on 9.410: after
+     * all 14 DriverUnload steps reached DONE, a core was still looping, and
+     * g_VmrunStopped was 0 - this code had never run once, because the guest is
+     * restarted from the same RIP on every iteration and never reaches a CPUID.
+     *
+     * The check now happens once per loop iteration, before vmload, where the
+     * stack invariants allow a call. See the note at SvLV10 in
+     * svm_simplevm206_x64.asm - including why the r11/call version (9.413) died
+     * with 0x139.
+     *
+     * Nothing is left here on purpose: a second check would double-count
+     * g_VmrunStopped and make the readout mean two different things again.
+     */
+    (void)0;
 
     //
     // Load some host state that are not loaded on #VMEXIT.

@@ -15,6 +15,9 @@ MACHINE_FRAME_SIZE          equ     28h
 .code
 
 extern SvHandleVmExit : proc
+; 9.414: the per-iteration stop check (implemented in svm_simplevm206.cpp).
+; Called from SvLV10 where the stack invariants allow a call - see the note there.
+extern Sv206VmrunShouldExit : proc
 
 ;
 ;   @brief      Saves all general purpose registers to the stack.
@@ -95,6 +98,38 @@ SvLV10: ;
         ;                 0x...ff8 Reserved1         ;
         ; ----
         ;
+        ;
+        ; 9.414: THE PER-ITERATION STOP CHECK, AT THE ONLY SAFE POINT IN THIS FRAME.
+        ;
+        ; 9.413 tried this after `jnz SvLV20` and produced 0x139 MISSING_GSFRAME:
+        ; at that point rsp still pointed into the KTRAP_FRAME and a call wrote the
+        ; return address into the PUSHAQ'd GuestRegisters block, and r11 (used to
+        ; save rax) is volatile. The invariants were not checked before the change.
+        ;
+        ; HERE, and only here, the invariants hold:
+        ;   rsp  = HostRsp, pointing at HostStackLayout (0xfd0..0xff8 of this
+        ;          frame). The stack grows DOWN from there, so rsp-8 and below is
+        ;          free stack - pushing here touches nothing the loop owns.
+        ;   rcx  = the original guest stack pointer. SvLV20 does `mov rsp, rcx`,
+        ;          so it MUST hold its entry value on every path out of here.
+        ;          rcx is volatile across a call (first integer argument), so it
+        ;          is pushed and restored around it.
+        ;   rax  = not yet loaded (the very next instruction loads it), so the
+        ;          call may clobber it.
+        ;   rdx/r8-r11 = volatile and unused at this point.
+        ;
+        ; Sv206VmrunShouldExit performs only interlocked reads: lock cmpxchg /
+        ; lock xadd intrinsics, no kernel API, so it is callable with GIF clear.
+        ; This is why the check can live in the loop at all - SvHandleVmExit is
+        ; C code that runs only on a #VMEXIT, and this guest is restarted from the
+        ; same RIP each iteration, so that check never fired (9.410: stopped=0).
+        ;
+        push rcx                            ; preserve the guest stack pointer
+        call Sv206VmrunShouldExit           ; 1 = leave through the normal exit
+        pop rcx                             ; restored BEFORE any branch
+        test al, al
+        jnz SvLV20                          ; rcx is already correct for SvLV20
+
         mov rax, [rsp]  ; RAX <= VpData->HostStackLayout.GuestVmcbPa
         vmload rax      ; load previously saved guest state from VMCB
 
