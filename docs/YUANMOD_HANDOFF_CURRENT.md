@@ -12423,3 +12423,86 @@ Misc3 在 `+0x014`，本树结构没有 Misc3，这一点 9.367 记过）。
 
 这次 dump 的 `g_ut_page` 物理页没被保存（`????????`），所以读不到历史环。
 但**崩溃点本身的位移已经足够说明 9.406 生效**。
+
+---
+
+#### 9.408 本次 dump 读不到 .bss：kernel dump 只保存内核可达的页
+
+**读到的**
+
+```
+g_ut_page  (VA 0xfffff804754ec000)  -> ???????? 读不到
+g_vcpus    (VA 0xfffff804754c03f0)  -> ???????? 读不到
+g_vcpu_count                        -> ???????? 读不到
+```
+
+而**栈和崩溃地址读得到**：
+
+```
+STACK_TEXT:
+  nt!KiPageFault+0x478 : 00000001`631f2000 00000001`631f3000 ffffcb85`7a3ec000 ffffcb85`6b9f1000
+  yghv_sk+0x24a2d
+```
+
+**所以 `yghv_sk` 的 `.bss` 段整个没有进这个 dump。** dump 是 2.9 GB 而物理内存 16 GB，
+kernel dump 只保存内核可用的、非页文件的页 —— 驱动 `.bss` 里那些**从未被写过**的页
+可能被跳过（它们不在 working set 里）。
+
+**这不是读法问题，是 dump 内容的边界。**
+
+**两个自我纠正**
+
+**① 我把 16 位字段当 64 位读了**
+
+`svm_simplevm206.hpp` 的定义是：
+
+```
++0x000 InterceptCrRead    UINT16
++0x002 InterceptCrWrite   UINT16
++0x008 InterceptException UINT32
++0x00C InterceptMisc1     UINT32
++0x010 InterceptMisc2     UINT32
+```
+
+而 9.402 我读 `dq` 出来的 `0x0004000000000002` 是**两个字段拼在一个 qword 里**，
+我把它当成"CrWrite = 0x00040000"解读。**正确读法是按 UINT16 拆**：
+
+```
+低 16 位 0x0002 = InterceptCrRead  = 0x0002
+高 16 位 0x0004 = InterceptCrWrite = 0x0004
+```
+
+`CrRead = 2` 是 **bit1 = CR3 被拦截**（CR0/CR2/CR3/CR4/CR8 对应 bit0..bit4）。
+`CrWrite = 4` 也是 bit2 = CR3。**这与代码里 `crIdx == 3` 的处理吻合。**
+
+所以 9.405 里"InterceptMisc2 = 0x03，VMRUN 被拦截"这个读法**也需要重查**
+（`+0x010` 是 Misc2，但我当时读的是 `+0x010` 开始的 `dd`，值 `0x00000003`
+—— 那一位对不上 `bit32 = VMRUN`，因为 Misc2 的 bit0 对应总 bit32）。
+`0x03` 意味着 **总 bit32 和 bit33 被设**，即 VMRUN 和 VMLOAD/VMSAVE —— **这个读法是对的**。
+
+**② 崩溃栈给出的真实信息**
+
+```
+rsp  = 0xffffcb857a3ec000   (有效内核栈)
+[rsp] 读到的值 = 0x00000001631f2000
+```
+
+`0x1631f2000` 是 **6 GB 量级**的地址 —— 既不是内核 VA（那会是 `0xffff...`），
+也不是有效的物理地址段。它是**垃圾值**。
+
+`Sv206LaunchVm+0xD` 是 `mov rax,[rsp]`，即读 `HostStackLayout.GuestVmcbPa`。
+**读到垃圾 = 那个 HostStackLayout 已被破坏或释放。**
+
+**所以 9.407 的推断站得住**：一个核仍在 `Sv206LaunchVm` 循环里，
+而它脚下的 `VpData` 已经不归它了。
+
+**流程上的一个缺陷（我可以修）**
+
+`g_ut_page` 的 PA 每次加载都变，而我**只在最后一次成功读过它**。
+这次崩溃后无从对账，因为我没在加载后把 PA 记下来。
+
+**修正**：加载后立刻用 `unload-trace` 命令读出 PA，写进本地文件
+（`D:\aaaaaavm\pa_<timestamp>.txt`），崩溃后拿这个 PA 去 dump 里找。
+成本是每次加载多一次 IOCTL（已验证可用），收益是**每次崩溃都能读到进度页**。
+
+**这个改动不需要动驱动**，只改测试脚本的流程。所以我先做它，再做下一个驱动改动。
