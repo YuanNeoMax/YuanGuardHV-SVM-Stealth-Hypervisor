@@ -32,6 +32,23 @@
 #define SVM_INTERCEPT_MISC2_VMRUN       (1UL << 0)
 
 /*
+ * 9.433: THE BIT NUMBER WAS WRONG. VMMCALL IS BIT 1, NOT BIT 2.
+ *
+ * Checked against the authoritative table (FreeBSD bhyve's amd/svm.h, VMCB
+ * control offset 0x10):
+ *
+ *     VMCB_INTCPT_VMRUN   BIT(0)
+ *     VMCB_INTCPT_VMMCALL BIT(1)      <-- this one
+ *     VMCB_INTCPT_VMLOAD  BIT(2)
+ *     VMCB_INTCPT_VMSAVE  BIT(3)
+ *     VMCB_INTCPT_STGI    BIT(4)
+ *     VMCB_INTCPT_CLGI    BIT(5)
+ *
+ * 9.432 armed bit 2, which is VMLOAD - so the guest's vmmcall was still not
+ * trapped and vmrun still never returned. The measurement that caught it: the
+ * crash offset stayed at Sv206LaunchVm+0x14 (inside vmrun) instead of moving,
+ * and g_inVmrunCount would still be 12.
+ *
  * 9.432: VMMCALL, WHICH THE TEST GUEST USES AS ITS ONLY EXIT.
  *
  * svm_trampoline.asm is three instructions:
@@ -53,7 +70,7 @@
  *
  * Total bit 34 = Misc2 bit 2.
  */
-#define SVM_INTERCEPT_MISC2_VMMCALL     (1UL << 2)
+#define SVM_INTERCEPT_MISC2_VMMCALL     (1UL << 1)
 #define SVM_NP_ENABLE_NP_ENABLE         (1UL << 0)
 
 /*
