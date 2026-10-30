@@ -13471,3 +13471,90 @@ Sv206Entry -> SvVirtualizeAllProcessors -> SvVirtualizeProcessor(每核)
 `svm_trampoline_test_guest` 的代码在 `svm_core.c` 或 ASM 里，看它是不是"跑一下就走"。
 
 **这次不再改代码。先读那个 guest 的源码。**
+
+---
+
+#### 9.431 ★★★★ 最终答案：guest 靠 `vmmcall` 退出，而 **VMMCALL 拦截位从未被武装**
+
+**guest 的真身（`svm_trampoline.asm`，20 行）**
+
+```asm
+svm_trampoline_test_guest:
+    mov rax, 1          # YGHV_CMD_HEARTBEAT
+    vmmcall             # <- 它靠这条产生 VMEXIT
+svm_trampoline_test_guest_resume:
+    jmp svm_trampoline_test_guest
+svm_trampoline_test_guest_end:
+```
+
+**它不执行普通指令：它每次都执行 `vmmcall`，然后跳回开头。**
+
+**而 VMMCALL 拦截位从未被武装**
+
+`svm_simplevm206.hpp` 里 `InterceptMisc2` 只定义了两个位：
+
+```c
+#define SVM_INTERCEPT_MISC2_VMRUN       (1UL << 0)    /* 总 bit32 */
+#define SVM_INTERCEPT_MISC2_RDTSCP      (1UL << (39 - 32))  /* 总 bit39 */
+```
+
+**没有 VMMCALL 的位定义**（它应在 bit 2，总 bit 34）。而 9.402 从 VMCB 读到的
+`InterceptMisc2 = 0x03` 正是 bit0|bit1 —— **VMRUN 和 VMLOAD/VMSAVE，没有 VMMCALL**。
+
+**所以完整链条闭合了**
+
+```
+guest 执行 vmmcall
+  -> VMMCALL 未拦截 -> 按 AMD APM，未被拦截的 VMMCALL 产生 #UD（行为属未定义/异常）
+  -> guest 没有 #UD 处理路径
+  -> 不产生 #VMEXIT
+  -> vmrun 永不返回
+  -> lock dec 永不执行
+  -> g_inVmrunCount = 12，永远
+```
+
+**这就是今晚全部 29 次重启的根因。**
+
+| 观察 | 解释 |
+|---|---|
+| `g_S206VrLog = 0` | `SvHandleVmExit` 一次不跑（没有 VMEXIT）|
+| `snap_vmrun_stopped = 0` | stop flag 检查点在回边，回边永不执行 |
+| `g_inVmrunCount = 12` | `vmmcall` 不产生出口，`vmrun` 不返回 |
+| 卸载 14 步走完（`step=120`）| `DriverUnload` 是系统线程，不在 guest 里 |
+| `PAGED_IP`（`0xD1`/`0x7F`）| 驱动 unmap 后，卡在 vmrun 里的核执行已失效代码 |
+| `0x101`（9.428 之后）| 无界等待挂住，禁中断上下文跑满 → watchdog |
+| **三种 stop-check 改动都不生效** | 全都依赖"有 VMEXIT"，而那正是缺失的前提 |
+| **改 `npt_cleanup` / `svm_core_cleanup` 都不影响** | 崩溃在 `vmrun`，释放与否都不是原因 |
+
+**修法（第一次真正对症，而且只有一行）**
+
+在 `SvPrepareForVirtualization` 里武装 VMMCALL 拦截：
+
+```c
+/* VMMCALL = 总 bit 34 = Misc2 bit 2 */
+#define SVM_INTERCEPT_MISC2_VMMCALL     (1UL << 2)
+...
+VpData->GuestVmcb.ControlArea.InterceptMisc2 |= SVM_INTERCEPT_MISC2_VMMCALL;
+```
+
+**加上这一位，`vmmcall` 就会产生 `VMEXIT_VMMCALL`（0x81），于是：**
+- `vmrun` 返回 → `vmsave` 执行 → `lock dec` 执行 → `g_inVmrunCount` 归零
+- `SvHandleVmExit` 跑起来 → `g_S206VrLog` 有记录 → stop flag 检查点生效
+- `DriverUnload` 的等待能等到 → 不挂死、不崩
+
+**为什么这一位从来没被武装**
+
+因为 `SVM_INTERCEPT_MISC2_VMRUN` 被武装了（bit0），而 VMMCALL 就在它旁边两位。
+上游 SimpleSvm 的设计是**让 guest 用 `vmmcall` 主动退出**——它一定武装了 VMMCALL。
+本树抄了近一半：抄了 VMRUN 拦截，漏了 VMMCALL。
+
+**这是 9.378 那个"ack 从未被写"的同类**：一个前提从未成立，而所有下游逻辑都建立在它上面。
+
+**风险评估**
+
+加这一位是**装载时的单次写**，不改变任何指令路径，也不碰卸载。
+唯一的风险是"如果 guest 真的在意未被拦截的 VMMCALL 的返回值" —— 但它只是
+`mov rax,1; vmmcall; jmp`，不检查返回值。
+
+**如果它错了，会在加载阶段立刻暴露**（`g_S206VrLog` 应该有记录），
+而不是等 29 次重启。
