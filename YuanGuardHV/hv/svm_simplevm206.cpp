@@ -777,11 +777,26 @@ static volatile LONG   g_BpInt3Intercept = 0;
  * Setting that from here means the loop takes the SAME path a CPUID_UNLOAD takes:
  * __svm_vmload, __svm_stgi, clear EFER.SVME, return. One exit path, not two.
  */
-static volatile LONG   g_VmrunStopRequested = 0;
+/*
+ * 9.416: NOT static any more - the ASM loop reads it directly.
+ *
+ * 9.414 called a C helper from SvLV10 and the machine died with 0x139 / 0x7F
+ * double fault. 9.415 worked out why: a C function's prolog (stack probe, SEH
+ * frame) expects a normal kernel context, and a VM-exit frame has no valid SEH
+ * chain. So the check cannot be a call - it has to be inline instructions against
+ * memory whose address the assembler knows at link time.
+ *
+ * That is the only reason these two lost their `static`: an external symbol is
+ * addressable from the .asm. Nothing else about them changed, and the semantics
+ * (request stays set until a fresh load) are unchanged from 9.412.
+ */
+extern "C" { volatile LONG g_VmrunStopRequested = 0; }
 /* How many VMRUN loops have taken the exit. The waiter needs a NUMBER, not a
  * flag: "I asked them to stop" and "they stopped" are different facts, and this
  * session lost 15 machines to confusing the two. */
-static volatile LONG   g_VmrunStopped;
+/* 9.416: non-static and extern "C" for the same reason as g_VmrunStopRequested -
+ * the ASM loop increments it directly, without a call. */
+extern "C" { volatile LONG g_VmrunStopped = 0; }
 
 /*
  * 9.414: called once per VMRUN-loop iteration, from SvLV10 in

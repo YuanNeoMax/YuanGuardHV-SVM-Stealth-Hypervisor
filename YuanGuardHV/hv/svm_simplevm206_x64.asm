@@ -17,7 +17,11 @@ MACHINE_FRAME_SIZE          equ     28h
 extern SvHandleVmExit : proc
 ; 9.414: the per-iteration stop check (implemented in svm_simplevm206.cpp).
 ; Called from SvLV10 where the stack invariants allow a call - see the note there.
-extern Sv206VmrunShouldExit : proc
+; 9.416: the stop flag and the counter, read and bumped INLINE from SvLV10.
+; No C call: a C prolog expects a valid SEH chain and the VM-exit frame has none
+; (9.413/9.414 produced 0x139 and 0x7F double fault proving that).
+extern g_VmrunStopRequested : dword
+extern g_VmrunStopped : dword
 
 ;
 ;   @brief      Saves all general purpose registers to the stack.
@@ -124,11 +128,36 @@ SvLV10: ;
         ; C code that runs only on a #VMEXIT, and this guest is restarted from the
         ; same RIP each iteration, so that check never fired (9.410: stopped=0).
         ;
-        push rcx                            ; preserve the guest stack pointer
-        call Sv206VmrunShouldExit           ; 1 = leave through the normal exit
-        pop rcx                             ; restored BEFORE any branch
-        test al, al
-        jnz SvLV20                          ; rcx is already correct for SvLV20
+        ;
+        ; 9.416: THE CHECK, INLINE - NO C CALL.
+        ;
+        ; Same invariants as the 9.414 attempt (rsp at HostRsp, rcx must survive,
+        ; rax not yet loaded) - but the work is done with three instructions
+        ; instead of a call, because a call into C in this frame is what killed
+        ; the machine twice:
+        ;   0x139 MISSING_GSFRAME_STACKPTR   (9.413: also had a broken rsp/r11)
+        ;   0x7F/8 double fault              (9.414: rsp correct, prolog still not)
+        ;
+        ; `lock cmp` is not an instruction. `cmpxchg` is, and it is what the
+        ; intrinsic compiles to: cmpxchg mem, 0 with eax=0 leaves eax untouched
+        ; when the memory is already 0, and loads the memory value otherwise.
+        ; Only the ZERO case means "no request", so the test is on ZF.
+        ;
+        ; The counter bump is `lock inc`, exactly what InterlockedIncrement
+        ; emits. Neither instruction touches rsp, rcx or rbx.
+        ;
+        xor eax, eax                        ; expected value for cmpxchg
+        lock cmpxchg dword ptr [g_VmrunStopRequested], eax
+        ; eax now holds the OLD value of the flag:
+        ;   0 -> nothing requested, continue into the guest
+        ;   1 -> stop requested, leave
+        test eax, eax
+        jnz SvLV10_stop                     ; non-zero = request present
+        jmp SvLV10_go                       ; zero = continue
+SvLV10_stop:
+        lock inc dword ptr [g_VmrunStopped]
+        jmp SvLV20                          ; leave via the same exit the handler uses
+SvLV10_go:
 
         mov rax, [rsp]  ; RAX <= VpData->HostStackLayout.GuestVmcbPa
         vmload rax      ; load previously saved guest state from VMCB
