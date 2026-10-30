@@ -13090,3 +13090,99 @@ SvLV10:
 
 需要 `core_id`。而桩里没有直接的方法拿 core id —— 但 `[rsp + 0xfe0]` 就是 `Self`
 （VpData 指针），从 VpData 能拿到 core 索引。
+
+---
+
+#### 9.424 in-vmrun 计数版：日志第一次走到 CALLING-STOP，但仍是硬复位
+
+**本次（21:07）**
+
+```
+IMAGE md5=89EE31EA
+STATE RUNNING
+TRACE-ALIVE unload-trace: page PA=0xC7BE8000 last step=0 value=0
+PA_RECORDED 0xC7BE8000
+NPT npt-range: 1030 page(s) allocated lowest 0xC7BEB000 highest 0xC7DED000
+CALLING-STOP          <- 日志推进到这里，之前都停在 PA_RECORDED
+```
+
+**事件：只有 6008（意外关闭），没有 1001（bugcheck）** —— 硬复位，无 dump。
+
+dump 时间戳仍是 20:45（上一次），所以这次无法取证。
+
+**但行为确实变了**
+
+| 版本 | 日志停在哪 |
+|---|---|
+| 9.409-9.420（多次）| `PA_RECORDED` 或连文件都没生成 |
+| **9.422-9.423（本次）** | **`CALLING-STOP`** |
+
+`CALLING-STOP` 是 `sc stop` **发出之后**才写的。所以这次：
+- 加载 ✅
+- 读 PA ✅
+- 读 NPT ✅
+- `sc stop` 发出 ✅
+- 之后硬复位
+
+**之前几次连 `sc stop` 都没发出去**（日志停在 `PA_RECORDED`）。**这是实质进展。**
+
+**可能的原因（未验证，仅列出）**
+
+1. ASM 里那两条 `lock inc/dec` 改变了时序，让卸载走得更远
+2. `svm_core_cleanup` 前的等待循环（上限 3000ms）让卸载变慢，从而**改变了崩溃发生的时机**
+3. 巧合（硬复位占 1/6 概率）
+
+**第 2 条最值得注意**：我加的等待会 `spin` 最多 3000 次 × 200000 迭代。
+如果 `g_inVmrunCount` 从不归零，这个循环会跑满，**让卸载在这段时间内什么也没做**。
+而硬复位可能就发生在这个等待中。
+
+**这暴露了我方案的一个缺陷**
+
+我假设"计数会归零"，因为"VMRUN 循环离开 guest 模式后就会 dec"。但如果：
+- 某个核在 `vmrun` 里被长时间阻塞（guest 死循环、等中断）
+- 或者 `vmsave` 之前的某个异常路径跳过 `dec`
+
+那么计数**永久非零**，等待必然超时，而超时后**仍然继续 `svm_core_cleanup`** → 还是同样的崩溃。
+**只是晚了几秒。**
+
+**更严格的约束应该是：不归零就不清理 VMCB**
+
+当前代码是"等 3000ms，超时也继续"。这在"1/5 崩溃 vs 必然挂死"的权衡下是合理的选择 ——
+但如果超时后继续清理就会崩，那么**这个等待只是为了争取时间，不是修复**。
+
+**真正的修复必须让"不归零"变成"绝不清理"**
+
+即：`svm_core_cleanup` 应该**跳过**那些 `g_inVmrunCount` 不为零时对应的 VCPU，
+而不是无条件释放全部。但那需要 per-core 信息 —— 又回到"VpData 没有 core index"的问题。
+
+**替代方案**：`g_inVmrunCount != 0` 时**整个跳过 svm_core_cleanup**（泄漏 12 个 VCPU，
+但机器活着）。泄漏是已知代价，而崩溃不是。
+
+**下一次改动方向**
+
+```c
+{
+    extern int yghv_s206_invmrun_count(void);
+    int inside = 0;
+    /* wait up to 3000ms */
+    ...
+    if (inside != 0) {
+        /* 9.425: DO NOT FREE. A leaked VCPU is better than a bugcheck. */
+        yghv_ut_mark_val(53, (uint64_t)inside);
+        goto skip_core_cleanup;
+    }
+    svm_core_cleanup();
+skip_core_cleanup:;
+}
+```
+
+**代价明示**：每次卸载泄漏约 12 × 32KB ≈ 384KB 非分页内存，且 VMCB 页不释放。
+但那是**可测量、可预期**的泄漏，而 `0xD1` 是不可预期的事故。
+
+**为什么这次值得做**
+
+因为它把"修复"和"赌"分开了：等待是赌（可能超时），跳过是确定（不崩）。
+而泄漏的代价可以在下一次加载时回收 —— 或者干脆接受"卸载即泄漏"直到有更好的时机约束。
+
+**但今天不做了** —— 需要先确认 `g_inVmrunCount` 到底是什么值。
+而这次 dump 没生成，读不到。
