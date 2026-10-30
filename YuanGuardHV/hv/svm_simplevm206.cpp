@@ -19,6 +19,12 @@
 #include <ntifs.h>
 #include <stdarg.h>
 
+/* 9.436: the test guest, exported by svm_trampoline.asm with a plain C name.
+ * Declared at file scope (extern "C" cannot be spelled inside a block) so
+ * SvPrepareForVirtualization can point the guest's RIP at it. */
+extern "C" const uint8_t svm_trampoline_test_guest[];
+
+
 //
 // 9.246 step206-B seams (both gated; with the gates OFF this file is the
 // 206-A baseline verbatim). YGHV_206B_GNPT: take the nested page table root
@@ -790,6 +796,11 @@ static volatile LONG   g_BpInt3Intercept = 0;
  * addressable from the .asm. Nothing else about them changed, and the semantics
  * (request stays set until a fresh load) are unchanged from 9.412.
  */
+/* 9.435: how many times the guest's vmmcall was actually trapped. Zero would
+ * mean the intercept bit is still not taking effect - a different fix from
+ * "the bit works and the guest left". */
+static volatile LONG64 g_S206Vmmcalls = 0;
+
 extern "C" { volatile LONG g_VmrunStopRequested = 0; }
 /* How many VMRUN loops have taken the exit. The waiter needs a NUMBER, not a
  * flag: "I asked them to stop" and "they stopped" are different facts, and this
@@ -3263,6 +3274,30 @@ tsc_policy_done:;
             VpData->GuestVmcb.StateSaveArea.Rip = VpData->GuestVmcb.ControlArea.NRip;
         }
         break;
+    /*
+     * 9.435: VMMCALL IS THE TEST GUEST'S ONLY WAY BACK — AND IT HAD NO CASE.
+     *
+     * 9.434 established that the guest entry was SvVirtualizeProcessor's own
+     * continuation, which never executes an intercepted instruction, so vmrun
+     * never returned and the in-vmrun counter stayed at 12 forever.
+     *
+     * Arming VMMCALL (9.432/9.433, bit 1 per bhyve's table) is only half of it:
+     * this handler had no case for VMEXIT_VMMCALL, so a trapped vmmcall would
+     * fall into `default`, call yghv_fail_degrade, and bugcheck 0xE2 - turning
+     * "the guest can finally exit" into a new failure mode.
+     *
+     * What the trampoline guest does with vmmcall is a HEARTBEAT: mov rax,1 then
+     * vmmcall in a loop. So the case records the exit and lets the loop continue;
+     * it does not terminate the guest, because the guest is meant to keep running.
+     *
+     * The counter exists so "did vmmcall ever trap" is answerable from a dump
+     * rather than inferred: g_S206Vmmcalls at zero would mean the bit is still not
+     * taking effect, which is a different fix from "the bit works but the guest
+     * left".
+     */
+    case VMEXIT_VMMCALL /* 0x81 */:
+        InterlockedIncrement64(&g_S206Vmmcalls);
+        break;
     case VMEXIT_SHUTDOWN /* 0x7f */:
         //
         // 9.250c: the guest triple-faulted (SHUTDOWN state). With SHUTDOWN
@@ -3870,7 +3905,39 @@ SvPrepareForVirtualization (
     VpData->GuestVmcb.StateSaveArea.Cr4 = __readcr4();
     VpData->GuestVmcb.StateSaveArea.Rflags = ContextRecord->EFlags;
     VpData->GuestVmcb.StateSaveArea.Rsp = ContextRecord->Rsp;
+    /*
+     * 9.436: THE GUEST ENTRY IS THE TRAMPOLINE, EXPLICITLY - NOT THE CALLER'S RIP.
+     *
+     * 9.434 found this line assigning `ContextRecord->Rip`, which is the RIP of
+     * SvVirtualizeProcessor itself (captured moments earlier). So the "guest" was
+     * SvVirtualizeProcessor's own continuation: code that expects host state and
+     * contains SV_DEBUG_BREAK() / KeBugCheck and no intercepted instruction.
+     * Consequence measured across the whole session: vmrun never returned,
+     * SvHandleVmExit never ran (g_S206VrLog empty), the in-vmrun counter stayed at
+     * 12 forever, and every unload ended in 0xD1 / 0x7F PAGED_IP or 0x101.
+     *
+     * The trampoline is what a guest should be: three instructions that end in
+     * vmmcall, i.e. a guest that HANDS CONTROL BACK. With VMMCALL armed (9.433)
+     * and a case for it in the handler (9.435), the exit is now well defined.
+     *
+     * RSP is deliberately left as ContextRecord->Rsp: the trampoline uses no
+     * stack before its vmmcall, and pointing it at the host stack keeps the first
+     * exit's saved state consistent with what SvHandleVmExit expects.
+     *
+     * Kept behind the 206 gate: other build steps rely on transparent
+     * virtualisation (guest == caller's own continuation), which is the upstream
+     * semantic this line used to implement.
+     */
+#if YGHV_BAREMETAL_STEP == 206 && defined(YGHV_206B_COEXIST)
+    {
+        /* The declaration lives at file scope (see the 9.436 note there):
+         * extern "C" cannot be spelled inside a block. */
+        VpData->GuestVmcb.StateSaveArea.Rip =
+            (UINT64)(uintptr_t)&svm_trampoline_test_guest[0];
+    }
+#else
     VpData->GuestVmcb.StateSaveArea.Rip = ContextRecord->Rip;
+#endif
     VpData->GuestVmcb.StateSaveArea.GPat = __readmsr(IA32_MSR_PAT);
 
     //
