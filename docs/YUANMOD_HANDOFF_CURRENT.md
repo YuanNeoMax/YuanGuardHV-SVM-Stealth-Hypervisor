@@ -13280,3 +13280,96 @@ DriverUnload 执行到末尾
 挂住是不崩的唯一方式，而崩溃是复用已 unmap 的代码。**
 
 **用一个可控的挂起换一个不可控的 PAGED_IP 崩溃** —— 这次数据支持这个选择。
+
+---
+
+#### 9.429 `0x101 CLOCK_WATCHDOG_TIMEOUT` —— 挂住的代价被证实，但诊断也被证实
+
+**本次（21:20）**
+
+```
+BUGCHECK_CODE:  101
+BUGCHECK_P1:    0x10   (INTERRUPTS_DISABLED)
+FAILURE_BUCKET: CLOCK_WATCHDOG_TIMEOUT_INTERRUPTS_DISABLED_nt!KiSystemCall64
+服务状态:       STOPPED        <- sc stop 执行了
+```
+
+**`PAGED_IP` 消失了** —— 那个跑在已 unmap 代码页上的 `vmrun` 崩溃**没有再出现**。
+
+**这同时证实和否证了两件事**
+
+**证实的**：9.427 的诊断完全正确。`DriverUnload` 确实挂在了 9.428 加的
+无界等待里（`g_inVmrunCount != 0` 永不归零），**而且这正是阻止 `PAGED_IP` 的原因**。
+不是"碰巧没崩"，是那个核被留在了仍然有效的代码里。
+
+**否证的**：9.428 引用"挂住比崩溃好"这个判断，**代价比预想的大**。
+`P1 = 0x10 = INTERRUPTS_DISABLED` —— 自旋发生在**禁中断**的上下文里，
+跑满后触发 watchdog。所以：
+
+| 选择 | 结果 |
+|---|---|
+| 照常返回（9.427 前）| `0xD1` / `0x7F` `PAGED_IP` 崩​溃，5 次 |
+| 无界自旋（9.428）| `0x101` watchdog，1 次 |
+
+**两个都会崩。** 区别是 `0x101` 有明确原因（我的自旋），而 `PAGED_IP` 是复用了别人的代码页。
+
+**但这里有一个真正有价值的发现**
+
+`g_inVmrunCount` **永不归零**。这已经不是"偶尔某个核卡住"，而是**每次卸载都归不了零**。
+而 `lock dec` 在 `vmsave` 之后 —— 如果 `vmrun` 正常返回，`vmsave` 会执行，`dec` 也会执行。
+
+**所以 `vmrun` 从未正常返回过。**
+
+这与 9.410 的 `step=120 DONE`（卸载走完）并不矛盾：`DriverUnload` 走完它的 14 步，
+但**那个核的 `vmrun` 还在跑**，从未返回。
+
+**而 `vmrun` 为什么不返回？**
+
+`InterceptMisc2 bit32 = VMRUN 拦截`（9.402 读到 `0x00000003`）。
+若该核的 `vmrun` 被拦截，它会立刻 VMEXIT → 回到 `vmsave` → `dec`。
+**所以不该永不归零。**
+
+**唯一剩下的解释：那个核的 `vmrun` 真的进入了 guest，而 guest 不产生任何
+可中断的 VMEXIT。**
+
+而 `InterceptMisc1 bit18 = CPUID 拦截` 已武装 —— guest 执行 CPUID 应该会 VMEXIT。
+除非那个核的 VMCB 是**另一个核的**（`g_vcpus` 索引错位），或者它用的是**没有拦截位的 VMCB**。
+
+**这指向一个具体的、可检查的可能性：`Sv206LaunchVm` 用的 VMCB 与实际一致的核不匹配。**
+
+`Sv206LaunchVm(&vpData->HostStackLayout.GuestVmcbPa)` —— 传的是**那个核自己的** VMCB。
+而 `SvPrepareForVirtualization` 在 `SvVirtualizeProcessor` 里为该核设置拦截位。
+**如果 `SvVirtualizeProcessor` 在某个核上走了 `SvIsSimpleSvmHypervisorInstalled() == TRUE`
+分支（跳过 `Sv206LaunchVm`），那个核的 VMCB 就**从未被 VMRUN**，`inc/dec` 也不配对。
+
+**但 `inc` 只在 `SvLV10` 里，所以没跑 `Sv206LaunchVm` 的核不会 `inc`。**
+
+**这个方向也堵死了。**
+
+**必须承认：`g_inVmrunCount` 永不归零的确切原因，我不知道。**
+
+而它已经花掉两次额外的崩溃（`0x101` 这次）。
+
+**当前状态该往哪走**
+
+9.428 的无界等待必须撤掉 —— 它把一个 `PAGED_IP` 换成了 `0x101`，**没有净收益**，
+而且 `0x101` 的代价是整机 watchdog（更长的停机、更多状态丢失）。
+
+**回到 9.427 之前的状态**（有界等待 600ms + 跳过释放），那是：
+- 数据不释放（安全）
+- `DriverUnload` 会在 600ms 后返回
+- 然后 `PAGED_IP` 崩
+
+**或者**：把有界等待改回来，同时**让 `DriverUnload` 在该情况下不做最后一次
+`yghv_trace_close()` 和 `LOG_INFO`** —— 但那不改变 `PAGED_IP`。
+
+**真正的解法仍然是：让那个核的 `vmrun` 退出。**
+
+而这需要知道它为什么没退。**`g_inVmrunCount` 的值本身就是一个突破口**：
+如果它是 1，说明一个核卡住；如果是 12，说明所有核都卡住（那就不是竞态而是系统性错误）。
+
+**这个值就在 dump 里**（`g_inVmrunCount` 是 `extern "C"` 非 static，有符号），
+但本次 dump 只读得到栈和观测页。
+
+**下一步**：先读本次 dump 里的 `g_inVmrunCount`（如果 `.bss` 可达），
+再决定是撤掉无界还是改成有界。
