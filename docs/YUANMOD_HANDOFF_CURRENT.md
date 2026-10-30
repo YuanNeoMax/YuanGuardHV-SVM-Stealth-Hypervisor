@@ -12720,3 +12720,102 @@ SEH frame 找不到自己的栈指针。
 - 可以安全压栈
 
 而 `rcx` 必须在检查后恢复（它保存着原始栈指针，`SvLV20` 要用）。
+
+---
+
+#### 9.415 gate 测试：进度页只到 NOTIFY_OFF(10)，比之前更早
+
+**读到的**
+
+```
+pa=0xC7BD5000  (PA 记录成功)
+历史环:
+  order=1  step=0x0a (10)  NOTIFY_OFF
+  order=2  step=0x0a (10)  NOTIFY_OFF
+  order=2  step=0x0a (10)  NOTIFY_OFF
+当前 step 字段 = 0x0a (10)
+```
+
+**只有 3 条记录，全是 `NOTIFY_OFF(10)`，没有 `START(1)` 之后的任何东西。**
+
+`seq` 只涨到 2。对照 `DriverUnload` 的埋点顺序：
+
+```
+START(1) -> NOTIFY_OFF(10) -> [45/46/47 停止判断] -> COOP_UNLOAD(20) | 21
+  -> STOP_REQUESTED(30) -> ...
+```
+
+`START` 都只写了一次，而 `NOTIFY_OFF` 写了三次 —— **这本身就矛盾**：
+`yghv_ut_mark(YGHV_UT_START)` 和 `yghv_ut_mark(YGHV_UT_NOTIFY_OFF)` 在同一函数里
+各出现一次，不该出现"START 一次、NOTIFY_OFF 三次"。
+
+**最可能的解释：这个过程被执行了不止一次。** `DriverUnload` 被调用了两三回
+（本树有 `d->DriverUnload` 被覆盖两次的历史，9.389 记过），每次都是
+`START` 写进**同一个** slot（order 1 循环复用），所以看到的是最后一次覆盖的结果。
+
+**而 step 停在 10** 说明：**每次进入 `DriverUnload` 都在 `NOTIFY_OFF` 之后就出事了** ——
+在到达我的 stop 请求之前。
+
+**崩溃信息**
+
+```
+0x7F  P1=8  双故障
+SYMBOL_NAME: nt!KiDoubleFaultAbort+2d2      <- 不是我们的驱动
+PROCESS_NAME: wallpaperui.exe               <- 用户态进程
+```
+
+**这次的失败点比 9.410 更早，而且不是我们代码里的崩溃**
+
+9.410 是卸载走完 14 步（`step=120`）之后崩。这次**连 stop 请求都没到**
+（没有 45/46/47），说明 `NOTIFY_OFF` 之后那条路径上有东西立刻坏了。
+
+`NOTIFY_OFF` 之后紧接着就是：
+
+```c
+(void)PsSetCreateProcessNotifyRoutine(yghv_s206_process_notify, TRUE);
+yghv_ut_mark(YGHV_UT_NOTIFY_OFF);
+...
+yghv_s206_vmrun_stop_request();
+```
+
+**而 9.414 的改动让 `Sv206VmrunShouldExit` 在每一次 `SvLV10` 迭代都被调用。**
+
+**这可能是问题所在**：`SvLV10` 是每轮 VMRUN 之前的检查点。如果某个核在
+`DriverUnload` 一开始就已经在循环里高频迭代，那么 `Sv206VmrunShouldExit`
+会被高频调用 —— 而它是一个 `extern "C"` 的 C 函数，在 **GIF=0 的 VM-exit 帧**里
+执行，**它的序言/尾声可能触发栈检查**（`0x7F/8` 是双故障，`nt!KiDoubleFaultAbort`
+说明栈已经坏到无法处理异常）。
+
+**这与 9.413 的 `0x139 MISSING_GSFRAME_STACKPTR` 是同一族**：都是由"在 VM-exit 帧里
+调用 C 函数"引起的栈问题，只是这次表现在双故障而不是 GS frame 检查。
+
+**9.414 的静态验证漏了一件重要的事**
+
+我验证了：
+- `push rcx` / `pop rcx` 配对 ✓
+- `rsp` 指向空闲栈 ✓
+- `SvLV20` 只用 `rcx`/`rbx` ✓
+- 易失寄存器被避开 ✓
+
+**但我没有验证：`Sv206VmrunShouldExit` 这个 C 函数自己的栈需求。**
+
+它用 `InterlockedCompareExchange` / `InterlockedIncrement`，这些是 intrinsic，
+理论上不调外部函数。但 **MSVC 在 debug 或某些配置下会给函数加栈检查
+（`__chkstk`）或 SEH 序言**，而 VM-exit 帧里没有合法的 SEH 链。
+
+**这就是 9.413 那次 `MISSING_GSFRAME` 的真正来源** —— 不是我把栈压歪了（虽然也压歪了），
+而是 **C 函数的序言期望一个正常的 SEH 环境，而 VM-exit 帧里没有**。
+
+**结论：在这个 VM-exit 帧里调用任何 C 函数都是不可靠的**
+
+要在这里做检查，必须用**纯内联汇编**，或者把检查逻辑做成
+**不需要序言的 leaf function**（`__declspec(naked)` 或纯 asm）。
+
+**下一步的两个选项**
+
+1. **在 ASM 里直接做检查**（不调用 C）：`cmp dword ptr [g_VmrunStopRequested], 0` +
+   `lock inc dword ptr [g_VmrunStopped]`，全部内联，零序言
+2. 放弃在循环里做检查，回到 9.410 的状态（卸载走完 14 步后崩，但可观测）
+
+**选项 1 是正确的方向**，而且它的验证很干净：如果 `g_VmrunStopped` 变成 12，
+就说明检查生效了；而它不调 C 函数，所以不会有序言问题。
