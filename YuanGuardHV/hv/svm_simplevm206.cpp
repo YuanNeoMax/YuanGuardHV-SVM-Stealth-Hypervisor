@@ -3679,7 +3679,26 @@ SvPrepareForVirtualization (
     // CPU dying silently = the instant-reset failure mode.
     VpData->GuestVmcb.ControlArea.InterceptMisc1 |= (1u << 31);
 #endif
+    /*
+     * 9.432: ARM VMMCALL, WHICH THE TEST GUEST NEEDS TO EVER RETURN.
+     *
+     * 9.430/9.431 traced the whole session's failures to one missing bit:
+     * svm_trampoline.asm is `mov rax,1 / vmmcall / jmp` - vmmcall is the ONLY
+     * instruction that produces a #VMEXIT for that guest. Without its intercept
+     * the call is not trapped, no exit happens, vmrun never returns, and every
+     * downstream mechanism that assumes "there will be exits" quietly stops
+     * working:
+     *
+     *   SvHandleVmExit        never runs  (g_S206VrLog stayed empty all session)
+     *   the stop-flag check   never runs  (it sits on the loop's back-edge)
+     *   lock dec after vmsave never runs  (g_inVmrunCount = 12, forever)
+     *
+     * VMRUN and VMMCALL are adjacent bits of the same field, which is how a tree
+     * ends up with one and not the other: upstream intercepts both, because its
+     * design is "the guest hands control back with vmmcall".
+     */
     VpData->GuestVmcb.ControlArea.InterceptMisc2 |= SVM_INTERCEPT_MISC2_VMRUN;
+    VpData->GuestVmcb.ControlArea.InterceptMisc2 |= SVM_INTERCEPT_MISC2_VMMCALL;
 
     //
     // NOTE (9.244): the "205k discriminator" exception-interception block that

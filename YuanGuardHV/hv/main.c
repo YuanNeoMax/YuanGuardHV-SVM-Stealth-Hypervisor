@@ -5210,70 +5210,46 @@ after_vmrun_guard:;
      * g_trace_file) and after the watchdog join, immediately before the
      * final LOG_INFO. */
     /*
-     * 9.428: DO NOT LET DriverUnload RETURN WHILE A CORE IS STILL INSIDE vmrun.
+     * 9.432: THE UNBOUNDED WAIT IS GONE - ITS PREMISE WAS THE BUG.
      *
-     * 9.427 settled what the crash actually is: FAILURE_BUCKET
-     * AV_CODE_AV_STACKPTR_ERROR_**PAGED_IP**_yghv_pa, i.e. the faulting
-     * instruction pointer is in code that has been paged out. Not a freed VMCB.
-     * The driver's own code page stopped being valid while a core was still
-     * executing `vmrun` inside it.
+     * 9.428 waited forever here on the reasoning "a hang beats a bugcheck". That
+     * reasoning was sound given what was known then, and it cost one 0x101
+     * CLOCK_WATCHDOG_TIMEOUT to learn the actual cause: the counter could never
+     * reach zero because the guest's only exit instruction, vmmcall, had no
+     * intercept. Waiting forever on a counter that cannot move is not patience,
+     * it is a hang with extra steps.
      *
-     * 9.425 already stopped freeing VMCBs and NPT tables when the in-vmrun count
-     * was non-zero, and that guard WORKS - the data survived. It cannot help here,
-     * because the code unmap is done by the OS AFTER DriverUnload returns. A guard
-     * inside the function cannot protect code that is unmapped outside it.
+     * With VMMCALL armed (9.432), vmmcall traps, vmrun returns, vmsave runs,
+     * lock dec runs, and the counter reaches zero on its own within one guest
+     * iteration. So the wait needs to be a BOUNDED grace period again - long
+     * enough to cover one iteration, short enough that a genuinely stuck core
+     * cannot turn unload into a watchdog.
      *
-     * So the wait moves to the very end, just before the last two statements, and
-     * it is UNBOUNDED - deliberately, and this reverses 9.424's judgement.
-     *
-     * The reasoning the data now supports:
-     *
-     *   hang here            : the driver object stays loaded, the machine keeps
-     *                          running, sc stop never completes. Recoverable by
-     *                          hand, and nothing else on the system breaks.
-     *   return anyway        : code pages go away under a running vmrun, and the
-     *                          machine bugchecks with PAGED_IP - five times so far,
-     *                          0xD1 and 0x7F alike.
-     *
-     * A hang you can see beats a bugcheck you cannot catch. And in the normal case
-     * the loop leaves on the next interruptible VMEXIT, so this is not a spin that
-     * lasts - it is a spin that should not happen at all.
-     *
-     * The value is recorded before waiting, so a hang can still be diagnosed from
-     * a live kernel debugger, and the mark history says the code reached here.
+     * If it does time out, the value is recorded and unload proceeds: the
+     * VMCB/NPT guard of 9.425/9.426 still decides whether to free, so a stuck
+     * core leaks memory rather than being handed freed pages.
      */
     {
         extern int yghv_s206_invmrun_count(void);
 
+        ULONG waited = 0;
         int inside = yghv_s206_invmrun_count();
 
         yghv_ut_mark_val(55, (uint64_t)inside);
 
-        if (inside != 0) {
-            yghv_ut_mark(56);          /* 56 = arrived at the final wait with cores in */
-            /*
-             * The log line matters as much as the wait: without it, a hung sc stop
-             * looks identical to "the driver is fine and something else is wrong".
-             * LOG_ERROR goes through g_trace_file, which is still open at this point
-             * (yghv_trace_close is AFTER this block on purpose).
-             */
-            LOG_ERROR("DriverUnload: %d core(s) still inside vmrun; waiting "
-                      "before returning (returning now would unmap code they are "
-                      "executing)", inside);
-            for (;;) {
-                inside = yghv_s206_invmrun_count();
-                if (inside == 0)
-                    break;
-                {
-                    volatile ULONG spin;
-                    for (spin = 0; spin < 200000UL; spin++) { }
-                }
-            }
-            yghv_ut_mark(57);          /* 57 = the cores finally left */
+        while (inside != 0 && waited < 600) {
+            volatile ULONG spin;
+            for (spin = 0; spin < 200000UL; spin++) { }
+            waited += 1;
+            inside = yghv_s206_invmrun_count();
         }
+
+        yghv_ut_mark_val(56, (uint64_t)inside);
+        yghv_ut_mark_val(57, (uint64_t)waited);
     }
 
     yghv_trace_close();
+    LOG_INFO("DriverUnload");    yghv_trace_close();
     LOG_INFO("DriverUnload");
 }
 

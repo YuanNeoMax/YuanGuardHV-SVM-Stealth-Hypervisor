@@ -30,6 +30,30 @@
 #define SVM_INTERCEPT_MISC1_CPUID       (1UL << 18)
 #define SVM_INTERCEPT_MISC1_MSR_PROT    (1UL << 28)
 #define SVM_INTERCEPT_MISC2_VMRUN       (1UL << 0)
+
+/*
+ * 9.432: VMMCALL, WHICH THE TEST GUEST USES AS ITS ONLY EXIT.
+ *
+ * svm_trampoline.asm is three instructions:
+ *
+ *     svm_trampoline_test_guest:
+ *         mov  rax, 1        ; YGHV_CMD_HEARTBEAT
+ *         vmmcall            ; <-- the only thing that produces a #VMEXIT
+ *         jmp  svm_trampoline_test_guest
+ *
+ * Upstream SimpleSvm intercepts VMMCALL, because that is the whole mechanism its
+ * test guest uses to hand control back. This tree armed VMRUN (bit 0) and left
+ * VMMCALL (bit 2) out - and the two are adjacent in the same field, which is
+ * exactly how a copy of "one and a half of two related facts" looks.
+ *
+ * Measured consequence of the gap (9.430): the guest's vmmcall is not intercepted,
+ * so no #VMEXIT happens, vmrun never returns, the in-vmrun counter never drops,
+ * SvHandleVmExit never runs (g_S206VrLog was empty for a whole session), and
+ * DriverUnload hung on a counter that could not reach zero.
+ *
+ * Total bit 34 = Misc2 bit 2.
+ */
+#define SVM_INTERCEPT_MISC2_VMMCALL     (1UL << 2)
 #define SVM_NP_ENABLE_NP_ENABLE         (1UL << 0)
 
 /*
