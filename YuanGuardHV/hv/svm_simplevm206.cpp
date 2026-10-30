@@ -806,6 +806,33 @@ static volatile LONG   g_BpInt3Intercept = 0;
  * "the bit works and the guest left". */
 static volatile LONG64 g_S206Vmmcalls = 0;
 
+/*
+ * 9.441: AN UNCONDITIONAL VMEXIT COUNTER - THE ONE INSTRUMENT THIS TREE LACKED.
+ *
+ * 9.440 established that three of the four readings the 9.434 causal chain rests
+ * on are not measurements at all: g_S206VrLog only records protected-page write
+ * NPFs (it stays empty on a machine with nothing armed, no matter how many exits
+ * happen), g_VmrunStopped has no caller left (9.419 deleted the ASM check and the
+ * C counter stayed behind, so it is identically zero), and g_resident_thread_count
+ * is never written in 206-B (residents are not started).
+ *
+ * So "is there a #VMEXIT at all" - the most basic question about a hypervisor -
+ * had no instrument that could answer it. This is that instrument. It is
+ * incremented as the FIRST statement of SvHandleVmExit, before any branch, so it
+ * counts exits regardless of exit code, arming state, or which path the handler
+ * takes afterwards.
+ *
+ * What each reading will mean:
+ *   exits == 0                        -> the guest never traps. Look at the VMCB
+ *                                        intercept bits actually reaching hardware,
+ *                                        and at what the guest is executing.
+ *   exits > 0 and inVmrun == 12       -> exits happen but cores never come back
+ *                                        out of the VMRUN loop. That is a different
+ *                                        bug, and it lives in the exit path.
+ *   exits climbing at MHz rates       -> VMEXIT storm (self-trapping guest).
+ */
+extern "C" { volatile LONG64 g_S206Exits = 0; }
+
 extern "C" { volatile LONG g_VmrunStopRequested = 0; }
 /* How many VMRUN loops have taken the exit. The waiter needs a NUMBER, not a
  * flag: "I asked them to stop" and "they stopped" are different facts, and this
@@ -835,6 +862,20 @@ extern "C" int Sv206VmrunShouldExit(VOID)
     InterlockedIncrement(&g_VmrunStopped);
     return 1;
 }
+
+/*
+ * 9.441: THE ABOVE IS STILL UNCALLED, AND NOW THAT IS FINE.
+ *
+ * 9.419 deleted the ASM loop's check (see the note in svm_simplevm206_x64.asm),
+ * so this function has had no caller since - which is why g_VmrunStopped was
+ * identically zero and DriverUnload's wait could only time out (9.440).
+ *
+ * The stop check now lives in SvHandleVmExit, in C, where the stack is real.
+ * This function is kept because it is the correct semantic for a caller that
+ * runs INSIDE the ASM frame, and because deleting it would remove the only
+ * written statement of what that semantic is. It is not called; it is not
+ * counted on.
+ */
 
 /*
  * 9.422: A GLOBAL COUNT OF CORES THAT ARE INSIDE vmrun RIGHT NOW.
@@ -904,6 +945,18 @@ extern "C" LONG yghv_s206_cpuid_view_for_trace(VOID)
 extern "C" int yghv_s206_vmrun_stopped_count(VOID)
 {
     return (int)InterlockedCompareExchange(&g_VmrunStopped, 0, 0);
+}
+
+/* 9.441: the exit counter's read-only door, for the pre-teardown snapshot and
+ * for any control-plane readout. Returns the raw value. */
+extern "C" LONG64 yghv_s206_exits_count(VOID)
+{
+    return InterlockedCompareExchange64(&g_S206Exits, 0, 0);
+}
+
+extern "C" LONG64 yghv_s206_vmmcalls_count(VOID)
+{
+    return InterlockedCompareExchange64(&g_S206Vmmcalls, 0, 0);
 }
 
 extern "C" int yghv_s206_bp_int3_intercept(UINT32 on)
@@ -2146,6 +2199,16 @@ SvHandleVmExit (
     GUEST_CONTEXT guestContext;
     KIRQL oldIrql;
 
+    /*
+     * 9.441: THE EXIT COUNTER, FIRST STATEMENT, NO BRANCH BEFORE IT.
+     *
+     * This is the only place in the tree that observes "a #VMEXIT happened".
+     * Everything below it is conditional - exit-code switches, policy checks,
+     * the ExitVm path - so a counter placed anywhere later would be measuring
+     * one of those instead. See the note at g_S206Exits.
+     */
+    InterlockedIncrement64(&g_S206Exits);
+
     guestContext.VpRegs = GuestRegisters;
     guestContext.ExitVm = FALSE;
 
@@ -2177,6 +2240,38 @@ SvHandleVmExit (
      *
      * Nothing is left here on purpose: a second check would double-count
      * g_VmrunStopped and make the readout mean two different things again.
+     */
+    (void)0;
+
+    /*
+     * 9.441: THIS STAYS EMPTY, AND NOW THERE IS A REASON THAT IS NOT A GAP.
+     *
+     * 9.419 removed the ASM loop's stop check and left this handler empty because
+     * three attempts (9.413/9.414/9.416) had all died. Its reasoning was "a
+     * zero-call inline version crashed identically, so the check is not the cause
+     * and adding it buys nothing".
+     *
+     * The observation was right; the conclusion was wrong. All three attempts took
+     * the exit and then died in SvLV20's `mov rsp, rcx`, where RCX held 'SSVM'
+     * because of 9.383 (see the note at the Rcx assignment below). 9.383 landed
+     * BEFORE 9.413, so all three experiments ran on a machine whose exit path was
+     * already broken: they were not measuring the check, they were measuring the
+     * rsp bug.
+     *
+     * A STOP FLAG SET FROM HERE WOULD BE THE WRONG FIX ANYWAY, and that is the
+     * part 9.396/9.397 got wrong. Exiting through this path means SvLV20 does
+     * `mov rsp, rcx; mov ecx,'SSVM'; jmp rbx` - it needs RCX and RBX, so the
+     * handler must overwrite two guest registers at an ARBITRARY instruction
+     * boundary. For the CPUID-unload path that is safe by construction (the guest
+     * is inside `__cpuidex`, which declares RAX/RBX/RCX/RDX clobbered). For a
+     * stop flag it is not: the interrupted thread is arbitrary Windows code with
+     * live registers, and silently corrupting them is how you trade a known crash
+     * for an unknown one.
+     *
+     * So the loop is NOT stopped from here. It is stopped the way upstream stops
+     * it: SvDevirtualizeAllProcessors runs __cpuidex on each core, the CPUID traps,
+     * the CPUID_UNLOAD leaf sets ExitVm, and the core leaves with register
+     * clobbering that CPUID itself documents. See 9.441 in main.c.
      */
     (void)0;
 
@@ -3404,7 +3499,43 @@ tsc_policy_done:;
          * continuing after CPUID) would need is kept in RBX (NRip) and is not read
          * by the unloader.
          */
-        guestContext.VpRegs->Rcx = 'SSVM';
+        /*
+         * 9.441: 9.383's `Rcx = 'SSVM'` WAS A STACK-POINTER BUG. REVERTED.
+         *
+         * 9.383 replaced `Rcx = StateSaveArea.Rsp` with the literal 'SSVM' so that
+         * SvDevirtualizeProcessor's `registers[2] != 'SSVM'` check would pass. The
+         * check does need ECX, and 9.383 correctly noticed that this line was
+         * overwriting it - but it "fixed" that by putting a magic number into the
+         * register that SvLV20 uses as a STACK POINTER.
+         *
+         * The ASM, in order (svm_simplevm206_x64.asm):
+         *
+         *     test al, al
+         *     POPAQ                  ; <- pop rcx restores Rcx from GuestRegisters
+         *     jnz SvLV20
+         *   SvLV20:
+         *     mov rsp, rcx           ; <- RSP = 0x4D565353
+         *     mov ecx, 'SSVM'        ; <- and THEN ECX gets the magic value
+         *     jmp rbx
+         *
+         * POPAQ runs BEFORE the branch, so by the time `mov rsp, rcx` executes,
+         * RCX is exactly what this line wrote. 0x4D565353 is not a canonical
+         * address on x64 (bit 47 disagrees with bits 48-63), so the very next
+         * stack operation - and `jmp rbx` into kernel code that will touch the
+         * stack immediately - raises #GP.
+         *
+         * AND THE LINE WAS REDUNDANT: `mov ecx, 'SSVM'` in SvLV20 already writes
+         * the ack after restoring RSP. The CPUID leaf itself also sets
+         * registers[2] = 'SSVM' (9.378, see the note above), so
+         * SvDevirtualizeProcessor's check is satisfied twice over without this.
+         *
+         * So the original assignment is restored: the guest's own RSP, which is
+         * what SvLV20 has always documented it expects ("RCX = An original stack
+         * pointer to restore"). 9.383's comment above ("RSP is not lost") argued
+         * about the wrong function: it is true of SvDevirtualizeProcessor and
+         * irrelevant to SvLV20, which runs first and uses the same register.
+         */
+        guestContext.VpRegs->Rcx = VpData->GuestVmcb.StateSaveArea.Rsp;
         guestContext.VpRegs->Rdx = reinterpret_cast<UINT64>(VpData) >> 32;
 
         //
