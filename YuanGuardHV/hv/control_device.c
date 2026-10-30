@@ -1948,6 +1948,88 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
         status = STATUS_INVALID_PARAMETER;
         break;
     }
+    case IOCTL_YGHV_NPT_VIEW: {
+        /*
+         * 9.450 (Tier 7.1): what would a GUEST see at this physical page.
+         *
+         * The NPT is an identity map, so PA == GPA and one lookup answers it. Read
+         * only: this never writes an entry, which is why it is safe to call on a
+         * page that is mid-hide.
+         */
+        if (in_len >= sizeof(ULONG_PTR) &&
+            out_len >= YGHV_NPT_VIEW_OUT_QWORDS * sizeof(UINT64)) {
+            UINT64 *out = (UINT64 *)buf;
+            UINT64 pa = (UINT64)(*(ULONG_PTR *)buf);
+            UINT64 entry = 0;
+            int st;
+
+            extern npt_mgr_t g_npt;
+            extern int npt_get_entry(npt_mgr_t *m, uint64_t g, uint64_t *out);
+
+            st = npt_get_entry(&g_npt, pa, &entry);
+
+            if (st != STATUS_SUCCESS) {
+                out[0] = 0;
+                out[1] = 0;
+                out[2] = 0;
+                out[3] = 0;
+                out[4] = 0;
+                out[5] = 0x11;   /* not identity mapped (no entry reachable) */
+                info = YGHV_NPT_VIEW_OUT_QWORDS * sizeof(UINT64);
+                status = STATUS_SUCCESS;
+                break;
+            }
+
+            /*
+             * NPT entry bit layout (AMD NPT, same low 12 bits as a long-mode
+             * PTE): bit0 present, bit1 write, bit2 user, bit63 NX. The NPT uses
+             * "read" as the present bit itself - an entry with present=0 is
+             * simply not readable, which is how exclusion works here
+             * (npt_set_page_perm(g, 0) is what npt_exclude_pa calls).
+             */
+            {
+                UINT64 present = entry & 1ULL;
+                UINT64 writable = (entry >> 1) & 1ULL;
+                UINT64 nx = (entry >> 63) & 1ULL;
+                UINT64 frame = entry & 0x000FFFFFFFFFF000ULL;
+                UINT64 ps = (entry >> 7) & 1ULL;    /* large page */
+
+                out[0] = present;
+                out[1] = (present ? 1ULL : 0ULL) | (writable ? 2ULL : 0ULL) |
+                         ((present && !nx) ? 4ULL : 0ULL);
+                out[2] = frame;
+                out[3] = ps;
+
+                /*
+                 * 9.450: HOST VISIBILITY IS NOT THE NPT ENTRY - and getting this
+                 * wrong produced a false "LOCKED OUT" on the first run.
+                 *
+                 * The NPT is the GUEST's translation. Our own accesses go
+                 * through the HOST page tables (our CR3), which the NPT never
+                 * touches. So a hidden page is guest-present=0 while remaining
+                 * perfectly readable BY US through the RIP-whitelist ALLOW loop
+                 * - and the first version reported host=0 for those pages,
+                 * i.e. it declared a healthy hide to be the 9.343 lockout.
+                 *
+                 * The honest test is whether the frame can still be read from
+                 * here: try it and say what happened. Reads at DISPATCH are
+                 * fine through yghv_pa_read (MmCopyMemory).
+                 */
+                {
+                    uint8_t probe = 0;
+                    extern int yghv_pa_read(uint64_t pa, void *dst, SIZE_T len);
+
+                    out[4] = (UINT64)yghv_pa_read(frame ? frame : pa, &probe, 1);
+                }
+                out[5] = 0;
+            }
+            info = YGHV_NPT_VIEW_OUT_QWORDS * sizeof(UINT64);
+            status = STATUS_SUCCESS;
+            break;
+        }
+        status = STATUS_BUFFER_TOO_SMALL;
+        break;
+    }
     case IOCTL_YGHV_NPT_REMAP: {
         /* Tier 4 prerequisite: rewrite one NPT entry to a different frame.
          *

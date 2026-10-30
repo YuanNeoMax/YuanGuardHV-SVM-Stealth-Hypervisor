@@ -419,7 +419,64 @@ yghv_ctl.ps1 unload-trace   → page PA / last step / value
 | 6.1 | 启动期控制 | **需要重启，最后做且要确认** |
 | 其余 5.x / 6.x / 8.x | | 未做 |
 
-### 8.6 性能基准：`mem-bench`，实测 B 快 3.7–4.0×（9.449，Tier 1.5 完成）
+### 8.6 自我隐藏（Tier 7.1）：做完一半，另一半有明确下一步（9.450）
+
+**先做的是观测面，不是隐藏。** `npt_exclude_self` 一直存在，但没有任何东西能回答
+「X 号页现在到底被排除了没有」—— 而一个页完全可以在每个计数器上 `hidden=1`，
+NPT 条目却仍写着 present。
+
+```powershell
+yghv_ctl.ps1 npt-view <hex_pa>
+```
+
+NPT 是 identity map（`GPA == SPA`），一个 PA 一次查表。输出关键是一对字段：
+
+| `guest` | `host` | 含义 |
+|---|---|---|
+| 0 | 1 | **正确隐藏** —— guest 够不到，我们够得到 |
+| 0 | 0 | **把自己锁在外面**（9.343 的形态）|
+| 1 | * | 根本没隐藏 |
+
+**第一个假阴性就在这一对上**：第一版把 `host` 也做成「NPT present」，
+于是隐藏成功的页报 `host=0`，判成 `LOCKED OUT`。
+
+> 错在把两套翻译混成一个。NPT 是 **guest 的**翻译；我们走 **host 页表**（自己的 CR3），
+> NPT 管不到。隐藏页 `guest=0` 而我们照常可读，靠的是 RIP 白名单 ALLOW loop。
+> 改成「真的去读一次这个帧」后判据才正确。
+
+**实测结论**
+
+```
+hidden page:   guest present=0  host=1   -> HIDDEN（正确）
+驱动自己的页:  guest present=1  perm=RWX, frame=0xC6E00000 large=1
+               -> VISIBLE to the guest（未隐藏）
+```
+
+**驱动自己的页落在 2MB identity 大页里。** 这就是 `npt_exclude_self` 没起作用的原因：
+它只在 `if(!pd[p1].large_page)` 里剔页表页，**2MB 大页整段跳过**；
+而且它的设计范围只有 PML4/PDPT/PD 表页，**不含代码/数据页**。
+
+**诚实状态**
+
+| 面 | 状态 |
+|---|---|
+| `npt-view` 观测面 | **完成** |
+| 三张 guard 表页隐藏 + host 仍可读 | **完成并实测** |
+| 驱动代码/数据页逐页拆剔 | **未做**（见下）|
+| 符号链接 `\\.\YuanGuardHV` | 实测可见，未隐藏 |
+| 服务注册表键 / SCM 条目 | 实测可见，未隐藏 |
+| `loader_stealth` 模块摘链 | 代码在，默认 0，未验证 |
+
+**为什么代码页那一半不能顺手补**
+
+`HIDE_UNMAP` 清 present，访问即 NPF，由 RIP 白名单 ALLOW loop 服务。
+数据页可以（访问稀疏）；**代码页不行** —— 每条指令取指一次 VMEXIT，机器立刻不可用。
+DECOY 也不行（present 保持但指向全零，我们的取指会拿到零字节）。
+
+唯一可行方向是把驱动代码搬到 guest 从未映射过的物理区、NPT 里根本不建条目 ——
+那是 Tier 2.2 自建映射的**反向应用**，是独立的一轮工作，不是一个补丁。
+
+### 8.7 性能基准：`mem-bench`，实测 B 快 3.7–4.0×（9.449，Tier 1.5 完成）
 
 **`MEM_ENGINE_PLAN.md` 4.3 那张表写 `1–3× / 5–20× / ~100×` —— 从没有运行支撑。**
 现在有 `mem-bench`（IOCTL 0x82B）。
@@ -455,7 +512,7 @@ yghv_ctl.ps1 mem-bench <pid> <hex_pattern> [start_hex] [end_hex] [budget]
 **基准必须能报自己的失败**：第一版在无页范围上报 `26,594×` —— 纯属产物。
 现在输出 `walk_cr3`，且 `pages_visited==0` 时打 `INVALID`。
 
-### 8.7 VMEXIT 覆盖：206 主线已补到 35 个（9.448）
+### 8.8 VMEXIT 覆盖：206 主线已补到 35 个（9.448）
 
 **`MEM_ENGINE_PLAN_TIER5/6/8_9.md` 开头写「现成 VMEXIT 已实现 35 种」——
 那句话原本只对 `vmexit.c`（旧 resident 路径）成立。** 206 主线只有 12 个 case。

@@ -86,6 +86,10 @@ public class YghvCtl {
      * B is faster on large ranges; this is the command that times it instead of
      * asserting it. */
     private static final int FN_MEM_BENCH = 0x82B;
+    /* 9.450 (Tier 7.1): what a guest sees at one physical page. The claim "no
+     * guest scan finds our pages" was unreadable until this existed - a page can
+     * look hidden in every counter while its NPT entry still says present. */
+    private static final int FN_NPT_VIEW = 0x82C;
 
     private static native long openHandle();
     private static native void closeHandle(long handle);

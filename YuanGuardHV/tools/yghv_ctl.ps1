@@ -3436,6 +3436,57 @@ try {
                 Write-Host ("mem-view: {0} {1}" -f $v, $(if([BitConverter]::ToUInt64($out,0)){'OK'}else{'FAILED'}))
             }
         }
+        'npt-view' {
+            # 9.450 (Tier 7.1): what would a GUEST see at this physical page.
+            #
+            # The NPT is an identity map, so one PA is one GPA. Read-only: this
+            # never writes an entry, so it is safe to call on a page mid-hide.
+            #
+            # usage: npt-view <hex_pa>
+            #
+            # HOW TO READ IT
+            #   guest    present=0 means the guest CANNOT reach this frame - that is
+            #            what hiding means here.
+            #   host     must still be 1, or we locked OURSELVES out. The pair
+            #            (guest=0, host=1) is correct hiding; (0,0) is the 9.343
+            #            failure; (1,*) means not hidden at all.
+            if ($null -eq $Arg1) { throw 'npt-view: usage: npt-view <hex_pa>' }
+            $pa = [Convert]::ToUInt64(($Arg1 -replace '^0x',''), 16)
+            $req = [BitConverter]::GetBytes([uint64]$pa)
+            $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x82C)) `
+                                     -InBytes $req -OutputLength 48
+
+            $pres = [BitConverter]::ToUInt64($out, 0)
+            $perm = [BitConverter]::ToUInt64($out, 8)
+            $frame = [BitConverter]::ToUInt64($out, 16)
+            $large = [BitConverter]::ToUInt64($out, 24)
+            $hostv = [BitConverter]::ToUInt64($out, 32)
+            $code  = [BitConverter]::ToUInt64($out, 40)
+
+            if ($code -ne 0) {
+                Write-Host ("npt-view: pa=0x{0:X} -> state=0x{1:X} (not identity mapped)" -f $pa, $code)
+                return
+            }
+
+            $permStr = @()
+            if ($perm -band 1) { $permStr += 'R' }
+            if ($perm -band 2) { $permStr += 'W' }
+            if ($perm -band 4) { $permStr += 'X' }
+            if ($permStr.Count -eq 0) { $permStr = @('none') }
+
+            Write-Host ("npt-view: pa=0x{0:X}" -f $pa)
+            Write-Host ("  guest   : present={0}  perm={1}" -f $pres, ($permStr -join ''))
+            Write-Host ("  frame   : 0x{0:X}  large={1}" -f $frame, $large)
+            Write-Host ("  host    : {0}" -f $hostv)
+
+            if ($pres -eq 1) {
+                Write-Host '  VERDICT : VISIBLE to the guest - not hidden.'
+            } elseif ($hostv -eq 1) {
+                Write-Host '  VERDICT : HIDDEN - guest excluded, our access intact.'
+            } else {
+                Write-Host '  VERDICT : LOCKED OUT - guest and host both excluded (9.343).'
+            }
+        }
         'npt-remap' {
             # Tier 4 prerequisite (2026-10-11): rewrite one NPT entry so a GPA
             # points at a different frame, then let the caller observe whether

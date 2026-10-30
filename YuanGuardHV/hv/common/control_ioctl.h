@@ -300,6 +300,33 @@ typedef struct {
 #define IOCTL_YGHV_MEM_BENCH \
     YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x82B, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
 #define YGHV_BENCH_OUT_QWORDS 11
+
+/*
+ * 9.450 (Tier 7.1): ASK THE NPT WHAT A GUEST WOULD SEE AT ONE PHYSICAL PAGE.
+ *
+ * Tier 7.1's claim is "no guest scan can find our physical pages". Until this
+ * command there was no way to READ that claim: npt_exclude_self existed, but
+ * nothing could answer "is page X actually excluded right now". Re-hiding without
+ * being able to check is how a page ends up in the guard table's DECOY mode while
+ * the NPT entry still says present - a state that looks hidden from every
+ * counter and is visible to the guest.
+ *
+ * Input:  {ULONG_PTR pa}   (the NPT is an identity map, so PA == GPA)
+ * Output (6 QWORDs):
+ *   [0] entry present    1 = the guest can reach this frame
+ *   [1] permission       bit0 read, bit1 write, bit2 execute (0 = excluded)
+ *   [2] frame mapped     should equal pa under identity mapping
+ *   [3] large-page       1 = still a 2MB entry, so no split happened
+ *   [4] host-visible     1 = WE can still reach it (our mapping intact)
+ *   [5] state code       0 ok / 0x11 not identity mapped / 0x12 unknown
+ *
+ * The PAIR [0] and [4] is the point: guest-invisible AND host-visible is hidden
+ * correctly. Guest-invisible and host-invisible means we locked ourselves out
+ * (the 9.343 failure). Guest-VISIBLE means not hidden at all.
+ */
+#define IOCTL_YGHV_NPT_VIEW \
+    YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x82C, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
+#define YGHV_NPT_VIEW_OUT_QWORDS 6
 typedef struct {
     ULONG     pid;
     ULONG     pat_len;
