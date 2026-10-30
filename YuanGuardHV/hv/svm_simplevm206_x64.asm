@@ -20,9 +20,9 @@ extern SvHandleVmExit : proc
 ; the entry trampoline can call it; the name is unmangled because it is extern "C".
 extern Sv206VirtualizeC : proc
 
-; 9.444: per-core exit stack pointers. The entry trampoline fills the slot for its
-; own core before the loop starts; SvHandleVmExit reads it on every VMMCALL.
-extern g_S206ThreadRsp : qword
+; 9.444: the exit stack pointer, recorded by Sv206EnterHypervisor before the loop
+; starts and moved into the per-core VMCB by SvPrepareForVirtualization.
+extern g_S206PendingExitRsp : qword
 
 ; 9.422: the in-vmrun counter. Bumped before vmrun, dropped immediately after
 ; vmsave. The stop-flag externs of 9.416 are gone: those variables are static
@@ -493,17 +493,29 @@ Sv206LeaveToHost endp
 ; 9.444: THE ENTRY TRAMPOLINE - CAPTURE THE EXIT POINT, THEN ENTER THE LOOP.
 ; ============================================================================
 ;
-; Called as:  Sv206EnterHypervisor(SharedVpData, coreIndex)
+; Called as:  Sv206EnterHypervisor(SharedVpData)
 ;   rcx = SharedVpData   (forwarded to the C wrapper)
-;   rdx = core index     (selects the g_S206ThreadRsp slot to fill)
 ;
-; THE SLOT MUST BE FILLED BEFORE THE LOOP RUNS, NOT AFTER IT RETURNS.
+; THE SLOT LIVES IN THE VMCB, NOT IN A GLOBAL ARRAY.
 ;
-; An earlier revision took an `&exitRsp` out-parameter and stored it in C after this
-; function returned. That is too late: SvHandleVmExit reads g_S206ThreadRsp[core] on
-; every VMMCALL, including the very first one - by which time the slot must already
-; hold the exit stack. Writing it here, before the call into the loop, removes the
-; ordering dependency entirely.
+; An earlier revision kept a global table indexed by KeGetCurrentProcessorNumber().
+; That was wrong: the threads are pinned with KeSetSystemAffinityThread(1 << CoreIndex)
+; - a processor MASK - while KeGetCurrentProcessorNumber() returns a processor INDEX.
+; On this machine the two do not coincide, so SvHandleVmExit read the wrong slot and
+; handed SvLV20 a garbage stack. Measured: 0x50 PAGE_FAULT_IN_NONPAGED_AREA at
+; nt!MiSystemFault, faulting on what turned out to be string data.
+;
+; But this function runs BEFORE SvVirtualizeProcessor has created the VpData, so it
+; cannot address the VMCB yet. It therefore records the value into a single global
+; (g_S206PendingExitRsp) and SvPrepareForVirtualization - which runs later, on this
+; same core, and DOES have the VpData - moves it into ControlArea.HostExitRsp.
+;
+; That is safe because each core runs its own thread: there is exactly one
+; Sv206EnterHypervisor and one SvPrepareForVirtualization in flight per core, and
+; they are strictly ordered within it.
+;
+; The slot is written before the loop starts, because SvHandleVmExit reads it on the
+; very first VMMCALL.
 ;
 ; WHY THIS IS ASM AND NOT C
 ;
@@ -541,13 +553,12 @@ Sv206LeaveToHost endp
 Sv206EnterHypervisor proc
     sub     rsp, 8
     ;
-    ; Record where the CALL below will push its return address, into this core's
-    ; slot, BEFORE entering the loop - SvHandleVmExit reads it on the very first
-    ; VMMCALL and must find a valid stack there.
+    ; Record where the CALL below will push its return address. SvVirtualizeProcessor
+    ; has not created the VpData yet, so this goes to a global that
+    ; SvPrepareForVirtualization later moves into the VMCB (see the note above).
     ;
     lea     rax, [rsp - 8]
-    lea     r8, g_S206ThreadRsp
-    mov     qword ptr [r8 + rdx*8], rax
+    mov     qword ptr [g_S206PendingExitRsp], rax
     call    Sv206VirtualizeC
     add     rsp, 8
     ret

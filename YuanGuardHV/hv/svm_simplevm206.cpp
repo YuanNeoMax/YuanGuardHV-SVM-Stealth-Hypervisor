@@ -63,12 +63,24 @@ static volatile LONG g_S206CoresExited = 0;
  * driver-allocated stack, then a wrong offset) crashed the machine.
  */
 /*
- * 9.444: the entry trampoline writes this table directly (see Sv206EnterHypervisor
- * in the ASM), so it must be addressable from assembly - hence extern "C" and the
- * non-static form. It is written once per core before that core's loop starts, and
- * read by SvHandleVmExit on every VMMCALL.
+ * 9.444: the exit stack pointer, handed from the entry trampoline to
+ * SvPrepareForVirtualization.
+ *
+ * It cannot go straight into the VMCB because the trampoline runs BEFORE
+ * SvVirtualizeProcessor has created the VpData. So it waits here, and
+ * SvPrepareForVirtualization - which runs later, on this same core, and does have
+ * the VpData - moves it into ControlArea.HostExitRsp. Each core runs its own
+ * thread, so there is exactly one value in flight per core and the two steps are
+ * strictly ordered within it.
+ *
+ * Why not an array indexed by core: the threads are pinned with
+ * KeSetSystemAffinityThread(1 << CoreIndex) - a processor MASK - while
+ * KeGetCurrentProcessorNumber() returns a processor INDEX. Those do not coincide on
+ * this machine, and indexing by the wrong one made SvHandleVmExit hand SvLV20 a
+ * garbage stack pointer. Measured: 0x50 PAGE_FAULT_IN_NONPAGED_AREA at
+ * nt!MiSystemFault, faulting on string data.
  */
-extern "C" { volatile UINT64 g_S206ThreadRsp[SVM206_MAX_THREADS] = { 0 }; }
+extern "C" { volatile UINT64 g_S206PendingExitRsp = 0; }
 
 //
 // 9.246 step206-B seams (both gated; with the gates OFF this file is the
@@ -3678,27 +3690,30 @@ tsc_policy_done:;
         if (VpData->GuestVmcb.ControlArea.ExitCode == VMEXIT_VMMCALL)
         {
             /*
-             * 9.444: THE STACK POINTER MUST BE THE ONE THE TRAMPOLINE RECORDED.
+             * 9.444: THE STACK POINTER COMES FROM THIS CORE'S VMCB.
              *
-             * Sv206EnterHypervisor stored, immediately before its `call`, the address
-             * where that call pushed a return address. Handing exactly that to
-             * SvLV20 means `mov rsp, rcx` lands on the thread's own stack at the
-             * right frame, and Sv206LeaveToHost's single `ret` resumes the
-             * trampoline - which then returns normally into Sv206CoreThread.
+             * SvPrepareForVirtualization stored, into ControlArea.HostExitRsp, the
+             * address where the entry trampoline's call pushed a return address.
+             * Handing exactly that to SvLV20 means `mov rsp, rcx` lands on this
+             * thread's own stack at the right frame, and Sv206LeaveToHost's single
+             * `ret` resumes the trampoline - which then returns normally into
+             * Sv206CoreThread.
              *
              * Two earlier attempts failed here, both on the stack:
              *   9.443   used &VpData->HostStackLayout (driver memory) -> the
              *           scheduler faulted in KiSwapContext, 0x1E.
-             *   9.444a  used a function's own return-address slot instead of the
-             *           call site -> `ret` popped a saved register, 0x0E at
-             *           nt!KiStartSystemThread+0x34.
+             *   9.444a  used a global indexed by KeGetCurrentProcessorNumber() while
+             *           the thread was pinned by a processor MASK -> wrong slot,
+             *           garbage stack, 0x50 at nt!MiSystemFault.
              */
-            ULONG coreIndex = KeGetCurrentProcessorNumber() & (SVM206_MAX_THREADS - 1);
-            UINT64 threadRsp = g_S206ThreadRsp[coreIndex];
+            UINT64 threadRsp = VpData->GuestVmcb.ControlArea.HostExitRsp;
 
-            guestContext.VpRegs->Rcx = threadRsp;
-            guestContext.VpRegs->Rbx =
-                reinterpret_cast<UINT64>(&Sv206LeaveToHost);
+            if (threadRsp != 0)
+            {
+                guestContext.VpRegs->Rcx = threadRsp;
+                guestContext.VpRegs->Rbx =
+                    reinterpret_cast<UINT64>(&Sv206LeaveToHost);
+            }
         }
 
         //
@@ -4244,6 +4259,22 @@ SvPrepareForVirtualization (
     VpData->GuestVmcb.StateSaveArea.Rip =
         reinterpret_cast<UINT64>(&Sv206GuestStub);
     VpData->GuestVmcb.StateSaveArea.GPat = __readmsr(IA32_MSR_PAT);
+
+    /*
+     * 9.444: adopt the exit stack pointer the entry trampoline recorded.
+     *
+     * The trampoline runs before this function exists (SvVirtualizeProcessor has not
+     * created the VpData yet), so it leaves the value in g_S206PendingExitRsp and this
+     * is where it moves into the per-core VMCB. SvHandleVmExit then reads it straight
+     * from VpData with no index arithmetic - which is the point: the previous design
+     * indexed a global by KeGetCurrentProcessorNumber(), but the threads are pinned
+     * with a processor MASK, the two numbers differ on this machine, and the wrong
+     * slot meant SvLV20 got a garbage stack (0x50 at nt!MiSystemFault).
+     *
+     * A zero here would mean the entry did not come through the trampoline; the exit
+     * path checks for that rather than trusting it.
+     */
+    VpData->GuestVmcb.ControlArea.HostExitRsp = g_S206PendingExitRsp;
 
     //
     // Save some of the current state on VMCB. Some of those states are:
@@ -5148,9 +5179,7 @@ typedef struct _SV206_CORE_THREAD_CONTEXT
  * trampoline, which returns normally into Sv206CoreThread. Both returns are on this
  * thread's own stack, so PsTerminateSystemThread is legal at the end.
  */
-extern "C" LONG Sv206EnterHypervisor(
-    PSHARED_VIRTUAL_PROCESSOR_DATA SharedVpData,
-    ULONG CoreIndex);
+extern "C" LONG Sv206EnterHypervisor(PSHARED_VIRTUAL_PROCESSOR_DATA SharedVpData);
 
 /*
  * The C half of the entry: a real function so the trampoline has something to call
@@ -5182,10 +5211,40 @@ static VOID Sv206CoreThread(PVOID Context)
      * returns to this statement - both on the thread's own stack, which is what makes
      * the termination below legal. It also returns on the early-out and error paths.
      */
-    ctx->Status = Sv206EnterHypervisor(ctx->SharedVpData, ctx->CoreIndex);
+    ctx->Status = Sv206EnterHypervisor(ctx->SharedVpData);
 
     InterlockedIncrement(&g_S206CoresExited);
-    PsTerminateSystemThread(STATUS_SUCCESS);
+
+    /*
+     * 9.444: TERMINATE THE THREAD THROUGH A VOLATILE POINTER, NOT DIRECTLY.
+     *
+     * Written directly, the optimiser turns this into a tail call:
+     *     add rsp,20h ; pop rbx ; jmp PsTerminateSystemThread
+     * discarding this frame first. That is fine only while the callee truly never
+     * returns. If it does return - wrong IRQL, or a stack that is not this thread's
+     * own - there is no frame left, and the thread dies inside KiStartSystemThread.
+     * Measured: 0x50 PAGE_FAULT_IN_NONPAGED_AREA at nt!MiSystemFault, with
+     * nt!PspSystemThreadStartup+0x55 and this function's address on the stack.
+     *
+     * Going through a volatile pointer keeps the frame intact, so a failure returns
+     * here instead of walking off the stack, and the park loop below keeps the
+     * thread alive rather than letting it fall into the startup stub.
+     */
+    {
+        typedef NTSTATUS (*PFN_TERMINATE_THREAD)(NTSTATUS);
+        static PFN_TERMINATE_THREAD volatile terminateFn = &PsTerminateSystemThread;
+
+        terminateFn(STATUS_SUCCESS);
+    }
+
+    /* Only reached if the call above returned, which it should not. */
+    for (;;)
+    {
+        LARGE_INTEGER delay;
+
+        delay.QuadPart = -10000;    /* 1 ms, relative */
+        KeDelayExecutionThread(KernelMode, FALSE, &delay);
+    }
 }
 
 /*!

@@ -129,7 +129,26 @@ typedef struct _VMCB_CONTROL_AREA
     UINT64 AvicPhysicalTablePointer;    // +0x0f8
     UINT64 Reserved3;                   // +0x100
     UINT64 VmcbSaveStatePointer;        // +0x108
-    UINT8 Reserved4[0x400 - 0x110];     // +0x110
+    /*
+     * 9.444: host-private slot, NOT part of the AMD VMCB layout.
+     *
+     * The VMCB control area is 0x400 bytes and everything above +0x110 is reserved
+     * by the architecture, so the tail of Reserved4 is ours to use. This field holds
+     * the stack pointer SvLV20 must restore when a 206 guest is stopped - i.e. the
+     * address where the entry trampoline's call pushed a return address.
+     *
+     * It lives here rather than in a global array because a global needs an index,
+     * and the index was the bug: the threads are pinned with a processor MASK while
+     * KeGetCurrentProcessorNumber() returns a processor INDEX, and on this machine
+     * the two do not coincide. The VMCB is per-core and is already handed to
+     * SvHandleVmExit, so the value is reachable without any index at all.
+     *
+     * Reserved4 below still reserves the rest of the architectural hole; this field
+     * is carved out of its head and the array is shortened to match, so the struct
+     * size and every other offset are unchanged.
+     */
+    UINT64 HostExitRsp;                 // +0x110  (yghv-private, not AMD-defined)
+    UINT8 Reserved4[0x400 - 0x118];     // +0x118
 } VMCB_CONTROL_AREA, *PVMCB_CONTROL_AREA;
 static_assert(sizeof(VMCB_CONTROL_AREA) == 0x400,
               "VMCB_CONTROL_AREA Size Mismatch");
