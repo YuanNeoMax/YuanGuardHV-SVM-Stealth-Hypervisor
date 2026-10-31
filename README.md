@@ -126,6 +126,12 @@ yuanguard/
 | **206-C5** | 实进程试点（notepad 真实目标 + scan-pid/wpm-write）+ WPM 内核中介旁路定性实证 + 遥测环扩容 | ✅ |
 | **206-C6** | 假写路线：六条 NPT 冲刷路径全部证伪（Zen3 硬件事实）→ **换设计为周期同步守卫** | ✅ |
 | **C 线（周期同步守卫）** | **不翻转 NPT 权限**，后台轮询快照比对 + 漂移回滚；延迟 92s → **2.3s**（40×）；64 页 @20 polls/s 仅 **0.38% 单核** | ✅ |
+| **Tier 1.5 内存基准** | `mem-bench`：Engine A(`MmCopyVirtualMemory`) vs B(PTE walk + 直读)，实测 B 快 **3.7–4.0×** | ✅ |
+| **Tier 2.4 零拷贝窗口** | 4K NonPagedPool 共享页 + seqlock，guest/host 双向字节级验证，**零拷贝** | ✅ |
+| **Tier 7.1 自我隐藏** | 观测面 `npt-view`（UNMAP/DECOY/大页三判据）+ `sections` 段报告（含 IAT 定位）+ **`.pdata` 段隐藏实测通过** + guard 表页 + 符号链接自恢复 | ✅ |
+| **诊断指标** | `vmmcall` 计数 + 单核 `Rflags/VIntr/shadow/EventInj` 可读，`hlt` 类现象的判定从推测变为可验证 | ✅ |
+| **性能：VMEXIT 削减** | 修复 `VMEXIT_VMMCALL` 不推进 RIP 的真 bug，退出率 **1418 万/秒 → 738/秒（降 19,200 倍）** | ✅ |
+| **构建期检查** | `exit_rip_contract.ps1`：38 个 VMEXIT case 的 RIP 契约（三类断言）+ **自检**（每次构建注入缺陷证明能失败）| ✅ |
 | **缺陷 C** | `DriverUnload` 补 `yghv_trace_close()`（progress.log 句柄泄漏，A/B 因果证明） | ✅ |
 | 旧 B 路线 | 整机进 guest 的 APIC 虚拟化实验 | ⛔ 已由 206 通路取代（历史见 docs） |
 
@@ -301,15 +307,25 @@ run.bat state      # 用法与 PowerShell 客户端一致
 
 ## 测试
 
-- **静态校验**（构建自动执行）：`tests\run_static_checks.ps1`
-  - `ioctl_parity.ps1`：C 头文件 ↔ PowerShell/Java 客户端 IOCTL 编号一致（当前 C=21 / PS=21 / Java=21）；
-  - `command_parity.ps1`：README ↔ 客户端命令一致（当前 PS=34 / Java=18）；
-  - `safety_checks.ps1`：安全红线静态检查。
-- **VMEXIT 验证链**：VMMCALL 心跳（10000 轮）、NPT translate/perm/range/split 单测、NPF 注入恢复。
+- **静态校验**（构建自动执行）：`tests\run_source_checks.ps1`（源级）+ `tests\run_map_checks.ps1`（链接后）
+  - `ioctl_parity.ps1`：C 头文件 ↔ PowerShell/Java 客户端 IOCTL 编号一致（当前 **C=49 / PS=49 / Java=49**）；
+  - `command_parity.ps1`：README ↔ 客户端命令一致（当前 **PS=70 / Java=18**）；
+  - `safety_checks.ps1`：安全红线静态检查；
+  - `irql_contract_check.ps1`：IRQL 可达性与岛内约束；
+  - **`exit_rip_contract.ps1`**：38 个 VMEXIT case 的 RIP 契约 ——
+    ADVANCE（必须推进）/ INJECT（必须注入）/ HOLD（必须**不**推进）三类断言，
+    **附自检**：每次构建都往副本注入一次真缺陷，要求检查器必须抓到。
+    > 为什么需要它：`VMEXIT_VMMCALL` 漏写 `Rip = NRip` 很久没人发现，
+    > 因为它**没有失败模式** —— 机器正常启停，计数器在动，唯一症状是
+    > 「改参数没效果」，而那看起来像「这条指令在这个平台上不做事」。
+  - `page_layout_check.ps1`：隐藏表不与 guard 状态共页、岛内读区域页对齐。
+- **VMEXIT 验证链**：VMMCALL 心跳、NPT translate/perm/range/split 单测、NPF 注入恢复。
 - **实机回归**：物理机加载 → 双核心跳 → 保护测试 → 卸载（不重启）。
 - **C 线四步验证**（2026-10，推荐流程）：最小面（不 arm）→ 单页 → 16 页 → 64 页上限。
   脚本样例见 `docs/YUANMOD_HANDOFF_CURRENT.md` 9.304。
 - **痕迹自查**：`tools\yghv_stealth_check.ps1`（只读，输出 `[VISIBLE]`/`[CLEAN]` 清单）。
+  > 要传 `-ServiceName`：实际部署的服务名是 `yghvpa`，不是 `yuanguard`。
+  > 不传的话所有项都会报 `CLEAN` —— 因为它在查一个不存在的服务。
 - **调试通道**：`start_kd.ps1` / `run_kd.bat`（VM 串口命名管道连 KD）。
   ⚠️ 单机交互式内核调试**原理上不可行**（内核断点挂起整机），本机 NIC 亦不支持 KDNET ——
   详见 `docs/YUANMOD_HANDOFF_CURRENT.md` 9.296。
@@ -320,7 +336,8 @@ run.bat state      # 用法与 PowerShell 客户端一致
 
 | 文档 | 内容 |
 |---|---|
-| `docs/YUANMOD_HANDOFF_CURRENT.md` | 全程交接与决策记录（最高优先级，当前至 9.304） |
+| `docs/YUANMOD_HANDOFF_CURRENT.md` | 全程交接与决策记录（最高优先级，**当前至 9.471**） |
+| **`docs/RESUME_PROMPT.md`** | **★ 续接入口** —— 基线/雷区/方法论/加速查证 |
 | **`docs/KERNEL_API_CHECKLIST.md`** | **★ 写内核代码前必读** —— 三次蓝屏换来的 API 契约核对清单 |
 | `docs/YUANMOD_NEXT_WINDOW_PROMPT.md` | 新窗口接手提示词（基线/雷区/候选） |
 | `docs/TASKS.md` | 任务清单与 P0 复核结论 |
@@ -342,9 +359,21 @@ run.bat state      # 用法与 PowerShell 客户端一致
 5. **WPM 内核中介写旁路**：`WriteProcessMemory` 类内核 API 经 `MmCopyVirtualMemory`+`KeStackAttachProcess` 以"目标 CR3 + cpl=0"完成写，现行裁决（is_target_cr3 ‖ cpl==0 → ALLOW）无法区分它与内核合法写——已在实机定性实证（run_c17）。**此项不再是主线阻塞**（C 线走的是同步守卫路线）。
 6. **DENY 的 AV 报告地址为 VA 0**：精确 GVA 重建在实测平台不可实现（`MmGetVirtualForPhysical` 选择性失效 + 直接映射基址不可无故障验证，206c5g/h 两轮蓝屏学费已记录并回退）。DENY 语义本身无损（确定性递 AV、零风暴），CR2=0/ec P=0 为最终行为。
 7. **隐形是尽力而为**：内核驱动在真实 Windows 中加载，绝对隐形不现实；`loader_stealth` 默认关闭且未经 kd `!driver` 复核；不承诺绕过任何具体反作弊产品（ACE 仅尽力优化，不作验收标准）。
-8. **单机交互式内核调试不可行**：内核断点 = 挂起整个 OS（含调试器自身），且本机 NIC 不支持 KDNET。**唯一路径 = 第二台物理机**（详见 9.296）。
-9. **仓库卫生**：`reference/` 参考实现、历史日志归档等清理项未完成。
-10. **路线图**：真实产品目标（Minecraft/Forge）目标选择/页选取流程化 → R1 私有内存剔除 → `loader_stealth` 并入默认（先 kd 复核）→ MSR/IO/处理器层隐藏（需裸机/KVM）→ 产品化整合。
+   - **7.1 自我隐藏的边界（实测）**：`.pdata` 段可藏（guest 读零、host 可读）；
+     `.text` 与 `.rdata` **不可藏** —— 前者是取指页、后者含 IAT（实测崩溃
+     `0x3B C0000005, rip=0`，指令本身正确但目标被自己藏掉了）。`.data` 未试。
+8. **常驻虚拟化的 CPU 开销无法在本机消除（硬件约束）**：12 个核持续在 guest 里运行，
+   实测 **基线 29% → 加载后 100%**。已把 VMEXIT 从 1418 万/秒压到 **738/秒**（降 19,200 倍），
+   但**那降的是往返次数，不是核的工作量**。
+   - `hlt` 在本机**不能停住核**：`powercfg /availablesleepstates` 显示固件不提供
+     S1/S2（只有系统级 S3），无 C-state 可进，`hlt` 执行后立即返回。
+   - 真正的解法只有两条：① 不做常驻虚拟化（架构改动，且 NPT 保护会从常驻变成窗口式）；
+     ② 换一台有 C-state 的机器 —— 桩已是 `hlt + pause` 形态，到那时无需改代码。
+9. **单机交互式内核调试不可行**：内核断点 = 挂起整个 OS（含调试器自身），且本机 NIC 不支持 KDNET。**唯一路径 = 第二台物理机**（详见 9.296）。
+10. **仓库卫生**：`reference/` 参考实现、历史日志归档等清理项未完成。
+11. **路线图**：真实产品目标（Minecraft/Forge）目标选择/页选取流程化 → R1 私有内存剔除 → `loader_stealth` 并入默认（先 kd 复核）→ MSR/IO/处理器层隐藏（需裸机/KVM）→ 产品化整合。
+    - **7.1 收尾后**：段隐藏已完成，剩 `.data`（53 页，含活状态，风险最高）；
+      建议先做「PA → 所属段」查询再动它，否则藏错子区间会把自己弄坏。
 
 ---
 
