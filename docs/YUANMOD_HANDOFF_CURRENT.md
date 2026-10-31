@@ -15819,3 +15819,58 @@ RIP 修复后，hlt 才第一次真正被跑到。所以重测。
 **38 个 case / 13 个 fallthrough 组 / 3 类断言。**
 新增 case 而未分类时，检查器报 UNCLASSIFIED 并失败 ——
 这正是 `VMMCALL` 当年那个洞的形状。
+
+---
+
+#### 9.470 给检查器加自检：证明它「仍然能失败」
+
+##### 9.470.1 为什么检查器自己也需要被检查
+
+`exit_rip_contract.ps1` 写好后做过一次手工注入验证（删掉 `VMMCALL` 的 RIP 推进，
+确认它点名，再恢复）。**那次验证只活在这段对话里**，下次改检查器的解析逻辑，
+没有任何东西阻止它悄悄变成一个「永远通过」的检查器。
+
+**永远通过的检查器和正常工作的检查器，在出问题之前完全无法区分。**
+
+这个树的历史正好证明了这不是假想：
+- 第一版把「下一个 case」当 body 结尾 → 25 个假失败
+- 第二版只查 body 字面量 → `VMRUN` 假失败
+- 第三版窗口太窄 → `SvHandleMsrAccess` 假失败
+
+三次都是「检查器错了，代码是对的」。
+
+##### 9.470.2 实现：每次构建都注入一次缺陷
+
+自检在每次构建时：
+
+1. 从**真实源文件**里按结构定位 `VMEXIT_VMMCALL` 的 body（不靠行号，靠 case 组）
+2. 删掉那行 `Rip = NRip`，写到临时副本
+3. 通过 `YGHV_RIP_CONTRACT_OVERRIDE` 让**本脚本自己**跑那个副本
+4. 要求：退出码非 0，且输出**点名 `VMEXIT_VMMCALL`**、且含 `repeat this instruction forever`
+5. 清理临时文件，真实源文件从不被触碰
+
+复用脚本本身（而非另写一份逻辑）是关键 —— 否则自检测的是复制品，
+复制品可以和本体一起漂移。
+
+递归用 `YGHV_RIP_CONTRACT_SELFTEST_CHILD` 守卫，子进程不再自检。
+
+##### 9.470.3 写自检时踩的两个坑
+
+1. **`$ErrorActionPreference = 'Stop'` 让子进程的预期失败变成终止错误**：
+   - `2>&1 | Out-String` → 异常文本消失，只剩空串
+   - `(...) 2>$null | Out-String` → stdout 也消失（`[FAIL]` 行没了）
+   两者都导致自检报「failed for the wrong reason」，**而那时代码其实是好的**。
+   修正：改用 `cmd /c ... > log 2>&1` 写文件 —— 重定向由子进程自己的 shell 做，
+   没有管道的流交互。
+2. **`($a + $b -join x)` 在 PowerShell 里不解析**：混用 `..` 范围与 `-join`
+   放进同一对括号里是语法错误。改成先分别赋 `$head`/`$tail` 再 `-join`。
+
+##### 9.470.4 现在的构建输出
+
+    [RUN] exit_rip_contract.ps1
+      [PASS] VMEXIT RIP contract: every instruction case can reach NRip,
+             every injection case injects
+      [PASS] self-test: planted defect in VMEXIT_VMMCALL was caught
+    ALL SOURCE CHECKS PASS
+
+**「这个检查器还能失败」现在是每次构建都验证的事实，不是一段记忆。**

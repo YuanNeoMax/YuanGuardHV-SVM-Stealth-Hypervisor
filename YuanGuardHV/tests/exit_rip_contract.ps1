@@ -37,6 +37,14 @@ $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $svm = Join-Path $repoRoot 'hv\svm_simplevm206.cpp'
 
+# 9.470: the self-test at the end of this file plants a defect in a COPY and
+# re-runs this script against it through this variable. Reading the path from an
+# environment variable is what lets the self-test exercise THIS checker instead
+# of a reimplementation that could drift from it.
+if ($env:YGHV_RIP_CONTRACT_OVERRIDE -and (Test-Path $env:YGHV_RIP_CONTRACT_OVERRIDE)) {
+    $svm = $env:YGHV_RIP_CONTRACT_OVERRIDE
+}
+
 if (-not (Test-Path $svm)) {
     throw "exit_rip_contract: cannot find $svm"
 }
@@ -369,7 +377,7 @@ if ($unclassified.Count -gt 0) {
 }
 
 # Stale entries: a listed case that no longer exists is dead guidance.
-foreach ($listed in ($injectCases + $advanceCases)) {
+foreach ($listed in ($injectCases + $advanceCases + $holdCases)) {
     if (-not ($present | Where-Object { $_.Name -eq $listed })) {
         $failures += "$listed is listed in exit_rip_contract.ps1 but no longer exists in SvHandleVmExit"
     }
@@ -381,3 +389,134 @@ if ($failures.Count -gt 0) {
 }
 
 Write-Host '[PASS] VMEXIT RIP contract: every instruction case can reach NRip, every injection case injects'
+
+# ---------------------------------------------------------------------------
+# 9.470: SELF-TEST - prove this checker still detects the defect it was written
+# for, by planting that defect in a COPY and requiring the copy to FAIL.
+#
+# WHY A CHECKER NEEDS THIS
+# Measured history in this tree: the first version of this checker reported 25
+# false failures on a healthy tree (fallthrough groups cut in half), and later
+# versions reported two more false failures before the classification was right.
+# Then it was VERIFIED once by hand - the VMMCALL advance was deleted, the checker
+# named it, the file was restored - and that verification exists only in a
+# transcript. Nothing stops a future edit to the parser from silently turning the
+# checker into one that always passes.
+#
+# A checker that always passes is indistinguishable from a checker that works,
+# until it matters. So the ability to fail is now itself tested, on every build,
+# against a copy - the real source is never touched.
+#
+# WHAT IS PLANTED: the `Rip = NRip` line inside VMEXIT_VMMCALL's body. It is
+# located structurally (by the case group), not by line number, so the self-test
+# keeps working when the file shifts.
+# ---------------------------------------------------------------------------
+
+$selfTestFailures = @()
+#
+# RECURSION GUARD: the self-test re-runs this same script. Without this flag the
+# child would run its own self-test, which would run its own... The flag says
+# "this run IS the self-test's child; do not self-test again".
+#
+if (-not $env:YGHV_RIP_CONTRACT_SELFTEST_CHILD) {
+try {
+    $copy = Join-Path $env:TEMP ("exit_rip_selftest_" + [guid]::NewGuid().ToString('N') + ".cpp")
+
+    # Find VMEXIT_VMMCALL's body in the real file, then remove its advance line
+    # from the copy.
+    $vmcallGroup = $groups | Where-Object { $_.Names -contains 'VMEXIT_VMMCALL' } | Select-Object -First 1
+    if (-not $vmcallGroup) {
+        $selfTestFailures += 'VMEXIT_VMMCALL group not found - cannot plant the defect'
+    }
+    else {
+        $advanceLine = -1
+        for ($i = $vmcallGroup.BodyStart; $i -lt $vmcallGroup.BodyEnd; $i++) {
+            if ($lines[$i] -match 'StateSaveArea\.Rip\s*=' -and $lines[$i] -notmatch '==') {
+                $advanceLine = $i
+                break
+            }
+        }
+        if ($advanceLine -lt 0) {
+            $selfTestFailures += 'VMEXIT_VMMCALL has no advance line to remove - the body already violates the contract'
+        }
+        else {
+            # Build the mutated copy as: lines before the advance, then lines after
+            # it. Written as two range expressions assigned separately because a
+            # single expression mixing `..` ranges with `-join` inside one set of
+            # parentheses does not parse (PowerShell reads `($a + $b -join x)` as a
+            # malformed parenthesised expression).
+            $head = @()
+            if ($advanceLine -gt 0) {
+                $head = $lines[0..($advanceLine - 1)]
+            }
+            $tail = @()
+            if ($advanceLine + 1 -lt $lines.Count) {
+                $tail = $lines[($advanceLine + 1)..($lines.Count - 1)]
+            }
+            $mutated = ($head + $tail) -join "`n"
+            Set-Content -Path $copy -Value $mutated -Encoding UTF8 -NoNewline
+
+            # Re-run the same logic against the mutated copy. Reusing the script
+            # itself (via an env var pointing at a substitute path) is the honest
+            # way: it tests THIS checker, not a reimplementation of it.
+            $env:YGHV_RIP_CONTRACT_OVERRIDE = $copy
+            $env:YGHV_RIP_CONTRACT_SELFTEST_CHILD = '1'
+
+            # Capture the child through a FILE, not through a pipeline.
+            #
+            # Measured dead ends on the way here, both producing false alarms about
+            # a checker that was actually working:
+            #   `2>&1 | Out-String`          -> the exception text vanished, leaving ''
+            #   `(...) 2>$null | Out-String` -> stdout vanished too (the [FAIL] lines)
+            # $ErrorActionPreference='Stop' in this scope makes the child's EXPECTED
+            # `throw` a terminating error here, and PowerShell's handling of that
+            # inside a pipeline swallowed one stream or the other.
+            # A redirect inside a cmd line has no such interaction - it is the
+            # child's own shell doing the writing.
+            $logPath = Join-Path $env:TEMP ("exit_rip_selftest_" + [guid]::NewGuid().ToString('N') + ".log")
+            $cmdLine = '/c powershell -NoProfile -ExecutionPolicy Bypass -File "' +
+                       $PSCommandPath + '" > "' + $logPath + '" 2>&1'
+            $childExit = 0
+            try {
+                $null = & cmd.exe $cmdLine
+                $childExit = $LASTEXITCODE
+            }
+            catch {
+                $childExit = 1
+            }
+
+            $all = ''
+            if (Test-Path $logPath) {
+                $all = Get-Content $logPath -Raw
+                Remove-Item $logPath -Force -ErrorAction SilentlyContinue
+            }
+
+            $env:YGHV_RIP_CONTRACT_OVERRIDE = $null
+            $env:YGHV_RIP_CONTRACT_SELFTEST_CHILD = $null
+
+            if ($childExit -eq 0) {
+                $selfTestFailures += 'the mutated copy PASSED - the checker accepted a tree with the VMMCALL advance removed'
+            }
+            elseif ($all -notmatch 'VMEXIT_VMMCALL') {
+                $selfTestFailures += "the mutated copy failed but never named VMEXIT_VMMCALL (child output: $($all.Trim()))"
+            }
+            elseif ($all -notmatch 'repeat this instruction forever') {
+                $selfTestFailures += "the mutated copy named VMEXIT_VMMCALL but not the RIP-contract reason (child output: $($all.Trim()))"
+            }
+            else {
+                Write-Host '[PASS] self-test: planted defect in VMEXIT_VMMCALL was caught'
+            }
+        }
+    }
+}
+finally {
+    if ($copy -and (Test-Path $copy)) { Remove-Item $copy -Force -ErrorAction SilentlyContinue }
+    $env:YGHV_RIP_CONTRACT_OVERRIDE = $null
+    $env:YGHV_RIP_CONTRACT_SELFTEST_CHILD = $null
+}
+}   # end of the RECURSION GUARD
+
+if ($selfTestFailures.Count -gt 0) {
+    foreach ($f in $selfTestFailures) { Write-Host "[FAIL] $f" }
+    throw "exit_rip_contract: self-test failed"
+}
