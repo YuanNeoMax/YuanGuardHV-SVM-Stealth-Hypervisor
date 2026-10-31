@@ -4144,6 +4144,31 @@ tsc_policy_done:;
      */
     case VMEXIT_VMMCALL /* 0x81 */:
         InterlockedIncrement64(&g_S206Vmmcalls);
+
+        /*
+         * 9.465: ADVANCE RIP - and this is the bug that made every "slow the stub
+         * down" attempt look like it did nothing.
+         *
+         * Measured shape: the stub was `mov ecx,1000000 / pause... / vmmcall /
+         * jmp`, vmmcall stayed at ~12.6 MILLION per second no matter how large
+         * the counter was, and 100000 vs 1000000 pauses changed the rate by
+         * nothing at all. The reason is this case: it counted the exit and broke,
+         * WITHOUT writing Rip = NRip. So VMRUN re-entered the guest at the SAME
+         * `vmmcall` instruction every time. The counter and the whole pause loop
+         * ahead of it were never executed - not once, after the first pass.
+         *
+         * That also explains why 9.462/9.463/9.464 all measured ~12-14 million
+         * exits regardless of what the stub did: they were measuring a loop that
+         * ran a single instruction, so every change to the surrounding code was
+         * invisible.
+         *
+         * The pattern is the same one this tree already documented for every
+         * other boundary exit (the 9.448 block above advances RIP for exactly
+         * this reason): an intercept that does not advance RIP turns the guest
+         * into an infinite repetition of the intercepted instruction.
+         */
+        VpData->GuestVmcb.StateSaveArea.Rip = VpData->GuestVmcb.ControlArea.NRip;
+
         if (Sv206VmrunShouldExit() != 0)
         {
             guestContext.ExitVm = TRUE;

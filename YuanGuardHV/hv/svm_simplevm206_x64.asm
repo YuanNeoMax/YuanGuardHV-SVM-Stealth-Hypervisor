@@ -404,7 +404,6 @@ SvInvlpgaByVa endp
 ; property that makes a stub safe to enter on a stack that belongs to the host.
 ;
 Sv206GuestStub proc
-Sv206Spin:
     ; 9.464: HLT FOLLOWED BY VMMCALL - the root fix, and why neither alone worked.
     ;
     ; THE PROBLEM, STATED EXACTLY
@@ -447,10 +446,42 @@ Sv206Spin:
     ; exactly the hang 9.462 produced, so this is the assumption to check first if
     ; a future change makes the stub stop leaving hlt.
 Sv206GuestTick:
-    hlt                         ; (1) stop consuming cycles; wakes on any interrupt
+    ; 9.465: hlt stays (harmless, and instantly correct on a C-state-capable
+    ; machine) but it does NOT park here, because this platform has no C-state:
+    ; measured with powercfg, only S3 exists - no C1/C2/C3. With no C-state to
+    ; enter, hlt returns immediately and the loop below is what actually keeps
+    ; the core occupied. See 9.464 for the four-part proof that every hlt wake
+    ; condition (IF=1, VIntr=0, shadow=0, EventInj=0) was already satisfied and
+    ; hlt still returned on every pass.
+    ;
+    ; THE COUNT IS THE WHOLE TUNING KNOB. Measured relationship on this machine:
+    ;   no pause loop        -> ~12.6 MILLION exits/s   (0.95us per iteration)
+    ;   100000 pause         -> ~13.7 million exits/s   (did not help: see below)
+    ;
+    ; Why 100000 pause changed nothing: `pause` on this AMD core is ~1-3 cycles,
+    ; not the ~30 that ended up in an earlier estimate, so 100000 of them is a
+    ; quarter of a microsecond - invisible next to the VMRUN round trip it sits
+    ; inside. The delay has to be two orders of magnitude larger to matter.
+    ;
+    ; 1000000 pause at ~2 cycles each is ~2M cycles at 3GHz ~= 0.7ms per
+    ; iteration, so ~1400 exits/s per core, ~17000/s across twelve cores. That is
+    ; below any rate a guest could notice, while a stop request is still seen
+    ; within a millisecond - faster than the old 4-pause loop ever was.
+    ;
+    ; WHAT THIS DOES NOT FIX, STATED PLAINLY: the core still spins, so CPU stays
+    ; at 100%. This changes how often the core reports in, not whether it works.
+    ; Genuinely freeing the core needs C-states (absent) or not-virtualising it
+    ; (a different architecture). Chosen deliberately per operator direction.
+Sv206Spin:
+    hlt                         ; free on a C-state machine; a no-op here
+    mov     ecx, 1000000
+Sv206SpinLoop:
+    pause
+    dec     ecx
+    jnz     Sv206SpinLoop
     mov     rax, 1              ; YGHV_CMD_HEARTBEAT - "awake, check the flag"
-    vmmcall                     ; (2) EVERY wake becomes one VMEXIT
-    jmp     Sv206GuestTick
+    vmmcall                     ; the ONE intercepted instruction, now rare
+    jmp     Sv206Spin
 
     ; Reached only when the handler set ExitVm and SvLV20 resumed us here with
     ; SVM already disabled.
