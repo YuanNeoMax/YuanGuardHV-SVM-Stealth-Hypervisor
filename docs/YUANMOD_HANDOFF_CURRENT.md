@@ -15746,3 +15746,76 @@ RIP 修复后，hlt 才第一次真正被跑到。所以重测。
 （同组 fallthrough 的 25 个指令型 case 共用一个 `break`，NPF 则是一个大块）。
 所以暂不加入自动化检查，改为把这份审计表写进文档，
 下次动 handler 时对照。
+
+---
+
+#### 9.469 ★★★★ 把「VMMCALL 漏推进 RIP」这类缺陷做成构建期检查
+
+##### 9.469.1 为什么这类缺陷必须自动化
+
+`VMMCALL` 漏了 `Rip = NRip` 很久没人发现，因为**它没有失败模式**：
+
+- 机器正常启动、运行、卸载干净
+- 计数器在动，而且动得很快、很稳定
+- 唯一的症状是「某个参数没有效果」
+
+而「参数没有效果」会被读成「那条指令在这个平台上不做事」——
+9.464 正是这样错误地判定 `hlt` 是 nop。**没有枚举，就没有发现的机会。**
+
+##### 9.469.2 三类 case，三种相反的断言
+
+写这个检查时最大的价值不是"通过"，而是**逼出分类**：
+
+| 类别 | 断言 | 例子 |
+|---|---|---|
+| **ADVANCE** | 必须写 `StateSaveArea.Rip = NRip` | CPUID、MSR、RDTSC、25 个指令型、**VMMCALL** |
+| **INJECT** | 必须注入事件（可直接或经handler） | NPF、VMRUN、INTR、NMI |
+| **HOLD** | **必须不写 RIP** | #BP、#DB、SHUTDOWN |
+
+**HOLD 这一类是我最初没想到的**，而且它是三个类别里唯一断言"不写"的：
+
+- `#BP`/`#DB` 是 **trap**：保存的 RIP 已指向下一条。
+  APM 规定 exception VMEXIT 的 NRIP = RIP+1（一个字节），
+  所以 `Rip = NRip` 会让 guest **从指令中间恢复**。
+  这棵树在 9.254 实测过这个后果："RIP=NRip 从指令中间恢复 →
+  guest 流被破坏 → 两轮 selftest 都死在稳定的 AccessViolationException"。
+- `SHUTDOWN` 根本不 resume（`S206RecordFatal` + `yghv_fail_degrade`），
+  问它"注入吗""推进吗"都是错的问题。
+
+##### 9.469.3 检查器自己出过的三次错（都记下来）
+
+写这个检查的过程本身验证了它要防的东西：
+
+1. **把"下一个 case"当 body 结尾** → 25 个 fallthrough 共用一个 body 的 case
+   全部被切成空体，报 25 个假失败（含这棵树早已手工验证过的四个）。
+   **一个把好树报成坏的检查器比没有更糟**——它会训练人忽略它。
+   修正：连续 case 标签合并成一组，body 从最后一个标签之后算。
+2. **只查 body 字面量** → `VMRUN` 的 body 是 `SvHandleVmrun(...)`，
+   注入在被调函数内部，于是误报。修正：允许跟踪一层调用。
+3. **给的窗口太窄** → 审计 `SvHandleMsrAccess` 时用 `[2430,2520)` 搜不到
+   RIP 推进（实际在 2537），一度判为第二处缺陷。
+   修正：检查器从**函数定义推到 `^}`**，不猜窗口。
+
+##### 9.469.4 关键验证：它抓得住那个真实的 bug
+
+写好后做了一次**注入测试**：手工删掉 `VMMCALL` 的 `Rip = NRip`，
+检查器输出：
+
+    [FAIL] VMEXIT_VMMCALL (line 4145) is an instruction case but its body
+           cannot reach StateSaveArea.Rip = NRip - the guest will repeat
+           this instruction forever
+
+**精确点名 case 与行号。** 恢复源码后 `[PASS]`。
+一个从不失败的检查器等于没有，所以这一步是它的价值证明。
+
+##### 9.469.5 现状
+
+已接入 `tests/run_source_checks.ps1`，构建期第 5 项检查：
+
+    [RUN] exit_rip_contract.ps1
+      [PASS] VMEXIT RIP contract: every instruction case can reach NRip,
+             every injection case injects
+
+**38 个 case / 13 个 fallthrough 组 / 3 类断言。**
+新增 case 而未分类时，检查器报 UNCLASSIFIED 并失败 ——
+这正是 `VMMCALL` 当年那个洞的形状。

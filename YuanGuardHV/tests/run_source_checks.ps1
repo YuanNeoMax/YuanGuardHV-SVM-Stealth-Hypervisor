@@ -14,7 +14,14 @@ $scripts = @(
     'ioctl_parity.ps1',
     'command_parity.ps1',
     'safety_checks.ps1',
-    'irql_contract_check.ps1'
+    'irql_contract_check.ps1',
+    # 9.469: every #VMEXIT case in SvHandleVmExit must satisfy its RIP contract.
+    # VMMCALL violated it for a long time and nothing noticed, because the
+    # violation has no failure mode - the machine boots, runs, unloads cleanly,
+    # and a counter moves. The only symptom is that a parameter has no effect,
+    # which reads as "that instruction is a no-op here" (9.464 concluded exactly
+    # that about hlt, wrongly). This check is what makes such a hole visible.
+    'exit_rip_contract.ps1'
 )
 
 foreach ($script in $scripts) {
