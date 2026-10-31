@@ -225,8 +225,29 @@ int yghv_guard_add_va(const void *va, uint32_t len, const char *tag, int hide) {
         }
     }
 
+    /*
+     * 9.480: CLAIM THE SLOT ATOMICALLY, NOT BY LOOKING AND THEN WRITING.
+     *
+     * This used to read `active` with a CAS(=0,0) and then fill fields
+     * unprotected, publishing `active = 1` only at the end. Reading is not
+     * claiming: two threads can both observe the same slot free, both fill it,
+     * and both publish. The second overwrites the first's digest, gpa and tag,
+     * and the count is incremented twice for one slot.
+     *
+     * The consequence is not a crash but something harder to see: a guard the
+     * caller believes it armed holds ANOTHER page's hash, so `verify` reports a
+     * change on a page nobody touched and stays silent about the one that was
+     * modified. The whole purpose of this table is to answer "did this page
+     * change", and a duplicate claim makes it answer wrongly while looking fine.
+     *
+     * Fix: observation and claim become one operation - CAS 0 -> 2 ("claimed,
+     * still being filled"). Only the winner proceeds. `active` is published as 1
+     * at the end, and every reader tests truthiness rather than the literal
+     * value, so 2 already counts as occupied: a half-filled slot can never be
+     * read as free and cannot be handed out twice.
+     */
     for (i = 0; i < YGHV_GUARD_MAX; i++) {
-        if (!InterlockedCompareExchange(&g_guard[i].active, 0, 0)) {
+        if (InterlockedCompareExchange(&g_guard[i].active, 2, 0) == 0) {
             slot = i;
             break;
         }
@@ -238,6 +259,14 @@ int yghv_guard_add_va(const void *va, uint32_t len, const char *tag, int hide) {
         uint8_t sha[YGHV_SHA256_DIGEST];
         if (!yghv_guard_hash_va(va, len, sha)) {
             InterlockedIncrement64(&g_g_hashfail);
+            /* 9.480: RELEASE THE CLAIM. Before the CAS-claim change this slot
+             * was still active==0 on every failure path, so returning leaked
+             * nothing. Now that the slot is claimed with active==2 BEFORE the
+             * hash is taken, every early return must hand it back or it stays
+             * "claimed, being filled" forever - invisible to `list` (which skips
+             * 2) and never reusable, so repeated failures exhaust the table and
+             * look like "the guard table is full" on a table that is empty. */
+            InterlockedExchange(&g_guard[slot].active, 0);
             return -5;
         }
         RtlCopyMemory(g_guard[slot].digest, sha, YGHV_SHA256_DIGEST);
@@ -671,7 +700,10 @@ static int yghv_guard_find(uint64_t gpa) {
     int i;
 
     for (i = 0; i < YGHV_GUARD_MAX; i++) {
-        if (InterlockedCompareExchange(&g_guard[i].active, 0, 0) &&
+        /* 9.480: `== 1`, not truthiness. A slot in the "claimed, being filled"
+         * state still carries the PREVIOUS owner's gpa, so a truthiness test can
+         * match the wrong slot and hand a caller somebody else's entry. */
+        if (InterlockedCompareExchange(&g_guard[i].active, 0, 0) == 1 &&
             g_guard[i].gpa == page)
             return i;
     }
@@ -745,8 +777,29 @@ int yghv_guard_add_range(uint64_t gpa, uint32_t off, uint32_t len,
         }
     }
 
+    /*
+     * 9.480: CLAIM THE SLOT ATOMICALLY, NOT BY LOOKING AND THEN WRITING.
+     *
+     * This used to read `active` with a CAS(=0,0) and then fill fields
+     * unprotected, publishing `active = 1` only at the end. Reading is not
+     * claiming: two threads can both observe the same slot free, both fill it,
+     * and both publish. The second overwrites the first's digest, gpa and tag,
+     * and the count is incremented twice for one slot.
+     *
+     * The consequence is not a crash but something harder to see: a guard the
+     * caller believes it armed holds ANOTHER page's hash, so `verify` reports a
+     * change on a page nobody touched and stays silent about the one that was
+     * modified. The whole purpose of this table is to answer "did this page
+     * change", and a duplicate claim makes it answer wrongly while looking fine.
+     *
+     * Fix: observation and claim become one operation - CAS 0 -> 2 ("claimed,
+     * still being filled"). Only the winner proceeds. `active` is published as 1
+     * at the end, and every reader tests truthiness rather than the literal
+     * value, so 2 already counts as occupied: a half-filled slot can never be
+     * read as free and cannot be handed out twice.
+     */
     for (i = 0; i < YGHV_GUARD_MAX; i++) {
-        if (!InterlockedCompareExchange(&g_guard[i].active, 0, 0)) {
+        if (InterlockedCompareExchange(&g_guard[i].active, 2, 0) == 0) {
             slot = i;
             break;
         }
@@ -758,6 +811,9 @@ int yghv_guard_add_range(uint64_t gpa, uint32_t off, uint32_t len,
         uint8_t sha[YGHV_SHA256_DIGEST];
         if (!yghv_guard_hash_region(page, off, len, sha)) {
             InterlockedIncrement64(&g_g_hashfail);
+            /* 9.480: release the claim - see the note on the other allocation
+             * site: an early return from a claimed slot leaks it permanently. */
+            InterlockedExchange(&g_guard[slot].active, 0);
             return -5;
         }
         RtlCopyMemory(g_guard[slot].digest, sha, YGHV_SHA256_DIGEST);
@@ -768,8 +824,11 @@ int yghv_guard_add_range(uint64_t gpa, uint32_t off, uint32_t len,
     if (hide) {
         if (!yghv_protect_npt_unmap_page(page)) {
             InterlockedIncrement64(&g_g_hidefail);
-            if (!hash)
+            if (!hash) {
+                /* 9.480: release the claim (see the two hash-failure sites). */
+                InterlockedExchange(&g_guard[slot].active, 0);
                 return -4;
+            }
         } else {
             if (yghv_guard_do_hide(slot, page, YGHV_HIDE_AUTO)) {
                 (void)0;
@@ -895,7 +954,9 @@ uint32_t yghv_guard_verify_all(void) {
     int i;
 
     for (i = 0; i < YGHV_GUARD_MAX; i++) {
-        if (!InterlockedCompareExchange(&g_guard[i].active, 0, 0))
+        /* 9.480: skip 0 (free) AND 2 (claimed-but-still-being-filled). Listing a
+         * half-filled slot would report a stale gpa/digest as if it were armed. */
+        if (InterlockedCompareExchange(&g_guard[i].active, 0, 0) != 1)
             continue;
         if (yghv_guard_verify(g_guard[i].gpa) == 0)
             changed++;
@@ -910,7 +971,9 @@ uint32_t yghv_guard_list(yghv_guard_info_t *out, uint32_t max) {
     if (!out || !max)
         return 0;
     for (i = 0; i < YGHV_GUARD_MAX && n < max; i++) {
-        if (!InterlockedCompareExchange(&g_guard[i].active, 0, 0))
+        /* 9.480: see the verify loop above - 2 means "still being filled", and
+         * exposing such a slot would show the previous owner's gpa and digest. */
+        if (InterlockedCompareExchange(&g_guard[i].active, 0, 0) != 1)
             continue;
         out[n].gpa = g_guard[i].gpa;
         RtlCopyMemory(out[n].digest, g_guard[i].digest, YGHV_SHA256_DIGEST);

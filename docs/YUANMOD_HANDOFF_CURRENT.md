@@ -16047,3 +16047,71 @@ share write 0x11 0xCAFEBABE
     share write 0x11 0xCAFEBABE  -> host writes=1  last seq=1   （修复前抛异常）
     share read                   -> "nothing new"（正确：read 消费的是 guest 写的消息）
     卸载 invmrun at unload = 0x0，无蓝屏
+
+---
+
+#### 9.480 ★★★★ guard 表槽分配有竞态：先探测、后填充，不是原子占用
+
+##### 缺陷
+
+两处分配点（`yghv_guard_add_va` 与 `yghv_guard_add_range`）都是这个形状：
+
+```
+for (i = 0; i < MAX; i++)
+    if (!InterlockedCompareExchange(&g_guard[i].active, 0, 0)) {
+        slot = i; break;            // <- 只是"观察到"它空闲
+    }
+...填充该槽的八个字段...          // <- 完全无保护
+InterlockedExchange(&g_guard[slot].active, 1);   // <- 最后才发布
+```
+
+用 CAS(=0,0) 读 `active` **是原子读，但不是占用**。两个线程可以同时看到
+槽 3 空闲、同时填充、同时发布 —— 第二个覆盖第一个的 `digest`/`gpa`/`tag`，
+而 `g_guard_count` 对同一个槽加了两。
+
+**后果不是崩溃，是更难发现的那种**：调用方以为自己武装了 A 页，
+实际那条记录存的是 B 页的哈希。于是 `verify` 在没人动过的页上报「变了」，
+而对真正被改的页保持沉默。这张表存在的全部意义是回答「这一页变了吗」，
+重复占用会让它**看起来健康地回答错误**。
+
+##### 修法
+
+把「观察」和「占用」变成同一个操作：CAS `0 -> 2`（"已认领，正在填充"）。
+只有赢家继续；`active` 在填充完成后才发布成 1。
+
+关键点：`2` 对所有读者已经算「占用」，所以**半填充的槽不可能被当成空闲**、
+也不可能被发两次。但这要求**每个读者的判定从"非零"改成"等于 1"**——否则
+正在填充的槽会被列出来，露出上一个主人的 `gpa` 和 `digest`。三处读取点
+（`verify` 循环、`list` 循环、`guard_find`）都已改成 `== 1`。
+
+##### 修法引出的第二个缺陷：失败路径泄漏槽
+
+改成 CAS 占用之后，**三处早期 return 必须归还槽**：
+
+| 位置 | 原因 |
+|---|---|
+| 哈希失败（`add_va`）| `return -5` |
+| 哈希失败（`add_range`）| `return -5` |
+| 隐藏失败且不哈希 | `return -4` |
+
+在改动之前这些路径上槽还是 `active==0`，所以返回不泄漏任何东西。
+现在槽已经是 `2`，不归还会让它**永久停在"正在填充"**：`list` 看不见它
+（跳过 2），也永远不会被重用。反复失败会耗尽整张表，
+而现象是「guard 表满了」——在一张实际为空的表上。
+
+三处都补了 `InterlockedExchange(&g_guard[slot].active, 0)`。
+
+##### 实测
+
+    sys-guard arm      -> armed 3 page(s)
+    section-hide 3     -> hid 1 page(s)
+    sys-guard list     -> 4 page(s)，四个条目完整，无半填槽
+       [0] bp-table / [1] frame-ta / [2] view-tab / [3] .pdata(hidden=1)
+    卸载 invmrun at unload = 0x0，无蓝屏
+
+##### 一条可复用的教训
+
+**「读一遍再写」在内核里永远是错的**，哪怕读本身是原子的。
+判断一个槽是否空闲、然后单独去填它，这两步之间就是一个窗口。
+把状态从「布尔」扩成「三态」（0 空闲 / 2 认领中 / 1 就绪）是标准解法，
+**但它的前提是所有读者都改用精确值比较**——只改写入侧会把半成品暴露出去。
