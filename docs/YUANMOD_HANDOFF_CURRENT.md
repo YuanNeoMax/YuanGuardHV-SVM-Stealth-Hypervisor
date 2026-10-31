@@ -15114,3 +15114,109 @@ link-hide off  ->  CreateFile failed, Win32 error 0x2    ✗ 恢复不了
 
 **剩下三件是同类工作，都不需要新机制**：注册表键删除（`ZwDeleteKey`）、
 SCM 条目隐藏、模块摘链验证。成本都在小时级，且都能用同样「可测 + 可恢复」的形状做。
+
+---
+
+#### 9.454 ★★★★ loader_stealth 从来没被执行过；观测面原来查错了服务名
+
+### 9.454.1 一个从未运行过的「特性」
+
+`YGHV_LOADER_STEALTH` 一直是默认 0 的编译期开关，文档里写作「代码在，默认 0，未验证」。
+去验证时发现它**在唯一发布的构建配置里从未被执行过**：
+
+```c
+#if YGHV_BAREMETAL_STEP == 206 && !defined(YGHV_206B_COEXIST)
+    {
+        return Sv206Entry(d, r);      // <- 这一分支在 COEXIST 下整块不编译
+    }
+#endif
+
+#if YGHV_LOADER_STEALTH
+    yghv_loader_stealth(d, r);        // <- 调用点在这里，永远到不了
+#endif
+```
+
+我们实际发布的是 `YGHV_206B_COEXIST=1`，**第一个 `#if` 为假，整块被排除**；
+而 `yghv_loader_stealth` 的调用点位于该块**之后**，所以它也从未被编译进任何一条路径。
+
+**证据链**（这是写这条记录的原因，不是"看起来像"）：
+
+| 检查 | 结果 |
+|---|---|
+| `YGHV_LOADER_STEALTH=1` 构建，符号表 | `yghv_loader_stealth @ 0x1400137B0` **存在** |
+| 同上，反汇编找 `call 0x1400137B0` | **零命中** —— 函数编进去了，没人调用 |
+| 原因 | 唯一调用点在 `!defined(COEXIST)` 分支里 |
+
+**「代码存在」和「代码会跑」是两件事**，而二进制里两者都能查到 —— 只是需要去查。
+
+修法：把调用放到 `YGHV_206B_COEXIST` 的真实入口（`Sv206Entry` **之前**，
+因为 `yghv_unlink_module` 遍历 `PsLoadedModuleList` 找 `DriverObject->DriverStart`，
+只有在还没被 `Sv206Entry` 接管之前才找得到）；非 COEXIST 分支保留自己那份。
+两处都带门控。
+
+**修完的证据**：
+
+```
+LOADER_STEALTH=1   ->  0x140002AE9: call 0x1400137B0    调用存在
+LOADER_STEALTH 不设 ->  无命中                          门控正确
+```
+
+开关现在是诚实的：设了会跑，不设不跑。
+
+### 9.454.2 `yghv_stealth_check.ps1` 一直在查一个不存在的服务名
+
+这个脚本是 9.135 就有的暴露面审计。跑第一次就发现它报「全 CLEAN」——
+
+**因为它写死查 `yuanguard`，而这棵树部署的服务叫 `yghvpa`。**
+查一个不存在的名字，当然什么都找不到，然后报告"干净"。
+
+这是**监控范围不含被测对象**的教科书形态：报告读起来是"我查过了，没有暴露"，
+实际是"我查的是别的东西"。
+
+改成接受 `-ServiceName`（默认 `yghvpa`），并把 7.1 的六条面都实名列出。
+同时**新增 `UNKNOWN` 状态**：`PsLoadedModuleList` 用户态读不到，
+以前它会归到 `CLEAN`，现在诚实报 `UNKNOWN` ——
+「我没能看到」和「我看到了，是干净的」是两个答案，只有一个是真的。
+
+**跑出来的真实暴露面（驱动 RUNNING）**：
+
+```
+[CLEAN]   service yghvpa                  ← SCM 里查不到（服务名是 yghvpa 但 Win32_Service 无此项）
+[VISIBLE] kernel driver yghvpa            State=Running Path=\??\C:\yghv_pa.sys
+[VISIBLE] registry service key            HKLM\SYSTEM\CurrentControlSet\Services\yghvpa
+[UNKNOWN] PsLoadedModuleList entry        用户态不可观察
+[CLEAN]   file C:\yuanguard_hv.sys
+[CLEAN]   file C:\Windows\yghv_progress.log
+[VISIBLE] control device \.\YuanGuardHV  CreateFile 成功
+[VISIBLE] shared window (Tier 2.4)        设计如此，非泄漏，但必须进 7.1 排除差异
+visible=4 unknown=1
+```
+
+### 9.454.3 注册表键与 SCM 条目：**没做，因为风险不对等**
+
+这两条是 7.1 剩下的暴露面里唯一还没动的。评估后**不做**，理由是实打实的：
+
+| 面 | 隐藏手段 | 代价 |
+|---|---|---|
+| 注册表服务键 | `ZwDeleteKey` | **删掉后 SCM 找不到这个服务 = 驱动无法 `sc stop` = 只能重启** |
+| SCM 条目 | 没有合法手段（SCM 是服务控制管理器自己的数据库） | — |
+
+驱动卸载走的是 SCM → 服务键这条链。删键等于自断卸载路径，
+这和 9.453 里「摘符号链接把客户端自己的门一起摘了」是同一类错误，
+只是这次**没有定时器能把它恢复回来**（SCM 的数据结构不是我们能重建的）。
+
+**7.1 的最终状态（这一轮结束）**
+
+| 面 | 状态 |
+|---|---|
+| `npt-view` 观测面 | **完成** |
+| 三张 guard 表页隐藏 | **完成并实测** |
+| 符号链接隐藏（5 秒自恢复，可重复窗口）| **完成并实测**（9.453 + 9.453b）|
+| `yghv_stealth_check` 暴露面审计（真服务名 + UNKNOWN 态）| **完成并实测**（9.454）|
+| `loader_stealth` 模块摘链 | **修好并验证「设了会跑」**；功能本身仍未在实机启用验证 |
+| 驱动数据页逐页拆剔 | 可做未做 |
+| 驱动代码页隐藏 | **当前设计下不可完成**（见 9.452.2）|
+| 注册表服务键 / SCM 条目 | **不做**，风险不对等（见 9.454.3）|
+
+**7.1 到此可以收尾**：能做的做了、测了；不能做的写清了为什么不能。
+剩下「数据页逐页拆剔」是与三张表同源的工作，没有新机制，随时可补。

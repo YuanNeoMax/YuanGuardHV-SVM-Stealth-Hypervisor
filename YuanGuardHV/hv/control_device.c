@@ -141,11 +141,23 @@ static VOID yghv_link_work_routine(PDEVICE_OBJECT DeviceObject, PVOID Context)
     UNREFERENCED_PARAMETER(DeviceObject);
     UNREFERENCED_PARAMETER(Context);
 
+    /*
+     * 9.453b: DO NOT FREE THE WORK ITEM HERE.
+     *
+     * The first version freed g_link_work inside this routine and nulled it. Two
+     * problems, both real for this code:
+     *
+     *  - the DPC can fire again while this routine is still running (a second
+     *    `link-hide on` before the first window closed), and IoFreeWorkItem on a
+     *    work item that is queued or running is undefined behaviour;
+     *  - a routine freeing the item it is running on is a lifetime this code
+     *    cannot prove - it would have to be certain nothing ever queues it again.
+     *
+     * So the item is allocated once and released at unload. "Never free" is a
+     * strictly safer lifetime than "free under a race", and the memory at stake is
+     * one small nonpaged block per driver lifetime.
+     */
     yghv_link_restore_on_unload();
-    if (g_link_work) {
-        IoFreeWorkItem(g_link_work);
-        g_link_work = NULL;
-    }
 }
 
 static VOID yghv_link_timer_dpc(PKDPC Dpc, PVOID Context, PVOID Arg1, PVOID Arg2)
@@ -163,16 +175,27 @@ static VOID yghv_link_timer_dpc(PKDPC Dpc, PVOID Context, PVOID Arg1, PVOID Arg2
      * yghv_link_restore_on_unload also covers, so the failure degrades to "hidden
      * for the rest of this session" rather than "hidden forever".
      */
+    /*
+     * 9.453b: QUEUE ON EVERY WINDOW, NOT ONLY THE FIRST.
+     *
+     * The first version queued only when `g_link_work == NULL`, i.e. only the
+     * FIRST window ever got a restore. A second `link-hide on` left the name
+     * removed with no timer path back - the same one-way trap the whole design
+     * exists to avoid, reintroduced by a lifetime check.
+     *
+     * The item is allocated once and re-QUEUED for each window; IoQueueWorkItem
+     * on an item that is already queued would be wrong, so the guard is on
+     * "queued", not on "allocated".
+     */
     if (g_link_work == NULL) {
         g_link_work = IoAllocateWorkItem(g_yghv_device);
-        if (g_link_work) {
-            IoQueueWorkItem(g_link_work, yghv_link_work_routine,
-                            DelayedWorkQueue, NULL);
-        } else {
+        if (!g_link_work) {
             LOG_ERROR("link restore: IoAllocateWorkItem failed - name stays "
                       "removed until unload");
+            return;
         }
     }
+    IoQueueWorkItem(g_link_work, yghv_link_work_routine, DelayedWorkQueue, NULL);
 }
 
 extern LONG yghv_link_hide_op(ULONG op)
@@ -2832,6 +2855,22 @@ NTSTATUS yghv_control_device_init(PDRIVER_OBJECT driver) {
 void yghv_control_device_cleanup(PDRIVER_OBJECT driver) {
     UNICODE_STRING link_name;
     (void)driver;
+
+    /*
+     * 9.453b: CANCEL THE WINDOW TIMER BEFORE THE DEVICE GOES AWAY.
+     *
+     * The restore work item takes a device object, and a queued item holding a
+     * pointer to a device that is about to be deleted is a use-after-free that
+     * shows up as a bugcheck in an unrelated driver. Cancel first, then free the
+     * item, then delete the device - in that order.
+     */
+    if (InterlockedExchange(&g_link_timer_armed, 0) != 0) {
+        KeCancelTimer(&g_link_timer);
+    }
+    if (g_link_work) {
+        IoFreeWorkItem(g_link_work);
+        g_link_work = NULL;
+    }
 
     RtlInitUnicodeString(&link_name, YGHV_DOS_DEVICE_NAME_STRING);
     IoDeleteSymbolicLink(&link_name);

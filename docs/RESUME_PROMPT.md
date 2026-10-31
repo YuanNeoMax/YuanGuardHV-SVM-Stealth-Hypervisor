@@ -464,8 +464,8 @@ hidden page:   guest present=0  host=1   -> HIDDEN（正确）
 | 三张 guard 表页隐藏 + host 仍可读 | **完成并实测** |
 | 符号链接 `\\.\YuanGuardHV` | **完成并实测**（9.453，5 秒窗口自恢复）|
 | 驱动代码/数据页逐页拆剔 | 数据页**可做未做**；代码页见下 |
-| 服务注册表键 / SCM 条目 | 实测可见，未隐藏 |
-| `loader_stealth` 模块摘链 | 代码在，默认 0，未验证 |
+| 服务注册表键 / SCM 条目 | **不做**（删键=自断卸载路径，与 9.453 同类错误且无恢复手段）|
+| `loader_stealth` 模块摘链 | **修好并验证「设了会跑」**（9.454：之前调用点在被编译掉的分支里，从未执行过）|
 
 **为什么代码页那一半不能顺手补**
 
@@ -529,7 +529,54 @@ yghv_ctl.ps1 mem-bench <pid> <hex_pattern> [start_hex] [end_hex] [budget]
 **第二个错**：DPC 里直接调 `IoCreateSymbolicLink` —— DPC 在 DISPATCH，这个 API 要 PASSIVE。 DPC 只发现「窗口结束」，恢复交给 `IoAllocateWorkItem` 排到 PASSIVE。
 
 `device_present` 全程为真，**这是诚实标注**：设备本体一直在 `\Device\YuanGuardHV`，。把「少一个名字」说成「不可见」正是 7.1 反复警告的过称。
-### 8.9 VMEXIT 覆盖：206 主线已补到 35 个（9.448）
+### 8.9 loader_stealth 从来没被执行过；审计查错了服务名（9.454）
+
+**YGHV_LOADER_STEALTH 在唯一发布的构建配置里从未执行。**
+
+```c
+#if YGHV_BAREMETAL_STEP == 206 && !defined(YGHV_206B_COEXIST)
+    { return Sv206Entry(d, r); }      // COEXIST 下整块不编译
+#endif
+#if YGHV_LOADER_STEALTH
+    yghv_loader_stealth(d, r);        // 调用点在这里，永远到不了
+#endif
+```
+
+我们发布的是 YGHV_206B_COEXIST=1，第一个 #if 为假，整块排除；
+调用点在其后，所以从未进过任何路径。
+
+**证据链**
+
+| 检查 | 结果 |
+|---|---|
+| =1 构建符号表 | yghv_loader_stealth @ 0x1400137B0 **存在** |
+| =1 构建反汇编找 call 0x1400137B0 | **零命中** |
+
+> 「代码存在」和「代码会跑」是两件事，二进制里两者都能查到——只是需要去查。
+
+修法：调用放到 COEXIST 的真实入口，**在 Sv206Entry 之前**
+（yghv_unlink_module 要遍历 PsLoadedModuleList，只有还没被接管时才找得到）。
+修完：=1 有 call，不设无 call——开关现在诚实了。
+
+**审计脚本一直查错了服务名**
+
+yghv_stealth_check.ps1 写死查 yuanguard，而实际服务叫 yghvpa。
+查一个不存在的名字当然全 CLEAN——**监控范围不含被测对象**的教科书形态：
+报告读起来是「我查过了，没有暴露」，实际是「我查的是别的东西」。
+
+改成接受 -ServiceName，并新增 **UNKNOWN** 状态：PsLoadedModuleList
+用户态读不到，以前归到 CLEAN，现在诚实报 UNKNOWN——
+「我没能看到」和「我看到了，是干净的」是两个答案。
+
+驱动 RUNNING 时的真实结果：isible=4 unknown=1。
+
+**注册表键 / SCM 条目：不做**
+
+删服务键后 SCM 找不到服务 = **驱动无法 sc stop = 只能重启**。
+这和 9.453「摘符号链接把客户端自己的门一起摘了」是同类错误，
+而且这次**没有定时器能恢复**（SCM 的数据结构不是我们能重建的）。
+
+### 8.10 VMEXIT 覆盖：206 主线已补到 35 个（9.448）
 
 **`MEM_ENGINE_PLAN_TIER5/6/8_9.md` 开头写「现成 VMEXIT 已实现 35 种」——
 那句话原本只对 `vmexit.c`（旧 resident 路径）成立。** 206 主线只有 12 个 case。

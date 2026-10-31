@@ -5329,11 +5329,28 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
      * full yghv init further below) instead shares g_npt. */
     {
         extern NTSTATUS Sv206Entry(struct _DRIVER_OBJECT *, PUNICODE_STRING);
+
+        /*
+         * 9.454: the loader_stealth call for THIS branch only.
+         *
+         * The real fix for the shipped build is at the YGHV_206B_COEXIST site
+         * further down - this branch is compiled out under COEXIST, which is why
+         * putting the call only here left it unreachable. Both sites now carry it
+         * so the switch is honest in either configuration.
+         */
+#if YGHV_LOADER_STEALTH
+        yghv_loader_stealth(d, r);
+#endif
         return Sv206Entry(d, r);
     }
 #endif
 
-#if YGHV_LOADER_STEALTH
+#if YGHV_LOADER_STEALTH && !defined(YGHV_206B_COEXIST)
+    /*
+     * The non-coexist build reaches its own init below and needs the call here.
+     * Two sites rather than one because the coexist path returns above and a
+     * single call could not reach both without a branch.
+     */
     yghv_loader_stealth(d, r);
 #endif
 #if !YGHV_UNLOAD_GUARD
@@ -5613,6 +5630,28 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
         yghv_trace_u64("s206b notify reg rc", (uint64_t)(NTSTATUS)sv);
         if (sv)
             sv = 0;
+
+        /*
+         * 9.454 (Tier 7.1): THIS IS THE SITE THAT MATTERS, AND IT WAS MISSING.
+         *
+         * The yghv_loader_stealth call in this file lives inside
+         * `#if YGHV_BAREMETAL_STEP == 206 && !defined(YGHV_206B_COEXIST)` -
+         * a branch that is EMPTY for the configuration this tree actually ships.
+         * Measured: with YGHV_LOADER_STEALTH=1 the function was emitted into the
+         * binary (`yghv_loader_stealth @ 0x1400137b0` is in the map) but NOTHING
+         * CALLED IT, because the only call site was in the branch we compile out.
+         * So "the module unlink feature exists and is gated off" was true of the
+         * source and false of every binary this tree has ever produced.
+         *
+         * IT MUST RUN HERE, BEFORE Sv206Entry. yghv_unlink_module walks
+         * PsLoadedModuleList looking for DriverObject->DriverStart - that only
+         * finds us while we are still linked, and Sv206Entry is what takes over
+         * the entry point. After it, the window is gone.
+         */
+#if YGHV_LOADER_STEALTH
+        yghv_loader_stealth(d, r);
+#endif
+
         sv = Sv206Entry(d, r);
         yghv_trace_u64("s206b entry rc", (uint64_t)(NTSTATUS)sv);
         if (sv) {
