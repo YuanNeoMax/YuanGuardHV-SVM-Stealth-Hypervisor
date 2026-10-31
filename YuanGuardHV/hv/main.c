@@ -5509,6 +5509,21 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
     {
         extern void yghv_guard_set_code_range(uint64_t start, uint64_t size);
         extern int yghv_guard_decoy_init(void);
+        /*
+         * 9.455 (Tier 7.1): remember the image range for the sections report.
+         *
+         * `yghv_guard_set_code_range` already takes these two numbers, but that
+         * stores them as VAs for the RIP whitelist - a different consumer with a
+         * different question. The sections command needs the BASE POINTER + SIZE
+         * to walk PE headers, and it is registered here so both readers see the
+         * same image. A second place computing "our image" is a second answer
+         * waiting to disagree.
+         */
+        {
+            extern void yghv_pa_set_driver_range(PVOID start, uint32_t size);
+            yghv_pa_set_driver_range(d->DriverStart, d->DriverSize);
+        }
+
         yghv_guard_set_code_range((uint64_t)d->DriverStart,
                                   (uint64_t)d->DriverSize);
         (void)yghv_guard_decoy_init();

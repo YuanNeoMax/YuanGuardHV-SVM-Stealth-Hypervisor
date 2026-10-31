@@ -7,6 +7,7 @@
 #include "mem_pa.h"       /* Phase 2: physical frame primitives */
 #include "mem_bench.h"    /* Phase 5 (Tier 1.5): Engine A vs B measurement */
 #include "mem_share.h"    /* Tier 2.4: zero-copy shared window */
+#include "yghv_sections.h" /* Tier 7.1: own PE sections (read-only) */
 #include "mem_selfmap.h"  /* Phase 2b: self-built mapping window */
 #include "mem_coop.h"     /* Phase 7: guard cooperation */
 #include "mem_island.h"   /* Phase 6: island (direct-map) access */
@@ -71,6 +72,33 @@ NTKERNELAPI NTSTATUS ZwFlushBuffersFile(HANDLE FileHandle,
                                         PIO_STATUS_BLOCK IoStatusBlock);
 
 static PDEVICE_OBJECT g_yghv_device = NULL;
+
+/*
+ * 9.455 (Tier 7.1): the driver's own image range, for the sections report.
+ *
+ * Registered once at DriverEntry (where the DriverObject is in hand), read by the
+ * sections command. Kept here rather than re-derived at IOCTL time because the
+ * dispatcher never receives the DriverObject - and because two ways of computing
+ * "our image" is two answers waiting to disagree.
+ */
+static PVOID    g_driver_start = NULL;
+static uint32_t g_driver_size = 0;
+
+extern void yghv_pa_set_driver_range(PVOID start, uint32_t size)
+{
+    InterlockedExchangePointer(&g_driver_start, start);
+    InterlockedExchange((volatile LONG *)&g_driver_size, (LONG)size);
+}
+
+extern PVOID yghv_pa_driver_start(void)
+{
+    return InterlockedCompareExchangePointer(&g_driver_start, NULL, NULL);
+}
+
+extern uint32_t yghv_pa_driver_size(void)
+{
+    return (uint32_t)InterlockedCompareExchange((volatile LONG *)&g_driver_size, 0, 0);
+}
 
 /*
  * 9.452 (Tier 7.1): symbolic-link hide/enable, and a way to READ which state we
@@ -2346,6 +2374,195 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
             status = STATUS_SUCCESS;
         } else {
             status = STATUS_BUFFER_TOO_SMALL;
+        }
+        break;
+    }
+    case IOCTL_YGHV_SECTION_HIDE: {
+        /*
+         * 9.456 (Tier 7.1): hide ONE named data section of our own image.
+         *
+         * The refusal for executable sections is not a limitation, it is the
+         * point: a present=0 code page stops our own instruction fetch and this
+         * tree has no ALLOW loop to serve it (9.450b). Refusing by NAME keeps that
+         * from becoming "the index was off by one and we hid .text".
+         */
+        extern PVOID yghv_pa_driver_start(void);
+        extern uint32_t yghv_pa_driver_size(void);
+        extern int yghv_guard_add_va(const void *va, uint32_t len, const char *tag, int hide);
+
+        ULONG idx = 0;
+        UINT64 *out = (UINT64 *)buf;
+
+        if (in_len >= 16) {
+            UINT64 *in = (UINT64 *)buf;
+            idx = (ULONG)in[0];
+        }
+
+        out[3] = (UINT64)idx;
+
+        {
+            yghv_section_info_t si[YGHV_SECTIONS_MAX];
+            uint32_t nsec = 0, pflags = 0, i;
+            uint8_t *base = (uint8_t *)yghv_pa_driver_start();
+            uint32_t size = yghv_pa_driver_size();
+            int parsed = 0, hidden = 0, lastRc = 0;
+
+            /*
+             * 9.456: FILL FIRST, ZERO ONLY ON FAILURE.
+             *
+             * The first version called RtlZeroMemory(&si) AFTER a successful
+             * report, wiping the very data it had just filled; the size loop then
+             * saw zeroed sections and hid 0 pages while returning success.
+             */
+            if (base && size) {
+                if (!yghv_sections_report(base, size, si, YGHV_SECTIONS_MAX,
+                                          &nsec, &pflags)) {
+                    RtlZeroMemory(&si, sizeof(si));
+                    nsec = 0;
+                } else {
+                    parsed = 1;
+                }
+            }
+
+            if (!parsed) {
+                out[0] = 0; out[1] = 0; out[2] = 0x21;
+                info = YGHV_SECTION_HIDE_OUT_QWORDS * sizeof(UINT64);
+                status = STATUS_SUCCESS;
+                break;
+            }
+
+            if (idx >= nsec) {
+                out[0] = 0; out[1] = 0; out[2] = 0x22;
+                info = YGHV_SECTION_HIDE_OUT_QWORDS * sizeof(UINT64);
+                status = STATUS_SUCCESS;
+                break;
+            }
+
+            if (si[idx].executable) {
+                out[0] = 0; out[1] = 0; out[2] = 0x23;
+                info = YGHV_SECTION_HIDE_OUT_QWORDS * sizeof(UINT64);
+                status = STATUS_SUCCESS;
+                break;
+            }
+
+            /*
+             * Page by page, inside the section's OWN size - not the page-rounded
+             * one. Hiding a page past VirtualSize would take a frame that belongs
+             * to whatever the loader put after this section.
+             */
+            for (i = 0; i < si[idx].size; i += 0x1000) {
+                uint32_t left = si[idx].size - i;
+                uint32_t chunk = (left < 0x1000) ? left : 0x1000;
+
+                /*
+                 * yghv_guard_add_va records the object bytes AND arms the hide in
+                 * one step, which is what makes this measurable afterwards: the
+                 * guard list shows tag = the section name and hidden = 1, and
+                 * `npt-view` can confirm guest=0 / host=1 on the same PA.
+                 */
+                lastRc = yghv_guard_add_va(base + si[idx].va + i, chunk,
+                                           si[idx].name, 1);
+                if (lastRc < 0) {
+                    break;
+                }
+                hidden += 1;
+            }
+
+            /*
+             * 9.456: report WHY the count is what it is.
+             *
+             * "hid 0 page(s)" with ok=1 was reachable from three causes and the
+             * first version reported them identically: the section size was zero,
+             * the base pointer was null, or guard_add_va refused. A count without
+             * its reason costs another rebuild+load cycle to interpret.
+             */
+            out[0] = 1;
+            out[1] = (UINT64)hidden;
+            out[2] = (UINT64)(lastRc < 0 ? (UINT64)(-lastRc == 1 ? 0x26 : 0x27)
+                                       : (si[idx].size ? 0 : 0x25));
+            info = YGHV_SECTION_HIDE_OUT_QWORDS * sizeof(UINT64);
+            status = STATUS_SUCCESS;
+        }
+        break;
+    }
+    case IOCTL_YGHV_SECTIONS: {
+        /*
+         * 9.455 (Tier 7.1): the driver's own PE sections, read-only.
+         *
+         * Answers only "what sections do I have and which are executable". No NPT
+         * writes, no allocation, no locks - so calling it cannot damage the state
+         * it describes. The hide that consumes this answer comes later; this is
+         * the observation that has to be right first (9.450's discipline).
+         */
+        extern PVOID yghv_pa_driver_start(void);
+        extern uint32_t yghv_pa_driver_size(void);
+
+        uint8_t *base = (uint8_t *)yghv_pa_driver_start();
+        uint32_t size = yghv_pa_driver_size();
+        yghv_section_info_t si[YGHV_SECTIONS_MAX];
+        uint32_t nsec = 0, pflags = 0, i;
+        int parsed = 0;
+
+        if (base && size) {
+            parsed = yghv_sections_report(base, size, si, YGHV_SECTIONS_MAX,
+                                          &nsec, &pflags);
+        }
+
+        /*
+         * Header goes out even when nothing parsed or the buffer is too small for
+         * every entry: the caller learns `parsed` and `count` and can size its
+         * next request. A truncated reply that says it is truncated beats silence.
+         */
+        if (out_len < YGHV_SECTIONS_HDR_QWORDS * sizeof(UINT64)) {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+
+        {
+            UINT64 *out = (UINT64 *)buf;
+
+            out[0] = (UINT64)(parsed ? 1 : 0);
+            out[1] = (UINT64)pflags;
+            out[2] = (UINT64)nsec;
+            out[3] = (UINT64)size;
+            out[4] = 0;
+
+            if (parsed) {
+                for (i = 0; i < nsec; i++) {
+                    UINT64 *e = &out[YGHV_SECTIONS_HDR_QWORDS +
+                                     i * YGHV_SECTIONS_PER_ENTRY];
+                    const char *nm = si[i].name;
+
+                    if (YGHV_SECTIONS_HDR_QWORDS + (i + 1) * YGHV_SECTIONS_PER_ENTRY >
+                        out_len / sizeof(UINT64)) {
+                        break;
+                    }
+
+                    e[0] = ((UINT64)(uint8_t)nm[0]) |
+                           ((UINT64)(uint8_t)nm[1] << 8) |
+                           ((UINT64)(uint8_t)nm[2] << 16) |
+                           ((UINT64)(uint8_t)nm[3] << 24) |
+                           ((UINT64)(uint8_t)nm[4] << 32) |
+                           ((UINT64)(uint8_t)nm[5] << 40) |
+                           ((UINT64)(uint8_t)nm[6] << 48) |
+                           ((UINT64)(uint8_t)nm[7] << 56);
+                    e[1] = ((UINT64)(uint8_t)nm[8]) |
+                           ((UINT64)(uint8_t)nm[9] << 8) |
+                           ((UINT64)(uint8_t)nm[10] << 16) |
+                           ((UINT64)(uint8_t)nm[11] << 24);
+                    e[2] = (UINT64)si[i].va;
+                    e[3] = (UINT64)si[i].size;
+                    e[4] = (UINT64)si[i].executable;
+                    e[5] = (UINT64)si[i].writable;
+                }
+            }
+
+            info = (ULONG)(YGHV_SECTIONS_HDR_QWORDS * sizeof(UINT64) +
+                           (SIZE_T)nsec * YGHV_SECTIONS_PER_ENTRY * sizeof(UINT64));
+            if (info > out_len) {
+                info = out_len;
+            }
+            status = STATUS_SUCCESS;
         }
         break;
     }

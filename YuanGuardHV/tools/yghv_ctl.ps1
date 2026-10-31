@@ -3554,6 +3554,119 @@ try {
                 }
             }
         }
+        'sections' {
+            # 9.455 (Tier 7.1): the driver's own PE sections, read-only.
+            #
+            # The last 7.1 item is "exclude the driver's data pages from the guest
+            # NPT". That CANNOT be done for CODE pages - present=0 stops our own
+            # fetch and there is no ALLOW loop (9.450b) - so the hide has to know
+            # which sections are executable. This answers that and nothing else.
+            #
+            # parsed=0 means "treat every page as unhideable", NOT "nothing to
+            # hide": guessing which pages are data is how a code page gets
+            # excluded and the machine dies in a fetch fault.
+            $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x82F)) -OutputLength 784
+
+            $parsed = [BitConverter]::ToUInt64($out, 0)
+            $pflag  = [BitConverter]::ToUInt64($out, 8)
+            $nsec   = [BitConverter]::ToUInt64($out, 16)
+            $isize  = [BitConverter]::ToUInt64($out, 24)
+
+            $kind = switch ($pflag) { 1 {'PE32'} 2 {'PE32+'} default {'unknown'} }
+            Write-Host ("sections: parsed={0}  fmt={1}  image=0x{2:X} byte  sections={3}" -f $parsed, $kind, $isize, $nsec)
+
+            if ($parsed -eq 0) {
+                Write-Host '  PARSE FAILED - treat every page as UNHIDEABLE (do not guess)'
+                return
+            }
+
+            $hideable = 0
+            $locked = 0
+            for ($i = 0; $i -lt [int]$nsec; $i++) {
+                $b = 40 + $i * 48
+                $lo = [BitConverter]::ToUInt64($out, $b)
+                $hi = [BitConverter]::ToUInt64($out, $b + 8)
+                $nm = ''
+                for ($k = 0; $k -lt 8; $k++) {
+                    $ch = ($lo -shr (8 * $k)) -band 0xFF
+                    if ($ch -ne 0) { $nm += [char]$ch }
+                }
+                for ($k = 0; $k -lt 4; $k++) {
+                    $ch = ($hi -shr (8 * $k)) -band 0xFF
+                    if ($ch -ne 0) { $nm += [char]$ch }
+                }
+                $va  = [BitConverter]::ToUInt64($out, $b + 16)
+                $sz  = [BitConverter]::ToUInt64($out, $b + 24)
+                $ex  = [BitConverter]::ToUInt64($out, $b + 32)
+
+                $pages = [math]::Ceiling($sz / 4096)
+                if ($ex -eq 1) {
+                    $verdict = 'CODE - must NOT be hidden'
+                    $locked += [int]$pages
+                } else {
+                    $verdict = 'data - hideable'
+                    $hideable += [int]$pages
+                }
+
+                Write-Host ("  [{0}] {1,-9} va=0x{2:X6} size=0x{3:X6} ({4,3} pages)  {5}" -f $i, $nm, $va, $sz, $pages, $verdict)
+            }
+            Write-Host ("  totals: hideable={0} page(s)  must-stay-visible={1} page(s)" -f $hideable, $locked)
+        }
+        'section-hide' {
+            # 9.456 (Tier 7.1): hide ONE data section of our own image.
+            #
+            # usage: section-hide <index>     (index comes from `sections`)
+            #
+            # WHY ONE AT A TIME, BY NAME
+            #   Hiding all 62 data pages at once is one experiment with 62 chances
+            #   to lock ourselves out, and a failure arrives as a bugcheck in
+            #   whatever code touched the page first - not as "section X is unsafe".
+            #
+            # SUGGESTED ORDER: .reloc first (the loader consumed it, nothing reads
+            # it afterwards), then .rdata/.pdata, and .data LAST (it holds live
+            # state and is the one that can actually hurt).
+            #
+            # Refusals are named: 0x21 not parsed / 0x22 bad index /
+            # 0x23 section is EXECUTABLE (refused on purpose) / 0x25 size zero /
+            # 0x26 guard_add_va: APC disabled / 0x27 guard_add_va: bad VA.
+            if ($null -eq $Arg1) { throw 'section-hide: usage: section-hide <index>' }
+            $idx = [uint64]::Parse($Arg1)
+
+            $req = New-Object byte[] 16
+            [BitConverter]::GetBytes($idx).CopyTo($req, 0)
+
+            $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x830)) `
+                                    -InBytes $req -OutputLength 32
+
+            $ok  = [BitConverter]::ToUInt64($out, 0)
+            $hid = [BitConverter]::ToUInt64($out, 8)
+            $rc  = [BitConverter]::ToUInt64($out, 16)
+            $e   = [BitConverter]::ToUInt64($out, 24)
+
+            if ($ok -eq 1) {
+                Write-Host ("section-hide: index={0} -> hid {1} page(s)" -f $e, $hid)
+                if ($rc -ne 0) {
+                    $rx = switch ($rc) {
+                        0x25 { 'section size is ZERO - nothing to hide (wrong index?)' }
+                        0x26 { 'guard_add_va refused: APC disabled in this context' }
+                        0x27 { 'guard_add_va refused: bad VA (MmGetPhysicalAddress returned 0)' }
+                        default { ("code 0x{0:X}" -f $rc) }
+                    }
+                    Write-Host ("  WHY ZERO: {0}" -f $rx)
+                } else {
+                    Write-Host '  verify with: sys-guard list   and   npt-view <pa of the page>'
+                }
+            } else {
+                $why = switch ($rc) {
+                    0x21 { 'not parsed - image headers unreadable' }
+                    0x22 { 'index out of range' }
+                    0x23 { 'section is EXECUTABLE - refused (no ALLOW loop to serve a fetch fault)' }
+                    0x24 { 'guard table full' }
+                    default { ("code 0x{0:X}" -f $rc) }
+                }
+                Write-Host ("section-hide: index={0} REFUSED {1}" -f $e, $why)
+            }
+        }
         'npt-view' {
             # 9.450 (Tier 7.1): what would a GUEST see at this physical page.
             #

@@ -96,6 +96,10 @@ public class YghvCtl {
     private static final int FN_SHARE = 0x82D;
     /* 9.452 (Tier 7.1): remove the DosDevices name from enumeration. */
     private static final int FN_LINK_HIDE = 0x82E;
+    /* 9.455 (Tier 7.1): own PE sections, read-only. Decides which pages may be hidden. */
+    private static final int FN_SECTIONS = 0x82F;
+    /* 9.456 (Tier 7.1): hide ONE data section, by index from FN_SECTIONS. */
+    private static final int FN_SECTION_HIDE = 0x830;
 
     private static native long openHandle();
     private static native void closeHandle(long handle);

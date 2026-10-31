@@ -377,6 +377,64 @@ typedef struct {
 #define IOCTL_YGHV_LINK_HIDE \
     YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x82E, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
 #define YGHV_LINKHIDE_OUT_QWORDS 4
+
+/*
+ * 9.455 (Tier 7.1): the driver's own PE sections, read-only.
+ *
+ * The last 7.1 item is "exclude the driver's data pages from the guest NPT".
+ * That cannot be done for CODE pages (present=0 stops our own fetch and there is
+ * no ALLOW loop - see 9.450b), so the hide must know which sections are
+ * executable. This command answers that and nothing else: no NPT writes, no
+ * allocation, no locks.
+ *
+ * Zero-length input -> 5 header qwords, then 6 qwords per section:
+ *   [0] parsed (1)    [1] PE flag (1=PE32, 2=PE32+)   [2] section count
+ *   [3] image size    [4] reserved
+ *   per section: [0..1] name (16 bytes, NUL padded)
+ *                [2] va   [3] size   [4] executable   [5] writable
+ *
+ * A caller must treat "parsed == 0" as "everything is unhideable", NOT as
+ * "nothing to hide": guessing which pages are data is how a code page ends up
+ * excluded and the machine dies in a fetch fault.
+ */
+#define IOCTL_YGHV_SECTIONS \
+    YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x82F, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
+#define YGHV_SECTIONS_HDR_QWORDS 5
+#define YGHV_SECTIONS_PER_ENTRY  6
+#define YGHV_SECTIONS_MAX        32
+
+/*
+ * 9.456 (Tier 7.1): hide ONE named data section, by walking the PE report.
+ *
+ * WHY NAMED, AND WHY ONE AT A TIME
+ *
+ * The sections report proves 62 of our 101 pages are data and 39 are code. Hiding
+ * all 62 in one call would be a single experiment with 62 chances to lock ourselves
+ * out, and a failure would arrive as a bugcheck in whatever code touched the page
+ * first - not as "section X is unsafe to hide".
+ *
+ * So the unit is one section, chosen by name. `.reloc` is the natural first one:
+ * the loader consumed it at load time and nothing reads it afterwards, so hiding
+ * it is the cheapest possible proof that the mechanism works on our own image at
+ * all. If `.reloc` survives a hide and a busy period, `.rdata`/`.pdata` are next,
+ * and `.data` last - `.data` holds live state and is the one that can actually
+ * hurt.
+ *
+ * Input:  {ULONG_PTR va_offset, ULONG len}  -- actually {ULONG_PTR delta, ULONG pad}
+ *         where `delta` selects the section by its index in the sections report,
+ *         NOT by address: the client should pass what `sections` printed so it
+ *         cannot aim at a page the report never described.
+ *
+ * Output (4 QWORDs):
+ *   [0] ok (1)          [1] pages hidden this call
+ *   [2] refusal code    [3] section index echoed
+ *
+ * refusal codes: 0x21 not parsed / 0x22 index out of range / 0x23 section is
+ * executable (refused on purpose) / 0x24 guard table full.
+ */
+#define IOCTL_YGHV_SECTION_HIDE \
+    YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x830, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
+#define YGHV_SECTION_HIDE_OUT_QWORDS 4
 typedef struct {
     ULONG     pid;
     ULONG     pat_len;

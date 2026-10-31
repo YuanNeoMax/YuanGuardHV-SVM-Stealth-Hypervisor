@@ -100,6 +100,8 @@ yghv_ctl.ps1 mem-bench <pid> <hex_pattern> [start_hex] [end_hex] [budget]
 yghv_ctl.ps1 npt-view <hex_pa>
 yghv_ctl.ps1 share [init|read|write <kind> [arg]|reset]
 yghv_ctl.ps1 link-hide [on|off]
+yghv_ctl.ps1 sections
+yghv_ctl.ps1 section-hide <index>
 ```
 
 `protect` sets the target, enumerates committed pages of the real Java process,
