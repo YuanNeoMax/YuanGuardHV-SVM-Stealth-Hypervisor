@@ -2886,10 +2886,25 @@ try {
                 [Array]::Copy($tb, 0, $req, 32, $n)
             }
             if ($op -eq 3) {
-                $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x826)) -InBytes $req -OutputLength 256
+                # 9.460: SIZE THE BUFFER FROM THE REPORTED COUNT, NOT A GUESS.
+                #
+                # 256 bytes was enough for three entries (8 + 3*80 = 248) and
+                # produced IndexOutOfRangeException on the fourth. Worse, the
+                # first version had a DUPLICATED `for` line, so the exception
+                # arrived while the header line had already printed "4 page(s)" -
+                # i.e. the count and the rows disagreed and nothing said why.
+                #
+                # Asking for a size big enough for the header plus the maximum the
+                # driver will ever return means the loop can never overrun: YGHV_GUARD_MAX
+                # entries at 80 bytes. 8 + 32*80 = 2568.
+                $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x826)) -InBytes $req -OutputLength 2600
                 $n = [BitConverter]::ToUInt64($out, 0)
+                $maxRows = [math]::Floor(($out.Length - 8) / 80)
+                if ($n -gt $maxRows) {
+                    Write-Host ("sys-guard list: driver reports {0} page(s) but only {1} fit in the reply" -f $n, $maxRows)
+                    $n = $maxRows
+                }
                 Write-Host ("sys-guard list: {0} page(s)" -f $n)
-                for ($i = 0; $i -lt $n; $i++) {
                 for ($i = 0; $i -lt $n; $i++) {
                     # 9.363: stride is 10 qwords = 80 bytes, per the C side
                     # (control_device.c case 3):
@@ -2912,7 +2927,6 @@ try {
                         [BitConverter]::ToUInt64($out,$o+8),
                         [BitConverter]::ToUInt64($out,$o+16),
                         [BitConverter]::ToUInt64($out,$o+24), $tg)
-                }
                 }
                 return
             }
@@ -3691,7 +3705,7 @@ try {
             $pa = [Convert]::ToUInt64(($Arg1 -replace '^0x',''), 16)
             $req = [BitConverter]::GetBytes([uint64]$pa)
             $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x82C)) `
-                                     -InBytes $req -OutputLength 48
+                                     -InBytes $req -OutputLength 56
 
             $pres = [BitConverter]::ToUInt64($out, 0)
             $perm = [BitConverter]::ToUInt64($out, 8)
@@ -3699,6 +3713,7 @@ try {
             $large = [BitConverter]::ToUInt64($out, 24)
             $hostv = [BitConverter]::ToUInt64($out, 32)
             $code  = [BitConverter]::ToUInt64($out, 40)
+            $decoy = [BitConverter]::ToUInt64($out, 48)
 
             if ($code -ne 0) {
                 Write-Host ("npt-view: pa=0x{0:X} -> state=0x{1:X} (not identity mapped)" -f $pa, $code)
@@ -3716,12 +3731,22 @@ try {
             Write-Host ("  frame   : 0x{0:X}  large={1}" -f $frame, $large)
             Write-Host ("  host    : {0}" -f $hostv)
 
-            if ($pres -eq 1) {
-                Write-Host '  VERDICT : VISIBLE to the guest - not hidden.'
-            } elseif ($hostv -eq 1) {
-                Write-Host '  VERDICT : HIDDEN - guest excluded, our access intact.'
+            # 9.459: a hidden page can keep present=1 (DECOY). The test is not
+            # "is it present" but "does it still resolve to its own frame".
+            if ($large -eq 1) {
+                Write-Host '  VERDICT : LARGE PAGE - not split, so the 4K page is not hidden'
+                Write-Host '            (frame shown is the 2MB base, not this page)'
+            } elseif ($pres -eq 0) {
+                if ($hostv -eq 1) {
+                    Write-Host '  VERDICT : HIDDEN (UNMAP) - guest excluded, our access intact.'
+                } else {
+                    Write-Host '  VERDICT : LOCKED OUT - guest and host both excluded (9.343).'
+                }
+            } elseif ($decoy -eq 1) {
+                Write-Host '  VERDICT : HIDDEN (DECOY) - entry stays present but points at a'
+                Write-Host '            zeroed frame; the guest reads zeros, not our data.'
             } else {
-                Write-Host '  VERDICT : LOCKED OUT - guest and host both excluded (9.343).'
+                Write-Host '  VERDICT : VISIBLE to the guest - not hidden.'
             }
         }
         'npt-remap' {

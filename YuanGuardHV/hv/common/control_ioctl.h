@@ -326,7 +326,7 @@ typedef struct {
  */
 #define IOCTL_YGHV_NPT_VIEW \
     YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x82C, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
-#define YGHV_NPT_VIEW_OUT_QWORDS 6
+#define YGHV_NPT_VIEW_OUT_QWORDS 7
 
 /*
  * 9.451 (Tier 2.4): the zero-copy shared window.

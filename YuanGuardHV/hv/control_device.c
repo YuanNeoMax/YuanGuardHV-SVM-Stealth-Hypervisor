@@ -2746,6 +2746,31 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
                 out[3] = ps;
 
                 /*
+                 * 9.459: A PAGE CAN BE HIDDEN WITH present STILL SET, AND MY
+                 * VERDICT MISSED IT.
+                 *
+                 * Measured on the first successful section hide: `.pdata` was
+                 * hidden (sys-guard why reported hidden=1 hide_mode=1), yet
+                 * npt-view called it "VISIBLE to the guest" because it only
+                 * recognised present=0 as hiding. hide_mode 1 is YGHV_HIDE_DECOY,
+                 * which keeps the entry PRESENT and points it at a zeroed frame -
+                 * so the guest's map stays continuous and every read returns zeros
+                 * instead of our data.
+                 *
+                 * The second measurement is what named it: for an identity-mapped
+                 * page, out[2] (frame) must equal the pa that was asked for. It did
+                 * not (0x421036000 resolved to 0x42A3C0000), and that mismatch IS
+                 * the decoy. So the honest guest test is not "is it present" but
+                 * "does it still resolve to the frame it is supposed to":
+                 *
+                 *   present=0                      -> hidden by UNMAP
+                 *   present=1 and frame != pa      -> hidden by DECOY
+                 *   present=1 and frame == the 2MB base of pa -> large page, not yet split
+                 *   present=1 and frame == pa      -> genuinely visible
+                 */
+                out[6] = ((present && !ps && frame != (pa & ~(UINT64)0xFFF)) ? 1ULL : 0ULL);
+
+                /*
                  * 9.450: HOST VISIBILITY IS NOT THE NPT ENTRY - and getting this
                  * wrong produced a false "LOCKED OUT" on the first run.
                  *
