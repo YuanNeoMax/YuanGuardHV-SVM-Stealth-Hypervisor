@@ -441,7 +441,7 @@ NPT 是 identity map（`GPA == SPA`），一个 PA 一次查表。输出关键�
 于是隐藏成功的页报 `host=0`，判成 `LOCKED OUT`。
 
 > 错在把两套翻译混成一个。NPT 是 **guest 的**翻译；我们走 **host 页表**（自己的 CR3），
-> NPT 管不到。隐藏页 `guest=0` 而我们照常可读，靠的是 RIP 白名单 ALLOW loop。
+> NPT 管不到。隐藏页 `guest=0` 而我们照常可读，是因为 `host` 字段用的是 **物理直读**（`yghv_pa_read`），它根本不经过 NPT。
 > 改成「真的去读一次这个帧」后判据才正确。
 
 **实测结论**
@@ -462,14 +462,14 @@ hidden page:   guest present=0  host=1   -> HIDDEN（正确）
 |---|---|
 | `npt-view` 观测面 | **完成** |
 | 三张 guard 表页隐藏 + host 仍可读 | **完成并实测** |
-| 驱动代码/数据页逐页拆剔 | **未做**（见下）|
-| 符号链接 `\\.\YuanGuardHV` | 实测可见，未隐藏 |
+| 符号链接 `\\.\YuanGuardHV` | **完成并实测**（9.453，5 秒窗口自恢复）|
+| 驱动代码/数据页逐页拆剔 | 数据页**可做未做**；代码页见下 |
 | 服务注册表键 / SCM 条目 | 实测可见，未隐藏 |
 | `loader_stealth` 模块摘链 | 代码在，默认 0，未验证 |
 
 **为什么代码页那一半不能顺手补**
 
-`HIDE_UNMAP` 清 present，访问即 NPF，由 RIP 白名单 ALLOW loop 服务。
+`HIDE_UNMAP` 清 present，访问即 NPF。**注意：没有 ALLOW loop** —— `yghv_guard_fault_is_ours` 无调用者，`unmap_bare` 也没有放行分支。我们之所以还能读隐藏页，靠的是物理直读绕开 NPT，不是被放行。
 数据页可以（访问稀疏）；**代码页不行** —— 每条指令取指一次 VMEXIT，机器立刻不可用。
 DECOY 也不行（present 保持但指向全零，我们的取指会拿到零字节）。
 
@@ -512,7 +512,24 @@ yghv_ctl.ps1 mem-bench <pid> <hex_pattern> [start_hex] [end_hex] [budget]
 **基准必须能报自己的失败**：第一版在无页范围上报 `26,594×` —— 纯属产物。
 现在输出 `walk_cr3`，且 `pages_visited==0` 时打 `INVALID`。
 
-### 8.8 VMEXIT 覆盖：206 主线已补到 35 个（9.448）
+### 8.8 符号链接隐藏：`link-hide`，5 秒窗口自恢复（9.453）
+
+`powershell
+ yghv_ctl.ps1 link-hide        # 读回 link_present / device_present
+ yghv-ctl.ps1 link-hide on     # 摘掉 \\.\YuanGuardHV
+ yghv_ctl.ps1 link-hide off    # 恢复
+`$nl：隐藏后用户态 **NOT OPENABLE**，5 秒后自动 **OPENED**。
+
+**第一版是单向开关，实测立刻打脸**：`link-hide off` 报 ERROR_FILE_NOT_FOUND ——**客户端自己就是经 `\\.\` 打开设备的**，摘掉名字等于把撤销它所需的那扇门一起摘了。
+`\Device\` 用户态单独够不到，没有第二扇门。
+
+> 考虑过用 CPUID 通道或共享窗做撤销，否决了：那会让**撤销路径的可达性和执行路径不一样**，
+> 而不对等的撤销是证明不了的撤销。改为**隐藏自带恢复定时器**。
+
+**第二个错**：DPC 里直接调 `IoCreateSymbolicLink` —— DPC 在 DISPATCH，这个 API 要 PASSIVE。 DPC 只发现「窗口结束」，恢复交给 `IoAllocateWorkItem` 排到 PASSIVE。
+
+`device_present` 全程为真，**这是诚实标注**：设备本体一直在 `\Device\YuanGuardHV`，。把「少一个名字」说成「不可见」正是 7.1 反复警告的过称。
+### 8.9 VMEXIT 覆盖：206 主线已补到 35 个（9.448）
 
 **`MEM_ENGINE_PLAN_TIER5/6/8_9.md` 开头写「现成 VMEXIT 已实现 35 种」——
 那句话原本只对 `vmexit.c`（旧 resident 路径）成立。** 206 主线只有 12 个 case。

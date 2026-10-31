@@ -3436,6 +3436,124 @@ try {
                 Write-Host ("mem-view: {0} {1}" -f $v, $(if([BitConverter]::ToUInt64($out,0)){'OK'}else{'FAILED'}))
             }
         }
+        'link-hide' {
+            # 9.452 (Tier 7.1): take the \\.\ name off the enumeration surface.
+            #
+            # usage: link-hide            (read back)
+            #        link-hide on         (remove IoDeleteSymbolicLink)
+            #        link-hide off        (restore IoCreateSymbolicLink)
+            #
+            # WHAT THIS BUYS AND WHAT IT DOES NOT
+            #   buys     a `\\.\`-style enumeration no longer resolves the name -
+            #            that is where user mode and most scanners look.
+            #   does NOT hide the DEVICE. It stays in the driver's device list at
+            #            \Device\YuanGuardHV. Calling that "invisible" would be the
+            #            overclaim Tier 7.1 keeps warning about.
+            #
+            # WARNING: the rest of this client goes through \\.\YuanGuardHV. After
+            # `on`, the client cannot reach the driver - use `off` from a session
+            # that still holds the handle, or reload the driver.
+            $op = 0
+            if ($null -ne $Arg1) {
+                $v = "$Arg1".ToLower()
+                if ($v -eq 'on') { $op = 1 }
+                elseif ($v -eq 'off') { $op = 2 }
+                else { throw 'link-hide: use on|off' }
+            }
+
+            if ($op -ne 0) {
+                $req = [BitConverter]::GetBytes([uint32]$op)
+                $r = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x82E)) `
+                                      -InBytes $req -OutputLength 32
+            } else {
+                $r = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x82E)) -OutputLength 32
+            }
+
+            $lp = [BitConverter]::ToUInt64($r, 0)
+            $dp = [BitConverter]::ToUInt64($r, 8)
+            $rc = [BitConverter]::ToInt64($r, 16)
+            $ch = [BitConverter]::ToUInt64($r, 24)
+
+            Write-Host ("link-hide: link_present={0}  device_present={1}  changes={2}" -f $lp, $dp, $ch)
+            if ($rc -ne 0) {
+                Write-Host ("  last op status = 0x{0:X8}" -f $rc)
+            }
+            if ($lp -eq 1) {
+                Write-Host '  \\.\YuanGuardHV RESOLVES - enumerable.'
+            } else {
+                Write-Host '  \\.\YuanGuardHV does not resolve - name removed.'
+                Write-Host '  (the DEVICE is still at \Device\YuanGuardHV - not hidden)'
+            }
+        }
+        'share' {
+            # 9.451 (Tier 2.4): the zero-copy shared window.
+            #
+            # The NPT is an identity map, so a frame the driver allocates is the
+            # SAME frame a guest reaches by touching its physical address.
+            # Nothing is copied - what this adds is the handshake and the proof.
+            #
+            # usage: share            (stats: PA, counters)
+            #        share init       (bring the window up)
+            #        share read       (consume one guest message)
+            #        share write <kind> [arg]
+            #        share reset
+            #
+            # NOTE ON TIER 7.1: this page is DELIBERATELY guest-visible. 7.1 hides
+            # pages from the guest; this one exists so the guest can touch it. The
+            # PA is printed so it can be audited against the 7.1 exclusion list
+            # rather than quietly contradicting it.
+            $op = 0; $ka = [uint64]0; $kb = [uint64]0
+            if ($null -ne $Arg1) {
+                $v = "$Arg1".ToLower()
+                if ($v -eq 'init') { $op = 0 }
+                elseif ($v -eq 'read') { $op = 1 }
+                elseif ($v -eq 'reset') { $op = 3 }
+                elseif ($v -eq 'write') {
+                    $op = 2
+                    if ($null -eq $Arg2) { throw 'share: write needs <kind> [arg]' }
+                    $ka = [uint64]::Parse($Arg2)
+                    if ($null -ne $Arg3) { $kb = [uint64]::Parse($Arg3) }
+                }
+                else { throw 'share: use init|read|write <kind> [arg]|reset' }
+            }
+
+            if ($op -ne 0 -or $null -ne $Arg1) {
+                $req = New-Object byte[] 32
+                [BitConverter]::GetBytes([uint32]$op).CopyTo($req, 0)
+                [BitConverter]::GetBytes([uint64]$ka).CopyTo($req, 8)
+                [BitConverter]::GetBytes([uint64]$kb).CopyTo($req, 16)
+                $r = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x82D)) `
+                                      -InBytes $req -OutputLength 72
+            } else {
+                $r = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x82D)) -OutputLength 72
+            }
+
+            $o0 = [BitConverter]::ToUInt64($r, 0)
+            $o1 = [BitConverter]::ToUInt64($r, 8)
+            $o2 = [BitConverter]::ToUInt64($r, 16)
+            $o3 = [BitConverter]::ToUInt64($r, 24)
+            $o4 = [BitConverter]::ToUInt64($r, 32)
+            $o5 = [BitConverter]::ToUInt64($r, 40)
+            $o6 = [BitConverter]::ToUInt64($r, 48)
+            $o7 = [BitConverter]::ToUInt64($r, 56)
+            $o8 = [BitConverter]::ToUInt64($r, 64)
+
+            if ($op -eq 1) {
+                if ($o0 -eq 1) {
+                    Write-Host ("share read: GOT message kind={0} arg0={1} arg1={2} seq={3}" -f $o1, $o2, $o3, $o4)
+                } else {
+                    Write-Host 'share read: nothing new (seq unchanged or a write raced the read)'
+                }
+                Write-Host ("  window pa=0x{0:X}" -f $o6)
+            } else {
+                Write-Host ("share: up={0}  pa=0x{1:X}  page={2}  payload_max={3}" -f $o0, $o1, $o7, $o8)
+                Write-Host ("  host writes={0} reads={1}  guest writes seen={2}  seq-mismatch={3}" -f $o2, $o3, $o5, $o4)
+                Write-Host ("  last seq={0}" -f $o6)
+                if ($o0 -eq 0) {
+                    Write-Host '  window is DOWN - run: share init'
+                }
+            }
+        }
         'npt-view' {
             # 9.450 (Tier 7.1): what would a GUEST see at this physical page.
             #

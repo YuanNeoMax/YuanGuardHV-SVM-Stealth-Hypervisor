@@ -327,6 +327,56 @@ typedef struct {
 #define IOCTL_YGHV_NPT_VIEW \
     YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x82C, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
 #define YGHV_NPT_VIEW_OUT_QWORDS 6
+
+/*
+ * 9.451 (Tier 2.4): the zero-copy shared window.
+ *
+ * The NPT is an identity map, so a frame this driver allocates is the SAME frame
+ * a guest reaches by touching its physical address. Nothing needs copying or
+ * mapping - what was missing is a handshake and a way to prove the exchange
+ * happened. This is that.
+ *
+ * Zero-length input -> 9 qwords of statistics:
+ *   [0] up (1 = window live)   [1] PA the GUEST must use   [2] host writes
+ *   [3] host reads             [4] seq mismatches          [5] guest writes seen
+ *   [6] last seq               [7] page size               [8] max payload
+ *
+ * 32-byte input {ULONG op, pad, a, b}:
+ *   op 0 = init      bring the window up (PASSIVE, idempotent)
+ *   op 1 = read      consume one guest message; fills out[0]=1 on success,
+ *                    out[1]=kind, out[2..5]=args, out[6]=seq
+ *   op 2 = write     publish a host message with kind a and one arg b
+ *   op 3 = reset
+ *
+ * A note the client can act on: the window is DELIBERATELY guest-visible. Tier
+ * 7.1 hides pages from the guest; this page exists so the guest can touch it. The
+ * PA is reported in [1] precisely so it can be audited against the 7.1 exclusion
+ * list instead of quietly contradicting it.
+ */
+#define IOCTL_YGHV_SHARE \
+    YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x82D, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
+#define YGHV_SHARE_OUT_QWORDS 9
+
+/*
+ * 9.452 (Tier 7.1)：转身把控制面的"名字"从枚举面上摘下来。
+ *
+ * 9.450 的实测结论：驱动加载时 `\\.\YuanGuardHV` 明文可打开。
+ * 这个命令让那件事变成可切换、可测的状态：
+ *
+ *   op 0 = 读回   -> 4 qwords {link_present, device_present, last_error, changes}
+ *   op 1 = 摘链   -> IoDeleteSymbolicLink（设备本体仍在 \Device\YuanGuardHV）
+ *   op 2 = 恢复   -> IoCreateSymbolicLink
+ *
+ * 必须说清这一条能买到什么、买不到什么：摘掉之后 `\\.\` 枚举找不到这个名字，
+ * 这是用户态和大多数扫描器看的地方；但**设备对象本身仍然在**驱动设备列表里，
+ * 这个命令不隐藏它。把"少一个名字"说成"不可见"就是这一节要避免的事。
+ *
+ * 默认不摘，因为 67 条客户端命令和回归套件都经 `\\.\` 走。
+ * 默认摘等于拿一个能用的控制面换一句话。
+ */
+#define IOCTL_YGHV_LINK_HIDE \
+    YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x82E, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
+#define YGHV_LINKHIDE_OUT_QWORDS 4
 typedef struct {
     ULONG     pid;
     ULONG     pat_len;

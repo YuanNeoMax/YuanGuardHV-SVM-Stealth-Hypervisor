@@ -98,6 +98,8 @@ yghv_ctl.ps1 sys-guard [arm|hidecore|add|del|verify|list|uncovered|why]
 yghv_ctl.ps1 exit-mask [quiet|full|events|host-insn|clear|explicit <m1hex> <m2hex>]
 yghv_ctl.ps1 mem-bench <pid> <hex_pattern> [start_hex] [end_hex] [budget]
 yghv_ctl.ps1 npt-view <hex_pa>
+yghv_ctl.ps1 share [init|read|write <kind> [arg]|reset]
+yghv_ctl.ps1 link-hide [on|off]
 ```
 
 `protect` sets the target, enumerates committed pages of the real Java process,

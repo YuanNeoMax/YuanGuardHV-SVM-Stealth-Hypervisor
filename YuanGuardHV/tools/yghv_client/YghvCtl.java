@@ -90,6 +90,12 @@ public class YghvCtl {
      * guest scan finds our pages" was unreadable until this existed - a page can
      * look hidden in every counter while its NPT entry still says present. */
     private static final int FN_NPT_VIEW = 0x82C;
+    /* 9.451 (Tier 2.4): the zero-copy shared window. The NPT is an identity map,
+     * so a frame we allocate is the same frame a guest reaches by its PA.
+     */
+    private static final int FN_SHARE = 0x82D;
+    /* 9.452 (Tier 7.1): remove the DosDevices name from enumeration. */
+    private static final int FN_LINK_HIDE = 0x82E;
 
     private static native long openHandle();
     private static native void closeHandle(long handle);

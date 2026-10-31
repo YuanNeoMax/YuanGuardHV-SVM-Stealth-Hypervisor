@@ -6,6 +6,7 @@
 #include "mem_engine.h"   /* Phase 3: dual-engine typed access */
 #include "mem_pa.h"       /* Phase 2: physical frame primitives */
 #include "mem_bench.h"    /* Phase 5 (Tier 1.5): Engine A vs B measurement */
+#include "mem_share.h"    /* Tier 2.4: zero-copy shared window */
 #include "mem_selfmap.h"  /* Phase 2b: self-built mapping window */
 #include "mem_coop.h"     /* Phase 7: guard cooperation */
 #include "mem_island.h"   /* Phase 6: island (direct-map) access */
@@ -70,6 +71,243 @@ NTKERNELAPI NTSTATUS ZwFlushBuffersFile(HANDLE FileHandle,
                                         PIO_STATUS_BLOCK IoStatusBlock);
 
 static PDEVICE_OBJECT g_yghv_device = NULL;
+
+/*
+ * 9.452 (Tier 7.1): symbolic-link hide/enable, and a way to READ which state we
+ * are in.
+ *
+ * `yghv_link_present` resolves the name through the object namespace instead of
+ * consulting a flag. The difference matters and is the reason this file does not
+ * keep a boolean: a cached flag reports what we asked for, while the namespace
+ * reports what IS - and the failure mode Tier 7.1 is about is exactly "we believe
+ * it is hidden while it is still resolvable". GiST 9.364 went after that class of
+ * bug once already.
+ */
+static volatile LONG64 g_link_hide_changes = 0;
+
+extern LONG64 yghv_link_hide_changes(void)
+{
+    return InterlockedCompareExchange64(&g_link_hide_changes, 0, 0);
+}
+
+/*
+ * 9.452: THE HIDE IS TIMED, AND THAT IS THE WHOLE SAFETY ARGUMENT.
+ *
+ * Measured the hard way, immediately after building the one-way version:
+ * `link-hide on` removes the name the CLIENT ITSELF opens the device through, so
+ * `link-hide off` then failed with ERROR_FILE_NOT_FOUND. User mode cannot reach
+ * `\Device\YuanGuardHV` directly (no `\\.\` prefix means no IoGetDeviceObject
+ * resolution), so there is no second door: a naked removal is a one-way switch
+ * that disables its own undo.
+ *
+ * This driver does have two other channels (the CPUID leaf and the Tier 2.4
+ * shared window), but routing the undo through them means the undo path has a
+ * DIFFERENT reachability than the do path - and an undo you cannot reach on the
+ * same terms as the action is an undo you cannot prove.
+ *
+ * So the removal CARRIES ITS OWN RESTORE: a timer puts the name back after a
+ * bounded interval. Three consequences, each deliberate:
+ *
+ *   1. The window is observable. A guest or scanner looking during it finds no
+ *      name; looking after it finds the name again. That is a real, measurable
+ *      property rather than a claim about a state nobody can inspect.
+ *   2. The machine cannot be stranded. Even if the caller dies mid-operation,
+ *      the timer fires.
+ *   3. The client keeps working. It opens the device, asks for the hide, and can
+ *      re-open once the timer has run - or simply reload the driver.
+ *
+ * The default window is short on purpose. Long enough to measure (a scan takes
+ * milliseconds), short enough that nobody is locked out for long.
+ */
+#define YGHV_LINK_HIDE_MS 5000
+
+static KTIMER g_link_timer;
+static KDPC   g_link_dpc;
+static PIO_WORKITEM g_link_work = NULL;
+static volatile LONG  g_link_timer_armed = 0;
+
+extern void yghv_link_restore_on_unload(void);
+
+/*
+ * The actual restore runs HERE, at PASSIVE, from a work item.
+ *
+ * The first version called IoCreateSymbolicLink straight from the timer DPC and
+ * that is simply illegal: a DPC runs at DISPATCH, and IoCreateSymbolicLink
+ * touches the object namespace, which requires PASSIVE. The timer's only job is
+ * to notice that the window ended and hand off.
+ */
+static VOID yghv_link_work_routine(PDEVICE_OBJECT DeviceObject, PVOID Context)
+{
+    UNREFERENCED_PARAMETER(DeviceObject);
+    UNREFERENCED_PARAMETER(Context);
+
+    yghv_link_restore_on_unload();
+    if (g_link_work) {
+        IoFreeWorkItem(g_link_work);
+        g_link_work = NULL;
+    }
+}
+
+static VOID yghv_link_timer_dpc(PKDPC Dpc, PVOID Context, PVOID Arg1, PVOID Arg2)
+{
+    UNREFERENCED_PARAMETER(Dpc);
+    UNREFERENCED_PARAMETER(Context);
+    UNREFERENCED_PARAMETER(Arg1);
+    UNREFERENCED_PARAMETER(Arg2);
+
+    InterlockedExchange(&g_link_timer_armed, 0);
+
+    /*
+     * Hand off to a work item so the namespace call happens at PASSIVE. If the
+     * allocation fails the link simply stays removed until unload - which
+     * yghv_link_restore_on_unload also covers, so the failure degrades to "hidden
+     * for the rest of this session" rather than "hidden forever".
+     */
+    if (g_link_work == NULL) {
+        g_link_work = IoAllocateWorkItem(g_yghv_device);
+        if (g_link_work) {
+            IoQueueWorkItem(g_link_work, yghv_link_work_routine,
+                            DelayedWorkQueue, NULL);
+        } else {
+            LOG_ERROR("link restore: IoAllocateWorkItem failed - name stays "
+                      "removed until unload");
+        }
+    }
+}
+
+extern LONG yghv_link_hide_op(ULONG op)
+{
+    UNICODE_STRING dev_name, link_name;
+    NTSTATUS st;
+    LARGE_INTEGER due;
+
+    RtlInitUnicodeString(&dev_name, YGHV_DEVICE_NAME_STRING);
+    RtlInitUnicodeString(&link_name, YGHV_DOS_DEVICE_NAME_STRING);
+
+    if (op == 1) {
+        st = IoDeleteSymbolicLink(&link_name);
+        if (NT_SUCCESS(st)) {
+            /*
+             * Arm the restore timer. KeInitializeTimer/KeSetTimer must not race
+             * each other, so the initialize happens once and only the due time is
+             * re-armed.
+             */
+            if (InterlockedCompareExchange(&g_link_timer_armed, 1, 0) == 0) {
+                KeInitializeTimer(&g_link_timer);
+                KeInitializeDpc(&g_link_dpc, yghv_link_timer_dpc, NULL);
+                due.QuadPart = -(LONGLONG)YGHV_LINK_HIDE_MS * 10000;
+                KeSetTimer(&g_link_timer, due, &g_link_dpc);
+            } else {
+                due.QuadPart = -(LONGLONG)YGHV_LINK_HIDE_MS * 10000;
+                KeSetTimer(&g_link_timer, due, &g_link_dpc);
+            }
+        }
+    } else if (op == 2) {
+        if (InterlockedExchange(&g_link_timer_armed, 0) != 0) {
+            KeCancelTimer(&g_link_timer);
+        }
+        st = IoCreateSymbolicLink(&link_name, &dev_name);
+    } else {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    InterlockedIncrement64(&g_link_hide_changes);
+    return st;
+}
+
+/*
+ * Is the \??\-space name resolvable right now?
+ *
+ * ObReferenceObjectByName with a NULL type reads the namespace entry. If it
+ * succeeds the link exists; we drop the reference immediately - this is a
+ * question, not a use.
+ */
+static volatile LONG g_link_probe_result = -1;
+
+extern int yghv_link_present(void)
+{
+    UNICODE_STRING link_name;
+    OBJECT_ATTRIBUTES oa;
+    NTSTATUS st;
+    HANDLE h = NULL;
+
+    /*
+     * Resolve the \??\-space name by OPENING it, not by looking at a flag.
+     *
+     * ObReferenceObjectByName needs a declaration this translation unit does not
+     * get from ntddk.h, and inventing one was the first thing tried. ZwOpenSymbolicLinkObject
+     * is declared, is exactly the question being asked ("does this name resolve"),
+     * and needs PASSIVE - which the METHOD_BUFFERED dispatcher gives us. If it ever
+     * moves to a stronger IRQL this probe must move with it rather than silently
+     * report "absent".
+     */
+    RtlInitUnicodeString(&link_name, YGHV_DOS_DEVICE_NAME_STRING);
+    InitializeObjectAttributes(&oa, &link_name, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
+                               NULL, NULL);
+
+    st = ZwOpenSymbolicLinkObject(&h, GENERIC_READ, &oa);
+    if (NT_SUCCESS(st)) {
+        ZwClose(h);
+        InterlockedExchange(&g_link_probe_result, 1);
+        return 1;
+    }
+
+    InterlockedExchange(&g_link_probe_result, 0);
+    return 0;
+}
+
+/*
+ * 9.452: PUT THE LINK BACK. Called from DriverUnload, unconditionally.
+ *
+ * WHY THIS EXISTS, AND WHY IT IS A BUG FIX RATHER THAN A CONVENIENCE
+ *
+ * `link-hide on` removes the name that THE CLIENT ITSELF uses to reach the driver
+ * (`\\.\YuanGuardHV`). Measured immediately: after `on`, `link-hide off` failed
+ * with ERROR_FILE_NOT_FOUND - the client could not open the device in order to
+ * ask for the name back. A one-way switch that disables its own undo is not a
+ * feature; it is a trap, and I built it.
+ *
+ * Two ways out of that trap were considered:
+ *
+ *   (a) a second control channel (the CPUID leaf, or the shared window) that does
+ *       not depend on the name. Both exist in this tree, but routing an undo
+ *       through them means the undo path has a different reachability than the do
+ *       path - exactly the asymmetry that makes recovery hard to prove.
+ *   (b) PUT IT BACK ON RELOAD, ALWAYS.
+ *
+ * (b) is chosen, and the reason is the same one this file already uses for
+ * YGHV_NO_DEVICE: the claim has to be MEASURABLE without trading away the ability
+ * to keep working. `link-hide on` is a state you can observe; a driver reload is
+ * a state you always come back from. The unload path restores the name before the
+ * device goes away, so a machine can never be left with a driver whose namespace
+ * entry is missing.
+ *
+ * This also means the hidden state is honest about its scope: it lasts until
+ * unload, and unload cleans up. Nothing persists.
+ */
+extern void yghv_link_restore_on_unload(void)
+{
+    UNICODE_STRING dev_name, link_name;
+    NTSTATUS st;
+
+    RtlInitUnicodeString(&dev_name, YGHV_DEVICE_NAME_STRING);
+    RtlInitUnicodeString(&link_name, YGHV_DOS_DEVICE_NAME_STRING);
+
+    /*
+     * If the link is already present, IoCreateSymbolicLink fails with
+     * STATUS_OBJECT_NAME_COLLISION - that is the normal case and is not an error
+     * worth logging. Only a genuine failure (a different failure status) is.
+     */
+    if (!yghv_link_present()) {
+        st = IoCreateSymbolicLink(&link_name, &dev_name);
+        if (!NT_SUCCESS(st)) {
+            LOG_ERROR("link restore on unload failed 0x%x - name stays missing "
+                      "until the next load", st);
+        } else {
+            LOG_INFO("link restore on unload: name back");
+        }
+    }
+}
 
 typedef struct {
     PEPROCESS owner_process;
@@ -1948,6 +2186,146 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
         status = STATUS_INVALID_PARAMETER;
         break;
     }
+    case IOCTL_YGHV_LINK_HIDE: {
+        /*
+         * 9.452 (Tier 7.1): take the \\.\ name off the enumeration surface.
+         *
+         * WHAT THIS DOES NOT DO: it does not hide the DEVICE. The device object
+         * stays in the driver's device list under \Device\YuanGuardHV, and
+         * IoCreateDevice already linked it there at load. Removing the symbolic
+         * link only removes the name a `\\.\`-style enumeration resolves through.
+         * Saying otherwise would be the exact overclaim Tier 7.1 keeps warning
+         * about.
+         *
+         * The link state is READ BACK from the objects, not remembered in a
+         * variable: a cached flag would say "hidden" while the link was still
+         * resolvable (a failure path that returns success), which is the class of
+         * bug 9.364 went after.
+         */
+        extern PDEVICE_OBJECT g_yghv_device;
+        extern LONG64 yghv_link_hide_changes(void);
+        extern LONG yghv_link_hide_op(ULONG op);
+        ULONG op = 0;
+        LONG rc = 0;
+
+        if (in_len >= sizeof(ULONG)) {
+            op = *(ULONG *)buf;
+        }
+
+        if (op >= 1) {
+            rc = yghv_link_hide_op(op);
+        }
+
+        if (out_len >= YGHV_LINKHIDE_OUT_QWORDS * sizeof(UINT64)) {
+            UINT64 *out = (UINT64 *)buf;
+
+            /*
+             * Link presence is read from the OBJECT NAMESPACE, not from a cached
+             * flag: ObReferenceObjectByName succeeds on the \??\: name only while
+             * the link exists. A flag would report what we ASKED for; this reports
+             * what IS, which is the difference between a state and a wish.
+             */
+            out[0] = (UINT64)(yghv_link_present() ? 1 : 0);
+            out[1] = (UINT64)(g_yghv_device ? 1 : 0);
+            out[2] = (UINT64)(INT64)rc;
+            out[3] = (UINT64)yghv_link_hide_changes();
+            info = YGHV_LINKHIDE_OUT_QWORDS * sizeof(UINT64);
+            status = STATUS_SUCCESS;
+        } else {
+            status = STATUS_BUFFER_TOO_SMALL;
+        }
+        break;
+    }
+    case IOCTL_YGHV_SHARE: {
+        /*
+         * 9.451 (Tier 2.4): the zero-copy shared window.
+         *
+         * See mem_share.c. Two things a reader should know before using it:
+         *  - the page is DELIBERATELY guest-visible (that is its purpose, and it
+         *    is the one stated conflict with Tier 7.1);
+         *  - the exchange is a seqlock, so a read that raced a write is reported
+         *    as 0 and should be retried, not treated as "no message".
+         */
+        ULONG op = 0;
+        ULONG a = 0, b = 0;
+
+        if (in_len >= 32) {
+            UINT64 *in = (UINT64 *)buf;
+            op = (ULONG)in[0];
+            a = (ULONG)in[1];
+            b = (ULONG)in[2];
+        }
+
+        switch (op) {
+        case 0:   /* init */
+            yghv_share_init();
+            break;
+        case 2: { /* host publishes one message */
+            UINT64 args[4];
+            uint8_t seq = 0;
+
+            args[0] = (UINT64)a;
+            args[1] = (UINT64)b;
+            args[2] = 0;
+            args[3] = 0;
+            yghv_share_host_write(a, args, 3, NULL, 0, &seq);
+            break;
+        }
+        case 1:   /* consume one guest message */
+        case 3:   /* reset */
+        default:
+            break;
+        }
+
+        if (out_len >= YGHV_SHARE_OUT_QWORDS * sizeof(UINT64)) {
+            UINT64 *out = (UINT64 *)buf;
+            yghv_share_stats_t ss;
+
+            if (op == 3) {
+                yghv_share_stats_reset();
+            }
+
+            yghv_share_stats_get(&ss);
+
+            if (op == 1 && ss.up) {
+                /*
+                 * The read result goes in [0], OVERWRITING the "up" field: the
+                 * caller asked for a consume, so "did I get one" is the answer it
+                 * needs first. `ss.up` is still visible in the stats path.
+                 */
+                uint8_t exp = (uint8_t)ss.last_seq;
+                uint32_t kind = 0;
+                UINT64 rargs[4] = { 0, 0, 0, 0 };
+                uint32_t plen = 0;
+                int got = yghv_share_host_read(&exp, &kind, rargs, 4, NULL, 0, &plen);
+
+                out[0] = (UINT64)(got ? 1 : 0);
+                out[1] = (UINT64)kind;
+                out[2] = rargs[0];
+                out[3] = rargs[1];
+                out[4] = (UINT64)exp;
+                out[5] = (UINT64)plen;
+                out[6] = ss.pa;
+                out[7] = ss.page_size;
+                out[8] = ss.payload_max;
+            } else {
+                out[0] = ss.up;
+                out[1] = ss.pa;
+                out[2] = ss.host_writes;
+                out[3] = ss.host_reads;
+                out[4] = ss.seq_mismatch;
+                out[5] = ss.guest_writes_seen;
+                out[6] = ss.last_seq;
+                out[7] = ss.page_size;
+                out[8] = ss.payload_max;
+            }
+            info = YGHV_SHARE_OUT_QWORDS * sizeof(UINT64);
+            status = STATUS_SUCCESS;
+        } else {
+            status = STATUS_BUFFER_TOO_SMALL;
+        }
+        break;
+    }
     case IOCTL_YGHV_NPT_VIEW: {
         /*
          * 9.450 (Tier 7.1): what would a GUEST see at this physical page.
@@ -2395,6 +2773,45 @@ NTSTATUS yghv_control_device_init(PDRIVER_OBJECT driver) {
         IoDeleteDevice(dev);
         return status;
     }
+
+    /*
+     * 9.452 (Tier 7.1): OPTIONAL SYMBOL-LINK REMOVAL.
+     *
+     * Tier 7.1 lists "\\.\YuanGuardHV is a plain-text symbolic link" as an
+     * unhidden exposure, and 9.450 measured it: opening `\\.\YuanGuardHV` from
+     * user mode succeeds while the driver is loaded.
+     *
+     * THE LINK IS CREATED FIRST AND REMOVED AFTER, DELIBERATELY. Creating the
+     * link and immediately deleting it achieves exactly what creating nothing
+     * achieves - except that this way the DoS-name path has existed, so the code
+     * that would fail if it could not create it is exercised, and a failure to
+     * delete is a visible log line rather than a silent "we never created it".
+     * A feature that only ever runs its happy path is a feature whose failure
+     * behaviour is unknown.
+     *
+     * WHAT REMAINS REACHABLE, SAID PLAINLY: the DEVICE still exists at
+     * `\Device\YuanGuardHV`, and IoCreateDevice has already put it in the
+     * driver's device list - nothing here hides that. What the removal buys is
+     * narrower and honest: a `\\.\`-style enumeration (which is how both user
+     * mode and most scanners look) no longer finds the name.
+     *
+     * Gated, because the 67-command client and the regression suite go through
+     * the DoS name - removing it by default would trade a working control plane
+     * for a claim. The same sentence the YGHV_NO_DEVICE block already uses.
+     */
+#if defined(YGHV_HIDE_LINK)
+    {
+        NTSTATUS del = IoDeleteSymbolicLink(&link_name);
+
+        if (NT_SUCCESS(del)) {
+            LOG_INFO("control device: symbol link REMOVED (YGHV_HIDE_LINK) - "
+                     "device still at \\Device\\YuanGuardHV");
+        } else {
+            LOG_ERROR("control device: IoDeleteSymbolicLink failed 0x%x - link REMAINS",
+                      del);
+        }
+    }
+#endif
 
     for (i = 0; i <= IRP_MJ_MAXIMUM_FUNCTION; i++)
         driver->MajorFunction[i] = yghv_control_dispatch_default;
