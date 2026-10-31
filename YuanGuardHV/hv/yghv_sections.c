@@ -137,7 +137,8 @@ typedef struct {
 
 int yghv_sections_report(uint8_t *image_base, uint32_t image_size,
                          yghv_section_info_t *out, uint32_t out_max,
-                         uint32_t *count_out, uint32_t *flags_out)
+                         uint32_t *count_out, uint32_t *flags_out,
+                         uint32_t *iat_unplaced_out)
 {
     YGHV_DOS_HEADER *dos;
     YGHV_FILE_HEADER *fh;
@@ -151,6 +152,8 @@ int yghv_sections_report(uint8_t *image_base, uint32_t image_size,
         return 0;
 
     *count_out = 0;
+    if (iat_unplaced_out)
+        *iat_unplaced_out = 0;
     if (flags_out)
         *flags_out = 0;
 
@@ -263,19 +266,50 @@ int yghv_sections_report(uint8_t *image_base, uint32_t image_size,
 
             if (iat_rva) {
                 uint32_t j;
+                uint32_t marked = 0;
 
                 for (j = 0; j < i; j++) {
-                    uint32_t start = out[j].va;
-                    uint32_t end = out[j].va + out[j].size;
+                    /*
+                     * 9.474: COMPUTED IN 64 BITS, NOT 32.
+                     *
+                     * `va + size` is two uint32_t, so an IAT near the top of the
+                     * 4GB space (or a corrupt section size) wraps to a small
+                     * number and the overlap test silently says "no overlap" -
+                     * which un-marks the IAT and lets section-hide remove it.
+                     * Widened here so a wrap cannot turn into a permission.
+                     */
+                    uint64_t start = (uint64_t)out[j].va;
+                    uint64_t end   = (uint64_t)out[j].va + (uint64_t)out[j].size;
+                    uint64_t s     = (uint64_t)iat_rva;
+                    uint64_t e     = (uint64_t)iat_rva + (uint64_t)iat_size;
 
                     /* An IAT that straddles two sections marks both; refusing one
                      * of the two would still break the calls through the other. */
-                    if (iat_rva >= start && iat_rva < end) {
+                    if (s >= start && s < end) {
                         out[j].has_iat = 1;
-                    } else if (iat_size &&
-                               iat_rva + iat_size > start && iat_rva < end) {
+                        marked += 1;
+                    } else if (iat_size && e > start && s < end) {
                         out[j].has_iat = 1;
+                        marked += 1;
                     }
+                }
+
+                /*
+                 * 9.474: AN IAT WE CANNOT PLACE IS MORE DANGEROUS THAN ONE WE CAN.
+                 *
+                 * Before this check, an IAT that fell outside every parsed section
+                 * (a truncated section table, or a linker that put it elsewhere)
+                 * marked NOTHING - so `section-hide` saw no section holding the
+                 * IAT and would happily hide the page containing it. That is the
+                 * exact shape of the 9.458 crash (`0x3B C0000005`, rip = 0, from
+                 * `call [IAT slot]` reading the zeroed entry).
+                 *
+                 * "I do not know where the IAT is" must therefore be reported,
+                 * not silently treated as "no section holds it". The caller gets
+                 * a flag it can refuse on.
+                 */
+                if (marked == 0) {
+                    *iat_unplaced_out = 1;
                 }
             }
         }

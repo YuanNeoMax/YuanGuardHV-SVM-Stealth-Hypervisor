@@ -2551,6 +2551,7 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
             uint8_t *base = (uint8_t *)yghv_pa_driver_start();
             uint32_t size = yghv_pa_driver_size();
             int parsed = 0, hidden = 0, lastRc = 0;
+            uint32_t iat_unplaced = 0;
 
             /*
              * 9.456: FILL FIRST, ZERO ONLY ON FAILURE.
@@ -2561,7 +2562,7 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
              */
             if (base && size) {
                 if (!yghv_sections_report(base, size, si, YGHV_SECTIONS_MAX,
-                                          &nsec, &pflags)) {
+                                          &nsec, &pflags, &iat_unplaced)) {
                     RtlZeroMemory(&si, sizeof(si));
                     nsec = 0;
                 } else {
@@ -2571,6 +2572,29 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
 
             if (!parsed) {
                 out[0] = 0; out[1] = 0; out[2] = 0x21;
+                info = YGHV_SECTION_HIDE_OUT_QWORDS * sizeof(UINT64);
+                status = STATUS_SUCCESS;
+                break;
+            }
+
+            /*
+             * 9.474: AN IAT WE CANNOT LOCATE MEANS REFUSE EVERYTHING.
+             *
+             * If the report found the IAT directory but no section contains it,
+             * `has_iat` is all zeros - and the per-section refusal below would
+             * then allow hiding the page that holds it. That is exactly how 9.458
+             * crashed (0x3B C0000005, rip = 0). "I do not know where my import
+             * table is" must stop the hide, not pass through it.
+             *
+             * 9.477: 0x29, NOT 0x28. Both refusals reported 0x28, so a caller
+             * could not tell "this section holds the IAT, pick another" from
+             * "the IAT cannot be found at all, nothing is hideable". Those need
+             * different reactions: the first is a normal retry with a different
+             * index, the second means the whole feature is unavailable on this
+             * image and no index will work.
+             */
+            if (iat_unplaced) {
+                out[0] = 0; out[1] = 0; out[2] = 0x29;
                 info = YGHV_SECTION_HIDE_OUT_QWORDS * sizeof(UINT64);
                 status = STATUS_SUCCESS;
                 break;
@@ -2616,23 +2640,49 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
              * Page by page, inside the section's OWN size - not the page-rounded
              * one. Hiding a page past VirtualSize would take a frame that belongs
              * to whatever the loader put after this section.
+             *
+             * 9.475: THE STEP IS PAGE-ALIGNED, NOT `i += 0x1000`.
+             *
+             * The obvious loop walks the section with a fixed 0x1000 stride. It
+             * is correct only while `si[idx].va` is itself 4K-aligned - every
+             * section in THIS image happens to be (measured: all six), but that
+             * is a property of the current linker, not of the format. If a
+             * section ever started mid-page, `base + va + i` would advance in
+             * 4K steps from an unaligned origin, so two iterations would land in
+             * the same page (the second add_va finds the slot and silently
+             * returns) and one page at the end would never be visited.
+             *
+             * This version starts each iteration at the page CONTAINING
+             * (va + i) and advances to the next page boundary, so an unaligned
+             * section step can neither skip a page nor visit one twice.
              */
-            for (i = 0; i < si[idx].size; i += 0x1000) {
-                uint32_t left = si[idx].size - i;
-                uint32_t chunk = (left < 0x1000) ? left : 0x1000;
+            {
+                uint32_t off = 0;
 
-                /*
-                 * yghv_guard_add_va records the object bytes AND arms the hide in
-                 * one step, which is what makes this measurable afterwards: the
-                 * guard list shows tag = the section name and hidden = 1, and
-                 * `npt-view` can confirm guest=0 / host=1 on the same PA.
-                 */
-                lastRc = yghv_guard_add_va(base + si[idx].va + i, chunk,
-                                           si[idx].name, 1);
-                if (lastRc < 0) {
-                    break;
+                while (off < si[idx].size) {
+                    uint32_t abs   = si[idx].va + off;      /* RVA of this page */
+                    uint32_t page  = abs & ~0xFFFu;         /* page-aligned RVA */
+                    uint32_t start = (abs > page) ? abs : page;  /* first byte we want */
+                    uint32_t left  = si[idx].size - off;
+                    uint32_t chunk = (left < (page + 0x1000 - start))
+                                     ? left : (page + 0x1000 - start);
+
+                    /*
+                     * yghv_guard_add_va records the object bytes AND arms the hide
+                     * in one step, which is what makes this measurable afterwards:
+                     * the guard list shows tag = the section name and hidden = 1,
+                     * and `npt-view` can confirm guest=0 / host=1 on the same PA.
+                     */
+                    lastRc = yghv_guard_add_va(base + start, chunk,
+                                               si[idx].name, 1);
+                    if (lastRc < 0) {
+                        break;
+                    }
+                    hidden += 1;
+
+                    /* Advance to the byte after this page's worth. */
+                    off += chunk;
                 }
-                hidden += 1;
             }
 
             /*
@@ -2668,11 +2718,12 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
         uint32_t size = yghv_pa_driver_size();
         yghv_section_info_t si[YGHV_SECTIONS_MAX];
         uint32_t nsec = 0, pflags = 0, i;
+        uint32_t iat_unplaced = 0;
         int parsed = 0;
 
         if (base && size) {
             parsed = yghv_sections_report(base, size, si, YGHV_SECTIONS_MAX,
-                                          &nsec, &pflags);
+                                          &nsec, &pflags, &iat_unplaced);
         }
 
         /*
@@ -2692,7 +2743,14 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
             out[1] = (UINT64)pflags;
             out[2] = (UINT64)nsec;
             out[3] = (UINT64)size;
-            out[4] = 0;
+            /*
+             * 9.474: out[4] used to be a hardcoded zero, so the caller had no way
+             * to learn that the IAT could not be placed in any section - and that
+             * is precisely the state in which `section-hide` refuses everything
+             * (0x28). Reporting it here means the refusal has a visible cause
+             * instead of looking like a switch that never fires.
+             */
+            out[4] = (UINT64)iat_unplaced;
 
             if (parsed) {
                 for (i = 0; i < nsec; i++) {

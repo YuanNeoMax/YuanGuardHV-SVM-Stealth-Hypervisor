@@ -47,9 +47,17 @@ typedef struct {
  *
  * `flags_out` receives 1 for PE32, 2 for PE32+, 0 for an unrecognised magic, so a
  * caller can tell "parsed a 32-bit image" from "parsed nothing".
+ *
+ * `iat_unplaced_out` receives 1 when the Import Address Table directory was found
+ * but NO parsed section contains it. That is not a cosmetic gap: with nothing
+ * marked, a caller that walks has_iat to decide what is hideable would conclude
+ * "no section holds the IAT" and hide the page anyway - the exact shape of the
+ * 9.458 crash (0x3B C0000005, rip = 0, from `call [IAT slot]` reading a zeroed
+ * entry). Callers must treat this as "unknown, refuse".
  */
 int yghv_sections_report(uint8_t *image_base, uint32_t image_size,
                          yghv_section_info_t *out, uint32_t out_max,
-                         uint32_t *count_out, uint32_t *flags_out);
+                         uint32_t *count_out, uint32_t *flags_out,
+                         uint32_t *iat_unplaced_out);
 
 #endif /* YGHV_SECTIONS_H */

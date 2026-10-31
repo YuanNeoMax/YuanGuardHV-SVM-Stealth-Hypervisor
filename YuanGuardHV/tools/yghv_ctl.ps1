@@ -3595,6 +3595,7 @@ try {
             $pflag  = [BitConverter]::ToUInt64($out, 8)
             $nsec   = [BitConverter]::ToUInt64($out, 16)
             $isize  = [BitConverter]::ToUInt64($out, 24)
+            $iunp   = [BitConverter]::ToUInt64($out, 32)
 
             $kind = switch ($pflag) { 1 {'PE32'} 2 {'PE32+'} default {'unknown'} }
             Write-Host ("sections: parsed={0}  fmt={1}  image=0x{2:X} byte  sections={3}" -f $parsed, $kind, $isize, $nsec)
@@ -3602,6 +3603,16 @@ try {
             if ($parsed -eq 0) {
                 Write-Host '  PARSE FAILED - treat every page as UNHIDEABLE (do not guess)'
                 return
+            }
+
+            # 9.474: the IAT was located but NO section contains it. section-hide
+            # refuses everything in that state (0x28), because hiding a page whose
+            # IAT role we cannot see is exactly how 9.458 crashed
+            # (rip=0 from `call [IAT slot]` reading a zeroed entry).
+            if ($iunp -eq 1) {
+                Write-Host '  *** IAT NOT PLACED IN ANY SECTION - section-hide will REFUSE everything'
+                Write-Host '      (truncated section table or unusual linker layout; hiding is'
+                Write-Host '       unsafe while we cannot tell which page holds the IAT)'
             }
 
             $hideable = 0
@@ -3692,6 +3703,7 @@ try {
                     0x23 { 'section is EXECUTABLE - refused (no ALLOW loop to serve a fetch fault)' }
                     0x24 { 'guard table full' }
                     0x28 { 'section HOLDS OUR IAT - refused (hiding it would zero our own import calls)' }
+                    0x29 { 'IAT NOT LOCATED in any section - refusing everything (no index will work)' }
                     default { ("code 0x{0:X}" -f $rc) }
                 }
                 Write-Host ("section-hide: index={0} REFUSED {1}" -f $e, $why)

@@ -462,6 +462,34 @@ static_assert(sizeof(EVENTINJ) == 8,
 #define VMEXIT_INVLPG               0x0079
 #define VMEXIT_INVLPGA              0x007a
 #define VMEXIT_IOIO                 0x007b
+/*
+ * 9.476: THIS MACRO HAS TWO SPELLINGS IN THE TREE, AND THE WARNING THAT GAVE IT
+ * AWAY WAS A MACRO-REDEFINITION (C4005) NOBODY WAS READING.
+ *
+ * common/svm_defs.h defines VMEXIT_MSR/VMMCALL/NPF as aliases of SVM_EXIT_*;
+ * this header defines them as literals. Measured, the values currently agree
+ * (0x7C / 0x81 / 0x400), so the redefinition is harmless TODAY - but a macro
+ * redefinition is the one kind of disagreement the compiler reports and the
+ * build then ignores, so the next person to change one copy gets two values
+ * silently, whichever header happened to be included first winning.
+ *
+ * The guard below turns that into a COMPILE ERROR: if svm_defs.h was already
+ * included and its value differs, this #if fires instead of a warning scrolling
+ * past. If it was not included, the literal stands as before.
+ */
+#if defined(SVM_EXIT_MSR) && (SVM_EXIT_MSR != 0x7C)
+#error "svm_defs.h SVM_EXIT_MSR disagrees with svm_simplevm206.hpp VMEXIT_MSR"
+#endif
+#if defined(SVM_EXIT_VMMCALL) && (SVM_EXIT_VMMCALL != 0x81)
+#error "svm_defs.h SVM_EXIT_VMMCALL disagrees with svm_simplevm206.hpp VMEXIT_VMMCALL"
+#endif
+#if defined(SVM_EXIT_NPF) && (SVM_EXIT_NPF != 0x400)
+#error "svm_defs.h SVM_EXIT_NPF disagrees with svm_simplevm206.hpp VMEXIT_NPF"
+#endif
+#if defined(SVM_EXIT_CPUID) && (SVM_EXIT_CPUID != 0x72)
+#error "svm_defs.h SVM_EXIT_CPUID disagrees with svm_simplevm206.hpp VMEXIT_CPUID"
+#endif
+
 #define VMEXIT_MSR                  0x007c
 #define VMEXIT_TASK_SWITCH          0x007d
 #define VMEXIT_FERR_FREEZE          0x007e

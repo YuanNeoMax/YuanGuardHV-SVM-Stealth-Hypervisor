@@ -642,7 +642,26 @@ typedef struct _GUEST_CONTEXT
 #define IA32_MSR_PAT    0x00000277
 #define IA32_MSR_EFER   0xc0000080
 
-#define EFER_SVME       (1UL << 12)
+/*
+ * 9.476: 64-BIT, AND THE WIDTH IS THE POINT - NOT THE VALUE.
+ *
+ * This was `(1UL << 12)`. On x64 Windows `unsigned long` is 32 bits, so `~EFER_SVME`
+ * is `0x00000000FFFFEFFF`, and `__readmsr(x) & ~EFER_SVME` therefore clears every
+ * bit ABOVE 32 in the EFER it is writing back.
+ *
+ * Measured: with a realistic EFER (`0x0D01`) the 32-bit and 64-bit masks give the
+ * same answer, which is why this has never shown up as a defect. But `__readmsr`
+ * returns a full 64-bit register, and any bit above 32 that AMD defines (or any
+ * future one) would be silently discarded by a 32-bit complement. A mask that
+ * happens to be harmless today because the top half is zero is still the wrong
+ * mask - the failure it causes would be a reserved-bit fault on EFER, i.e. #GP
+ * inside our own unload path, and it would look like something else entirely.
+ *
+ * The tree already had the correct form in common/svm_defs.h (`1ULL << 12`), so
+ * this was also a duplicate definition that disagreed in TYPE while agreeing in
+ * VALUE. Two spellings of one constant is how a value and a type drift apart.
+ */
+#define EFER_SVME       (1ULL << 12)
 
 #define RPL_MASK        3
 #define DPL_SYSTEM      0
