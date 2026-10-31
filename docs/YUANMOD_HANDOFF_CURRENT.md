@@ -16200,3 +16200,73 @@ if (payload_len_out)
 这次 40 和 88 在同一个命令的两条分支里，我改了上面那条，忘了下面那条。
 `STATUS_BUFFER_TOO_SMALL` 是**正确的防御**（它拒绝了截断回复），
 但它把「我长度写错了」伪装成了「这个功能不工作」。
+
+---
+
+#### 9.483–9.484 ★★★★ 把「常量长大了、调用点没跟」做成构建期检查
+
+##### 这个形状在本树出现过三次，每次都报告「功能不工作」
+
+| 位置 | 客户端要 | 驱动要 | 现象 |
+|---|---|---|---|
+| `sys-guard list` | 256 | 2568 | 第 4 条抛 IndexOutOfRange，**表头已打印「4 page(s)」** |
+| `exit-mask` 设置路径 | 40 | 88 | 返回 `BUFFER_TOO_SMALL`，**mask 实际已写进 12 个 VMCB** |
+| `sys-guard why` | 40 | 64 | 五个字段全部读不到（9.484 新发现）|
+
+**三次都是「驱动健康、客户端报失败」** —— 最糟的一种错误，因为用户会断定
+「这个功能不能用」。
+
+##### 为什么必须自动化
+
+两个数字在**不同文件、不同语言**里，两个编译器都看不到对方。这正是自动化检查
+该做的事。
+
+##### 判据踩了三次坑（都记下来）
+
+1. **`[^I]{0,200}?` 永远匹配不上**：`-OutputLength` 几乎总在下一行，
+   中间那段 `Invoke-YghvIoctl -Code (...IoCtl(0x82A))` 里就有大写 `I`。
+   实测：注入 9.482 的 `88 → 40`，检查器**一条都没报**。
+   **正则够不到它要检查的文本，比没有检查器更糟**——它把「没检查」变成「检查过、通过」。
+2. **「必须满足 OUT_QWORDS 全尺寸」产生 19 个假失败**：很多调用**故意只要
+   1 个 qword**（`sys-guard add` 返回槽号、`del` 返回布尔）——驱动只在
+   有空间时才写完整回复，这是**正确契约**。
+3. **修正方向：看调用方实际读到哪**。读 offset 32 只需 40 字节，
+   `0x82A` 那次看起来完全自洽 —— 但驱动要求 88。
+   所以**「够我读」不是契约，「够驱动发」才是**。
+
+##### 最终判据（两条，缺一不可）
+
+```
+call 读了 offset > 0  AND  请求长度 < OUT_QWORDS*8   ->  FAIL
+call 读了 offset K                                   ->  必须 >= K+8
+```
+
+且**排除自适应 handler**：`GUARD / SENTRY / SECTIONS / FRAME` 四个 case
+内部用 `out_len / sizeof(UINT64)` 做循环上界，**主动按调用方空间返回部分回复**，
+那是设计好的行为，小请求是合法的。这个集合是**从源码结构检测出来的**，
+不是硬编码——以后新增自适应 handler 不会被误判成 bug。
+
+##### 验证：必须证明它能失败
+
+注入 9.482 的 `88 → 40`，检查器精确报出：
+
+```
+[FAIL] line 2533 : $rr <- IOCTL 0x82a requests 40 bytes and reads offset 32,
+       but YGHV_EXITMASK_OUT_QWORDS = 88 bytes and the driver refuses a smaller reply
+```
+
+恢复后 `[PASS]`，零假阳性。
+
+##### 9.484 `sys-guard why` 是同一形状的第三个实例
+
+`case IOCTL_YGHV_GUARD` 的 gate 是 `out_len >= 8 * sizeof(UINT64)` = 64，
+而 `why` 子命令只请求 40 并读 offset 0..32。**偏移完全够读，驱动却拒绝整个回复**。
+改成 64 后五个字段全部可读（实测 `hide_mode=-1` 正确显示）。
+
+##### 实测
+
+    构建  ALL SOURCE CHECKS PASS（含新检查器）/ Build SUCCESS
+          adaptive handlers detected: GUARD, SENTRY, SECTIONS, FRAME
+    sys-guard arm  -> armed 3 page(s)
+    sys-guard why  -> 五个字段全部可读（修复前全部丢失）
+    卸载 invmrun at unload = 0x0，无蓝屏

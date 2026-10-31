@@ -2873,7 +2873,19 @@ try {
                 $req7 = New-Object byte[] 32
                 [BitConverter]::GetBytes([uint64]7).CopyTo($req7, 0)
                 [BitConverter]::GetBytes([uint64]$a).CopyTo($req7, 8)
-                $o7 = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x826)) -InBytes $req7 -OutputLength 40
+                # 9.484: 64 BYTES, NOT 40 - the driver refuses anything smaller.
+                #
+                # control_device.c `case IOCTL_YGHV_GUARD` gates on
+                # `out_len >= 8 * sizeof(UINT64)`, i.e. 64 bytes. This call asked
+                # for 40 and read offsets 0..32, so the offsets FIT (40 >= 32+8)
+                # while the driver's own gate did not - meaning it returned
+                # STATUS_BUFFER_TOO_SMALL and none of those offsets were ever
+                # delivered.
+                #
+                # A size that satisfies "what I read" but not "what the driver
+                # sends" is the shape that keeps recurring here: the call looks
+                # self-consistent and the feature looks broken.
+                $o7 = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x826)) -InBytes $req7 -OutputLength 64
                 $why    = [BitConverter]::ToUInt64($o7, 0)
                 $isTgt  = [BitConverter]::ToUInt64($o7, 8)
                 $slot   = [BitConverter]::ToInt64($o7, 16)

@@ -21,7 +21,17 @@ $scripts = @(
     # and a counter moves. The only symptom is that a parameter has no effect,
     # which reads as "that instruction is a no-op here" (9.464 concluded exactly
     # that about hlt, wrongly). This check is what makes such a hole visible.
-    'exit_rip_contract.ps1'
+    'exit_rip_contract.ps1',
+    # 9.483: a reply-size constant that grows while a client call site does not
+    # follow is the shape behind three separate defects in this tree:
+    #   sys-guard list  256 bytes vs 8 + 32*80 = 2568
+    #   exit-mask        40 on the SET path vs 88 on the read-back path
+    #   sys-guard why    40 vs the driver's 64-byte gate
+    # All three reported FAILURE while the driver was healthy - the worst way to
+    # be wrong, because the user concludes the feature does not work. The two
+    # numbers live in different files, in different languages, and neither
+    # compiler can see the other side.
+    'ioctl_buffer_size.ps1'
 )
 
 foreach ($script in $scripts) {
