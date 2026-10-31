@@ -781,8 +781,11 @@ host 自己执行的指令武装起来就是自指，第一次开 `full` 会几�
 | `hv/npt_core.c` | NPT。`npt_cleanup` 的 `pt_reg` 已修失效复用（9.381）|
 | `hv/mem_pte.c` vs `hv/protect.c` | **两套页表遍历**，用前者 |
 | `hv/yghv_unload_trace.c` | 卸载进度页（第 6.1 节）|
-| `tools/yghv_ctl.ps1` | 客户端，63 条命令。有 `unload-trace` / `npt-range` / `sys-auth` |
-| `tests/` | 7 个静态检查脚本，`build.bat` 自动跑 |
+| `hv/yghv_sections.c` | **Tier 7.1** 段报告：PE 头解析 + IAT 定位（`has_iat`）。只读 |
+| `tools/yghv_ctl.ps1` | 客户端，**70 条命令**（`command_parity.ps1` 是权威计数）|
+| `tests/` | 源级 5 项 + 链接后 1 项，`build.bat` 自动跑；详见 `tests/README.md` |
+| **`tests/exit_rip_contract.ps1`** | **38 个 VMEXIT case 的 RIP 契约 + 自检**。改 `SvHandleVmExit` 前必看 |
+| **`docs/WINDOW_HANDOFF_20261031.md`** | **★ 一次性交接摘要** —— 状态、硬边界、六条方法论、下一步 |
 
 ---
 
