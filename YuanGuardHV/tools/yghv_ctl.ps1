@@ -3535,8 +3535,28 @@ try {
                 elseif ($v -eq 'write') {
                     $op = 2
                     if ($null -eq $Arg2) { throw 'share: write needs <kind> [arg]' }
-                    $ka = [uint64]::Parse($Arg2)
-                    if ($null -ne $Arg3) { $kb = [uint64]::Parse($Arg3) }
+                    # 9.479: ACCEPT 0x LIKE EVERY OTHER COMMAND IN THIS CLIENT.
+                    #
+                    # `[uint64]::Parse('0xCAFEBABE')` throws FormatException, so
+                    # `share write 0x11 0xCAFEBABE` failed with a .NET parser error
+                    # instead of doing the write - while `npt-view 0x...`,
+                    # `sys-guard add 0x...` and `exit-mask` all accept hex. One
+                    # command reading hex and its neighbour not doing so is how a
+                    # client teaches people to distrust it.
+                    #
+                    # Done inline (not via a helper function) because a `function`
+                    # declared inside this switch arm would leak into the caller's
+                    # scope and stay defined for the rest of the session.
+                    $ka = if ($Arg2 -match '^0[xX]') {
+                              [uint64]::Parse($Arg2.Substring(2),
+                                  [System.Globalization.NumberStyles]::HexNumber)
+                          } else { [uint64]::Parse($Arg2) }
+                    if ($null -ne $Arg3) {
+                        $kb = if ($Arg3 -match '^0[xX]') {
+                                  [uint64]::Parse($Arg3.Substring(2),
+                                      [System.Globalization.NumberStyles]::HexNumber)
+                              } else { [uint64]::Parse($Arg3) }
+                    }
                 }
                 else { throw 'share: use init|read|write <kind> [arg]|reset' }
             }

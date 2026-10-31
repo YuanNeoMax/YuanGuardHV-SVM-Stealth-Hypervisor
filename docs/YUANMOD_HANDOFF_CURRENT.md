@@ -16005,3 +16005,45 @@ __writemsr(EFER, __readmsr(EFER) & ~EFER_SVME);
     section-hide 3  -> hid 1 page(s)
     section-hide 1  -> REFUSED (0x28, 段含 IAT)
     卸载 invmrun at unload = 0x0，无蓝屏
+
+---
+
+#### 9.478–9.479 ★★★★ seqlock 缺编译器屏障 + 客户端十六进制解析不一致
+
+##### 9.478 seqlock 两侧都缺编译器屏障
+
+`mem_share.c` 的协议是「写 body，然后 bump SEQ」。x86 硬件不会重排
+store-to-store，所以看起来安全 —— **但编译器会**，而这一页上的每个写都是普通字节写。
+
+编译器可以把 SEQ 的发布提到 payload 拷贝之前，于是消费者读到
+**新的序号 + 旧的 body** —— 正是 seqlock 存在的意义被绕过了。
+
+`volatile` 也挡不住：它只约束 volatile 访问之间，不约束
+`RtlCopyMemory`（可能被内联）与后面的 SEQ 写。**这里之前一个屏障都没有。**
+
+读侧反向同理：没有屏障，编译器可以把**第二次 SEQ 读取提到 body 拷贝之前**，
+两次读几乎总是同值，「变了就重试」变成装饰。
+
+修法：写入侧在发布 SEQ 前 `_ReadWriteBarrier()`，读侧在第二次读 SEQ 前同样加一个。
+这是编译器屏障（x86 上 store-store 只需这个），不发任何指令。
+
+##### 9.479 `share write` 不接受 0x 前缀，而这个客户端其它命令都接受
+
+```
+share write 0x11 0xCAFEBABE
+  -> Exception: Input string was not in a correct format
+```
+
+`[uint64]::Parse('0xCAFEBABE')` 抛 FormatException。而 `npt-view 0x...`、
+`sys-guard add 0x...` 都正常接受十六进制 —— **同一个客户端里一条命令认十六进制、
+邻座不认**，是那种会教用户不信任整个工具的不一致。
+
+修法：按 `^0x` 前缀走 `NumberStyles.HexNumber`，否则十进制，与文件其余部分同一规则。
+**内联实现而非辅助函数**：在 switch 分支里写 `function` 会泄漏到调用方作用域，
+整个会话都留着这个定义。
+
+##### 实测
+
+    share write 0x11 0xCAFEBABE  -> host writes=1  last seq=1   （修复前抛异常）
+    share read                   -> "nothing new"（正确：read 消费的是 guest 写的消息）
+    卸载 invmrun at unload = 0x0，无蓝屏

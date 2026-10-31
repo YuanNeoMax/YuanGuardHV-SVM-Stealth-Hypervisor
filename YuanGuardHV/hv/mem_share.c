@@ -152,6 +152,25 @@ int yghv_share_host_write(uint32_t kind, const uint64_t *args, uint32_t nargs,
     g_share_va[SH_OFF_STATUS] = SH_ST_IDLE;
 
     /*
+     * 9.478: A COMPILER BARRIER BEFORE PUBLISHING SEQ.
+     *
+     * The protocol is "write the body, THEN bump SEQ". x86 does not reorder
+     * store-to-store in hardware, so this looks safe - but the COMPILER may move
+     * an ordinary store across another ordinary store, and every write on this
+     * page is a plain byte store. The compiler could publish SEQ before the
+     * payload copy lands, and the consumer would then read a NEW sequence number
+     * with an OLD body: exactly the torn read the seqlock exists to prevent.
+     *
+     * `volatile` does not help: it orders volatile accesses against each other,
+     * not the RtlCopyMemory above against the SEQ store below (a call is only a
+     * compiler barrier until it is inlined, and it can be).
+     *
+     * _ReadWriteBarrier() is the right primitive: compiler-only, which is all x86
+     * needs for store-store ordering, and it emits no instruction.
+     */
+    _ReadWriteBarrier();
+
+    /*
      * SEQ last, and every bump is a real change (0 is skipped so a zeroed page
      * cannot look like a newly published message).
      */
@@ -206,6 +225,19 @@ int yghv_share_host_read(uint8_t *expect_seq, uint32_t *kind, uint64_t *args,
     }
     if (payload_len_out)
         *payload_len_out = max_payload;
+
+    /*
+     * 9.478: THE SAME BARRIER ON THE READ SIDE, IN THE OTHER DIRECTION.
+     *
+     * The seqlock read is "SEQ, body, SEQ again". Without a compiler barrier the
+     * compiler may HOIST the second SEQ read above the body copies - the two
+     * reads then observe the same value almost always, and the retry-on-change
+     * check becomes decoration while torn bodies pass through it.
+     *
+     * This barrier is what makes the second read actually happen after the copies
+     * rather than wherever the optimiser preferred.
+     */
+    _ReadWriteBarrier();
 
     /*
      * The second read is the entire synchronisation. If it differs, the guest was
