@@ -2550,6 +2550,28 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
             }
 
             /*
+             * 9.458: REFUSE THE SECTION THAT HOLDS OUR OWN IMPORT ADDRESS TABLE.
+             *
+             * This refusal is the fix for a bugcheck that came from a CORRECT
+             * instruction: hiding .rdata hid the IAT (it sits at RVA 0x28000, the
+             * first page of .rdata), so the very next `call [IAT slot]` read 0 and
+             * jumped to address 0 - 0x3B C0000005 with rip = 0 at
+             * `call IoAcquireRemoveLockEx`.
+             *
+             * A page we CALL THROUGH cannot be hidden for the same reason a code
+             * page cannot: once it is gone, the instruction following it has no
+             * way to reach anything. The distinction the section report now draws
+             * (executable vs has_iat) is exactly "cannot execute it" vs "cannot
+             * call through it", and both are refusals.
+             */
+            if (si[idx].has_iat) {
+                out[0] = 0; out[1] = 0; out[2] = 0x28;
+                info = YGHV_SECTION_HIDE_OUT_QWORDS * sizeof(UINT64);
+                status = STATUS_SUCCESS;
+                break;
+            }
+
+            /*
              * Page by page, inside the section's OWN size - not the page-rounded
              * one. Hiding a page past VirtualSize would take a frame that belongs
              * to whatever the loader put after this section.
@@ -2658,6 +2680,7 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
                     e[3] = (UINT64)si[i].size;
                     e[4] = (UINT64)si[i].executable;
                     e[5] = (UINT64)si[i].writable;
+                    e[6] = (UINT64)si[i].has_iat;
                 }
             }
 

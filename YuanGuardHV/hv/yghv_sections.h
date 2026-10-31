@@ -19,6 +19,20 @@ typedef struct {
     uint32_t size;       /* VirtualSize, or SizeOfRawData when VirtualSize is 0 */
     uint32_t executable; /* 1 = IMAGE_SCN_MEM_EXECUTE: must NOT be hidden */
     uint32_t writable;   /* 1 = IMAGE_SCN_MEM_WRITE */
+    /*
+     * 9.458: 1 = this section CONTAINS the import address table.
+     *
+     * Measured, and it cost a bugcheck: the IAT sits at RVA 0x28000, which is the
+     * first page of .rdata. Hiding .rdata therefore hides OUR OWN import table -
+     * every later call through it reads 0 and jumps to address 0. The crash was
+     * 0x3B C0000005 with rip = 0 at `call IoAcquireRemoveLockEx`, i.e. a perfectly
+     * correct instruction whose target had been hidden by us.
+     *
+     * An executable section is refused for the same class of reason (a present=0
+     * fetch cannot be served); this is that reason for data: a page we CALL
+     * THROUGH cannot be hidden either, whether it holds code or pointers to code.
+     */
+    uint32_t has_iat;
 } yghv_section_info_t;
 
 /*

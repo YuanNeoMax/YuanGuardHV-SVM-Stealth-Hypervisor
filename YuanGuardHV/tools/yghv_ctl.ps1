@@ -3583,7 +3583,8 @@ try {
             $hideable = 0
             $locked = 0
             for ($i = 0; $i -lt [int]$nsec; $i++) {
-                $b = 40 + $i * 48
+                # 7 qwords per entry (9.458 added has_iat), 8 bytes each.
+                $b = 40 + $i * 56
                 $lo = [BitConverter]::ToUInt64($out, $b)
                 $hi = [BitConverter]::ToUInt64($out, $b + 8)
                 $nm = ''
@@ -3598,10 +3599,14 @@ try {
                 $va  = [BitConverter]::ToUInt64($out, $b + 16)
                 $sz  = [BitConverter]::ToUInt64($out, $b + 24)
                 $ex  = [BitConverter]::ToUInt64($out, $b + 32)
+                $iat = [BitConverter]::ToUInt64($out, $b + 48)
 
                 $pages = [math]::Ceiling($sz / 4096)
                 if ($ex -eq 1) {
                     $verdict = 'CODE - must NOT be hidden'
+                    $locked += [int]$pages
+                } elseif ($iat -eq 1) {
+                    $verdict = 'HOLDS THE IAT - must NOT be hidden'
                     $locked += [int]$pages
                 } else {
                     $verdict = 'data - hideable'
@@ -3662,6 +3667,7 @@ try {
                     0x22 { 'index out of range' }
                     0x23 { 'section is EXECUTABLE - refused (no ALLOW loop to serve a fetch fault)' }
                     0x24 { 'guard table full' }
+                    0x28 { 'section HOLDS OUR IAT - refused (hiding it would zero our own import calls)' }
                     default { ("code 0x{0:X}" -f $rc) }
                 }
                 Write-Host ("section-hide: index={0} REFUSED {1}" -f $e, $why)

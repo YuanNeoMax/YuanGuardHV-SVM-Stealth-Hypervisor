@@ -76,6 +76,26 @@ typedef struct {
     uint32_t ImageBase;             /* PE32+ : 64-bit */
 } YGHV_PE32PLUS_TAIL;
 
+/*
+ * 9.458: the two optional-header prefixes needed to reach the data directories.
+ *
+ * PE32 and PE32+ differ in the size of the base-of-code/ImageBase fields before
+ * the directory array, so the offset is computed rather than assumed. Only the
+ * fields up to SizeOfHeaders are declared here; everything after is reached by
+ * arithmetic, which is why the layout is bounded at each step.
+ */
+typedef struct {
+    uint16_t Magic;
+    uint8_t  MajorLinkerVersion;
+    uint8_t  MinorLinkerVersion;
+    uint32_t SizeOfCode;
+    uint32_t SizeOfInitializedData;
+    uint32_t SizeOfUninitializedData;
+    uint32_t AddressOfEntryPoint;
+    uint32_t BaseOfCode;
+    uint32_t BaseOfData;            /* PE32 only; PE32+ has ImageBase here */
+} YGHV_OPTIONAL_COMMON;
+
 typedef struct {
     uint16_t Machine;
     uint16_t NumberOfSections;
@@ -204,6 +224,61 @@ int yghv_sections_report(uint8_t *image_base, uint32_t image_size,
         out[i].size = sh[i].VirtualSize ? sh[i].VirtualSize : sh[i].SizeOfRawData;
         out[i].executable = (sh[i].Characteristics & YGHV_SCN_MEM_EXECUTE) ? 1 : 0;
         out[i].writable = (sh[i].Characteristics & YGHV_SCN_MEM_WRITE) ? 1 : 0;
+    }
+
+    /*
+     * 9.458: MARK THE SECTION THAT CONTAINS THE IMPORT ADDRESS TABLE.
+     *
+     * Measured, and it cost a bugcheck: hiding .rdata hides the IAT, because the
+     * IAT lives at RVA 0x28000 - the first page of .rdata. After that hide, `call
+     * [IAT slot]` read 0 and jumped to address 0: 0x3B C0000005 with rip = 0 at
+     * `call IoAcquireRemoveLockEx`, an instruction that was itself correct.
+     *
+     * The directory is read here rather than assumed, because a linker is free to
+     * place the IAT anywhere. Bounds are checked at each hop: a short optional
+     * header or a directory index past the header must produce "unknown", not a
+     * read off the end of the allocation.
+     */
+    {
+        uint32_t dir_off;
+        uint32_t iat_rva = 0;
+        uint32_t iat_size = 0;
+
+        /*
+         * DataDirectory[0] = export, [1] = import, [12] = IAT. Its offset differs
+         * by magic: PE32 puts BaseOfData (4 bytes) before ImageBase (4); PE32+
+         * drops BaseOfData and uses an 8-byte ImageBase.
+         */
+        dir_off = (magic == YGHV_PE32PLUS) ? 112u : 96u;
+
+        if (opt_size >= dir_off + 13u * 8u &&
+            (uint32_t)((uint8_t *)fh + sizeof(YGHV_FILE_HEADER) - image_base) +
+                dir_off + 13u * 8u <= image_size) {
+
+            uint8_t *dd = (uint8_t *)fh + sizeof(YGHV_FILE_HEADER) + dir_off;
+
+            /* entry 12: RVA and size */
+            iat_rva  = *(uint32_t *)(dd + 12u * 8u);
+            iat_size = *(uint32_t *)(dd + 12u * 8u + 4u);
+
+            if (iat_rva) {
+                uint32_t j;
+
+                for (j = 0; j < i; j++) {
+                    uint32_t start = out[j].va;
+                    uint32_t end = out[j].va + out[j].size;
+
+                    /* An IAT that straddles two sections marks both; refusing one
+                     * of the two would still break the calls through the other. */
+                    if (iat_rva >= start && iat_rva < end) {
+                        out[j].has_iat = 1;
+                    } else if (iat_size &&
+                               iat_rva + iat_size > start && iat_rva < end) {
+                        out[j].has_iat = 1;
+                    }
+                }
+            }
+        }
     }
 
     *count_out = i;
