@@ -2518,12 +2518,20 @@ try {
                 [BitConverter]::GetBytes([uint32]$op).CopyTo($req, 0)
                 [BitConverter]::GetBytes([uint32]$m1).CopyTo($req, 8)
                 [BitConverter]::GetBytes([uint32]$m2).CopyTo($req, 12)
-                # The driver's reply is 5 qwords (the 5th reports how many live
-                # VMCBs the change reached), and STATUS_BUFFER_TOO_SMALL (0x7A)
-                # is what a too-small OutputLength produces - not a silent
-                # truncation. 40 bytes on BOTH calls, not 32 on this one.
+                # 9.482: 88 BYTES, NOT 40 - the driver now replies with 11 qwords.
+                #
+                # YGHV_EXITMASK_OUT_QWORDS grew 5 -> 6 -> 11 as the vmmcall
+                # counter and the guest-state block were added. The read-back call
+                # below was updated each time; THIS call was not. Setting a mask
+                # therefore asked for 40 bytes, the driver's `out_len >= 11 qwords`
+                # test failed, and it returned STATUS_BUFFER_TOO_SMALL - so
+                # `applied` (out[4]) was never delivered and `exit-mask quiet`
+                # reported a failure it had actually performed.
+                #
+                # Both calls use the same size now because they hit the same
+                # handler, whose reply shape does not depend on the op.
                 $rr = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x82A)) `
-                                       -InBytes $req -OutputLength 40
+                                       -InBytes $req -OutputLength 88
                 $ap = [BitConverter]::ToInt64($rr, 32)
             }
 

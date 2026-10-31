@@ -16160,3 +16160,43 @@ if (payload_len_out)
 **一个只有「容量」没有「长度」的协议，读方一定会把容量当长度用。**
 不是读方偷懒，是它没有别的东西可读。设计共享内存布局时，
 「最多多少」和「实际多少」必须是两个独立字段。
+
+---
+
+#### 9.482 ★★★ `exit-mask` 的设置路径还在用 5 qword 的缓冲，驱动已要 11
+
+##### 缺陷
+
+`YGHV_EXITMASK_OUT_QWORDS` 这轮从 5 → 6（加 `vmmcall` 计数）→ 11
+（加单核 guest 状态）。客户端**两处调用**：
+
+| 位置 | OutputLength | 结果 |
+|---|---|---|
+| 读回（`exit-mask`）| 88 ✅ | 每次都跟着改了 |
+| **设置（`exit-mask quiet`）** | **40** ❌ | **没改** |
+
+驱动检查 `out_len >= 11 qwords`，40 字节不满足，于是直接返回
+`STATUS_BUFFER_TOO_SMALL` —— **`applied`（out[4]）根本没被下发**。
+
+所以设置一个 mask 会「看起来失败」，而实际上**驱动已经把它写进 12 个活 VMCB 了**。
+这是最糟的一种假象：报告失败、实际成功，让人以为 mask 机制不能用。
+
+##### 修法
+
+两处都用 88 字节。它们命中同一个 handler，而这个 handler 的回复形状
+不依赖 op，所以没有理由用两个不同的长度。
+
+##### 实测
+
+    exit-mask quiet -> extra Misc1=0x01800000
+                       applied: 12 live VMCB(s) NOW - no reload needed
+                       vmmcall=16775  guest core#0: Rflags=0x40246 IF=1
+    恢复 exit-mask 0 -> 正常
+    卸载 invmrun at unload = 0x0
+
+##### 教训
+
+**一个常量长大了，它的所有调用点都要跟着长 —— 而"所有"包括那些看起来不相干的。**
+这次 40 和 88 在同一个命令的两条分支里，我改了上面那条，忘了下面那条。
+`STATUS_BUFFER_TOO_SMALL` 是**正确的防御**（它拒绝了截断回复），
+但它把「我长度写错了」伪装成了「这个功能不工作」。
