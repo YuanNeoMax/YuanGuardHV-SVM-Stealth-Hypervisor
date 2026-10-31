@@ -1031,6 +1031,68 @@ extern "C" VOID yghv_s206_unregister_vpd(PVOID vpData)
  * in by the next prepare - which is the pre-9.448b behaviour, now distinguishable
  * from success.
  */
+/*
+ * 9.462: WAKE EVERY PARKED CORE, FROM THE HOST SIDE.
+ *
+ * The stub now parks in `hlt` instead of spinning on `vmmcall`, which removes the
+ * ~56 million VMEXITs per second that kept the machine at 100% CPU. The cost of
+ * that change is that a parked core performs NO exits, so the old stop checkpoint
+ * (`Sv206VmrunShouldExit` inside `case VMEXIT_VMMCALL`) would never run - the
+ * exact failure 9.432 documented when it said removing vmmcall stops everything
+ * downstream.
+ *
+ * So the stop is INITIATED from here instead: write an event into each parked
+ * core's VMCB EventInj. A parked core takes it at its next instruction boundary
+ * (hlt is not interrupt-shadowable), the resulting VMEXIT runs the SAME handler,
+ * and that handler runs the SAME `Sv206VmrunShouldExit` check. One stop path,
+ * one exit protocol - only the initiator moved.
+ *
+ * WHICH EVENT, AND WHY NMI
+ * Vector 2 (NMI). Chosen over a maskable vector because the guest's IF is not
+ * something this function can assert about a core it does not own: IF is forced
+ * to 1 at prepare (see the Rflags line), but an injected maskable vector would be
+ * held pending if that ever became false, and the core would never wake. NMI
+ * cannot be masked, so delivery does not depend on a flag we do not control.
+ *
+ * TYPE 4 = NMI in the VMCB EventInj encoding (bits 7:0 vector, 10:8 type, 11
+ * error-code-valid). Vector 2 with type 4 and no error code is 0x402.
+ *
+ * VmcbClean = 0 after each write: the processor caches the control area, and an
+ * injected event written without dirtying the VMCB would simply not be seen -
+ * the same lesson 9.448e paid two reboots for.
+ *
+ * Returns the number of VMCBs written. Zero means no core is virtualized, which
+ * is a normal answer for a stop that arrives before any core started.
+ */
+extern "C" LONG yghv_s206_kick_parked_cores(VOID)
+{
+    LONG kicked = 0;
+
+    for (UINT32 i = 0; i < SVM206_MAX_VPD; i++)
+    {
+        PVIRTUAL_PROCESSOR_DATA vp = g_S206LiveVpd[i];
+
+        if (vp == NULL)
+            continue;
+
+        /*
+         * 9.462: OVERWRITE, DO NOT ASK "IS THE SLOT FREE".
+         *
+         * The first version skipped a core whose EventInj was non-zero, reasoning
+         * that a pending event would be taken anyway. Measured on the unload path:
+         * invmrun stayed at 0xc - all twelve cores still parked - and the machine
+         * bugchecked 0xD1 with PAGED_IP once the image was unmapped. A slot holding
+         * a stale or already-consumed event is exactly the case where "something
+         * is pending" and "the core will wake" are NOT the same statement.
+         * Overwriting with our own NMI makes the wake deterministic.
+         */
+        vp->GuestVmcb.ControlArea.EventInj = 0x402ULL;   /* NMI, vector 2 */
+        vp->GuestVmcb.ControlArea.VmcbClean = 0;
+        kicked += 1;
+    }
+    return kicked;
+}
+
 extern "C" LONG yghv_s206_apply_extra_intercepts(VOID)
 {
     LONG applied = 0;
@@ -1043,7 +1105,6 @@ extern "C" LONG yghv_s206_apply_extra_intercepts(VOID)
 
         if (vp == NULL)
             continue;
-
         /*
          * SET, NOT OR. The caller's mask is the whole truth for the extra bits:
          * clear must be able to take a bit back out, and OR-ing only ever adds.
@@ -1417,6 +1478,21 @@ extern "C" int Sv206VmrunShouldExit(VOID)
  */
 extern "C" { volatile LONG g_inVmrunCount = 0; }
 
+/*
+ * 9.462: how many parked cores the last stop request actually woke.
+ *
+ * This is the replacement for "the stub ticks, so the flag is checked constantly".
+ * A zero here after a `sc stop` would mean no core was ever woken, i.e. the unload
+ * would hang waiting for threads that are asleep in hlt - a silent, permanent
+ * STOP_PENDING. Reporting it turns that into a number a caller can read.
+ */
+static volatile LONG64 g_S206KickedCores = 0;
+
+extern "C" LONG64 yghv_s206_kicked_cores(VOID)
+{
+    return InterlockedCompareExchange64(&g_S206KickedCores, 0, 0);
+}
+
 extern "C" int yghv_s206_invmrun_count(VOID)
 {
     return (int)InterlockedCompareExchange(&g_inVmrunCount, 0, 0);
@@ -1424,7 +1500,23 @@ extern "C" int yghv_s206_invmrun_count(VOID)
 
 extern "C" void yghv_s206_vmrun_stop_request(VOID)
 {
+    /*
+     * 9.462: SET THE FLAG, THEN WAKE THE PARKED CORES.
+     *
+     * Order matters: a core that wakes must find the flag already set, or it takes
+     * the injected event, runs the handler, sees "not stopping", and parks again -
+     * and the wake is wasted. Flag first, kick second.
+     *
+     * The kick is what replaces the old `vmmcall` tick. Without it a parked core
+     * would never take a VMEXIT and Sv206VmrunShouldExit would never run, which is
+     * why 9.432 could not simply delete vmmcall.
+     */
+    extern LONG yghv_s206_kick_parked_cores(VOID);
+    LONG kicked;
+
     InterlockedExchange(&g_VmrunStopRequested, 1);
+    kicked = yghv_s206_kick_parked_cores();
+    InterlockedExchange64(&g_S206KickedCores, (LONG64)kicked);
 }
 
 extern "C" int yghv_s206_vmrun_stop_pending(VOID)
@@ -4905,6 +4997,15 @@ SvPrepareForVirtualization (
     VpData->GuestVmcb.StateSaveArea.Cr2 = __readcr2();
     VpData->GuestVmcb.StateSaveArea.Cr3 = __readcr3();
     VpData->GuestVmcb.StateSaveArea.Cr4 = __readcr4();
+    /*
+     * 9.463: RFLAGS IS INHERITED AGAIN, WITHOUT THE IF FORCING.
+     *
+     * 9.462 forced IF=1 because the stub parked in hlt, and hlt with IF=0 cannot
+     * be woken by maskable interrupts. hlt is gone (see the stub) so the forcing
+     * protects nothing - and every bit written into the guest's saved state is
+     * one more thing that can disagree with the thread it belongs to. The guest
+     * here is a bounded spin, which has no interest in IF either way.
+     */
     VpData->GuestVmcb.StateSaveArea.Rflags = ContextRecord->EFlags;
     VpData->GuestVmcb.StateSaveArea.Rsp = ContextRecord->Rsp;
     /*

@@ -5094,6 +5094,29 @@ void DriverUnload(struct _DRIVER_OBJECT *d) {
             stopped = yghv_s206_vmrun_stopped_count();
             while ((ULONG)stopped < active && waited < 20000) {
                 volatile ULONG spin;
+
+                /*
+                 * 9.462: KICK AGAIN ON EVERY PASS, NOT ONCE.
+                 *
+                 * The stub parks in `hlt` now, so a core that misses the first
+                 * wake sleeps until something else interrupts it - and nothing
+                 * else will, because Windows does not know it has a core sitting
+                 * inside our guest. Measured without this loop: invmrun = 0xc after
+                 * the stop, i.e. all twelve cores still parked; DriverUnload then
+                 * returned, the image was unmapped, and the parked cores executed
+                 * `hlt` on dead code pages -> 0xD1 PAGED_IP at Sv206LaunchVm+0x1e
+                 * with rcx = 0xa (the value `mov rsp, rcx` had written).
+                 *
+                 * A repeated injection is safe by construction: a core that already
+                 * woke and left increments g_S206CoresExited and is not in the
+                 * registry's parked set next pass, and a core that is still parked
+                 * gets a fresh EventInj.
+                 */
+                {
+                    extern LONG yghv_s206_kick_parked_cores(void);
+                    (void)yghv_s206_kick_parked_cores();
+                }
+
                 for (spin = 0; spin < 200000UL; spin++) { }
                 waited += 1;
                 stopped = yghv_s206_vmrun_stopped_count();
