@@ -71,6 +71,24 @@ static volatile LONG64 g_share_last_seq = 0;
 #define SH_OFF_SEQ     0u
 #define SH_OFF_KIND    1u
 #define SH_OFF_STATUS  2u
+/*
+ * 9.481: THE PAYLOAD LENGTH HAD NO FIELD, SO THE READER INVENTED ONE.
+ *
+ * The page carried SEQ/KIND/STATUS/ARGS/PAYLOAD and nothing else. `host_read`
+ * then filled `*payload_len_out = max_payload` - the CALLER'S buffer size, not
+ * the number of bytes the publisher actually wrote. A publisher that sent 10
+ * bytes made the reader report "you have 4032 bytes of payload", i.e. the
+ * consumer would go on to parse 4022 bytes of stale data from the previous
+ * message as if they were part of this one.
+ *
+ * "Copy at most N bytes" and "here is how many there were" are two different
+ * numbers and the page needs both. This slot is the second one. SH_MAX_PAYLOAD
+ * is 4032, which does not fit in one byte, so the field is 16-bit and occupies
+ * bytes 3..4 - still inside the reserved padding between STATUS and ARGS, so no
+ * offset above it moves and an old reader/writer still finds KIND, STATUS, ARGS
+ * and PAYLOAD exactly where they were.
+ */
+#define SH_OFF_PLEN    3u        /* uint16 payload length, published with SEQ */
 #define SH_OFF_ARGS    8u        /* four qwords: 8..39   */
 #define SH_OFF_PAYLOAD 64u       /* 448 bytes: 64..511   */
 
@@ -150,6 +168,15 @@ int yghv_share_host_write(uint32_t kind, const uint64_t *args, uint32_t nargs,
 
     g_share_va[SH_OFF_KIND] = (uint8_t)kind;
     g_share_va[SH_OFF_STATUS] = SH_ST_IDLE;
+    /* 9.481: publish the ACTUAL payload length, not the caller's capacity - see
+     * the note on SH_OFF_PLEN. 16-bit because SH_MAX_PAYLOAD is 4032; clamped
+     * anyway so a future larger window cannot silently wrap this field. */
+    {
+        uint16_t plen = (payload_len > 0xFFFFu) ? 0xFFFFu : (uint16_t)payload_len;
+
+        g_share_va[SH_OFF_PLEN]     = (uint8_t)(plen & 0xFF);
+        g_share_va[SH_OFF_PLEN + 1] = (uint8_t)(plen >> 8);
+    }
 
     /*
      * 9.478: A COMPILER BARRIER BEFORE PUBLISHING SEQ.
@@ -223,8 +250,25 @@ int yghv_share_host_read(uint8_t *expect_seq, uint32_t *kind, uint64_t *args,
     if (payload && max_payload) {
         RtlCopyMemory(payload, g_share_va + SH_OFF_PAYLOAD, max_payload);
     }
-    if (payload_len_out)
-        *payload_len_out = max_payload;
+    /*
+     * 9.481: REPORT THE PUBLISHED LENGTH, NOT `max_payload`.
+     *
+     * This used to be `*payload_len_out = max_payload`, i.e. it answered "how
+     * much room did you give me" when the caller asked "how much did I get". A
+     * 10-byte message made the consumer parse 4022 bytes of the PREVIOUS
+     * message's leftovers as part of this one.
+     *
+     * The value is clamped to max_payload because the publisher may have written
+     * more than this caller can hold - the copy above was already clipped, so
+     * reporting the larger number would describe bytes the caller does not
+     * have.
+     */
+    if (payload_len_out) {
+        uint16_t plen = (uint16_t)(g_share_va[SH_OFF_PLEN] |
+                                  ((uint16_t)g_share_va[SH_OFF_PLEN + 1] << 8));
+
+        *payload_len_out = (plen > max_payload) ? max_payload : (uint32_t)plen;
+    }
 
     /*
      * 9.478: THE SAME BARRIER ON THE READ SIDE, IN THE OTHER DIRECTION.
