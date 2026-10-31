@@ -1582,6 +1582,49 @@ extern "C" int yghv_s206_bp_int3_intercept(UINT32 on)
     return 1;
 }
 
+/*
+ * 9.464: READ ONE LIVE CORE'S GUEST STATE, because "hlt does nothing" is a
+ * symptom with three different causes and I could not tell them apart.
+ *
+ * Measured shape of the problem: the stub runs `hlt / mov rax,1 / vmmcall / jmp`
+ * and vmmcall still fires ~12.6 million times per second, i.e. hlt returns
+ * immediately every time. Three candidates, and each needs a different fix:
+ *
+ *   RFLAGS.IF == 0    -> hlt cannot be woken by maskable interrupts, so it would
+ *                        WAIT, not return. (Rules this out if IF is 1.)
+ *   VIntr pending     -> the virtual interrupt is already asserted, so the core
+ *                        services "a pending interrupt" and falls straight through
+ *                        hlt. This is the most likely one: nothing in this tree
+ *                        ever clears VIntr, and 9.448's `events` experiments wrote
+ *                        EventInj freely.
+ *   InterruptShadow   -> a stale shadow makes the next sti-window instruction
+ *                        behave differently, but by itself does not un-park hlt.
+ *
+ * Returns 0 if no core is registered. Otherwise fills the caller's 5 qwords:
+ *   [0] Rflags   [1] VIntr   [2] InterruptShadow   [3] EventInj   [4] core index
+ */
+extern "C" LONG yghv_s206_guest_state(UINT64 *out)
+{
+    if (!out)
+        return 0;
+
+    for (UINT32 i = 0; i < SVM206_MAX_VPD; i++)
+    {
+        PVIRTUAL_PROCESSOR_DATA vp = g_S206LiveVpd[i];
+
+        if (vp == NULL)
+            continue;
+
+        out[0] = vp->GuestVmcb.StateSaveArea.Rflags;
+        out[1] = vp->GuestVmcb.ControlArea.VIntr;
+        out[2] = vp->GuestVmcb.ControlArea.InterruptShadow;
+        out[3] = vp->GuestVmcb.ControlArea.EventInj;
+        out[4] = (UINT64)i;
+        return 1;
+    }
+    return 0;
+}
+
 extern "C" int yghv_s206_bp_int3_intercept_get(VOID)
 {
     return (int)InterlockedCompareExchange(&g_BpInt3Intercept, 0, 0);

@@ -269,7 +269,7 @@ typedef struct {
  */
 #define IOCTL_YGHV_EXITMASK \
     YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x82A, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
-#define YGHV_EXITMASK_OUT_QWORDS 5
+#define YGHV_EXITMASK_OUT_QWORDS 11
 
 /*
  * 9.449 (Tier 1.5): Engine A vs Engine B, head to head, on the same range.

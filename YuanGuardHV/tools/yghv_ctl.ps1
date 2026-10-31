@@ -1952,7 +1952,7 @@ try {
             # the ALT table and register an observer (mem-view).
             # usage: mem-cache [set <gpa> <mode> | setalt <gpa> <mode> | reset <gpa>]
             if ($null -eq $Arg1) {
-                $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x822)) -OutputLength 48
+                $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x822)) -OutputLength 88
                 Write-Host ("mem-cache: tracked={0} sets={1} resets={2} failures={3}" -f `
                     [BitConverter]::ToUInt64($out,16), [BitConverter]::ToUInt64($out,24),
                     [BitConverter]::ToUInt64($out,32), [BitConverter]::ToUInt64($out,40))
@@ -2527,12 +2527,20 @@ try {
                 $ap = [BitConverter]::ToInt64($rr, 32)
             }
 
-            $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x82A)) -OutputLength 40
+            $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x82A)) -OutputLength 88
             $rm1 = [BitConverter]::ToUInt64($out, 0)
             $rm2 = [BitConverter]::ToUInt64($out, 8)
             $obs = [BitConverter]::ToUInt64($out, 16)
             $tot = [BitConverter]::ToUInt64($out, 24)
             if ($op -eq 0) { $ap = [BitConverter]::ToInt64($out, 32) }
+            # 9.464: the stub's own instruction count - the only direct proof that
+            # the guest stub is executing at all.
+            $vmm = [BitConverter]::ToUInt64($out, 40)
+            $grf = [BitConverter]::ToUInt64($out, 48)
+            $gvi = [BitConverter]::ToUInt64($out, 56)
+            $gsd = [BitConverter]::ToUInt64($out, 64)
+            $gev = [BitConverter]::ToUInt64($out, 72)
+            $gix = [BitConverter]::ToUInt64($out, 80)
             Write-Host ("exit-mask: extra Misc1=0x{0:X8}  Misc2=0x{1:X8}" -f $rm1, $rm2)
             if ($op -ne 0) {
                 if ($ap -lt 0) {
@@ -2545,6 +2553,8 @@ try {
                 }
             }
             Write-Host ("  distinct exit codes observed={0}  total exits={1}" -f $obs, $tot)
+            Write-Host ("  vmmcall (stub ticks)={0}" -f $vmm)
+            Write-Host ("  guest core#{0}: Rflags=0x{1:X}  IF={2}  VIntr=0x{3:X}  shadow={4}  EventInj=0x{5:X}" -f $gix, $grf, $(if($grf -band 0x200){1}else{0}), $gvi, $gsd, $gev)
             if ($rm1 -eq 0 -and $rm2 -eq 0) {
                 Write-Host '  no extra bits armed - 25 of the 35 handled codes cannot'
                 Write-Host '  fire this run. Use: exit-mask quiet (HLT+PAUSE) or full'
@@ -3253,7 +3263,7 @@ try {
             #   mem-watch snapshot [max]   non-destructive: read the same window again
             #   mem-watch reset
             if ($null -eq $Arg1) {
-                $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x820)) -OutputLength 48
+                $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x820)) -OutputLength 88
                 Write-Host ("mem-watch: pages={0} hits={1} recorded={2} dropped={3} seq={4}" -f `
                     [BitConverter]::ToUInt64($out,0), [BitConverter]::ToUInt64($out,8),
                     [BitConverter]::ToUInt64($out,16), [BitConverter]::ToUInt64($out,24),
@@ -3354,7 +3364,7 @@ try {
                 # Zero-length input: the driver treats that as "read diagnostics".
                 # (Note: the parameter is -InBytes; an unknown name is silently
                 # ignored by PowerShell and the call goes out with no input.)
-                $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x821)) -OutputLength 48
+                $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x821)) -OutputLength 88
                 Write-Host ("mem-time: pages={0} snapshots={1} switches={2} failures={3}" -f `
                     [BitConverter]::ToUInt64($out,16), [BitConverter]::ToUInt64($out,24),
                     [BitConverter]::ToUInt64($out,32), [BitConverter]::ToUInt64($out,40))
@@ -3380,7 +3390,7 @@ try {
             [BitConverter]::GetBytes([uint32]$op).CopyTo($req, 0)
             [BitConverter]::GetBytes([uint64]$a).CopyTo($req, 8)
             [BitConverter]::GetBytes([uint64]$b).CopyTo($req, 16)
-            $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x821)) -InBytes $req -OutputLength 48
+            $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x821)) -InBytes $req -OutputLength 88
             $ok  = [BitConverter]::ToUInt64($out, 0)
             $cur = [BitConverter]::ToInt64($out, 8)
             Write-Host ("mem-time: {0} {1}  current={2} pages={3} snapshots={4} switches={5}" -f `

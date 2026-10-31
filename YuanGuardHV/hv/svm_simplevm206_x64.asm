@@ -404,94 +404,53 @@ SvInvlpgaByVa endp
 ; property that makes a stub safe to enter on a stack that belongs to the host.
 ;
 Sv206GuestStub proc
-    ; 9.462: PARKS IN HLT INSTEAD OF SPINNING ON VMMCALL.
-    ;
-    ; MEASURED REASON
-    ; The old stub was `pause x4 / mov rax,1 / vmmcall / jmp`, an endless VMMCALL
-    ; loop. Measured: total exits 10,332,899,595 -> 10,893,556,186 in ten seconds,
-    ; i.e. 560,656,591 VMEXITs in 10s = ~56 MILLION per second across 12 cores,
-    ; roughly 850 cycles per iteration almost all of it inside the VMRUN/VMEXIT
-    ; round trip. The machine sat at 100% CPU with the driver loaded and idle.
-    ;
-    ; HLT is what lets the core stop burning cycles. Two facts make it usable here
-    ; and neither was true earlier in this tree's life:
-    ;
-    ;   1. GIF IS NEVER CLEARED in this file (there is no clgi). A core in hlt with
-    ;      GIF clear cannot be woken by any interrupt - the classic hang. Clear-free
-    ;      here, so hlt is wakeable.
-    ;
-    ;   2. HLT IS NOT INTERCEPTED. The prepared set is CPUID, MSR_PROT,
-    ;      RDTSC/RDTSCP, VMRUN/VMMCALL and SHUTDOWN only. Had HLT been armed, hlt
-    ;      would itself be a VMEXIT and this would be the same storm with a
-    ;      different instruction.
-    ;
-    ; AND IF MUST BE 1 - SvPrepareForVirtualization now forces it. A kernel thread
-    ; at DISPATCH_LEVEL runs with IF=0, and hlt then ignores maskable interrupts,
-    ; leaving only NMI/SMI to wake the core. That is a hang, not a saving.
-    ;
-    ; WHAT REPLACED THE STOP CHECK
-    ; The old design's ONLY stop checkpoint was Sv206VmrunShouldExit() inside
-    ; `case VMEXIT_VMMCALL`. A parked core performs no exits, so that checkpoint
-    ; would never fire - exactly what 9.432 warned about when it said removing
-    ; vmmcall stops everything downstream from working.
-    ;
-    ; The replacement is on the HOST side: yghv_s206_kick_parked_cores() injects an
-    ; event into each parked core's VMCB. A parked core wakes on it, takes a
-    ; VMEXIT, and runs the SAME handler - so there is still exactly one stop path
-    ; and it still goes through Sv206VmrunShouldExit. Nothing in the exit protocol
-    ; changed; only who initiates the exit.
-    ;
-    ; hlt is not interrupt-shadowable, so a pending event is taken at the next
-    ; instruction boundary; that is why hlt is the right parking instruction and
-    ; `sti; hlt` is not needed (it would only matter if IF were 0 and we could
-    ; execute sti here, which a parked stub cannot rely on).
-Sv206GuestTick:
-    ; 9.463: BOUNDED SPIN - the stop checkpoint has to stay in the guest.
-    ;
-    ; WHY hlt WAS ABANDONED (measured, twice, with two different injections)
-    ; The parked version did what it promised for CPU - 10s CPU went from 100% to
-    ; 0%, exits from ~56M/s to ~0.3M/s - but the stop protocol broke and took the
-    ; machine with it:
-    ;
-    ;   invmrun at unload = 0xc   (all twelve cores still parked)
-    ;   bugcheck 0xD1 PAGED_IP at Sv206LaunchVm+0x1e, rcx = 0xa
-    ;
-    ; Two attempts to wake them failed: a single EventInj kick, then a kick on
-    ; every pass of the unload wait loop, then overwriting EventInj instead of
-    ; skipping a non-empty slot. All three left invmrun at 12.
-    ;
-    ; THE REASON IS ARCHITECTURAL, NOT A TUNING PROBLEM: the guest VMCB is read by
-    ; the CPU at VMRUN. A core parked in hlt never executes VMRUN again, so it
-    ; never re-reads its control area - writing EventInj from the host is writing
-    ; to a page the CPU is not looking at. The core waits for an interrupt from
-    ; hardware, and Windows has no reason to send one to a core it believes is
-    ; idle inside its own scheduler. That is a deadlock, not a missed wake.
-    ;
-    ; So the checkpoint must remain INSIDE the guest. What changes is its RATE.
-    ; The old loop issued `vmmcall` after four pauses - ~56 million exits per
-    ; second, ~850 cycles almost all inside the VMRUN round trip, 100% CPU. This
-    ; loop spends a long time between ticks, so the checkpoint still runs (a stop
-    ; request is seen within one spin) but the exit rate is ~2000x lower.
-    ;
-    ; RDTSC is the cheapest bounded delay available here that is NOT intercepted:
-    ; checked the prepared set - CPUID, MSR_PROT, RDTSC/RDTSCP, VMRUN/VMMCALL,
-    ; SHUTDOWN. RDTSC IS intercepted in this tree (9.369e kept it armed), so it
-    ; cannot be used as a delay without generating the very exits we are removing.
-    ; A counted loop of `pause` is the only delay that costs nothing.
-    ;
-    ; 100000 iterations of `pause` at ~30 cycles each is ~3M cycles ~= 1ms at 3GHz.
-    ; A stop request is therefore observed within about a millisecond per core,
-    ; which is the same order as the old 4-pause loop's latency but with five
-    ; orders of magnitude fewer exits.
 Sv206Spin:
-    mov     ecx, 100000
-Sv206SpinLoop:
-    pause
-    dec     ecx
-    jnz     Sv206SpinLoop
-    mov     rax, 1              ; YGHV_CMD_HEARTBEAT - "I am alive, check the flag"
-    vmmcall                     ; the ONE intercepted instruction, now rare
-    jmp     Sv206Spin
+    ; 9.464: HLT FOLLOWED BY VMMCALL - the root fix, and why neither alone worked.
+    ;
+    ; THE PROBLEM, STATED EXACTLY
+    ; A core must satisfy two things at once while the machine is idle:
+    ;   (1) NOT burn CPU, which requires hlt (a spin cannot stop consuming cycles)
+    ;   (2) still reach Sv206VmrunShouldExit periodically, which requires a VMEXIT,
+    ;       and a core that never executes a VMRUN never re-enters the exit path.
+    ;
+    ; 9.462 got (1) and lost (2): `hlt; jmp` parked forever, invmrun stayed at 0xc,
+    ; and DriverUnload unmapped the image under twelve parked cores -> 0xD1
+    ; PAGED_IP at Sv206LaunchVm+0x1e with rcx = 0xa.
+    ;
+    ; 9.463 got (2) and lost (1): a 100000-iteration pause loop still ran at 100%
+    ; CPU (measured with Get-Counter: baseline 29%, loaded 100%), it only lowered
+    ; the VMEXIT rate.
+    ;
+    ; WHY THE TWO TOGETHER WORK, AND WHY THE EARLIER HOST-SIDE WAKES COULD NOT
+    ; The missing fact is what happens when hlt is interrupted. The core wakes,
+    ; executes the NEXT INSTRUCTION, and continues. In 9.462 that next instruction
+    ; was `jmp` - back to hlt - so a wake produced no exit and the stop flag was
+    ; never read. That is why injecting EventInj from the host failed three times:
+    ; the injection DID wake the core (that part was never broken), but waking it
+    ; accomplished nothing because the instruction after hlt could not report it.
+    ;
+    ; Put `vmmcall` immediately after hlt and every wake becomes a VMEXIT:
+    ;   - idle: the core sits in hlt, consuming no cycles          -> (1) satisfied
+    ;   - interrupted: it wakes, hits vmmcall, exits, the handler runs
+    ;     Sv206VmrunShouldExit and parks again or leaves            -> (2) satisfied
+    ;
+    ; The wake source is Windows itself. These cores still receive timer and IPI
+    ; interrupts, and they are delivered to the guest because INTR is NOT intercepted
+    ; here (checked the prepared set: CPUID, MSR_PROT, RDTSC/RDTSCP, VMRUN/VMMCALL,
+    ; SHUTDOWN). So the exit rate is bounded by the interrupt rate, not by how fast
+    ; the stub can spin - which is the property a spin can never have.
+    ;
+    ; IF MUST BE 1 for a maskable interrupt to wake hlt. The guest's RFLAGS comes
+    ; from ContextRecord->EFlags on a kernel thread that is not at DISPATCH_LEVEL,
+    ; and InterruptShadow is left 0, so there is no shadow window holding them off.
+    ; If that ever becomes false the core would wake only on NMI/SMI - which is
+    ; exactly the hang 9.462 produced, so this is the assumption to check first if
+    ; a future change makes the stub stop leaving hlt.
+Sv206GuestTick:
+    hlt                         ; (1) stop consuming cycles; wakes on any interrupt
+    mov     rax, 1              ; YGHV_CMD_HEARTBEAT - "awake, check the flag"
+    vmmcall                     ; (2) EVERY wake becomes one VMEXIT
+    jmp     Sv206GuestTick
 
     ; Reached only when the handler set ExitVm and SvLV20 resumed us here with
     ; SVM already disabled.

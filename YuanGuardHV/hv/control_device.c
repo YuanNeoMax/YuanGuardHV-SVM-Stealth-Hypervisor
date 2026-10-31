@@ -1736,7 +1736,48 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
              * version of this command reported the latter and called it the former.
              */
             out[4] = (UINT64)(INT64)applied;
-            info = 5 * sizeof(UINT64);
+
+            /*
+             * 9.464: THE VMMCALL COUNT, BECAUSE IT IS THE ONLY DIRECT PROOF THAT
+             * THE GUEST STUB IS RUNNING AT ALL.
+             *
+             * Chasing the hlt change I had no way to tell "the stub is parked and
+             * the exits come from somewhere else" apart from "the stub is still
+             * spinning". Both produce a large `total exits` and neither shows up
+             * in `distinct exit codes observed`, which reported 2 either way
+             * (CPUID and VMMCALL are both armed by default, so the count of
+             * DISTINCT codes is 2 no matter which of them dominates).
+             *
+             * vmmcalls counts only the stub's own instruction. If this number does
+             * not grow, the stub is not executing and every hypothesis about hlt
+             * or pause inside it is irrelevant.
+             */
+            {
+                extern LONG64 yghv_s206_vmmcalls_count(VOID);
+                out[5] = (UINT64)yghv_s206_vmmcalls_count();
+            }
+
+            /*
+             * 9.464: the live guest state of one core, because "hlt does nothing"
+             * has three causes and they need different fixes. See
+             * yghv_s206_guest_state in svm_simplevm206.cpp for what each field
+             * rules out.
+             */
+            {
+                extern LONG yghv_s206_guest_state(UINT64 *out);
+                UINT64 gs[5] = { 0, 0, 0, 0, 0 };
+
+                if (yghv_s206_guest_state(gs) && out_len >= 11 * sizeof(UINT64)) {
+                    out[6] = gs[0];   /* Rflags */
+                    out[7] = gs[1];   /* VIntr */
+                    out[8] = gs[2];   /* InterruptShadow */
+                    out[9] = gs[3];   /* EventInj */
+                    out[10] = gs[4];  /* core index */
+                    info = 11 * sizeof(UINT64);
+                } else {
+                    info = 6 * sizeof(UINT64);
+                }
+            }
             status = STATUS_SUCCESS;
         } else {
             /* The set/clear half-succeeded; the read-back did not fit. Reporting
