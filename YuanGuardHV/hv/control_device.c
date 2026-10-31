@@ -74,6 +74,60 @@ NTKERNELAPI NTSTATUS ZwFlushBuffersFile(HANDLE FileHandle,
 static PDEVICE_OBJECT g_yghv_device = NULL;
 
 /*
+ * 9.457 (Tier 7.1): A REMOVE LOCK, BECAUSE DELETING THE DEVICE DOES NOT CANCEL
+ * THE WORK THAT IS STILL USING IT.
+ *
+ * The crash this fixes: 0x3B C0000005, rip = 0, at
+ * yghv_control_dispatch_cleanup+0x2e. The instruction is
+ * `call qword ptr [yghv_pa+0x28050]`, and +0x28050 is the eleventh slot of the
+ * import address table - `ObfDereferenceObject`. Measured from the dump, that
+ * slot read ZERO, so the call jumped to address 0 and took the machine down.
+ *
+ * A zero IAT slot means the image has already been unmapped: ntoskrnl resolves
+ * the IAT when it loads a driver and clears it when it unloads one. So the fault
+ * was not a bad function pointer, it was OUR CODE RUNNING AFTER OUR IMAGE WAS
+ * GONE - reached through IRP_MJ_CLEANUP, i.e. a file handle being closed.
+ *
+ * The ordering that produced it: `yghv_control_device_cleanup` called
+ * IoDeleteDevice and returned; the driver unloaded; a user-mode handle that had
+ * been open all along was then closed, and the I/O manager dispatched CLEANUP to
+ * a device object whose driver no longer existed. IoDeleteDevice removes the
+ * DEVICE, it does not wait for outstanding IRPs or open handles - that is the
+ * driver's job, and nothing here was doing it.
+ *
+ * So each entry point takes a reference on the way in and releases it on the way
+ * out, and the unload path calls IoReleaseRemoveLockAndWait BEFORE deleting
+ * anything. After it returns, no dispatch routine is running and none can start.
+ *
+ * WHY THIS BELONGS IN THE 7.1 ROUND: the section-hide work is what exercises the
+ * cleanup path (guard entries are read back through the same handle), and a
+ * crash there is indistinguishable from a crash in the hide. Fixing the ordering
+ * first is what makes the next `section-hide 1` experiment readable.
+ */
+static IO_REMOVE_LOCK g_yghv_remove_lock;
+
+/* Acquire for one request. FALSE means the device is being removed: complete
+ * with STATUS_DELETE_PENDING rather than touching anything. */
+static BOOLEAN yghv_ctl_acquire(PDEVICE_OBJECT dev)
+{
+    NTSTATUS st;
+
+    if (!dev)
+        return FALSE;
+
+    st = IoAcquireRemoveLock(&g_yghv_remove_lock, NULL);
+    return NT_SUCCESS(st) ? TRUE : FALSE;
+}
+
+static VOID yghv_ctl_release(PDEVICE_OBJECT dev)
+{
+    if (dev) {
+        IoReleaseRemoveLock(&g_yghv_remove_lock, NULL);
+    }
+}
+
+
+/*
  * 9.455 (Tier 7.1): the driver's own image range, for the sections report.
  *
  * Registered once at DriverEntry (where the DriverObject is in hand), read by the
@@ -406,46 +460,87 @@ static NTSTATUS yghv_control_complete(PIRP irp, NTSTATUS status, ULONG info) {
 }
 
 static NTSTATUS yghv_control_dispatch_default(PDEVICE_OBJECT dev, PIRP irp) {
-    (void)dev;
+    if (!yghv_ctl_acquire(dev)) {
+        return yghv_control_complete(irp, STATUS_DELETE_PENDING, 0);
+    }
+    yghv_ctl_release(dev);
     return yghv_control_complete(irp, STATUS_INVALID_DEVICE_REQUEST, 0);
 }
 
 static NTSTATUS yghv_control_dispatch_open(PDEVICE_OBJECT dev, PIRP irp) {
-    (void)dev;
+    if (!yghv_ctl_acquire(dev)) {
+        return yghv_control_complete(irp, STATUS_DELETE_PENDING, 0);
+    }
+    yghv_ctl_release(dev);
     return yghv_control_complete(irp, STATUS_SUCCESS, 0);
 }
 
 static NTSTATUS yghv_control_dispatch_create(PDEVICE_OBJECT dev, PIRP irp) {
-    PIO_STACK_LOCATION stack = IoGetCurrentIrpStackLocation(irp);
+    PIO_STACK_LOCATION stack;
     PEPROCESS proc = IoGetRequestorProcess(irp);
     yghv_ctl_ctx_t *ctx;
-    (void)dev;
+
+    if (!yghv_ctl_acquire(dev)) {
+        return yghv_control_complete(irp, STATUS_DELETE_PENDING, 0);
+    }
+    stack = IoGetCurrentIrpStackLocation(irp);
 
     if (!proc) {
         LOG_ERROR("control device: create has no requestor process");
+        yghv_ctl_release(dev);
         return yghv_control_complete(irp, STATUS_ACCESS_DENIED, 0);
     }
     ctx = (yghv_ctl_ctx_t *)ExAllocatePoolWithTag(
         NonPagedPool, sizeof(*ctx), YGHV_TAG);
-    if (!ctx)
+    if (!ctx) {
+        yghv_ctl_release(dev);
         return yghv_control_complete(irp, STATUS_INSUFFICIENT_RESOURCES, 0);
+    }
     ctx->owner_process = proc;
     ctx->owner_cr3 = *(volatile uint64_t *)((uint8_t *)proc + 0x028);
     ObReferenceObject(proc);
     stack->FileObject->FsContext = ctx;
+    yghv_ctl_release(dev);
     return yghv_control_complete(irp, STATUS_SUCCESS, 0);
 }
 
 static NTSTATUS yghv_control_dispatch_cleanup(PDEVICE_OBJECT dev, PIRP irp) {
-    PIO_STACK_LOCATION stack = IoGetCurrentIrpStackLocation(irp);
-    yghv_ctl_ctx_t *ctx = (yghv_ctl_ctx_t *)stack->FileObject->FsContext;
-    (void)dev;
+    PIO_STACK_LOCATION stack;
+    yghv_ctl_ctx_t *ctx = NULL;
+
+    /*
+     * 9.457: THIS IS THE ROUTINE THAT CRASHED, so the guard is not decoration.
+     *
+     * The fault was `call ObfDereferenceObject` with a zeroed IAT slot at
+     * yghv_pa+0x105a8 - i.e. this function running after the image was unmapped.
+     * Acquiring first means it either gets a reference (the device is alive, so
+     * the IAT is alive) or it returns STATUS_DELETE_PENDING having touched
+     * nothing. There is no third state where it proceeds into a dead image.
+     */
+    if (!yghv_ctl_acquire(dev)) {
+        return yghv_control_complete(irp, STATUS_DELETE_PENDING, 0);
+    }
+    stack = IoGetCurrentIrpStackLocation(irp);
+
+    /*
+     * Read FsContext EXACTLY once, into a local, and clear the pointer before
+     * using it. Reading it twice is the other half of the same bug class: the
+     * second read can see NULL a concurrent close wrote, and then the
+     * dereference below is on a pointer nobody owns.
+     */
+    if (stack->FileObject) {
+        ctx = (yghv_ctl_ctx_t *)stack->FileObject->FsContext;
+        stack->FileObject->FsContext = NULL;
+    }
 
     if (ctx) {
-        stack->FileObject->FsContext = NULL;
-        ObDereferenceObject(ctx->owner_process);
+        if (ctx->owner_process) {
+            ObDereferenceObject(ctx->owner_process);
+            ctx->owner_process = NULL;
+        }
         ExFreePoolWithTag(ctx, YGHV_TAG);
     }
+    yghv_ctl_release(dev);
     return yghv_control_complete(irp, STATUS_SUCCESS, 0);
 }
 
@@ -481,11 +576,20 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
     PVOID buf;
     NTSTATUS status = STATUS_SUCCESS;
     ULONG info = 0;
-    (void)dev;
+
+    /*
+     * 9.457: take a reference BEFORE touching anything, and refuse once removal
+     * has begun. Between those two, the device object cannot be deleted while
+     * this routine is inside it.
+     */
+    if (!yghv_ctl_acquire(dev)) {
+        return yghv_control_complete(irp, STATUS_DELETE_PENDING, 0);
+    }
 
     stack = IoGetCurrentIrpStackLocation(irp);
     if (!yghv_control_ioctl_authorized(irp)) {
         LOG_ERROR("control device: unauthorized caller rejected");
+        yghv_ctl_release(dev);
         return yghv_control_complete(irp, STATUS_ACCESS_DENIED, 0);
     }
     code = stack->Parameters.DeviceIoControl.IoControlCode;
@@ -2963,6 +3067,15 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
         info = 0;
         yghv_ioctl_log("out", code);   /* only errors are logged (REV-018) */
     }
+    /*
+     * 9.457: release BEFORE completing the IRP.
+     *
+     * Order matters and only one way is correct: if the reference were dropped
+     * after IoCompleteRequest, the unload path could clear the remove lock and
+     * delete the device while this routine still had code to run - which is the
+     * exact shape of the crash this fixes.
+     */
+    yghv_ctl_release(dev);
     return yghv_control_complete(irp, status, info);
 }
 
@@ -2998,6 +3111,13 @@ NTSTATUS yghv_control_device_init(PDRIVER_OBJECT driver) {
     LOG_INFO("control device: NOT CREATED (YGHV_NO_DEVICE build) - channel only");
     return STATUS_SUCCESS;
 #else
+    /*
+     * 9.457: initialise the remove lock ONCE, before any handler can be reached.
+     * The dispatch routines are assigned a few lines below, so this cannot race
+     * a first request.
+     */
+    IoInitializeRemoveLock(&g_yghv_remove_lock, YGHV_TAG, 0, 0);
+
     RtlInitUnicodeString(&dev_name, YGHV_DEVICE_NAME_STRING);
     RtlInitUnicodeString(&link_name, YGHV_DOS_DEVICE_NAME_STRING);
 
@@ -3088,6 +3208,24 @@ void yghv_control_device_cleanup(PDRIVER_OBJECT driver) {
         IoFreeWorkItem(g_link_work);
         g_link_work = NULL;
     }
+
+    /*
+     * 9.457: WAIT FOR EVERY IN-FLIGHT REQUEST BEFORE DELETING THE DEVICE.
+     *
+     * IoReleaseRemoveLockAndWait sets the "removal" state and waits until every
+     * acquired reference has been released. After it returns, no dispatch routine
+     * is running and none can start, so the deletion below cannot strand one.
+     *
+     * This is the ordering that was missing. IoDeleteDevice alone takes the
+     * device away while IRP_MJ_CLEANUP is still queued behind a user handle; the
+     * driver finishes unloading, the IAT is cleared, and the queued cleanup runs
+     * against an unmapped image - which is the 0x3B C0000005 with rip = 0 that
+     * this round exists to fix.
+     *
+     * It is called exactly once per driver lifetime and must not be called twice:
+     * the second call would wait on a lock nothing can ever release.
+     */
+    IoReleaseRemoveLockAndWait(&g_yghv_remove_lock, NULL);
 
     RtlInitUnicodeString(&link_name, YGHV_DOS_DEVICE_NAME_STRING);
     IoDeleteSymbolicLink(&link_name);
