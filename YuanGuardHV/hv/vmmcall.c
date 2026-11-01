@@ -1,3 +1,29 @@
+/*
+ * vmmcall.c — guest -> hypervisor command channel.
+ *
+ * 9.493: READ THIS BEFORE ASSUMING THESE CHECKS PROTECT ANYTHING IN THE 206 BUILD.
+ *
+ * The authorization below (cpl==0, control CR3, cookie, per-vcpu key) lives on the
+ * path  svm_dispatch_exit -> vmmcall_dispatch -> yghv_vmmcall_authorized.
+ *
+ * THE 206 MAINLINE DOES NOT TAKE THAT PATH. Measured: `svm_simplevm206.cpp`
+ * contains ZERO references to svm_dispatch_exit; its own `case VMEXIT_VMMCALL`
+ * only counts the exit, advances RIP, and checks the stop flag. The two chains are
+ * mutually exclusive and 206 uses only the latter.
+ *
+ * Consequence: in the shipping 206 configuration this file's checks never run. It
+ * is kept because the vendored 206-A path and other GPU/coexist configurations do
+ * reach it - deleting it would remove their protection.
+ *
+ * WHY THIS PARAGRAPH EXISTS: a reader who finds `yghv_vmmcall_authorized` here
+ * would reasonably conclude that VMMCALL commands are gated, and might hang a
+ * sensitive operation on one of them believing it is protected. That is the same
+ * mistake as 9.450b, where the tree documented a RIP-whitelist ALLOW loop that
+ * had zero callers. "The code exists" and "the code runs" read identically.
+ *
+ * If you need a command reachable from the 206 guest, handle it in SvHandleVmExit
+ * and put the gate THERE - not here.
+ */
 #include <ntddk.h>
 #include "svm_defs.h"
 #include "svm_vcpu.h"

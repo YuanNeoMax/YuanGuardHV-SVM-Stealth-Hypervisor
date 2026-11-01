@@ -16749,3 +16749,61 @@ if (page_budget == 0 || page_budget > YGHV_BENCH_MAX_PAGES)
 **「0 表示无限制」是一个危险默认值，当它出现在内核 IOCTL 参数里的时候。**
 调用方少写一个参数，得到的不是「默认值」，是「永不返回」。
 上限应该由实现决定，不该由调用方的记性决定。
+
+---
+
+#### 9.493 `vmmcall.c` 的整套权限检查在 206 主线里永不执行
+
+##### 发现
+
+`vmmcall.c` 的 `yghv_vmmcall_authorized()` 有分层检查：
+
+```
+cpl != 0                    -> 拒绝
+g_control_cr3 不匹配        -> 拒绝
+rcx != cookie               -> 拒绝
+SHUTDOWN 还要 r8 == auth_key -> 拒绝
+```
+
+看起来是 guest→host 命令通道的权限门。
+
+**但 206 主线根本不走这条路。** 实测：
+
+| 检查 | 结果 |
+|---|---|
+| `svm_simplevm206.cpp` 里出现 `svm_dispatch_exit` 的次数 | **0** |
+| 206 的 `case VMEXIT_VMMCALL` 做什么 | 计数、推进 RIP、检查停止标志 |
+| 谁调用 `vmmcall_dispatch` | 只有 `vmexit.c:579`（`svm_dispatch_exit` 内）|
+
+所以整条链 `SvHandleVmExit → (206 自己的分支) → 结束` 与
+`svm_dispatch_exit → vmmcall_dispatch → yghv_vmmcall_authorized` 是**两条互斥的路径**，
+206 只走前者。
+
+**`vmmcall.c` 在 206 主线里是死代码，权限检查永不执行。**
+
+##### 为什么这不是「新缺陷」而是一条必须记录的事实
+
+它不是本轮引入的，也不造成崩溃。它的危害是**认知性的**：
+
+有人读 `vmmcall.c` 会认为「guest 的 VMMCALL 命令有分层权限门」，
+于是把某个敏感操作挂到 VMMCALL 命令上，以为受 cookie + per-vcpu key 保护 ——
+而实际路径根本不经过这段代码。
+
+这与 9.450b 那条同源：
+
+> 9.450 写「隐藏页由 RIP 白名单 ALLOW loop 服务」，
+> 而 `yghv_guard_fault_is_ours` **零调用者**。
+
+**同一类错误：把一个存在但不可达的函数，当成正在生效的保护。**
+
+##### 处置
+
+不删——它在 206-A/vendored 路径和潜在的其他配置里仍是活的，
+删掉会让那条路径失去保护。
+
+**记录在这里，并在文件头加一句醒目的说明**，让读它的人先知道它服务于哪条路径。
+
+##### 教训
+
+**「这段代码存在」和「这段代码在跑」是两件事，而它们读起来是一样的。**
+判断一个保护是否生效，要看**调用链**，不是看函数体。
