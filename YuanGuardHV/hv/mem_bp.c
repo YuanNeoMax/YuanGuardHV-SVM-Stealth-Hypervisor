@@ -324,7 +324,28 @@ uint64_t g_dbg_args[8];   /* 9.327: last bp_add_ex arguments, for diagnosis */
 static int yghv_bp_find(uint64_t gpa, uint64_t rip) {
     int i;
     uint64_t page = gpa & ~(uint64_t)0xFFFULL;
-    int n = (int)InterlockedCompareExchange(&g_bp_count, 0, 0);
+    /*
+     * 9.485: DO NOT BOUND THE SCAN BY g_bp_count - IT IS A CENSUS, NOT AN EXTENT.
+     *
+     * g_bp_count counts LIVE slots. It is incremented on arm and decremented on
+     * remove, but the SLOTS ARE NOT COMPACTED: removing a slot in the middle
+     * leaves g_bp[1].active = 0 while g_bp[2].active = 1. Scanning `i < n` then
+     * looks at fewer slots than exist and NEVER REACHES the ones above the hole.
+     *
+     * Measured consequence, and it is silent: arm three breakpoints, remove the
+     * middle one, and the third stops firing. The table still reports count=2, the
+     * lists agree, and nothing anywhere says a breakpoint went dark. A debugger
+     * that quietly stops breaking is worse than one that errors.
+     *
+     * The scan must therefore cover the whole array and decide validity per slot
+     * with `active`, which is what every caller already tests anyway.
+     */
+    /* 9.485: SCAN THE WHOLE ARRAY, NOT `g_bp_count` SLOTS.
+     * g_bp_count counts LIVE slots but the array is NOT COMPACTED - removing a
+     * slot mid-table leaves a hole, and `i < n` then stops before the slots above
+     * it. Measured: arm three, remove the middle one, the third stops firing, and
+     * nothing anywhere reports it. Validity is decided per slot with `active`. */
+    int n = YGHV_BP_MAX;
 
     for (i = 0; i < n && i < YGHV_BP_MAX; i++) {
         if (!InterlockedCompareExchange(&g_bp[i].active, 0, 0))
@@ -340,7 +361,28 @@ static int yghv_bp_find(uint64_t gpa, uint64_t rip) {
 
 int yghv_bp_find_int3(uint64_t va) {
     int i;
-    int n = (int)InterlockedCompareExchange(&g_bp_count, 0, 0);
+    /*
+     * 9.485: DO NOT BOUND THE SCAN BY g_bp_count - IT IS A CENSUS, NOT AN EXTENT.
+     *
+     * g_bp_count counts LIVE slots. It is incremented on arm and decremented on
+     * remove, but the SLOTS ARE NOT COMPACTED: removing a slot in the middle
+     * leaves g_bp[1].active = 0 while g_bp[2].active = 1. Scanning `i < n` then
+     * looks at fewer slots than exist and NEVER REACHES the ones above the hole.
+     *
+     * Measured consequence, and it is silent: arm three breakpoints, remove the
+     * middle one, and the third stops firing. The table still reports count=2, the
+     * lists agree, and nothing anywhere says a breakpoint went dark. A debugger
+     * that quietly stops breaking is worse than one that errors.
+     *
+     * The scan must therefore cover the whole array and decide validity per slot
+     * with `active`, which is what every caller already tests anyway.
+     */
+    /* 9.485: SCAN THE WHOLE ARRAY, NOT `g_bp_count` SLOTS.
+     * g_bp_count counts LIVE slots but the array is NOT COMPACTED - removing a
+     * slot mid-table leaves a hole, and `i < n` then stops before the slots above
+     * it. Measured: arm three, remove the middle one, the third stops firing, and
+     * nothing anywhere reports it. Validity is decided per slot with `active`. */
+    int n = YGHV_BP_MAX;
 
     for (i = 0; i < n && i < YGHV_BP_MAX; i++) {
         if (!InterlockedCompareExchange(&g_bp[i].active, 0, 0))
@@ -369,7 +411,28 @@ int yghv_bp_is_armed(uint64_t gpa) {
 
 int yghv_bp_dr_slot_for_va(uint64_t va) {
     int i;
-    int n = (int)InterlockedCompareExchange(&g_bp_count, 0, 0);
+    /*
+     * 9.485: DO NOT BOUND THE SCAN BY g_bp_count - IT IS A CENSUS, NOT AN EXTENT.
+     *
+     * g_bp_count counts LIVE slots. It is incremented on arm and decremented on
+     * remove, but the SLOTS ARE NOT COMPACTED: removing a slot in the middle
+     * leaves g_bp[1].active = 0 while g_bp[2].active = 1. Scanning `i < n` then
+     * looks at fewer slots than exist and NEVER REACHES the ones above the hole.
+     *
+     * Measured consequence, and it is silent: arm three breakpoints, remove the
+     * middle one, and the third stops firing. The table still reports count=2, the
+     * lists agree, and nothing anywhere says a breakpoint went dark. A debugger
+     * that quietly stops breaking is worse than one that errors.
+     *
+     * The scan must therefore cover the whole array and decide validity per slot
+     * with `active`, which is what every caller already tests anyway.
+     */
+    /* 9.485: SCAN THE WHOLE ARRAY, NOT `g_bp_count` SLOTS.
+     * g_bp_count counts LIVE slots but the array is NOT COMPACTED - removing a
+     * slot mid-table leaves a hole, and `i < n` then stops before the slots above
+     * it. Measured: arm three, remove the middle one, the third stops firing, and
+     * nothing anywhere reports it. Validity is decided per slot with `active`. */
+    int n = YGHV_BP_MAX;
 
     for (i = 0; i < n && i < YGHV_BP_MAX; i++) {
         if (InterlockedCompareExchange(&g_bp[i].active, 0, 0) &&
@@ -869,7 +932,23 @@ int yghv_bp_on_npf(uint64_t gpa, uint64_t rip, uint32_t kind, uint32_t cpl,
                    uint64_t cr3) {
     int slot;
     uint64_t page = gpa & ~(uint64_t)0xFFFULL;
+    /* 9.485: the early-out asks "is ANY breakpoint armed" - the one question
+     * g_bp_count answers correctly. The SCANS must not use it as an extent. */
+
     int n = (int)InterlockedCompareExchange(&g_bp_count, 0, 0);
+
+
+
+
+
+
+
+
+
+
+
+
+
 
     if (n <= 0)
         return 0;
@@ -955,7 +1034,23 @@ int yghv_bp_shadow_switch(uint64_t gpa, int to_shadow) {
  * are keyed by VA, so this walks for a matching gpa. */
 int yghv_bp_find_int3_page(uint64_t page) {
     int i;
-    int n = (int)InterlockedCompareExchange(&g_bp_count, 0, 0);
+    /*
+     * 9.485: DO NOT BOUND THE SCAN BY g_bp_count - IT IS A CENSUS, NOT AN EXTENT.
+     *
+     * g_bp_count counts LIVE slots. It is incremented on arm and decremented on
+     * remove, but the SLOTS ARE NOT COMPACTED: removing a slot in the middle
+     * leaves g_bp[1].active = 0 while g_bp[2].active = 1. Scanning `i < n` then
+     * looks at fewer slots than exist and NEVER REACHES the ones above the hole.
+     *
+     * Measured consequence, and it is silent: arm three breakpoints, remove the
+     * middle one, and the third stops firing. The table still reports count=2, the
+     * lists agree, and nothing anywhere says a breakpoint went dark. A debugger
+     * that quietly stops breaking is worse than one that errors.
+     *
+     * The scan must therefore cover the whole array and decide validity per slot
+     * with `active`, which is what every caller already tests anyway.
+     */
+    int n = YGHV_BP_MAX;
     for (i = 0; i < n && i < YGHV_BP_MAX; i++) {
         if (InterlockedCompareExchange(&g_bp[i].active, 0, 0) &&
             g_bp[i].mode == YGHV_BP_MODE_INT3 &&
@@ -968,7 +1063,23 @@ int yghv_bp_find_int3_page(uint64_t page) {
 int yghv_bp_on_int3(uint64_t va, uint32_t cpl, uint64_t cr3) {
     int slot;
     uint32_t kind = YGHV_BP_EXEC;
+    /* 9.485: the early-out asks "is ANY breakpoint armed" - the one question
+     * g_bp_count answers correctly. The SCANS must not use it as an extent. */
+
     int n = (int)InterlockedCompareExchange(&g_bp_count, 0, 0);
+
+
+
+
+
+
+
+
+
+
+
+
+
 
     if (n <= 0)
         return 0;
@@ -990,7 +1101,23 @@ int yghv_bp_on_int3(uint64_t va, uint32_t cpl, uint64_t cr3) {
 
 int yghv_bp_on_dr(uint64_t dr6, uint64_t rip, uint32_t cpl, uint64_t cr3) {
     int i;
+    /* 9.485: the early-out asks "is ANY breakpoint armed" - the one question
+     * g_bp_count answers correctly. The SCANS must not use it as an extent. */
+
     int n = (int)InterlockedCompareExchange(&g_bp_count, 0, 0);
+
+
+
+
+
+
+
+
+
+
+
+
+
 
     if (n <= 0)
         return -1;
