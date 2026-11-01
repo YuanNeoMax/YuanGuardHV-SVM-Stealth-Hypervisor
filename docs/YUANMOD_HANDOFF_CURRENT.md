@@ -11044,3 +11044,140 @@ Build SUCCESS              bin\yuanguard_hv.sys  14:53:06  0936CA59C3C7595A
 **这一条的方法学价值在于：它是被「全仓扫控制字符」这个动作找到的，不是被读代码找到的。**
 同一个 PowerShell 引号陷阱，这轮咬了我一次（Markdown），9.486 咬了源码四次（注释），
 而两次都是**内容静默损坏、输出看起来仍然完整**。已写进 QUICKSTART 第 5 节的坑表。
+
+---
+
+#### 9.500 客户端 4 条命令写死服务名 —— 它们从来没工作过，而且没有检查器管
+
+`set-auto-start` / `unset-auto-start` / `harden-service` / `unharden-service` 四条命令
+全部 `sc.exe ... yuanguard ...`。**注册表里从来没有 `yuanguard` 这个服务键**：
+
+```
+sc config yuanguard  ->  [SC] OpenService FAILED 1060
+sc qc    yghvpa      ->  QueryServiceConfig SUCCESS, START_TYPE = DEMAND_START
+sc sdshow yghvpa     ->  D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)...
+```
+
+所以这四条一旦被调用就是 1060。它们又都在 `$sysCommands` 早退分支里（**先于
+`CreateFile` 执行**，不碰驱动），失败信息看起来完全像一个环境问题。
+
+**为什么 12 个检查器一个都没抓到**：每个检查器只读文件的不同部位。
+
+| 检查器 | 读什么 |
+|---|---|
+| `ioctl_parity` | IOCTL 编号 |
+| `command_parity` | 命令**名字** |
+| `client_undefined_vars` | 变量名 |
+| `ioctl_buffer_size` | 缓冲长度 |
+| （空） | **外部工具的参数** ← 就是这里 |
+
+##### 修法
+
+1. **一个地方决定名字**：`param` 加 `[string]$ServiceName = 'yghvpa'`，
+   `$YghvService = $ServiceName` 只算一次，四条命令全部改用它。
+2. **一条新的只读命令** `service-name`：打印解析出的名字、服务是否存在、`START_TYPE`、
+   `BINARY_PATH_NAME`、SDDL，并判断 `hardened` 是 YES/NO。
+   **它存在的理由就是上面那句话**：以前要验证这四条，只能真的跑其中一条 ——
+   用一个改变机器状态的动作去回答一个不需要改状态的问题。
+3. **`tests/service_name_check.ps1`（9.501）**：要求客户端里每个
+   `sc <verb> <operand>` 的 operand 是变量，不是字面量。带自检。
+
+##### 这一轮被自己写错的判据打脸两次，两次都在同一小时内
+
+**(a) `sc qc` 输出先被 `-join ' '` 拼成一个字符串，再 `Select-String`。**
+匹配到的是整份报告，于是 `START_TYPE` 与 `BINARY_PATH_NAME` 把同一段话打印了两次。
+修法：保持数组，逐行索引。
+
+**(b) 修的时候又踩了 PowerShell 的转义**：`"`$line"` 里的反引号让 `$line` 变成字面
+文本 `$line`，`-replace '\s{2,}'` 到了 PowerShell 里是「反斜杠 + s」，不是空白。
+修法：不用反引号、不用正则 —— `[string]::Join` + `while (Contains('  '))`。
+
+**(c) 更值钱的一次：检查器的自检一上线就报「the mutated copy PASSED」。**
+我写的是
+
+```powershell
+if ($inv.Operand -match '$') { continue }     # a variable
+```
+
+`-match` 收的是**正则**，`$` 是**串尾锚**，匹配**任何**字符串 —— 包括字面量 `yuanguard`。
+于是「7 项全部通过」这句话，是对的**数字**配错的**判据**：它当时确实全是变量，
+但缺陷回来后它还是会说 7 项全过。
+
+修法：`$inv.Operand.StartsWith('$')` —— 字符判断，不是模式判断。
+
+> **这是本轮唯一一次「自检跑起来就抓到真缺陷」的实例，而抓的是我刚写完一分钟的检查器。**
+> 这正好重申方法论第四条：**一个没能失败过的检查器，等于没写。**
+
+##### 实机读数
+
+```
+service-name: resolved = yghvpa
+  EXISTS = YES
+    START_TYPE : 3 DEMAND_START
+    BINARY_PATH_NAME : \??\C:\yghv_pa.sys
+  SDDL = D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)...
+  hardened = NO  (BA still holds delete - harden-service not applied)
+```
+
+**判据可失败性自检**：`service-name -ServiceName nosuchsvc` → `EXISTS = NO` + `exit 1`。
+即它不是一个只会报 YES 的命令。
+
+---
+
+#### 9.502 `byovd-scan` 从「名字命中」升级成「哈希确认」
+
+9.499 的 STRONG 只比文件名，本机两条 STRONG 全是错的：
+`PROCEXP152.SYS` v=17.0（KDU 要 ≤1.5.2）、`AMDRyzenMasterDriver.sys` v=3.1.0.0（要 ≤2.0.0.0）。
+
+**名字是候选，哈希才是结论。** 于是：
+
+- 从 `Help/providers.md` 抄出 68 行元数据，写成 `tools/kdu_providers.csv`
+  （FileSHA1 / AuthenticodeSHA1 / PageHashSHA256 / ImageSize / 版本上限 / CVE）。
+  **抓一次存本地，脚本永远不联网** —— 一个诊断命令不该依赖网络可达性。
+- 判据改成三档，**绝不合并成一个数**：
+
+| 档 | 判据 | 含义 |
+|---|---|---|
+| **HIT** | FileSHA1 命中 KDU 记录 | 就是那个文件 |
+| **CANDIDATE** | 名字命中但哈希不符 | 名字对、文件不对 |
+| **WEAK** | 名字被包含 | 还没到能判断的程度 |
+
+- **`PageHashSHA256` 那列没有用**，理由写在源码里：它只覆盖驱动的 PAGE 段，
+  Windows 不便宜地暴露页哈希，用别的办法算出来的值会**看起来像结论而不是结论**。
+
+**HIT 路径的自检**（否则又是一条只会报 0 的判据）：把 CSV 里 #19 的 FileSHA1
+临时换成本机 `PROCEXP152.SYS` 的实际 SHA1，重跑：
+
+```
+HIT (1) - FileSHA1 matches a KDU provider record. This IS the file:
+PROCEXP152.SYS  HIT  KDU #19 ProcExp152  v=17.0
+verdict: hit=1 candidate=1 ...
+```
+
+把 CSV 恢复后回到 `hit=0`。**两方向都验过，才敢说这条判据能分辨。**
+
+---
+
+#### 9.503 「`.data` 53 页」是手数出来的，实测 54 页
+
+四份文档都写 53 页。实测：
+
+```
+.data virtual size  35694 bytes          ->  9 页
+.data VA span       0x2F000..0x64693     -> 54 页（含 .bss 的 0x34694）
+```
+
+两个数都成立，而文档引的是**第三个**（手数的）。取 54 是因为
+「把这些页从 NPT 剔掉」必须按**跨度**算。已在四份文档里改成
+`54 页 · 按段跨度算（0x2F000..0x64693；虚表本身只有 9 页）`。
+
+> **一个读者无法自己重算的数字，就是他自己无法核对的数字。** 这条与
+> 9.497 的「把恒等式当测量」是同一族：差别只在这次错的不是判据，是常量。
+
+---
+
+#### 三项的共同点
+
+三件都不是「功能没做」，而是**已有的东西在说谎**：命令说它跑了（其实 1060）、
+扫描器说它查了（其实只比名字）、文档说它数过（其实是手数的）。
+修完之后每一条都配了一个**能失败的自检**，这正是本树方法论第 4 条要求的东西。
