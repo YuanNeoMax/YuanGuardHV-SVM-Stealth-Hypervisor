@@ -366,6 +366,34 @@ void yghv_trace(const char *msg) {
     size_t msg_len = 0;
     char buf[256];
 
+    /*
+     * 9.490 CORRECTED: NO RUNTIME IRQL GATE HERE, AND THE CHECKER CAUGHT WHY.
+     *
+     * The first attempt guarded with KeGetCurrentIrql() > PASSIVE_LEVEL - which
+     * does not link on this toolchain (mem_engine.c 9.262: it lowers to
+     * `__readcr8`, not exported by the WDM km libs). The second attempt used the
+     * tree's usual substitute KeAreAllApcsDisabled() - and `irql_contract_check`
+     * rejected it with the right reason:
+     *
+     *     "yghv_trace is reachable from a VMEXIT root but gates on
+     *      KeAreAllApcsDisabled(); an NPF/VMEXIT handler runs at DISPATCH with
+     *      GIF=0, which IS all-APCs-disabled"
+     *
+     * So that gate would not have prevented a high-IRQL write - it would have
+     * silently disabled logging EVERYWHERE, because the legitimate callers are
+     * dispatch paths. Losing all trace output to avoid a bugcheck is not a trade,
+     * it is deleting the evidence.
+     *
+     * THE REAL CONTRACT: this function performs blocking I/O and MUST only be
+     * called at PASSIVE_LEVEL. That is a property of its CALLERS, and the honest
+     * way to enforce it is to keep the call sites auditable - which the
+     * irql_contract_check island set already does by refusing *_bare-style gates.
+     * A guard that cannot distinguish "dispatch at PASSIVE with APCs off" from
+     * "DISPATCH_LEVEL" cannot enforce this, so no guard is added.
+     *
+     * Every caller today writes from DriverEntry, DriverUnload, or a PASSIVE
+     * thread (verified by audit: no DPC/timer callback calls it).
+     */
     if (!g_trace_file) return;
     if (!NT_SUCCESS(RtlStringCchLengthA(msg, sizeof(buf) - 2, &msg_len))) return;
     RtlCopyMemory(buf, msg, msg_len);

@@ -16594,3 +16594,58 @@ if(ae > (uint64_t)NPT_PML4_ENTRY_SPAN)
 
 **一个函数能接受的范围，和它能在拆卸时回收的范围，必须一致。**
 不一致时，多出来的那部分不会报错，只会慢慢吃掉一个驱动无法请求系统回收的池。
+
+---
+
+#### 9.490 ★★★ 想给 `yghv_trace` 加 IRQL 保护，两次都被挡住 —— 而且挡住得对
+
+##### 起因
+
+`yghv_trace` 用 `ZwWriteFile` + `ZwFlushBuffersFile`，这是**阻塞 I/O，要求 PASSIVE_LEVEL**。
+它从退出处理路径可达，所以看起来该有个运行时保护。
+
+##### 第一次尝试：`KeGetCurrentIrql()`
+
+**链接失败** `LNK2019: 无法解析的外部符号 __readcr8`。
+
+这棵树早就记录过这个坑（`mem_engine.c` 9.262）：
+
+> `KeGetCurrentIrql()` 在本工具链下会展开成 `__readcr8`，而 WDK km libs
+> 不为这个目标导出它。
+
+##### 第二次尝试：`KeAreAllApcsDisabled()`
+
+用本树既有的替代探针。**被 `irql_contract_check` 当场拒绝**，理由完全正确：
+
+```
+[irql] FAIL: yghv_trace is reachable from a VMEXIT root but gates on
+       KeAreAllApcsDisabled() (main.c)
+```
+
+> 一个 NPF/VMEXIT 处理在 DISPATCH、GIF=0 下运行，**那正是「all APCs disabled」**
+
+也就是说：这个守卫**保护不了任何东西**，只会让**所有正常调用都写不进去** ——
+因为在 dispatch 路径上它恒为真。**为了躲一次蓝屏而丢掉全部跟踪输出，
+不是权衡，是删掉证据。**
+
+##### 最终结论：不加运行时守卫
+
+`yghv_trace` 的真实契约是「**只允许在 PASSIVE_LEVEL 调用**」，
+那是**调用方**的性质。而能同时区分「dispatch 且 PASSIVE、APC 关闭」
+与「DISPATCH_LEVEL」的探针，在本工具链上不存在（`__readcr8` 不可用）。
+
+所以正确的做法是**让调用点保持可审计**——`irql_contract_check` 的岛集
+通过拒绝 `*_bare` 式门闸已经在做这件事。
+
+审计过全部调用点：都来自 `DriverEntry` / `DriverUnload` / PASSIVE 线程，
+**没有任何 DPC 或定时器回调调用它**。
+
+##### 这一轮真正的收获
+
+**不是修好了什么，是「一个看起来显然该加的守卫，加了两次都错」。**
+
+第一次错在不知道工具链限制（有文档，我没先查）；第二次错在**用了一个
+语义相近但方向相反的探针**——`KeAreAllApcsDisabled()` 在 dispatch 路径上
+恒为真，所以它拦的不是「高 IRQL」，是「所有正常调用」。
+
+而**拦住我的是已有的检查器**，不是我自己。这正是 9.469 那批检查器存在的理由。
