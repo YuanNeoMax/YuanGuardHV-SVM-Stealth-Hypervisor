@@ -31,7 +31,15 @@ $scripts = @(
     # be wrong, because the user concludes the feature does not work. The two
     # numbers live in different files, in different languages, and neither
     # compiler can see the other side.
-    'ioctl_buffer_size.ps1'
+    'ioctl_buffer_size.ps1',
+    # 9.486: a table that is NOT COMPACTED must not be scanned up to its live
+    # count. Five tables in hv/ shared this shape - mem_bp, mem_cache, mem_time,
+    # mem_view, mem_watch - and removing a slot in the MIDDLE made every entry
+    # above it unreachable, while the count and every list still agreed. The
+    # symptom is "a breakpoint/page/cache entry silently stops working", which no
+    # error code reports. protect.c is explicitly allowed: it compacts on removal
+    # (`pages[i] = pages[count-1]`), so there its count IS a true extent.
+    'count_as_extent.ps1'
 )
 
 foreach ($script in $scripts) {

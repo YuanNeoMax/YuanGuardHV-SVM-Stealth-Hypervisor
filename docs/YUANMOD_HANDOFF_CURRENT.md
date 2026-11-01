@@ -16328,3 +16328,85 @@ for (i = 0; i < n && i < YGHV_BP_MAX; i++) { ... }
 `g_bp_count` 在从没删过东西时正好等于「最后一个有效槽的下标+1」，
 所以这个 bug 只在**删除中间槽之后**才显形 —— 而且显形的方式是
 「某功能悄悄不工作了」，不是任何一个错误码。
+
+---
+
+#### 9.486 ★★★★★ 「用计数当扫描上界」是系统性缺陷：四个表都中招
+
+##### 9.485 不是孤例
+
+修完断点表后立刻做了一次**模式普查**，在 `hv/` 下找
+`int n = (int)InterlockedCompareExchange(&某个_count, 0, 0);` 后跟
+`for (i = 0; i < n ...)` 的形态。找到**四个**：
+
+| 文件 | 计数 | 表 |
+|---|---|---|
+| `mem_cache.c` | `g_cache_count` | `g_cache[]` |
+| `mem_time.c` | `g_time_count` | `g_time[]` |
+| `mem_view.c` | `g_view_page_count` | `g_view_pages[]` |
+| `mem_watch.c` | `g_watch_count` | `g_watch[]` |
+
+全部是 `active` + `Decrement`，**全部不压缩**。同一个 bug 的四个副本。
+
+##### `protect.c` 为什么不算
+
+它也有「删除时减计数」，但它**压缩**：
+
+```c
+t->pages[i] = t->pages[t->page_count - 1];
+t->page_count--;
+```
+
+把最后一页搬到洞里，所以它的 `page_count` **真的是范围**。
+这个对照正好说明判据不是「有没有计数」，而是「**删除后有没有洞**」。
+
+##### 修法 + 构建期检查
+
+五处（四个文件共六处循环）的边界全部改成数组大小，有效性由每槽 `active` 判断。
+
+新增 `tests/count_as_extent.ps1`：找出所有「`n` 来自 live count 且用于循环上界」
+的位置，**除非该文件存在压缩语句**（`arr[i] = arr[cnt-1]`）。
+
+##### 这个检查器自己也犯过一次错（必须记）
+
+第一版的消息是两段字符串拼接后再接 `-f`：
+
+```powershell
+$findings += ("{0}:{1} ... " + "... " -f $file.Name, $line, $counter)
+```
+
+`-f` **只绑定到第二个字符串**，于是第一段里的占位符原样输出：
+
+```
+[FAIL] {0}:{1} scans i < n where n = live {2}, ...
+```
+
+**一条不指名文件、不指名行号的发现，等于无从下手。**
+改成单段 `-f` 后输出 `mem_cache.c:64 ... g_cache_count`。
+
+##### 验证：必须先证明它能失败
+
+把 `mem_cache.c` 的 `YGHV_CACHE_MAX_PAGES` 改回 `g_cache_count`（注入回归），
+检查器精确报出：
+
+```
+[FAIL] mem_cache.c:64 scans i<n where n = live g_cache_count, and this file
+       does not compact its table on removal - entries above a hole are unreachable
+```
+
+**并且构建被它挡住**（`[ERROR] Static checks failed`）—— 这是它存在的意义。
+恢复后 `[PASS]`。
+
+##### 实测
+
+    构建 ALL SOURCE CHECKS PASS / Build SUCCESS
+          1 live-count-bounded loop(s)  -> 0（全部已改）
+    sys-health degraded=0 / sys-guard armed 3 page(s)
+    卸载 invmrun at unload = 0x0，无蓝屏
+
+##### 教训
+
+**缺陷一旦找到，立刻问「这个形状还有几个」。**
+
+9.485 只修了断点表的话，另外四个表的同一个 bug 会一直躺着 ——
+它们全都只在「删中间项」之后才显形，而且显形时没有任何错误码。

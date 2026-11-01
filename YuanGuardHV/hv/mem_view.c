@@ -151,7 +151,18 @@ void yghv_view_stop(void) {
 static int yghv_view_find(uint64_t gpa) {
     int i;
     uint64_t page = gpa & ~(uint64_t)0xFFFULL;
-    int n = (int)InterlockedCompareExchange(&g_view_page_count, 0, 0);
+    /*
+     * 9.486: SCAN THE WHOLE ARRAY, NOT $(System.Collections.Hashtable.Cnt) SLOTS.
+     *
+     * Same defect as 9.485 in the breakpoint table: this counter is incremented on
+     * install and decremented on remove, but the array is NEVER COMPACTED. Removing
+     * a slot in the middle leaves $(System.Collections.Hashtable.Arr)[i].active == 0 while a later slot is
+     * still live, and i < n then stops BEFORE that live slot - so the entry
+     * becomes invisible to every lookup while still being installed.
+     *
+     * Validity is decided per slot with ctive, which this loop already does.
+     */
+    int n = YGHV_VIEW_MAX_PAGES;
 
     for (i = 0; i < n && i < YGHV_VIEW_MAX_PAGES; i++) {
         if (InterlockedCompareExchange(&g_view_pages[i].active, 0, 0) &&
