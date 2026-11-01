@@ -338,7 +338,8 @@ run.bat state      # 用法与 PowerShell 客户端一致
 | 文档 | 内容 |
 |---|---|
 | `docs/YUANMOD_HANDOFF_CURRENT.md` | 全程交接与决策记录（最高优先级，**当前至 9.496**） |
-| **`docs/RESUME_PROMPT.md`** | **★ 续接入口** —— 基线/雷区/方法论/加速查证 |
+| **`docs/QUICKSTART.md`** | **★★ 跨会话快速承接** —— 三分钟上手 / 当前状态 / 下一步 / 七个坑 |
+| `docs/RESUME_PROMPT.md` | 深一层的基线/雷区/方法论/加速查证 |
 | **`docs/TIER_LEDGER.md`** | **Tier 清单最终台账** —— 8 完成 / 8 不做(附理由) / 1 需重启 |
 | **`docs/INDEX.md`** | **docs 目录索引** —— 22 个文件按用途分成入口/必读/归档/计划/专题五组 |
 | **`docs/KERNEL_API_CHECKLIST.md`** | **★ 写内核代码前必读** —— 三次蓝屏换来的 API 契约核对清单 |
