@@ -11181,3 +11181,132 @@ verdict: hit=1 candidate=1 ...
 三件都不是「功能没做」，而是**已有的东西在说谎**：命令说它跑了（其实 1060）、
 扫描器说它查了（其实只比名字）、文档说它数过（其实是手数的）。
 修完之后每一条都配了一个**能失败的自检**，这正是本树方法论第 4 条要求的东西。
+
+---
+
+#### 9.504 清掉 4 个悬空老服务
+
+`yghvfin` / `yghvg4t` / `yghvld` / `yghvload` 全部是 9.450 之前的实验残留，
+驱动文件还在 `C:\` 根目录（`yghv_fin.sys` 等 4 个，各约 180 KB），服务全是 STOPPED。
+
+**先备份再删**（`D:\aaaaaavm\svc_backup_20261101\`）：每个服务存一份 `qc` 与 `sdshow` 输出，
+另记二进制路径 + SHA256。`sc delete` 不删文件，所以文件还在，重建服务的材料齐全。
+
+```
+sc delete yghvfin / yghvg4t / yghvld / yghvload   ->  DeleteService SUCCESS ×4
+sc query 同样四个                                  ->  1060 ×4（REMOVED）
+yghvpa                                             ->  STOPPED（不受影响）
+```
+
+剩余 `yghv` 服务只有 `yghvpa` 一个。`byovd-scan` 的 `loaded=` 从 380 降到 376。
+
+> 顺带一个读数：`C:\` 根目录仍有 **31 个** `yghv_*.sys`，共 5.2 MB —— 那是各轮测试的
+> 部署快照，**不是服务残留**，删它们没有功能影响，但也没有必要（它们是历史镜像）。
+> 记录在此，不做处置。
+
+---
+
+#### 9.505 重新部署 + 加载/卸载冒烟 + T12 三件套
+
+**部署**（先哈希后 start）：
+
+```
+bin  0936CA59C3C7595A  14:53:06
+C:\yghv_pa.sys  B0532743678381C5 11:28:08 -> 覆盖 -> 0936CA59  14:53:06  ✓ 一致
+```
+
+**冒烟**：
+
+```
+sc start   -> RUNNING，6.8 秒
+sys-health -> degraded=0 total=0 fatal=0，24.6 秒
+sc stop    -> STOPPED，4.12 秒，WIN32_EXIT_CODE=0
+```
+
+```
+s206 exits at unload   = 0x4b53130  = 78,975,280
+s206 vmmcall at unload = 0x1cf0ca   = 1,896,650
+s206 invmrun at unload = 0x0                        ← 归零
+```
+
+**T12 三件套（NPF 路径，走 `yghv_bp_find`）**：
+
+```
+mem-engine pte                          -> set to pte
+mem-bp add 0x15E04C000 0 w              -> add OK
+mmf-write D:\aaaaaavm\g25_T.bin         -> LANDED
+mem-bp drain 48                         -> 6 qword(s)，#1 NPF W cpl=3 gpa=0x15E04C000
+mem-bp del  0x15E04C000 0               -> del OK (1)
+```
+
+**删中间槽后上方槽仍可处理**（三次装、删中间、再删上方，全部 `del OK`）：
+
+```
+add 0x5AE16000 / 0x34D617000 / 0x4763F000  -> count=3
+del 0x34D617000                            -> del OK (1)，count=2
+del 0x0 0xA541018000（DR 槽，在上方）      -> del OK (1)，count=1
+```
+
+##### 这里必须诚实标注：上面证明的不是 9.498
+
+`yghv_bp_remove` 的查找顺序是 `yghv_bp_find`（9.485 修的）→ `yghv_bp_find_int3`
+（9.485 修的）→ DR 分支自己的全表循环（line 820，本来就是全表）。**三次成功全部落在
+这三条路径上，而 9.498 修的是 `yghv_bp_on_dr`。**
+
+也就是说：**「删中间槽后上方还活着」这个判据，在 9.498 之前是对的、在 9.498 之后也是对的 ——
+它根本区分不了那个修复。** 这是本树反复踩的形态：判据的局限 ≠ 被测对象的结论。
+
+---
+
+#### 9.506 ★★★★ `mem-bp dr` 是三层都断的假功能；9.498 修的是一条死路径
+
+这一轮的实机验证本来想确认 9.498，结果发现了更大的东西。
+
+**现象**：`mem-bp dr <va> w` 报 `dr OK` 三次，`mem-bp` 显示 `dr=3`；目标进程在持续写那一页，
+`hits` 却一直停在 3 不动。
+
+**三层证据，逐层闭合**
+
+| 层 | 应该发生什么 | 实际 |
+|---|---|---|
+| **1 武装** | 把地址写进 DR0-DR3，并在 DR7 里置 L0-L3 使能位 | 只写了内核数组 `g_dr_shadow[s] = va` 与 `g_dr_used`。**VMCB 的 `StateSaveArea.Dr7` 全树无写入点**（`svm_core.c:479` 那行 `state->dr7 = 0x400` 属于旧 resident 路径） |
+| **2 硬件** | L0-L3 使能后，访问该地址产生 B0-B3 的 #DB | DR7 没使能 -> **硬件根本不产生这个 #DB** |
+| **3 消费** | `case VMEXIT_EXCEPTION_DB` 读 `Dr6` 的 B0-B3，调 `yghv_bp_on_dr` 匹配槽 | 该 case 体内 **`on_dr` 出现 0 次**（`Dr6` 只出现 1 次，是写进 `g_S206DbgLog` 遥测）。产物里对 `14001D230` 的 `call` **计 0** |
+
+**源码侧**：`yghv_bp_on_dr` 全树只有 1 个定义（`mem_bp.c:1102`）+ 1 个 `extern`
+（`svm_simplevm206.cpp:170`），**零调用**。
+
+**所以 9.498 修的那个函数，在实机上没有任何路径能走到它。**
+9.498 的修复是对的（扫全表、每槽判 `active`），但它修的是死代码 —— 而我上一轮
+把它写成了「9.498 之后需要实机复核 T12 断点三件套」，那条待办的**前提就是错的**。
+
+##### 这个假功能比死代码更糟，因为它会报成功
+
+```
+mem-bp: count=3  hits=3  by mode: npf=0 int3=0 dr=3
+last add raw: gpa=0x0 va=0xA541018000 ... mode=4
+```
+
+`dr=3` 会让人以为装了三个数据断点。**实际是三个永远不会触发的条目**，
+`hits` 不涨也只会被读成「目标没访问那一页」，而不是「这个机制不存在」。
+
+> **这正是本树第 3 条方法论（代码存在 ≠ 代码会跑）的升级版：**
+> **不止「代码没跑」，连「装上了」都是假的 —— 装的是一个没有消费者的数据结构。**
+> 前一版（9.454 的 `loader_stealth`）至少诚实地说自己是「开关关着」；
+> 这一版对外报 `dr OK` 与 `dr=3`。
+
+**处置：本轮不改代码。** 理由：修 DR 需要 (a) 写 VMCB `Dr7` 的 L0-L3、
+(b) 在 `VMEXIT_EXCEPTION_DB` 里调 `on_dr`（而该 case 在 VM-exit 帧内，
+9.413/9.414/9.416 三次证明这里加 `call` 会 `0x139`/`0x7F`），(c) 处理 DR 影子与真实
+寄存器的一致性。**那是独立一轮的工作，不是补一个调用。**
+
+**最小处置（下一轮）**：让 `mem-bp dr` **拒绝**而不是报 OK —— 一个会报成功的假功能
+比一个会说不支持的假功能更危险。已在 `TIER_LEDGER` 的待办里登记。
+
+##### 本轮其它已知缺陷（登记，不修）
+
+| # | 缺陷 | 说明 |
+|---|---|---|
+| 1 | `mmf-hold` 的 `size` 参数只 map 第 1 页 | 传 `8192`/`12288` 时后几页是 NOT MAPPED（`WriteVal` 只写 base）。多页测试实际只有 1 页可用 |
+| 2 | `mem-bp add/del` 的 GPA vs VA | 传 VA 会 `stage -3: could not split 2MB page`；G25 脚本用的是 `mem-pte` 报的 PA。**参数名与语义不一致，没有任何提示** |
+| 3 | `mem-pte` 后几页 NOT MAPPED 时 `kind=` 为空 | 输出格式在失败路径上不完整 |

@@ -2,7 +2,7 @@
 
 > **30 秒版**：AMD SVM 管理程序驱动，Windows 自己是 guest。代码在 `D:\yuanguard`，
 > 分支 `main`，构建一条命令，加载一条命令。
-> **当前最新编号 9.503**，G25 已在当前代码上重跑 **17 项 ALL PASS**。
+> **当前最新编号 9.506**，G25 已在当前代码上重跑 **17 项 ALL PASS**。
 
 ---
 
@@ -51,11 +51,11 @@ Get-Content C:\Windows\yghv_progress.log | Select-String "invmrun at unload"
 |---|---|
 | 分支 / HEAD | `main` @ `a6f31dc`（9.497/a/b + 9.498），与 origin/main 同步后再确认 |
 | 驱动 | `yghvpa` · **STOPPED** · 设备 `\\.\YuanGuardHV` |
-| 最新编号 | **9.503** |
+| 最新编号 | **9.506** |
 | 工作树 | 干净 |
 | 静态检查 | 10 个运行器 / 14 条 PASS（含 3 个自检），两个运行器全绿；客户端 **72** 条命令 |
-| 部署镜像 | `C:\yghv_pa.sys` = `B0532743`（11:28:08）；`bin` 已是 `17B1A3D6`（9.498 构建），**部署落后一代，下次测量前先重新部署** |
-| **最近一次卸载** | `invmrun at unload = 0x0`，`sc stop` 3.92 秒，无蓝屏 |
+| 部署镜像 | `C:\yghv_pa.sys` = `0936CA59`（14:53:06），**与 `bin` 哈希一致** |
+| **最近一次卸载** | `invmrun at unload = 0x0`，`sc stop` 4.12 秒，无蓝屏（9.505）|
 | **G25** | **17 项 ALL PASS**（2026-11-01 12:16–12:38，跑在 9.497 的镜像上；9.498 只改了扫描上界）|
 
 > **G25 的 target→T12 间隔 1056 秒**，`mmf-hold` 寿命 3600 秒 —— 余量 3.4×。
@@ -68,7 +68,7 @@ Get-Content C:\Windows\yghv_progress.log | Select-String "invmrun at unload"
 | # | 事项 | 为什么这个顺序 |
 |---|---|---|
 | **1** | **Tier 6.1 启动期控制验收** | 台账里唯一悬空项。**需重启，窗口不可回滚** |
-| 2 | G25 的 T12 断点三项实机复核（`mem-bp add / drain / del`）| 9.498 修了 `yghv_bp_on_dr` 的扫描上界，正向行为与修复前读数相同 —— **只有实机能确认它没扫坏** |
+| 2 | **`mem-bp dr` 改成「拒绝」而不是报 OK** | 9.506 实机确认它是三层都断的假功能（武装不写 DR7、#DB 不调 on_dr、产物 0 call），**却报 dr OK / dr=3** |
 | 3 | `.data` 段隐藏（54 页 · 按段跨度算（0x2F000..0x64693；虚表本身只有 9 页）） | 7.1 唯一没试的段。建议先做「PA → 所属段」查询 |
 
 > **G25 已完成（9.497）**，不再是待办。它跑在 9.465 的 RIP 推进与 9.448 的 35 个 VMEXIT
@@ -142,7 +142,7 @@ mmf-hold 寿命       : 3600 秒
 | 想知道什么 | 读哪个 | 大小 |
 |---|---|---|
 | **新会话第一步** | `docs/RESUME_PROMPT.md` | 49 KB |
-| 现在在哪、这一步做了什么 | `docs/YUANMOD_HANDOFF_CURRENT.md`（9.300–9.503） | 512 KB |
+| 现在在哪、这一步做了什么 | `docs/YUANMOD_HANDOFF_CURRENT.md`（9.300–9.506） | 518 KB |
 | 哪些功能做了 / 哪些不做 / 为什么 | `docs/TIER_LEDGER.md` | 7.6 KB |
 | **写内核代码前** | `docs/KERNEL_API_CHECKLIST.md` | 36 KB |
 | 目录总览 | `docs/INDEX.md` | — |
