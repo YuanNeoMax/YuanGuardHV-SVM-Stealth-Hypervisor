@@ -21,6 +21,7 @@ Commands:
   unset-auto-start
   harden-service
   unharden-service
+  byovd-scan                        (local only: blocklist + KDU provider names, no driver needed)
   selftest
   selftest-abort
   exit-test
@@ -621,7 +622,7 @@ public static class YghvMem
 }
 '@
 
-$sysCommands = @('set-auto-start', 'unset-auto-start', 'harden-service', 'unharden-service')
+$sysCommands = @('set-auto-start', 'unset-auto-start', 'harden-service', 'unharden-service', 'byovd-scan')
 if ($sysCommands -contains $Command.ToLower()) {
     switch ($Command.ToLower()) {
         'set-auto-start' {
@@ -670,6 +671,178 @@ if ($sysCommands -contains $Command.ToLower()) {
             }
             Write-Host 'unharden-service: OK (backup SDDL restored)'
             exit 0
+        }
+        'byovd-scan' {
+            # 9.499 (Tier 7.1, the other half): we can hide our OWN pages, but until
+            # now we could not answer "does this machine hold SOMEONE ELSE'S kernel
+            # read/write". That question is what KDU's provider list is, read from
+            # the other side of the same table.
+            #
+            # LOCAL AND READ-ONLY. It never loads, opens or talks to a driver - it
+            # returns before CreateFile, so it works whether or not yghvpa runs.
+            #
+            # TWO NAME SETS, and they are different kinds of evidence:
+            #   BLOCK  Microsoft's vulnerable-driver blocklist, parsed out of
+            #          System32\CodeIntegrity\driversipolicy.p7b. Authoritative:
+            #          Microsoft has already ruled these bad.
+            #   KDU    the provider drivers listed in hfiref0x/KDU Help/providers.md.
+            #          The attacker's menu - each is a signed driver giving arbitrary
+            #          kernel memory read/write. Only part of them is blocklisted,
+            #          so "absent from BLOCK" is NOT "not usable". That gap is the
+            #          reason both sets are scanned.
+            #
+            # WHAT IS INSPECTED, with counts printed so that "found nothing" can
+            # never be mistaken for "inspected nothing":
+            #   1. System32\drivers\*.sys on disk   -> basename match
+            #   2. currently loaded kernel drivers -> PathName basename match
+            #
+            # GRADING. An EXACT basename match is STRONG. A basename that merely
+            # CONTAINS a provider name of six or more characters is WEAK and is
+            # printed separately, because "winio" also matches "WinIoTool"; the two
+            # grades are never merged into one number.
+            #
+            # KNOWN LIMIT, stated here rather than left to be assumed: STRONG is a
+            # NAME match. Version is NOT judged against KDU's ceilings (e.g. it wants
+            # RTCore64 <= 4.6.2, ProcExp152 <= 1.5.2). A newer, fixed file with the
+            # same name therefore shows up as STRONG - which is why FileVersion is
+            # printed beside every STRONG line. Read the version before believing it.
+            $kduNames = @(
+                'NalDrv','RTCore64','Gdrv','ATSZIO','MsIo64','GLCKIo2','EneIo64',
+                'WinRing0x64','EneTechIo64','PhyMemx64','RtkIo64','LHA','AsIO2',
+                'DirectIo64','GmerDrv','DBUtil_2_3','mimidrv','KProcessHacker2',
+                'ProcExp152','DBUtilDrv2','Dbk64','AsIO3','hw','SysDrv3S','amsdk',
+                'inpoutx64','AsrDrv106','ALSysIO64','AMDRyzenMasterDriver','physmem',
+                'LDD','pcdsrvc_x64','winio','EtdSupport','KExplore','KObjExp',
+                'KRegExp','EchoDrv','nvoclock','IREC','PhyDMACC','rzpnk','PdFwKrnl',
+                'AODDriver','wnBios64','EleetX1','AxtuDrv','AppShopDrv103',
+                'AsrDrv107n','AsrDrv107','PmxDrv','HwRwDrv','NeacSafe64',
+                'ThrottleStop','TPwSav','LnvMSRIO','CorMem','Ipctype','WinHwDrv',
+                'affdriver','mtxC9CB','PGRHostControl','LECOMA','RootLaser','KtAPI',
+                'hpwks'
+            )
+
+            # ---- 1. the blocklist --------------------------------------------
+            $blNames = @()
+            $blNote = ''
+            $p7b = Join-Path $env:SystemRoot 'System32\CodeIntegrity\driversipolicy.p7b'
+            if (Test-Path -LiteralPath $p7b) {
+                # There is no documented API to enumerate a .p7b, so this extracts
+                # UTF-16LE strings and keeps anything shaped like a driver file
+                # name. It reads the bytes Microsoft's signed policy committed to;
+                # it is not a policy query. An entry stored in any other shape
+                # would be missed, which is why the name COUNT is printed.
+                $blob = [IO.File]::ReadAllBytes($p7b)
+                $blTxt = [Text.Encoding]::Unicode.GetString($blob)
+                $blNames = @([regex]::Matches($blTxt, '[A-Za-z0-9_\-.]{4,}\.sys') |
+                             ForEach-Object { $_.Value.ToLowerInvariant() } |
+                             Sort-Object -Unique)
+                $blNote = 'parsed'
+            } else {
+                $blNote = 'NOT FOUND - the BLOCK half did not run'
+            }
+
+            # ---- 2. what is on disk and what is loaded -----------------------
+            $drvDir = Join-Path $env:SystemRoot 'System32\drivers'
+            $onDisk = @(Get-ChildItem -LiteralPath $drvDir -Filter *.sys -ErrorAction SilentlyContinue)
+            $loaded = @(Get-CimInstance Win32_SystemDriver -ErrorAction SilentlyContinue)
+            $loadedNote = ''
+            if ($loaded.Count -eq 0) {
+                $loadedNote = 'Win32_SystemDriver returned nothing - the LOADED half did not run'
+            }
+
+            $strong = @()
+            $weak = @()
+            $blMs = $false
+            $msDowngraded = 0
+
+            foreach ($f in $onDisk) {
+                $fileLeaf = $f.Name.ToLowerInvariant()
+                $why = @()
+                if ($blNames -contains $fileLeaf) {
+                    # A name hit is not a verdict. The blocklist also keys files
+                    # by page hash and by certificate, so a MICROSOFT-signed file
+                    # that merely shares a name with a blocked one (appid.sys,
+                    # monitor.sys - both WinBuild files on this machine) is a
+                    # FALSE POSITIVE at name level. Downgrade it honestly and say
+                    # which channel proved it.
+                    $sg = (Get-AuthenticodeSignature -LiteralPath $f.FullName).SignerCertificate
+                    if ($sg -and $sg.Subject -match 'Microsoft') {
+                        $blMs = $true
+                    } else {
+                        $why += 'BLOCK'
+                    }
+                }
+                if ($blMs) { $msDowngraded++; $blMs = $false }
+                if ($kduNames -contains $f.BaseName) { $why += 'KDU' }
+                if ($why.Count -gt 0) {
+                    $strong += ('  {0,-26} on disk   v={1,-14} {2}' -f $f.Name,
+                                $f.VersionInfo.FileVersion, ($why -join '+'))
+                } else {
+                    foreach ($n in @($kduNames)) {
+                        if ($n.Length -ge 6 -and $fileLeaf.Contains($n.ToLowerInvariant())) {
+                            $weak += ('  {0,-26} on disk   contains "{1}"' -f $f.Name, $n)
+                            break
+                        }
+                    }
+                }
+            }
+
+            foreach ($d in @($loaded)) {
+                # Win32_SystemDriver.PathName comes in as \??\C:\... - a native
+                # path. Strip the device prefix before touching the file, or every
+                # version read fails and the column shows 'unreadable'.
+                $pn = "$($d.PathName)"
+                $pn = $pn.TrimStart('\??\')
+                if ($pn -notmatch '\.sys$') { continue }
+                $pn = $pn.TrimStart('\??\')
+                $leaf = [IO.Path]::GetFileName($pn)
+                $leafLower = $leaf.ToLowerInvariant()
+                $base = [IO.Path]::GetFileNameWithoutExtension($pn)
+                $why = @()
+                $msSigned = $false
+                if ($blNames -contains $leafLower) {
+                    $sg2 = (Get-AuthenticodeSignature -LiteralPath $pn -ErrorAction SilentlyContinue).SignerCertificate
+                    if ($sg2 -and $sg2.Subject -match 'Microsoft') { $msSigned = $true }
+                    else { $why += 'BLOCK' }
+                }
+                if ($kduNames -contains $base) { $why += 'KDU' }
+                if ($why.Count -eq 0) { continue }
+                $vv = ''
+                try { $vv = (Get-Item -LiteralPath $pn -ErrorAction Stop).VersionInfo.FileVersion }
+                catch { $vv = 'unreadable' }
+                $strong += ('  {0,-26} LOADED    v={1,-14} {2}  state={3}' -f $leaf,
+                            $vv, ($why -join '+'), $d.State)
+            }
+
+            # ---- 3. report --------------------------------------------------
+            Write-Host ("byovd-scan: block={0} name(s) [{1}]  kdu={2} name(s)  on-disk={3}  loaded={4}" -f
+                $blNames.Count, $blNote, $kduNames.Count, $onDisk.Count, $loaded.Count)
+            if ($loadedNote) { Write-Host ("  {0}" -f $loadedNote) }
+
+            if ($strong.Count -gt 0) {
+                Write-Host ("  STRONG ({0}) - exact name match; a signed driver with kernel R/W once its VERSION is in range:" -f $strong.Count)
+                foreach ($s in @($strong)) { Write-Host $s }
+            }
+            if ($weak.Count -gt 0) {
+                Write-Host ("  WEAK ({0}) - name merely contained, NOT a hit until a hash says so:" -f $weak.Count)
+                foreach ($s in @($weak)) { Write-Host $s }
+            }
+
+            $nLoad = 0
+            foreach ($s in @($strong)) { if ($s -match ' LOADED ') { $nLoad++ } }
+            Write-Host ("  verdict: strong={0} weak={1} strong-and-loaded={2} block-name-but-Microsoft-signed={3}" -f
+                $strong.Count, $weak.Count, $nLoad, $msDowngraded)
+
+            if ($blNames.Count -eq 0) {
+                Write-Host '  INCOMPLETE: the blocklist yielded no names, so a zero hit count here means nothing.'
+            } elseif ($strong.Count -eq 0 -and $onDisk.Count -gt 0 -and $loaded.Count -gt 0) {
+                Write-Host '  clean: no blocklisted driver and no KDU provider by name, on disk or loaded.'
+            }
+            # Local command: return before the device handle is opened. Falling
+            # through reached CreateFile and threw ERROR_FILE_NOT_FOUND whenever
+            # yghvpa was not running - a read-only scan that failed because the
+            # driver was stopped, which is exactly when you want to run it.
+            return
         }
     }
 }
