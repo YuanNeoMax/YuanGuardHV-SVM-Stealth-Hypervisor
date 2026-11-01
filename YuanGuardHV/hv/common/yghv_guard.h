@@ -225,6 +225,14 @@ int yghv_guard_fault_is_ours(uint64_t rip, uint32_t cpl);
 int yghv_guard_decoy_init(void);
 int yghv_guard_decoy_ready(void);
 uint64_t yghv_guard_decoy_pa(void);
+/*
+ * 9.487: free the decoy frame on unload. `decoy_init` allocated a non-paged page
+ * that nothing released, so every load/unload cycle leaked 4 KB - and this driver
+ * pins frames for a living, so that leak competes with its own mechanism.
+ * Call ONLY after every guard entry is disarmed: a hidden page whose NPT leaf
+ * still points here would leave the guest reading freed memory.
+ */
+void yghv_guard_decoy_free(void);
 
 /*
  * #3 Unregistered-page report.

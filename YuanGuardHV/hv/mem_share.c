@@ -327,3 +327,30 @@ void yghv_share_stats_reset(void)
     InterlockedExchange64(&g_share_seq_mismatch, 0);
     InterlockedExchange64(&g_share_guest_writes_seen, 0);
 }
+
+/*
+ * 9.487: THE SHARED PAGE IS RELEASED ON UNLOAD - it was not, and that is a leak
+ * of one non-paged frame per load.
+ *
+ * `yghv_share_init` allocates the frame once (the `g_share_va == NULL` guard stops
+ * a second allocation on a re-init), so a long-running session does not grow.
+ * But nothing ever freed it: unload, reload, unload, reload leaked 4 KB of
+ * NON-PAGED pool each cycle. Non-paged pool is the one resource a driver cannot
+ * ask the OS to reclaim, and this driver also pins frames for protection - so a
+ * slow leak here competes directly with the mechanism the project exists for.
+ *
+ * Order matters: drop `up` FIRST so no caller can enter `host_write`/`host_read`
+ * between the free and the pointer clearing, then free, then clear both the
+ * pointer and the recorded PA. A stale `g_share_pa` would let a caller still
+ * believe there is a window at a frame that now belongs to somebody else.
+ */
+void yghv_share_down(void)
+{
+    InterlockedExchange(&g_share_up, 0);
+
+    if (g_share_va) {
+        ExFreePoolWithTag(g_share_va, 'Yshr');
+        g_share_va = NULL;
+    }
+    g_share_pa = 0;
+}

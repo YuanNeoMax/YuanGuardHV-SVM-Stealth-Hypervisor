@@ -1673,3 +1673,25 @@ int yghv_guard_hidden_probe(uint64_t gpa) {
         return -1;
     return (int)g_guard[s].hidden;
 }
+
+/*
+ * 9.487: RELEASE THE DECOY FRAME ON UNLOAD.
+ *
+ * `yghv_guard_decoy_init` allocates one non-paged page that every DECOY hide
+ * points the guest at (see YGHV_HIDE_DECOY). `g_decoy_va` guards against a second
+ * allocation, so a long session does not grow - but nothing freed it, so each
+ * load/unload cycle leaked 4 KB of non-paged pool. That matters more than the size
+ * suggests: this driver's whole job is pinning and hiding frames, so a leak of
+ * non-paged pool competes with the resource it depends on.
+ *
+ * MUST RUN AFTER every guard entry has been disarmed: a hidden page whose NPT leaf
+ * still points here would have the guest reading a freed frame. `yghv_protect_cleanup`
+ * runs before this in DriverUnload precisely so the leaves are restored first.
+ */
+void yghv_guard_decoy_free(void) {
+    if (g_decoy_va) {
+        ExFreePoolWithTag(g_decoy_va, 'Ydcy');
+        g_decoy_va = NULL;
+    }
+    g_decoy_pa = 0;
+}

@@ -40,6 +40,13 @@ typedef struct {
 } yghv_share_stats_t;
 
 int      yghv_share_init(void);
+/*
+ * 9.487: teardown, called from DriverUnload. `init` allocated a non-paged frame
+ * that nothing ever freed, so every load/unload cycle leaked 4 KB of a resource
+ * the OS cannot reclaim - and this driver also pins frames for protection, so the
+ * leak competes with the mechanism it exists for.
+ */
+void     yghv_share_down(void);
 int      yghv_share_up(void);
 uint64_t yghv_share_pa(void);
 

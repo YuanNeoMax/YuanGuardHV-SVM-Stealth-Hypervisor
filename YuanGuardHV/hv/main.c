@@ -5205,9 +5205,36 @@ void DriverUnload(struct _DRIVER_OBJECT *d) {
     yghv_ut_mark_val(YGHV_UT_WAIT_RESIDENTS, (uint64_t)g_vcpu_count);
     yghv_ut_mark(YGHV_UT_CONTROL_CLEANUP);
     yghv_control_device_cleanup(d);
+    /*
+     * 9.487: RELEASE THE TIER 2.4 SHARED FRAME.
+     *
+     * `yghv_share_init` allocates one non-paged page and nothing freed it, so
+     * every load/unload cycle leaked 4 KB of a pool the OS cannot reclaim. Placed
+     * here, after the control device is gone (no caller can issue `share init`
+     * from here on) and before the protection teardown.
+     */
+    {
+        extern void yghv_share_down(void);
+        yghv_share_down();
+    }
     KeSetSystemAffinityThread((KAFFINITY)1);
     yghv_ut_mark(YGHV_UT_PROTECT_CLEANUP);
     yghv_protect_cleanup();
+    /*
+     * 9.487: RELEASE THE DECOY FRAME - AND ONLY HERE.
+     *
+     * Every DECOY-hidden page has its NPT leaf pointing at this frame, so freeing
+     * it while any leaf still points here would leave the guest reading memory
+     * that now belongs to somebody else. `yghv_protect_cleanup` above is what
+     * restores those leaves, which is why this must come AFTER it and not before.
+     *
+     * Nothing freed it at all before this line, so each load/unload leaked 4 KB of
+     * non-paged pool - the one pool a driver cannot ask the OS to reclaim.
+     */
+    {
+        extern void yghv_guard_decoy_free(void);
+        yghv_guard_decoy_free();
+    }
     if (g_guest_code_page) MmFreeContiguousMemory(g_guest_code_page);
     g_guest_code_page = NULL;
     if (g_resident_workload_page) MmFreeContiguousMemory(g_resident_workload_page);
