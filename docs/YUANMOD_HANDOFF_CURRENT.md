@@ -16534,3 +16534,63 @@ if (out_len < YGHV_SECTION_HIDE_OUT_QWORDS * sizeof(UINT64)) {
 
 **「有检查」必须是代码，不能是注释。**
 一个检查器的判据如果会被文档满足，它检查的是文档。
+
+---
+
+#### 9.489 ★★★★ NPT 只能映射 PML4[0] 的 512GB，但签名从不说这件事
+
+##### 发现
+
+`npt_cleanup` 释放 PD 页时用 `pd = m->pd_va[j]`，而 `m->pd_va[]` **只在
+`p4==0 && p2<512` 时被写入**（`npt_identity_map_range` L194）。所以：
+
+- p4 == 0 的 PD → 记录了 VA，**能被释放**
+- p4 > 0 的 PD → **没记录**，`cleanup` 里 `pd` 为 NULL → `continue`
+  → **该 PDPT 下所有 PD 和它们下面的 PT 全部泄漏**
+
+##### 为什么今天没暴露
+
+`main.c` 唯一的调用是：
+
+```c
+npt_identity_map_range(&g_npt, 0, 0x8000000000ULL);   // 512 GB
+```
+
+512GB 恰好**等于一个 PML4 条目**，所以 p4 恒为 0，`pd_va` 覆盖全部。
+
+##### 为什么仍然要修
+
+函数的签名接受任意 `e`，而**这棵树自己的文档把 GNPT 描述成覆盖 0–1TB**。
+有人照文档改成 1TB，就会：
+
+1. 建出 p4=1 的 PDPT / PD / PT
+2. 卸载时**静默泄漏约 512 个 PD 页及其下所有 PT**（数 MB 非分页池）
+3. 现象是「非分页池缓慢增长」，**没有任何错误码**
+
+##### 修法
+
+在 `npt_identity_map_range` 里拒绝越过一个 PML4 条目：
+
+```c
+if(ae > (uint64_t)NPT_PML4_ENTRY_SPAN)
+    return STATUS_INVALID_PARAMETER;
+```
+
+并新增 `NPT_PML4_ENTRY_SPAN (1ULL << 39)` 到 `npt.h` —— 用具名常量而不是内联
+`1ULL<<39`，是为了让这个检查和 `NPT_PML4_INDEX` **不可能各自漂移**。
+
+注释写明：真要支持 >512GB，必须先教 `npt_cleanup` 和 `pd_va` 记录认识 p4>0，
+**那是一次有意的改动，不该靠一个泄漏来发现**。
+
+##### 实测（关键是不能挡住正常路径）
+
+    启动 1.31s -> RUNNING
+    日志  npt_init ok / npt set ok      <- 512GB 映射正常通过新门槛
+    sys-health degraded=0
+    npt-view 0x1000 -> guest present=1 (identity map 正常)
+    卸载 invmrun at unload = 0x0，无蓝屏
+
+##### 教训
+
+**一个函数能接受的范围，和它能在拆卸时回收的范围，必须一致。**
+不一致时，多出来的那部分不会报错，只会慢慢吃掉一个驱动无法请求系统回收的池。

@@ -9,6 +9,15 @@ _Static_assert(sizeof(npt_entry_t) == 8, "NPT size");
 #define NPT_PD_INDEX(a) (((a)>>21)&0x1FF)
 #define NPT_PT_INDEX(a) (((a)>>12)&0x1FF)
 #define NPT_PAGE_OFFSET(a) ((a)&0xFFF)
+/*
+ * 9.489: how much address space ONE PML4 entry covers (512 GB).
+ *
+ * `npt_identity_map_range` refuses an end address above this, because the manager's
+ * teardown can only free PD pages recorded for p4==0 - see the comment at that
+ * check. A named constant rather than an inline 1ULL<<39 so the check and the index
+ * macro cannot drift apart.
+ */
+#define NPT_PML4_ENTRY_SPAN (1ULL << 39)
 #define NPT_LARGE_PAGE_FLAGS ((1ULL<<0)|(1ULL<<1)|(1ULL<<2)|(1ULL<<5)|(1ULL<<7))
 #define NPT_4K_PAGE_FLAGS ((1ULL<<0)|(1ULL<<1)|(1ULL<<2)|(1ULL<<5))
 #define NPT_PFN_4K(e)  (((e) >> 12) & 0xFFFFFFFFFULL)

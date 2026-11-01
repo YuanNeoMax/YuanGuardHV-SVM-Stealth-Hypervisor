@@ -174,6 +174,29 @@ int npt_init(npt_mgr_t*m,uint64_t mp){
 int npt_identity_map_range(npt_mgr_t*m,uint64_t s,uint64_t e){
     uint64_t pa=s&~(HV_LARGE_PAGE_SIZE-1);
     uint64_t ae=(e+HV_LARGE_PAGE_SIZE-1)&~(HV_LARGE_PAGE_SIZE-1);
+    /*
+     * 9.489: REFUSE A RANGE THAT LEAVES PML4[0], BECAUSE CLEANUP CANNOT FREE IT.
+     *
+     * `m->pd_va[]` records a PD page VA ONLY for p4==0 and p2<512 (see the store
+     * below and the note in npt.h: "the identity map (0..512GB) only uses p4==0").
+     * `npt_cleanup` walks with `pd = m->pd_va[j]` and does `continue` when that is
+     * NULL - so every PD allocated under p4 > 0 is UNREACHABLE AT TEARDOWN and is
+     * never freed, along with every split PT hanging under it.
+     *
+     * Measured: the current call site maps 0 .. 0x8000000000 = 512GB, exactly one
+     * PML4 entry, so p4 stays 0 and nothing leaks today. The hazard is that the
+     * signature invites any end address: this project's own notes describe GNPT as
+     * covering 0..1TB, and mapping that would build p4=1, silently leak ~512 PD
+     * pages plus their PTs on EVERY unload, and present as "non-paged pool slowly
+     * grows" with no error anywhere.
+     *
+     * Refusing is the honest answer. A caller that genuinely needs >512GB must
+     * teach npt_cleanup and the pd_va recording about p4>0 - a deliberate change,
+     * not something to discover through a leak.
+     */
+    if(ae > (uint64_t)NPT_PML4_ENTRY_SPAN)
+        return STATUS_INVALID_PARAMETER;
+
     for(;pa<ae;pa+=HV_LARGE_PAGE_SIZE){
         uint32_t p4=(uint32_t)NPT_PML4_INDEX(pa),p2=(uint32_t)NPT_PDPT_INDEX(pa),p1=(uint32_t)NPT_PD_INDEX(pa);
         if(!m->pml4_va[p4].present){
