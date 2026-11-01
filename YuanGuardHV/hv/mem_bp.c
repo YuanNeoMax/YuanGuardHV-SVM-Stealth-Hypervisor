@@ -1101,10 +1101,25 @@ int yghv_bp_on_int3(uint64_t va, uint32_t cpl, uint64_t cr3) {
 
 int yghv_bp_on_dr(uint64_t dr6, uint64_t rip, uint32_t cpl, uint64_t cr3) {
     int i;
-    /* 9.485: the early-out asks "is ANY breakpoint armed" - the one question
-     * g_bp_count answers correctly. The SCANS must not use it as an extent. */
+    /*
+     * 9.498: THE FOURTH SCAN 9.485 MISSED.
+     *
+     * 9.485 fixed yghv_bp_find, yghv_bp_find_int3 and yghv_bp_on_npf - the three
+     * paths it happened to be looking at. This one is the DR6 path (hardware
+     * data breakpoints) and kept the live count as its loop bound while
+     * the slot array itself is scanned up to YGHV_BP_MAX.
+     *
+     * Same defect, same silence, a different exit path: arm three data
+     * breakpoints, remove the middle one, and g_bp_count says 2 while slots
+     * [1,0,1] are live. A DR6 match on slot 2 is then never found, the CPU
+     * reports a debug exception nobody claims, and yghv_bp_on_dr returns -1 -
+     * which is a legal answer here, so nothing ever logs it.
+     *
+     * The census keeps only its one honest job, the early-out below. Validity is
+     * decided per slot, as in the other three scans.
+     */
+    int live = (int)InterlockedCompareExchange(&g_bp_count, 0, 0);
 
-    int n = (int)InterlockedCompareExchange(&g_bp_count, 0, 0);
 
 
 
@@ -1118,12 +1133,11 @@ int yghv_bp_on_dr(uint64_t dr6, uint64_t rip, uint32_t cpl, uint64_t cr3) {
 
 
 
-
-    if (n <= 0)
+    if (live <= 0)
         return -1;
 
     /* DR6 bits 0-3 report which of DR0-DR3 matched. */
-    for (i = 0; i < n && i < YGHV_BP_MAX; i++) {
+    for (i = 0; i < YGHV_BP_MAX; i++) {
         uint32_t s;
         if (!InterlockedCompareExchange(&g_bp[i].active, 0, 0))
             continue;
