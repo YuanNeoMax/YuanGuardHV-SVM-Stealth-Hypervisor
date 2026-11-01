@@ -1819,13 +1819,41 @@ try {
             Write-Host ("mem-bench: pid={0} range=0x{1:X}-0x{2:X} pattern={3} byte(s)" -f $bpid, $bstart, $bend, $patLen)
             Write-Host ("  A (api) : {0} cycles, {1} reads, {2} bytes, {3} hits" -f $ac, $ar, $ab, $ah)
             Write-Host ("  B (pte) : {0} cycles, {1} reads, {2} bytes, {3} hits  (pages visited {4})" -f $bc, $brd, $bb, $bh, $pv)
-            Write-Host ("  faster  : {0:N2}x  (B ran first, so A had the warmer cache)" -f ($sp / 100.0))
             Write-Host ("  walk    : cr3=0x{0:X}" -f $wcr3)
 
-            if ($pv -eq 0 -or $brid -eq 0) {
-                Write-Host '  INVALID : B visited 0 pages / read 0 bytes, so the ratio above is'
-                Write-Host '            an artefact, NOT a speedup. Check the walk CR3 (0 = the'
-                Write-Host '            target DTB could not be read) and the range.'
+            # 9.491: TWO BUGS IN ONE THREE-LINE BLOCK, AND BOTH CHANGED THE VERDICT.
+            #
+            # (a) `$brid` WAS NEVER DEFINED ANYWHERE IN THIS FILE - the variable is
+            #     `$brd` (B's read count, read from out[40] above). In PowerShell an
+            #     undefined variable is $null, and `$null -eq 0` is FALSE, so the
+            #     second half of the INVALID test never fired. A run where B visited
+            #     pages but read ZERO bytes (a walk that resolves but every page
+            #     misses) printed no warning at all.
+            #
+            # (b) The ratio was printed BEFORE the check, so a meaningless
+            #     "0.00x" appeared above a warning that called it an artefact. The
+            #     reader sees the number first and the caveat second; measured
+            #     consequence in this tree's own history is that the number is what
+            #     gets quoted (9.463 quoted a bogus "CPU 0%" the same way).
+            #
+            # Fixed by computing the verdict first, printing the ratio only when it
+            # means something, and naming it INVALID otherwise.
+            $invalid = ($pv -eq 0 -or $brd -eq 0 -or $bc -eq 0)
+
+            if ($invalid) {
+                if ($bc -eq 0) {
+                    Write-Host '  INVALID : B measured 0 cycles, so no ratio exists.'
+                } elseif ($pv -eq 0) {
+                    Write-Host '  INVALID : B visited 0 pages, so the ratio is an artefact,'
+                    Write-Host '            NOT a speedup. Check the walk CR3 (0 = the target'
+                    Write-Host '            DTB could not be read) and the range.'
+                } else {
+                    Write-Host ("  INVALID : B visited {0} page(s) but read 0 bytes, so the" -f $pv)
+                    Write-Host '            ratio is an artefact, NOT a speedup. The walk' 
+                    Write-Host '            resolved but every page missed.'
+                }
+            } else {
+                Write-Host ("  faster  : {0:N2}x  (B ran first, so A had the warmer cache)" -f ($sp / 100.0))
             }
 
             if ($ar -gt 0 -and $brd -gt 0) {

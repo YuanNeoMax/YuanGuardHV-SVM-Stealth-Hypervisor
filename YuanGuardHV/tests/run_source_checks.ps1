@@ -46,7 +46,13 @@ $scripts = @(
     # input would have had four qwords written past the allocation. The shipped
     # client always sends 32 bytes, which is why it never fired; a polite client
     # is not an interface property.
-    'ioctl_output_bounds.ps1'
+    'ioctl_output_bounds.ps1',
+    # 9.491: PowerShell turns an undefined variable into $null WITHOUT A WARNING,
+    # so a typo'd name makes a guard silently dead. Measured: `mem-bench` tested
+    # `$brid` where the variable is `$brd`, so `$null -eq 0` (FALSE) meant the
+    # second half of the INVALID test never ran, and a meaningless ratio was
+    # printed as a speedup.
+    'client_undefined_vars.ps1'
 )
 
 foreach ($script in $scripts) {

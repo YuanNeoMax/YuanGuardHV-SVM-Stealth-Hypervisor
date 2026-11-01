@@ -82,6 +82,14 @@ NTKERNELAPI NTSTATUS MmCopyVirtualMemory(
  */
 #define YGHV_BENCH_PAGE 4096u
 #define YGHV_BENCH_LARGE (2u * 1024u * 1024u)
+/*
+ * 9.492: hard ceiling on pages examined per call, because a caller that omits the
+ * budget used to get INFINITY and an unbounded IOCTL makes DriverUnload unbounded.
+ * See the note at yghv_mem_bench's entry. 32768 x 4K = 128MB of address space per
+ * call - more than a benchmark needs, small enough that one call cannot outlast a
+ * caller's patience.
+ */
+#define YGHV_BENCH_MAX_PAGES 32768u
 
 typedef struct {
     const uint8_t *pat;
@@ -260,6 +268,33 @@ int yghv_mem_bench(PEPROCESS proc, uint64_t start_va, uint64_t end_va,
         return 0;
     if (start_va >= end_va)
         return 0;
+
+    /*
+     * 9.492: A ZERO BUDGET MEANT "UNBOUNDED", AND THAT MADE THE DRIVER UNLOADABLE.
+     *
+     * `page_budget == 0` is documented as "no budget; both engines honour it"
+     * (see bench_ctx_t), and the client omits it unless asked. Measured
+     * consequence, and it cost a reboot: `mem-bench <pid> 4D5A` with no budget
+     * scanned explorer's whole address space for tens of minutes, and
+     * `IoReleaseRemoveLockAndWait` in DriverUnload blocked on the in-flight IOCTL
+     * the entire time - `sc stop` sat at STOP_PENDING past four minutes. Killing
+     * the client did NOT stop it: the IOCTL holds a reference to the TARGET
+     * process, not to the caller.
+     *
+     * An unbounded kernel operation reachable from an IOCTL is never acceptable,
+     * whatever the caller asked for - it makes the unload path unbounded too.
+     * The ceiling is imposed HERE, at the one place every path passes through,
+     * rather than trusting a caller that forgot the argument.
+     *
+     * THE NUMBER: engine A pays one MmCopyVirtualMemory per 4K page, engine B one
+     * callback per PT leaf. 32768 pages is ~32K syscall-equivalents; the measured
+     * runaway did millions. At the ~7us per A read measured in 9.449 that bounds
+     * one IOCTL to a few seconds - below any "hung" threshold, and still far more
+     * range than a benchmark needs. A caller that genuinely wants more can ask;
+     * what it can no longer do is forget and get infinity.
+     */
+    if (page_budget == 0 || page_budget > YGHV_BENCH_MAX_PAGES)
+        page_budget = YGHV_BENCH_MAX_PAGES;
 
     RtlZeroMemory(out, sizeof(*out));
     RtlZeroMemory(&a, sizeof(a));
