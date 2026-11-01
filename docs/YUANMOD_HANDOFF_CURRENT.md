@@ -10692,3 +10692,92 @@ SHUTDOWN 还要 r8 == auth_key -> 拒绝
 
 **全量构建与运行验证通过。** 本轮审查的 21 个缺陷修复、5 个构建期检查器、
 以及 Tier 台账（8 完成 / 8 不做附理由 / 1 需重启）都已落地。
+
+---
+
+#### 9.497 G25 在当前代码上重跑 —— 17 项 ALL PASS（补回 9.465 之后缺失的回归）
+
+**为什么这一轮不是重复劳动**：最后一次 G25 是 **10-31 02:31**（`d19bdc0`，9.447 时代）。
+之后有 **27 个非文档提交**动过 `hv/` `tools/` `tests/`，其中三条正好落在
+**每个核每一轮都走的路径**上：
+
+| 提交 | 改动 | 为什么它必须在回归里 |
+|---|---|---|
+| `1c1d4d6` 9.465 | `case VMEXIT_VMMCALL` 补 `Rip = NRip` | 桩从「同一条 `vmmcall` 的无尽重复」变成真正的循环 —— **执行流本身变了** |
+| `91962b2` 9.463 | `hlt` 停驻改有界空转 + 桩重写 | 12 核每次退出都经过这段 ASM |
+| `b0b5662` 9.448 | 206 主线 VMEXIT 12 → 35 个 case | 新 case 全在 `SvHandleVmExit` 热路径上 |
+
+**所以「卸载通过」不能替代这一轮**：`invmrun=0x0` 只证明 12 个核都离开了 VMRUN，
+不证明它们在离开之前做对了事。
+
+##### 部署（先哈希后 start —— 这条坑踩过）
+
+```
+bin            B0532743678381C5  11:28:08   （9.497 时的构建产物）
+C:\yghv_pa.sys A09994020E66006C  10:52:27  -> 覆盖 ->  B0532743678381C5  11:28:08   ✓ 哈希一致
+BINARY_PATH_NAME \??\C:\yghv_pa.sys                                        ✓ 服务确实指这个文件
+```
+
+##### 冒烟（yghvpa）
+
+```
+sc start   -> RUNNING，0.42 秒，WIN32_EXIT_CODE=0
+sys-health -> degraded=0 total=0 fatal=0（"no abnormal conditions recorded"），26.9 秒
+sc stop    -> STOPPED，3.92 秒，WIN32_EXIT_CODE=0，无蓝屏
+```
+
+```
+s206 exits at unload   = 0x2668cc  = 2,519,244
+s206 vmmcall at unload = 0x0b13f   = 45,375      (退出/vmmcall ≈ 55.5 —— 9.465 之后的桩形态)
+s206 invmrun at unload = 0x0                     ← 唯一可信判据
+```
+
+##### G25（yghvg25，17 项）
+
+脚本 `D:\aaaaaavm\g25_tier7.ps1`，参数未改（`HangTimeoutSec=240`、各命令 150/180 秒、`mmf-hold 3600` 秒）。
+
+```
+T1 sha256 selftest / T2 arm / T2b clean verify / T3 hidecore / T4 alive after hide
+T4b hidden reported / T5 uncovered report / T6 sha tamper / T7 decoy mechanism
+T7 mechanism name = DECOY (zero) / T8 exit timing / T9 escape path
+T10 surface (14 entries) / T11 health / T12 regression / T13 unload
+
+OVERALL: ALL PASS          （17 项全 True，零 False）
+```
+
+**读数要点**
+
+| 项 | 读数 | 说明 |
+|---|---|---|
+| T8 exit timing | `measured=16182140 worst=40428 avg=611 cycles` | 计数器在动，不是恒等式 |
+| T9 escape | `escapes=0` + `mechanism=DECOY` | **0 是机制的结果**，不是没观测到：DECOY 保住 present，按构造不产生 #NPF |
+| T12 bp | `mem-bp: add REFUSED (stage -11: registry page is hidden)` | 拒绝是正确的 —— T3 已经把注册表页藏了；**能拒绝说明它知道自己在被藏** |
+| T13 unload | `service: removed`（`sc query` 返 1060） | 卸载干净 |
+
+##### T12 的 target → T12 间隔：**1056 秒（17 分 36 秒）**
+
+```
+12:16:46   target pid=14688 va=0x2C17ADB0000     （mmf 目标创建）
+12:34:22   ########## T12: full regression ##########
+间隔 = 1056 s
+```
+
+**这一列必须一起记，因为 9.447 就是栽在它上面**：`mmf-hold` 寿命 900 秒时，
+跑得慢的一轮会在 T12 之前把目标进程到期杀掉，`mem-read` 报 `FAILED status=0x0`、
+`mem-pte` 报 `NOT MAPPED` —— 看起来完全像驱动回归。当前寿命 3600 秒，
+1056 秒后仍余 2544 秒，**余量 3.4×，不是 1.2×**。
+
+##### 本轮消掉的三个过期结论
+
+1. QUICKSTART 的「G25 17 项 ALL PASS」原本对应 9.447 时代的镜像 → **现在真的对当前代码成立**
+2. QUICKSTART 写的「构建产物是 11:19 的 `992FDF93`」→ 实际 `bin` 已是 11:28 的 `B0532743`
+3. QUICKSTART 写的「`C:\yghv_pa.sys` 是 10:52 的 `A0999402`」→ 现在与 `bin` 哈希一致
+
+##### 仍未解决的一条（留给下一轮）
+
+`tests/count_as_extent.ps1` 本轮打印
+`[WARN] matched no live-count-bounded loop at all - parser may be stale`，
+即它在 `hv\*.c` 里**一条都没匹配到**，却仍报 `[PASS]`。它没有
+`exit_rip_contract.ps1` 那样的注入缺陷自检，所以这个 PASS 现在是空过的。
+
+**按六条方法论第四条（检查器必须自证能失败），它需要补一次注入自检 —— 而不是继续把这个 PASS 当作证据。**

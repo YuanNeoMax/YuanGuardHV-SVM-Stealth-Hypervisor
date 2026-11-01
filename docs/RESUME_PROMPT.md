@@ -97,7 +97,12 @@ dump 配置     CrashDumpEnabled=2, CrashDumpType 已删除, AlwaysKeepMemoryDum
 ## 3. 当前代码状态与第一件事
 
 ```
-HEAD = b52434a  fix(9.445b)  卸载首次干净成功，invmrun 归零
+HEAD = 5d298bb  docs(9.497b)  快速承接文档（当前）
+       7016394  docs(9.496)   最终全量验证
+       1c1d4d6  fix(9.465)   VMMCALL handler 从不推进 RIP
+       91962b2  fix(9.463)   hlt 停驻改有界空转
+       b0b5662  feat(9.448)  206 主线 VMEXIT 12 -> 35 个
+       b52434a  fix(9.445b)  卸载首次干净成功，invmrun 归零
        f04d0ff  fix(9.445)   Sv206LaunchVm 自己保存线程 RSP
        23f34df  fix(9.444b)  exit 栈指针移入 VMCB
        d6af154  fix(9.444)   两步返回协议（失败，被 9.445 取代）
@@ -123,8 +128,9 @@ s206 vmmcall at unload = 0x11285c06 = 287,973,382
 s206 invmrun at unload = 0x0          ← 归零
 ```
 
-**G25 17 项已在 9.447 跑通两次（`OVERALL: ALL PASS`）** —— 卸载修好之后，
-保护功能也确认完好。见第 11 节。跑 G25 前必读 8.2 的四个超时值。
+**G25 17 项在 9.497 于当前代码上重跑，`OVERALL: ALL PASS`** —— 卸载修好之后，
+保护功能也确认完好；这一轮覆盖了 9.448 的 35 个 VMEXIT case 与 9.465 的 RIP 推进。
+（9.447 那两次跑的是 9.445b，不能当作当前代码的结论。）见第 11 节与 9.497。
 
 ---
 
@@ -370,9 +376,14 @@ yghv_ctl.ps1 unload-trace   → page PA / last step / value
 4. ~~加无条件 exit 计数器~~ —— 9.441（这个仪表带来了后面全部结论）
 5. ~~卸载路径修好~~ —— 9.445b，三轮连续验证通过
 
-### 8.2 G25 回归：已全绿（9.447 完成）
+### 8.2 G25 回归：已在当前代码上重跑全绿（9.497）
 
-**在 9.445b 上跑了两次，`OVERALL: ALL PASS`。** 见第 11 节。
+**最后一次：2026-11-01 12:16–12:38，`OVERALL: ALL PASS`，17 项全 True。**
+那次跑在 9.465（`Rip = NRip`）与 9.448（VMEXIT 12→35）之后的镜像上 ——
+**9.447 那两次是在 9.445b 上跑的，不能拿来代表当前代码。** 见第 11 节与 9.497。
+
+**T12 的 target→T12 间隔 = 1056 秒**（`12:16:46` 建目标 → `12:34:22` 进 T12），
+`mmf-hold` 3600 秒，余量 3.4×。这个数必须跟 OVERALL 一起记，理由见本节的坑。
 
 **跑 G25 时的四个超时（都被实测打脸后调过，别改回去）**
 
@@ -836,7 +847,8 @@ Get-Content D:\aaaaaavm\g25_result.txt | Select-String "OVERALL"
 
 | 测试 | 内容 | 结果 |
 |---|---|---|
-| **G25** | **17 项全功能回归，在 9.445b 上跑了两次** | **`OVERALL: ALL PASS`** |
+| **G25** | **17 项全功能回归** | **`OVERALL: ALL PASS`** —— **2026-11-01（9.497，当前代码）**，另在 9.445b 上跑过两次 |
+| **9.497 部署+冒烟** | **C:\yghv_pa.sys = B0532743 哈希一致 → start 0.42s / sys-health 26.9s / stop 3.92s** | **`invmrun=0x0`，WIN32_EXIT_CODE=0，无蓝屏** |
 | **9.445b** | **加载 → 运行 → 卸载，三轮连续** | **全部通过，无蓝屏** |
 | G33 | snapshot 非破坏 + drain 消费 | ALL PASS |
 | G39 | TSC 逐核武装与释放 | ALL PASS |
@@ -845,7 +857,7 @@ Get-Content D:\aaaaaavm\g25_result.txt | Select-String "OVERALL"
 | G43 | 无设备 CPUID 通道 | 部分（设备可移除已验证）|
 | G18/G28/G29/G30/G31 | hide/decoy/border/why | 见各 9.3xx |
 
-**G25 的 17 项（9.445b 实测）**
+**G25 的 17 项（2026-11-01 与 9.445b 两次实测，结果相同）**
 
 ```
 T1 sha256 selftest   T2 arm        T2b clean verify  T3 hidecore
@@ -863,6 +875,15 @@ T11 health           T12 regression T13 unload       T7 mechanism name
 | 3 | 0.79s | 2.73s | `0x0` |
 
 第一轮 `exits = 288,352,654`、`vmmcall = 287,973,382`、`WIN32_EXIT_CODE = 0`。
+
+**9.497 单轮（当前代码，9.465 之后）**
+
+| start | stop | `exits` | `vmmcall` | `invmrun` |
+|---|---|---|---|---|
+| 0.42s | 3.92s | 2,519,244 | 45,375 | `0x0` |
+
+退出/vmmcall ≈ **55.5**（9.445b 时代是 1.0009）——同一个判据，换了一个数量级的形态：
+桩现在是真循环，不是同一条 `vmmcall` 的无尽重复。
 
 **性能代价（9.447 实测）**：9.445b 比 `zAV_final` 慢约 **12 倍**
 （T1 从 4 秒变 42 秒），因为 12 个核全在 guest 里跑 VMRUN 循环。
