@@ -39,7 +39,14 @@ $scripts = @(
     # symptom is "a breakpoint/page/cache entry silently stops working", which no
     # error code reports. protect.c is explicitly allowed: it compacts on removal
     # (`pages[i] = pages[count-1]`), so there its count IS a true extent.
-    'count_as_extent.ps1'
+    'count_as_extent.ps1',
+    # 9.488: every handler that writes the reply buffer must test out_len first.
+    # `case IOCTL_YGHV_SECTION_HIDE` wrote `out[3] = idx` unconditionally - under
+    # METHOD_BUFFERED the buffer is max(in_len, out_len), so a caller sending only
+    # input would have had four qwords written past the allocation. The shipped
+    # client always sends 32 bytes, which is why it never fired; a polite client
+    # is not an interface property.
+    'ioctl_output_bounds.ps1'
 )
 
 foreach ($script in $scripts) {

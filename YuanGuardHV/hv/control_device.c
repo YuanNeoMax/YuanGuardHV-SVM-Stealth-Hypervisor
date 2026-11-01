@@ -2538,6 +2538,25 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
         ULONG idx = 0;
         UINT64 *out = (UINT64 *)buf;
 
+        /*
+         * 9.488: CHECK out_len BEFORE THE FIRST STORE - THIS HANDLER DID NOT.
+         *
+         * `out[3] = idx` below ran unconditionally. Under METHOD_BUFFERED the
+         * system buffer is max(in_len, out_len) bytes, so a caller sending 16
+         * bytes of INPUT and asking for 0 bytes of OUTPUT would have had four
+         * qwords written past the end of the allocation - a kernel-heap overwrite
+         * driven entirely by the caller. The client happens to send 32 bytes,
+         * which is exactly why this never fired; "the current client is polite"
+         * is not a property of the interface.
+         *
+         * YGHV_SECTION_HIDE_OUT_QWORDS is 4 (32 bytes) and every early return
+         * below writes all four qwords, so one check here covers them all.
+         */
+        if (out_len < YGHV_SECTION_HIDE_OUT_QWORDS * sizeof(UINT64)) {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+
         if (in_len >= 16) {
             UINT64 *in = (UINT64 *)buf;
             idx = (ULONG)in[0];

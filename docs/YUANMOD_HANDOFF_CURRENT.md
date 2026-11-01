@@ -16467,3 +16467,70 @@ guest 会读到一块已经属于别人的内存。顺序写进了两边的注�
 **「只分配不释放」在源码里不显眼，因为分配点和释放点可以相隔几千行。**
 最可靠的发现方式是把 `ExAllocatePool*` 和 `ExFreePool*` 的**文件级配对计数**
 扫一遍 —— 这次就是这么找到的（`mem_share.c` 1:0、`yghv_guard.c` 1:0）。
+
+---
+
+#### 9.488 ★★★★ `SECTION_HIDE` 在无 out_len 检查的情况下写回复缓冲区
+
+##### 缺陷
+
+```c
+case IOCTL_YGHV_SECTION_HIDE: {
+    ULONG idx = 0;
+    UINT64 *out = (UINT64 *)buf;
+
+    if (in_len >= 16) { ... idx = in[0]; }
+
+    out[3] = (UINT64)idx;      // <- 无条件写
+```
+
+**整个 case 没有一处 `out_len` 检查。**
+
+METHOD_BUFFERED 下系统缓冲区是 `max(in_len, out_len)` 字节。调用方送 16 字节
+输入、要 0 字节输出，`out[3]` 就是**向内核堆尾部写 32 字节** ——
+写入量由**调用方**决定。
+
+自带的客户端总是发 32 字节，所以**从来没触发过**。
+**「当前客户端很客气」不是接口的性质。**
+
+##### 修法
+
+顶部加一次门槛：
+
+```c
+if (out_len < YGHV_SECTION_HIDE_OUT_QWORDS * sizeof(UINT64)) {
+    status = STATUS_BUFFER_TOO_SMALL;
+    break;
+}
+```
+
+该 case 的所有早退都写满四个 qword，所以一次检查覆盖全部路径。
+
+##### 新增构建期检查 `ioctl_output_bounds.ps1`
+
+规则：**每个写回复缓冲区的 case，其代码里必须有 `out_len` 检查**。
+
+这次审计覆盖 49 个 case，**只有这一个违规** —— 其余 48 个都做对了，
+说明这个约定在本树里已经是常态，检查器只是堵住漏网的那一个。
+
+##### 检查器自己也犯了两个错（都记下来）
+
+1. **注释满足了检查**：第一版在 case body 里搜 `out_len`，而这个 case 里有一大段
+   **解释性注释**提到 `out_len`。注入原始缺陷后**报 PASS** ——
+   「检查存在」被**散文**满足了。修法：先剥离块注释与行注释，再找 `if`。
+2. **注入没生效却以为生效**：第一次用字符串替换删检查，替换没匹配上，
+   于是测的是「已修复的代码」，结果自然是 PASS。改成按行删除后，
+   检查器精确报出 `[FAIL] SECTION_HIDE (line 2525)`。
+
+##### 实测
+
+    构建  ALL SOURCE CHECKS PASS（含新检查器）/ Build SUCCESS
+          IOCTL output bounds: every handler ... tests out_len
+    section-hide 3 -> hid 1 page(s)
+    section-hide 1 -> REFUSED (含 IAT)
+    卸载 invmrun at unload = 0x0，无蓝屏
+
+##### 教训
+
+**「有检查」必须是代码，不能是注释。**
+一个检查器的判据如果会被文档满足，它检查的是文档。
