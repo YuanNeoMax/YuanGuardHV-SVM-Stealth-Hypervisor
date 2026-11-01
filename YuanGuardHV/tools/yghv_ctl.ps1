@@ -21,6 +21,7 @@ Commands:
   unset-auto-start
   harden-service
   unharden-service
+  service-name                      (read-only: which name, exists?, start type, SDDL)
   byovd-scan                        (local only: blocklist + KDU provider names, no driver needed)
   selftest
   selftest-abort
@@ -46,7 +47,12 @@ param(
     # mem-scan failed before its handler ever ran.
     [Parameter(Position = 5)]$Arg5 = $null,
     [Parameter(Position = 6)]$Arg6 = $null,
-    [Parameter(Position = 7)]$Arg7 = $null
+    [Parameter(Position = 7)]$Arg7 = $null,
+    # 9.500: the service the sc.exe commands act on. The tree's real service
+    # is yghvpa; the four commands used to hard-code `yuanguard`, which never
+    # existed (measured: sc config yuanguard -> 1060). Overridable so a
+    # differently-named deployment does not need a source edit.
+    [string]$ServiceName = 'yghvpa'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -622,29 +628,86 @@ public static class YghvMem
 }
 '@
 
-$sysCommands = @('set-auto-start', 'unset-auto-start', 'harden-service', 'unharden-service', 'byovd-scan')
+# 9.500: one place decides the service name for every sc.exe command.
+$YghvService = $ServiceName
+
+$sysCommands = @('set-auto-start', 'unset-auto-start', 'harden-service', 'unharden-service', 'byovd-scan', 'service-name')
 if ($sysCommands -contains $Command.ToLower()) {
     switch ($Command.ToLower()) {
-        'set-auto-start' {
-            & sc.exe config yuanguard start= auto | Out-Null
-            if ($LASTEXITCODE -ne 0) {
-                throw ("set-auto-start: sc config failed rc={0}" -f $LASTEXITCODE)
+        'service-name' {
+            # 9.500: READ-ONLY. Answers all three questions the four sc commands
+            # depend on, without changing anything: which name is in effect, does
+            # the service exist, what is its start type, and what is its DACL.
+            # It exists because the four commands below had a wrong name for a
+            # long time and there was no way to notice short of running one of
+            # THEM (which changes machine state to answer a question that did not
+            # need changing it).
+            $sc = Join-Path $env:SystemRoot 'System32\sc.exe'
+            Write-Host ("service-name: resolved = {0}" -f $YghvService)
+            if ($YghvService -ne 'yghvpa') {
+                Write-Host '  note: not the tree default (yghvpa) - passed with -ServiceName.'
             }
-            Write-Host 'set-auto-start: OK (start=auto)'
+            # Keep the output as an ARRAY. Joining it first made every
+            # Select-String match return the whole report, twice.
+            $qcLines = @(& $sc qc $YghvService 2>&1 | ForEach-Object { "$_" })
+            $qc = ($qcLines -join ' ')
+            if ($qc -match '1060') {
+                Write-Host ("  EXISTS = NO  (sc qc returned 1060: no service named {0})" -f $YghvService)
+                Write-Host '  Every command below would fail with 1060. Pass the right -ServiceName.'
+                exit 1
+            }
+            Write-Host '  EXISTS = YES'
+            $seen = @{}
+            foreach ($line in @($qcLines)) {
+                $text = [string]$line
+                foreach ($key in @('START_TYPE', 'BINARY_PATH_NAME')) {
+                    if (-not $seen.ContainsKey($key) -and $text.Contains($key)) {
+                        # collapse runs of whitespace without a regex escape
+                        $joined = ([string]::Join(' ', ($text -split '\s'))).Trim()
+                        while ($joined.Contains('  ')) { $joined = $joined.Replace('  ', ' ') }
+                        Write-Host ('    ' + $joined)
+                        $seen[$key] = $true
+                    }
+                }
+            }
+            $sddl = (& $sc sdshow $YghvService 2>&1 | Select-Object -Last 1).Trim()
+            if (-not $sddl) {
+                Write-Host '  SDDL = (empty) - the DACL could not be read.'
+                exit 1
+            }
+            Write-Host ('  SDDL = ' + $sddl)
+            if ($sddl -match 'D;;SDWP;;;BA') {
+                Write-Host '  hardened = YES (BA delete is denied - harden-service is in effect)'
+            } else {
+                Write-Host '  hardened = NO  (BA still holds delete - harden-service not applied)'
+            }
+            exit 0
+        }
+        'set-auto-start' {
+            # 9.500: was `sc.exe config yuanguard ...` - 1060, never worked.
+            $sc = Join-Path $env:SystemRoot 'System32\sc.exe'
+            $out = (& $sc config $YghvService start= auto 2>&1) -join ' '
+            if ($out -notmatch 'SUCCESS') {
+                throw ("set-auto-start: sc config {0} failed: {1}" -f $YghvService, $out)
+            }
+            Write-Host ("set-auto-start: OK (service {0} start=auto)" -f $YghvService)
             exit 0
         }
         'unset-auto-start' {
-            & sc.exe config yuanguard start= demand | Out-Null
-            if ($LASTEXITCODE -ne 0) {
-                throw ("unset-auto-start: sc config failed rc={0}" -f $LASTEXITCODE)
+            $sc = Join-Path $env:SystemRoot 'System32\sc.exe'
+            $out = (& $sc config $YghvService start= demand 2>&1) -join ' '
+            if ($out -notmatch 'SUCCESS') {
+                throw ("unset-auto-start: sc config {0} failed: {1}" -f $YghvService, $out)
             }
-            Write-Host 'unset-auto-start: OK (start=demand)'
+            Write-Host ("unset-auto-start: OK (service {0} start=demand)" -f $YghvService)
             exit 0
         }
         'harden-service' {
-            $backup = (& sc.exe sdshow yuanguard | Select-Object -Last 1).Trim()
+            # 9.500: was `sc.exe sdshow yuanguard` / `sdset yuanguard ...`.
+            $sc = Join-Path $env:SystemRoot 'System32\sc.exe'
+            $backup = (& $sc sdshow $YghvService 2>&1 | Select-Object -Last 1).Trim()
             if (-not $backup) {
-                throw 'harden-service: sdshow returned nothing'
+                throw ("harden-service: sdshow {0} returned nothing" -f $YghvService)
             }
             Set-Content -LiteralPath 'D:\aaaaaavm\yghv_service_sddl_backup.txt' `
                 -Value $backup -Encoding UTF8
@@ -652,24 +715,25 @@ if ($sysCommands -contains $Command.ToLower()) {
                 '(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)' +
                 '(A;;CCLCSWLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)' +
                 'S:(AU;FA;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;WD)'
-            $out = & sc.exe sdset yuanguard $hardenSddl
-            if (($out -join ' ') -notmatch 'SUCCESS') {
-                throw ("harden-service: sdset failed: {0}" -f ($out -join ' '))
+            $out = (& $sc sdset $YghvService $hardenSddl 2>&1) -join ' '
+            if ($out -notmatch 'SUCCESS') {
+                throw ("harden-service: sdset {0} failed: {1}" -f $YghvService, $out)
             }
-            Write-Host 'harden-service: OK (service delete denied, backup saved)'
+            Write-Host ("harden-service: OK (service {0} delete denied, backup saved)" -f $YghvService)
             exit 0
         }
         'unharden-service' {
+            $sc = Join-Path $env:SystemRoot 'System32\sc.exe'
             $backupPath = 'D:\aaaaaavm\yghv_service_sddl_backup.txt'
             if (-not (Test-Path $backupPath)) {
                 throw 'unharden-service: backup SDDL not found'
             }
             $backup = (Get-Content -LiteralPath $backupPath -Raw).Trim()
-            $out = & sc.exe sdset yuanguard $backup
-            if (($out -join ' ') -notmatch 'SUCCESS') {
-                throw ("unharden-service: sdset failed: {0}" -f ($out -join ' '))
+            $out = (& $sc sdset $YghvService $backup 2>&1) -join ' '
+            if ($out -notmatch 'SUCCESS') {
+                throw ("unharden-service: sdset {0} failed: {1}" -f $YghvService, $out)
             }
-            Write-Host 'unharden-service: OK (backup SDDL restored)'
+            Write-Host ("unharden-service: OK (service {0} backup SDDL restored)" -f $YghvService)
             exit 0
         }
         'byovd-scan' {
@@ -721,6 +785,23 @@ if ($sysCommands -contains $Command.ToLower()) {
                 'hpwks'
             )
 
+            # 9.502: the CSV beside this script is the authority when it exists -
+            # FileSHA1 per provider, so a hit can be CONFIRMED instead of argued.
+            # The literal list above stays as the fallback for a checkout that
+            # lacks the CSV, and the row count is printed so a stale table is
+            # visible rather than silent.
+            $kduTable = @{}
+            $kduCsvCount = 0
+            $csvPath = Join-Path $PSScriptRoot 'kdu_providers.csv'
+            if (Test-Path -LiteralPath $csvPath) {
+                $rows = @(Import-Csv -LiteralPath $csvPath)
+                foreach ($r in $rows) {
+                    if (-not $r.FileSHA1) { continue }
+                    $kduTable[$r.FileSHA1.ToUpperInvariant()] = $r
+                    $kduCsvCount++
+                }
+            }
+
             # ---- 1. the blocklist --------------------------------------------
             $blNames = @()
             $blNote = ''
@@ -754,10 +835,26 @@ if ($sysCommands -contains $Command.ToLower()) {
             $weak = @()
             $blMs = $false
             $msDowngraded = 0
+            $hits = @()
 
             foreach ($f in $onDisk) {
                 $fileLeaf = $f.Name.ToLowerInvariant()
                 $why = @()
+                # 9.502: hash first. A FileSHA1 match is the only thing that may
+                # be called a HIT; everything else is a candidate at best.
+                $fsha1 = ''
+                if ($kduCsvCount -gt 0) {
+                    try {
+                        $fsha1 = (Get-FileHash -LiteralPath $f.FullName -Algorithm SHA1).Hash
+                    } catch { $fsha1 = '' }
+                }
+                if ($fsha1 -and $kduTable.ContainsKey($fsha1)) {
+                    $rec = $kduTable[$fsha1]
+                    $hits += ('  {0,-26} HIT       KDU #{1} {2}  v={3}  advisory={4}' -f
+                              $f.Name, $rec.Id, $rec.DriverName,
+                              $f.VersionInfo.FileVersion, $rec.AdvisoryId)
+                    continue
+                }
                 if ($blNames -contains $fileLeaf) {
                     # A name hit is not a verdict. The blocklist also keys files
                     # by page hash and by certificate, so a MICROSOFT-signed file
@@ -800,6 +897,16 @@ if ($sysCommands -contains $Command.ToLower()) {
                 $base = [IO.Path]::GetFileNameWithoutExtension($pn)
                 $why = @()
                 $msSigned = $false
+                $lsha1 = ''
+                if ($kduCsvCount -gt 0 -and (Test-Path -LiteralPath $pn)) {
+                    try { $lsha1 = (Get-FileHash -LiteralPath $pn -Algorithm SHA1).Hash } catch { $lsha1 = '' }
+                }
+                if ($lsha1 -and $kduTable.ContainsKey($lsha1)) {
+                    $rec2 = $kduTable[$lsha1]
+                    $hits += ('  {0,-26} HIT+LOADED KDU #{1} {2}  state={3}  advisory={4}' -f
+                              $leaf, $rec2.Id, $rec2.DriverName, $d.State, $rec2.AdvisoryId)
+                    continue
+                }
                 if ($blNames -contains $leafLower) {
                     $sg2 = (Get-AuthenticodeSignature -LiteralPath $pn -ErrorAction SilentlyContinue).SignerCertificate
                     if ($sg2 -and $sg2.Subject -match 'Microsoft') { $msSigned = $true }
@@ -815,12 +922,17 @@ if ($sysCommands -contains $Command.ToLower()) {
             }
 
             # ---- 3. report --------------------------------------------------
-            Write-Host ("byovd-scan: block={0} name(s) [{1}]  kdu={2} name(s)  on-disk={3}  loaded={4}" -f
-                $blNames.Count, $blNote, $kduNames.Count, $onDisk.Count, $loaded.Count)
+            Write-Host ("byovd-scan: block={0} name(s) [{1}]  kdu={2} name(s)  hash-table={3}  on-disk={4}  loaded={5}" -f
+                $blNames.Count, $blNote, $kduNames.Count, $kduCsvCount, $onDisk.Count, $loaded.Count)
             if ($loadedNote) { Write-Host ("  {0}" -f $loadedNote) }
 
+            # 9.502: three grades, never merged into one number.
+            if ($hits.Count -gt 0) {
+                Write-Host ("  HIT ({0}) - FileSHA1 matches a KDU provider record. This IS the file:" -f $hits.Count)
+                foreach ($s in @($hits)) { Write-Host $s }
+            }
             if ($strong.Count -gt 0) {
-                Write-Host ("  STRONG ({0}) - exact name match; a signed driver with kernel R/W once its VERSION is in range:" -f $strong.Count)
+                Write-Host ("  CANDIDATE ({0}) - right NAME, wrong FILE; usable only if its version is in range:" -f $strong.Count)
                 foreach ($s in @($strong)) { Write-Host $s }
             }
             if ($weak.Count -gt 0) {
@@ -830,8 +942,8 @@ if ($sysCommands -contains $Command.ToLower()) {
 
             $nLoad = 0
             foreach ($s in @($strong)) { if ($s -match ' LOADED ') { $nLoad++ } }
-            Write-Host ("  verdict: strong={0} weak={1} strong-and-loaded={2} block-name-but-Microsoft-signed={3}" -f
-                $strong.Count, $weak.Count, $nLoad, $msDowngraded)
+            Write-Host ("  verdict: hit={0} candidate={1} weak={2} candidate-and-loaded={3} block-name-but-Microsoft-signed={4} kdu-table-rows={5}" -f
+                $hits.Count, $strong.Count, $weak.Count, $nLoad, $msDowngraded, $kduCsvCount)
 
             if ($blNames.Count -eq 0) {
                 Write-Host '  INCOMPLETE: the blocklist yielded no names, so a zero hit count here means nothing.'

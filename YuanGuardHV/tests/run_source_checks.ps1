@@ -52,6 +52,13 @@ $scripts = @(
     # `$brid` where the variable is `$brd`, so `$null -eq 0` (FALSE) meant the
     # second half of the INVALID test never ran, and a meaningless ratio was
     # printed as a speedup.
+    # 9.501: four client commands called sc.exe with the literal service name
+    # 'yuanguard'; the service is 'yghvpa' and the registry has never held that
+    # name (measured: sc config yuanguard -> 1060). They never worked, and no
+    # checker looked at an ARGUMENT to an external tool - every existing one
+    # reads a different part of the file. This one requires every sc operand to
+    # be a variable, and it carries a self-test that plants the original bug.
+    'service_name_check.ps1',
     'client_undefined_vars.ps1'
 )
 

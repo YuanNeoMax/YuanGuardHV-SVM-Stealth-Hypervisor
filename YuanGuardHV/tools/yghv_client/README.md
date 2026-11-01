@@ -103,6 +103,7 @@ yghv_ctl.ps1 link-hide [on|off]
 yghv_ctl.ps1 sections
 yghv_ctl.ps1 section-hide <index>
 yghv_ctl.ps1 byovd-scan
+yghv_ctl.ps1 service-name
 ```
 
 `protect` sets the target, enumerates committed pages of the real Java process,
