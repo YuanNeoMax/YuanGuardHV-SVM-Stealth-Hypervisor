@@ -10892,3 +10892,155 @@ DR6 命中槽 2:     扫 i<2 找不到 -> yghv_bp_on_dr 返回 -1
 **本轮只做了构建期验证，没有加载驱动。** 这个改动只影响扫描上界的选择，
 正向行为与修复前读数相同（9.485 已经证明这类修复「不崩、不报错、只是少扫几个槽」）。
 真正需要实机的是 G25 的 T12（`mem-bp add / drain / del`），那是下一轮的事。
+
+
+---
+
+#### 9.499 从 KDU 里拿两样东西：`byovd-scan` 与 `loader_stealth` 判死
+
+起点是 operator 提出的一个问题：能不能不用自签证书、改用「KDU 的证书」，让驱动在
+**不开测试模式**的正常 Windows 上加载。查完后结论是那条路从根部断掉，同时发现 KDU
+真正可用的东西不是它的证书，而是它那份 **provider 清单** 与 **`BadRkDemo` 里那四条
+PatchGuard 红线**。这一轮把这两样落地。
+
+##### 一、换证书这条路为什么不成立（三条独立否决）
+
+| # | 事实 | 依据 |
+|---|---|---|
+| 1 | **KDU 里没有证书。** 它带的是 `drv64.dll` 里内嵌的 68 个厂商驱动镜像，它自己没有签名能力 —— 它靠借别人签名，正是因为没有证书 | `Help/providers.md` 的 ResourceId/ImageSize 列 |
+| 2 | **交叉证书已于 2021-07 全部过期。** 微软文档原文：链接到过期交叉证书的代码签名证书**无法为任何版本的 Windows 创建新的内核模式签名** | `deprecation-of-software-publisher-certificates-and-commercial-release-certificates.md` |
+| 3 | **KDU 的 provider 能加载，靠的是 2015-07-29 之前的签名时间戳**，我们对今天编出来的 `.sys` 造不出那种时间戳 | Cisco Talos《Old certificate, new signature》 |
+
+本机实测的两条补充：
+
+- `testsigning=Yes` + `nointegritychecks=Yes` + `SecureBoot=False`，所以现在能加载；
+- **blocklist 真实内容**（从 `driversipolicy.p7b` 解析出 120 个 `.sys` 名）：其中 **18 个命中
+  KDU 的 provider**（`gdrv` / `ATSZIO` / `WinRing0` / `phymemx64` / `rtkio64` / `lha` /
+  `kprocesshacker` / `PROCEXP` / `SysDrv3S` / `ALSysIO` / `AMDRyzenMaster` / `physmem` /
+  `LenovoDiagnosticsDriver` / `pcdsrvc` / `nvoclock` / `rzpnk` / `AODDriver` / `HwRwDrv`）。
+  也就是说，即便拿到那些驱动的旧版，一半以上也会先被 blocklist 拦住。
+
+**本机版本是 Windows 10 Pro for Workstations**，所以 EEAFS（企业环境管理员强制签名策略，
+需要 Enterprise/Education）也用不了。剩下的合法路径只有 attestation signing —— 而它要求
+**每次重建都重新提交微软签名**，与本树「一天二十次构建」的节奏直接冲突。
+
+**结论：签名路线保持现状（testsigning）。** 这条不再讨论。
+
+##### 二、`byovd-scan`：Tier 7.1 的另一半
+
+我们一直能藏自己的页，但回答不了「这台机器上有没有**别人**的内核读写原语」。
+KDU 的 provider 清单从另一面读同一张表 —— 于是它变成了一条只读自查命令。
+
+```
+yghv_ctl.ps1 byovd-scan
+```
+
+**它是本地命令：不加载、不打开、不通信任何驱动**，在 `CreateFile` 之前 `return`。
+所以驱动 STOPPED 时也能跑 —— 而这正是最想跑它的时刻。
+
+**两个名字集，来源不同，绝不合并成一个数：**
+
+- **BLOCK** —— 从 `System32\CodeIntegrity\driversipolicy.p7b` 解析出来的 120 个 `.sys` 名。
+  微软已经判过它们有问题，权威。
+- **KDU** —— `Help/providers.md` 里 66 个 provider 驱动名（攻击者的菜单）。**只有一部分
+  被 blocklist 覆盖**，所以「不在 BLOCK」不等于「不能用」，这也是两个集都要扫的理由。
+
+**这一轮被它自己的第一次运行抓到的三个缺陷（都是我先写错、再修掉的）：**
+
+| 缺陷 | 症状 | 修法 |
+|---|---|---|
+| `Win32_SystemDriver.PathName` 带 `\??\` 前缀 | 所有版本列显示 `unreadable` | 用 `TrimStart('\??\')` 去前缀（**不是 `-replace`**：`'^\\\?\?\'` 是非法正则，第一次跑就报 `pattern ^\\\?\? is not valid`） |
+| 名字命中被当成结论 | `appid.sys` / `monitor.sys` 两个**微软 WinBuild 文件**被报成 BLOCK | 命中后查签名，`Subject` 含 Microsoft 就降级，并单独计一列 `block-name-but-Microsoft-signed` |
+| 命令跑完不返回 | 落到 `CreateFile`，驱动 STOPPED 时报 `ERROR_FILE_NOT_FOUND` | 本地命令必须 `return` |
+
+**第三次运行的真实输出（本机）：**
+
+```
+byovd-scan: block=120 name(s) [parsed]  kdu=66 name(s)  on-disk=413  loaded=380
+  STRONG (2) - exact name match; a signed driver with kernel R/W once its VERSION is in range:
+  PROCEXP152.SYS             on disk   v=17.0           KDU
+  AMDRyzenMasterDriver.sys   LOADED    v=3.1.0.0        BLOCK+KDU  state=Running
+  verdict: strong=2 weak=0 strong-and-loaded=1 block-name-but-Microsoft-signed=2
+```
+
+**这两个 STRONG 都不是真命中，命令自己把理由印在旁边了：**
+
+- `PROCEXP152.SYS` 是 **17.0**，KDU 要的是 **≤1.5.2**；
+- `AMDRyzenMasterDriver.sys` 是 **3.1.0.0**，KDU 要的是 **≤2.0.0.0**。
+
+> **已知局限，写在命令里而不是留给读者猜**：STRONG 是**名字**判据，**不比版本**。
+> 版本列因此在每条 STRONG 旁边，读版本再下结论。这是 a 类判据（名字）与 b 类判据
+> （哈希/版本）被有意分开的结果 —— 合起来会让一个命中的名字看起来像一次证实。
+
+计数打印（`on-disk=413  loaded=380`）是为了让 **「没找到」永远不会被读成「没检查」**：
+blocklist 解析失败时它会打 `INCOMPLETE`，而不是打 `clean`。
+
+##### 三、`loader_stealth` 判为不做（Tier 台账改写）
+
+台账里原先挂在「9.5 完成」下面的一行是：
+
+> `loader_stealth` 从模块列表 unlink（9.454 修复后**确实会执行**）
+
+**这句话是真的，但它只证明了「开关设成 1 之后产物里存在那个 `call`」。** 功能本身
+从未在任何一次实机运行中启用 —— 默认 0，我们发布的每一次构建都是默认。这就是
+「代码存在」≠「能力存在」的又一例（9.454 当时自己也写明了这一点，但台账读起来像完成）。
+
+判死的三条依据（已写入 `TIER_LEDGER.md`）：
+
+1. **那是 PatchGuard 巡视的表之一。** KDU 的 `BadRkDemo` 第一条就是改
+   `PsLoadedModuleList`（`RemoveEntryList(&LoaderSection->InLoadOrderLinks)`），预期结果
+   写的是 `Loaded module list modification` 蓝屏。
+2. **它是「部分 stealth」，比不 stealth 更糟。** `loader_stealth.c` 注释自陈只摘
+   `InLoadOrderLinks`，其他模块列表未动、字符串本体仍在 —— 风险付掉，收益没拿到。
+3. **买不到当下需要的东西。** 9.5 已有三样实测能力（`link-hide` / `.pdata` DECOY /
+   guard 表页隐藏），而 `byovd-scan` 正好证明这类枚举本来就有多通道（名字、哈希、签名、
+   已加载列表），堵一条没意义。
+
+**处置：代码与开关保留（默认 0，不进产物），结论写死，不再列为「未验证」。**
+汇总表相应把 Tier 9 的「不做」从 2 改成 3，合计 8 → 9（**8 个完成项一个都没减少**）。
+
+##### 四、这一轮自己的方法教训
+
+**用 PowerShell 的 `-replace`/双引号字符串拼源码会吃掉反引号。** 我第一版用
+`Set-Content` + 双引号 here-string 写台账，所有 `` ` `` 都被当成转义符消掉，
+`byovd-scan` 变成了 `\x08yovd-scan`（一个退格字符），`link-hide` 的引号也一并消失。
+**这不是排版问题，是内容损坏，而且肉眼第一眼看不出来。**
+
+> 修法：改写含反引号的 Markdown 时，走 Python（反引号在 Python 里就是普通字符），
+> 不要走 PowerShell 的双引号字符串。这条与本树已有的 7.x「PS 引号陷阱」是同一族。
+
+**第二个教训更值钱**：`byovd-scan` 的三次运行里，前两次的失败都是**命令自己的判据错**
+（前缀没剥、名字当结论、不 return），不是数据错。**判据写错时，输出看起来仍然是
+一份完整的报告。** 第一次跑报 `strong=6`，第三次跑报 `strong=2` —— 中间那 4 个
+（`appid.sys`×2、`monitor.sys`×2）全是微软自己签的。若只看第一次的数字，
+就会得出「本机有 6 个危险驱动」这个完全相反的结论。
+##### 9.499b 顺带清掉 9.486 留在源码里的 PowerShell 展开残骸
+
+扫全仓控制字符时发现 4 个 `.c` 文件的注释里有 **0x07（BEL）**：
+
+```
+mem_cache.c:60   * Validity is decided per slot with <0x07>ctive, ...
+mem_time.c:70    同上
+mem_view.c:163   同上
+mem_watch.c:113,252  同上
+```
+
+同一段注释里还有 `$(System.Collections.Hashtable.Cnt)`、`$(System.Collections.Hashtable.Arr)[i]`
+两处未展开的 PowerShell 插值。**这是 9.486 那轮用 PowerShell 双引号字符串拼源码留下的**，
+和本轮我自己踩的坑是同一个病（这轮它把我的 Markdown 反引号吃掉了）。
+
+- **它们只是注释**，编译产物不受影响 —— 但读起来像宏，而且 `ctive` 让人以为变量名是别的东西。
+- 清理：`$(...Cnt)` → `the LIVE COUNT`，`$(...Arr)[i]` → `table[i]`，`<0x07>ctive` → `active`。
+- 四个文件共 15 行，`git diff --numstat` 全是注释行的 1:1 替换。
+
+**重建验证（注释改了也必须重建，否则无法证明产物没被牵连）：**
+
+```
+ALL SOURCE CHECKS PASS     (12 条 PASS，含 2 个自检)
+ALL MAP CHECKS PASS
+Build SUCCESS              bin\yuanguard_hv.sys  14:53:06  0936CA59C3C7595A
+```
+
+**这一条的方法学价值在于：它是被「全仓扫控制字符」这个动作找到的，不是被读代码找到的。**
+同一个 PowerShell 引号陷阱，这轮咬了我一次（Markdown），9.486 咬了源码四次（注释），
+而两次都是**内容静默损坏、输出看起来仍然完整**。已写进 QUICKSTART 第 5 节的坑表。

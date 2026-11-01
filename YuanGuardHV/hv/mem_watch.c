@@ -102,15 +102,15 @@ static int yghv_watch_find(uint64_t gpa) {
     int i;
     uint64_t page = gpa & ~(uint64_t)0xFFFULL;
     /*
-     * 9.486: SCAN THE WHOLE ARRAY, NOT $(System.Collections.Hashtable.Cnt) SLOTS.
+     * 9.486: SCAN THE WHOLE ARRAY, NOT the LIVE COUNT SLOTS.
      *
      * Same defect as 9.485 in the breakpoint table: this counter is incremented on
      * install and decremented on remove, but the array is NEVER COMPACTED. Removing
-     * a slot in the middle leaves $(System.Collections.Hashtable.Arr)[i].active == 0 while a later slot is
+     * a slot in the middle leaves table[i].active == 0 while a later slot is
      * still live, and i < n then stops BEFORE that live slot - so the entry
      * becomes invisible to every lookup while still being installed.
      *
-     * Validity is decided per slot with ctive, which this loop already does.
+     * Validity is decided per slot with active, which this loop already does.
      */
     int n = YGHV_WATCH_MAX_PAGES;
 
@@ -241,15 +241,15 @@ int yghv_watch_match(uint64_t gpa, uint32_t kind) {
     int i;
     uint64_t page = gpa & ~(uint64_t)0xFFFULL;
     /*
-     * 9.486: SCAN THE WHOLE ARRAY, NOT $(System.Collections.Hashtable.Cnt) SLOTS.
+     * 9.486: SCAN THE WHOLE ARRAY, NOT the LIVE COUNT SLOTS.
      *
      * Same defect as 9.485 in the breakpoint table: this counter is incremented on
      * install and decremented on remove, but the array is NEVER COMPACTED. Removing
-     * a slot in the middle leaves $(System.Collections.Hashtable.Arr)[i].active == 0 while a later slot is
+     * a slot in the middle leaves table[i].active == 0 while a later slot is
      * still live, and i < n then stops BEFORE that live slot - so the entry
      * becomes invisible to every lookup while still being installed.
      *
-     * Validity is decided per slot with ctive, which this loop already does.
+     * Validity is decided per slot with active, which this loop already does.
      */
     int n = YGHV_WATCH_MAX_PAGES;
 
