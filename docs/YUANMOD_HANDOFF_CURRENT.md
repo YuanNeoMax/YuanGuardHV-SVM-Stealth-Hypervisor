@@ -10781,3 +10781,114 @@ OVERALL: ALL PASS          （17 项全 True，零 False）
 `exit_rip_contract.ps1` 那样的注入缺陷自检，所以这个 PASS 现在是空过的。
 
 **按六条方法论第四条（检查器必须自证能失败），它需要补一次注入自检 —— 而不是继续把这个 PASS 当作证据。**
+
+---
+
+#### 9.498 检查器空过 → 重写它 → 自检第一次跑起来就抓到第 4 个「计数当范围」
+
+9.497 收尾时记下了一条：`tests/count_as_extent.ps1` 报
+`[WARN] matched no live-count-bounded loop at all - parser may be stale`，
+**然后照样 `[PASS]`**。按方法论第四条，那条 PASS 不能当证据。这一轮补掉它。
+
+##### 一、空过的原因：一个猜出来的窗口
+
+9.486 的第一版只在「计数读取那一行之后 **5 行内**」找循环：
+
+```powershell
+for ($j = $i + 1; $j -lt [Math]::Min($i + 6, $lines.Count); $j++) { ... }
+```
+
+`hv/mem_bp.c` 里三处真实距离是 **18 / 20 / 19 行**（中间隔着一段注释）。全部落在窗口外，
+所以它一条都没匹配到 —— **然后它把「一条都没匹配到」写成 WARN，把「没有缺陷」写成 PASS。**
+
+这和 `exit_rip_contract.ps1` 第一版的病是一种，只是方向相反：
+
+| 检查器 | 窗口 | 后果 |
+|---|---|---|
+| `exit_rip_contract` v3 | 差 17 行 | **假失败**（把好树报成坏的） |
+| `count_as_extent` 9.486 | 差 13–14 行 | **假通过**（把没检查报成通过） |
+
+> **猜出来的窗口，两个方向都会错。** 一个是噪声，一个是沉默 —— 沉默的那种更贵。
+
+##### 二、重写（9.498）
+
+1. **不再用窗口**：用花括号配对导出函数体（`Get-FunctionBodies`），在函数体内任意位置找循环。
+2. **append-only 表按构造放行**：计数从不递减 ⇒ 它本身就是一个真正的范围
+   （`g_state_obj_count` 就是这种；全树 21 个计数读取里有 18 个属于这一类）。
+3. **匹配不到任何计数读取时硬失败**，不再是 WARN + PASS。
+4. **带自检**：把原始缺陷种进 `hv\` 的临时副本，要求必须抓到。
+
+自检的两个设计细节（都是踩过的）：
+
+- **种缺陷必须种在原始距离（19 行）上**。贴着循环种 1 行，连坏窗口都能抓到 ——
+  那等于什么都没证明。所以副本里恢复的是原始的「先读计数、隔一段、再 `i < n`」形状。
+- **复用脚本本身**（经 `YGHV_COUNT_EXTENT_HV_DIR` 指到副本），不重写一份逻辑，
+  否则自检测的是复制品，复制品会和本体一起漂移。
+
+##### 三、自检第一次真正跑起来，就抓到第四个扫描
+
+修好解析器后立刻在健康的树上报出一条真的：
+
+```
+[FAIL] mem_bp.c:1126 scans i<n where n = live g_bp_count, and this file does not
+       compact its table on removal - entries above a hole are unreachable
+```
+
+**`yghv_bp_on_dr`（DR6 / 硬件数据断点路径）仍然用 `g_bp_count` 当扫描上界。**
+9.485 修的是 `yghv_bp_find` / `yghv_bp_find_int3` / `yghv_bp_on_npf` —— 它当时看的三处。
+DR6 是第四条，形状一模一样：
+
+```
+装 3 个数据断点:  active = [1,1,1]  count = 3
+删中间:           active = [1,0,1]  count = 2
+DR6 命中槽 2:     扫 i<2 找不到 -> yghv_bp_on_dr 返回 -1
+```
+
+返回 -1 在这里是**合法答案**，所以什么都不会报。一次数据断点就这样静默失联。
+修法与其他三处一致：`live` 只用于早退（「有没有装过断点」是它唯一能正确回答的问题），
+扫描上界改成 `YGHV_BP_MAX`，有效性由每槽 `active` 判。
+
+> **这一条是自检的产出，不是读代码时发现的。** 一个只会报 PASS 的检查器
+> 不会给你第四条 —— 它连前三条都看不见。
+
+##### 四、产物复核（不信源码就信产物）
+
+`.map`：`yghv_bp_on_dr 000000014001d230  mem_bp.obj`。反汇编该处：
+
+```
+14001D237  xor         eax,eax
+14001D239  lock cmpxchg dword ptr [14004C008h],esi      <- g_bp_count 只读一次，给早退
+14001D247  test        eax,eax
+14001D249  jle         14001D338                        <- 早退分支
+14001D267  cmp         r11,40h                         <- 40h = 64 = YGHV_BP_MAX，常量上界
+14001D26B  je          14001D338                        <- 扫完 64 槽才退出
+```
+
+`g_bp_count` 出现在**早退的判断**里，**没有出现在循环的终止条件里**。
+这就是这次修复在产物里的样子：常量 `0x40` 是上界，计数只负责「要不要开始扫」。
+
+##### 五、两道自查
+
+```
+自检种在原始 19 行距离 -> 抓到，指名 mem_bp.c                （它能失败）
+主检查器在故意退回 9.486 窗口的脚本上 -> 主检查器 PASS，自检 FAIL （空过逃不掉）
+主检查器在修好的树上                          -> 0 条 FAIL
+```
+
+后两条才是这一轮最值钱的读数：**一条证明「空过会被自检挡住」，一条证明「修好之后不再误报」。**
+
+##### 六、结果
+
+```
+[RUN] count_as_extent.ps1
+  33 file(s); 21 census read(s) found; 18 append-only counter(s); 0 allowed by compaction
+[PASS] live-count scans: no un-compacted table is bounded by its counter
+[PASS] self-test: planted census-bounded scan in yghv_bp_on_dr was caught
+```
+
+`ALL SOURCE CHECKS PASS`（11 条 PASS，两个运行器全绿），
+`ALL MAP CHECKS PASS`，`Build SUCCESS`，产物 `17B1A3D66D177512`（13:24:33）。
+
+**本轮只做了构建期验证，没有加载驱动。** 这个改动只影响扫描上界的选择，
+正向行为与修复前读数相同（9.485 已经证明这类修复「不崩、不报错、只是少扫几个槽」）。
+真正需要实机的是 G25 的 T12（`mem-bp add / drain / del`），那是下一轮的事。
