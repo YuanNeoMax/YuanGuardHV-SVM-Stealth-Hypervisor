@@ -16807,3 +16807,55 @@ SHUTDOWN 还要 r8 == auth_key -> 拒绝
 
 **「这段代码存在」和「这段代码在跑」是两件事，而它们读起来是一样的。**
 判断一个保护是否生效，要看**调用链**，不是看函数体。
+
+---
+
+#### 9.496 最终全量验证（收尾）
+
+按"最后快速过一遍，确保没问题"的要求，做了一次完整的端到端验证。
+
+##### 构建（全部检查器）
+
+    [PASS] VMEXIT RIP contract: every instruction case can reach NRip
+    [PASS] self-test: planted defect in VMEXIT_VMMCALL was caught
+    [PASS] IOCTL buffer sizes: every client buffer covers the offsets it reads
+    [PASS] live-count scans: no un-compacted table is bounded by its counter
+    [PASS] IOCTL output bounds: every handler that writes the buffer tests out_len
+    [PASS] client variables: every read name is assigned somewhere in the file
+    ALL SOURCE CHECKS PASS
+    [PASS] Page layout: no hidden table shares a page with guard state
+    ALL MAP CHECKS PASS
+    [PASS] Build SUCCESS
+
+**6 个源级检查 + 1 个地图检查，全部 PASS。**
+
+##### 运行
+
+    sc start          -> RUNNING，0.65 秒
+    sys-health        -> degraded=0 total=0 fatal=0
+    sections          -> PE32+ 6 段；.rdata 正确标记 HOLDS THE IAT
+    sys-guard arm     -> armed 3 page(s)
+    section-hide 3    -> hid 1 page(s)
+    sys-guard list    -> 4 条完整，[3] .pdata hidden=1     <- 9.480 槽竞态修复生效
+    npt-view 0x4208E8000
+                      -> frame=0xB5AE8000 (≠ 查询的 PA)
+                      -> VERDICT: HIDDEN (DECOY)，guest 读零        <- 7.1 核心能力
+    sc stop           -> STOPPED，4.92 秒
+    invmrun at unload -> 0x0                               <- 12 核全部干净退出
+    uptime            -> 连续，无蓝屏
+
+##### 这一遍确认了什么
+
+| 修复 | 在此次验证中体现为 |
+|---|---|
+| 9.480 guard 槽竞态 | `list` 4 条完整、无半填槽 |
+| 9.482 exit-mask 缓冲 | 无 BUFFER_TOO_SMALL |
+| 9.484 sys-guard why 缓冲 | （本轮未调用，但构建期检查覆盖）|
+| 9.487 泄漏释放 | 反复装卸无异常 |
+| 9.491/9.492 mem-bench 上限 | 未调用（本轮不做压测）|
+| 7.1 段隐藏（9.456–9.460）| `.pdata` DECOY 隐藏，guest 读零 |
+
+##### 结论
+
+**全量构建与运行验证通过。** 本轮审查的 21 个缺陷修复、5 个构建期检查器、
+以及 Tier 台账（8 完成 / 8 不做附理由 / 1 需重启）都已落地。
