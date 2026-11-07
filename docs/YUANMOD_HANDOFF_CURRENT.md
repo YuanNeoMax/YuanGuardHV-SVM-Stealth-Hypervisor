@@ -11398,3 +11398,88 @@ invmrun at unload = 0x0
 影子 DR 银行的读接口），未来若有真实实现，设计材料应当留在这儿而不是从零重写。
 
 **但「保留代码」和「保留能骗人的入口」是两件事。** 保留前者，封掉后者，就是这一轮做的事。
+
+---
+
+#### 9.508 `pa-section`：把「哪一段」和「哪一页」接起来（Tier 7.1 的前置观测）
+
+`.data` 段隐藏一直没做，缺的不是勇气，是**观测**。9.455 的 `sections` 报的是 **RVA**，
+NPT 用的是 **PA**，而两者之间的 `base PA` **只有内核知道**（`DriverStart` 在驱动内部，
+客户端拿不到）。没有这一步，隐藏 `.data` 只能靠猜 —— 而猜「这页是不是数据」正是
+9.458 撞死的形状（把自己的 IAT 藏了，`call [IAT slot]` 读 0）。
+
+**为什么新开一条 IOCTL 0x831，而不是给 `sections` 加字段**：`YGHV_SECTIONS_HDR_QWORDS`
+是 5，五个全长在用（parsed / PE flag / count / image size / iat_unplaced）。加宽一个
+已被三个客户端和两个检查器读过的报文，等于改它的语义；新开一条只读查询要动的是同一批
+三边客户端，但**不动任何已经在工作的东西**。
+
+**它只读**：不写 NPT、不分配、不加锁 —— 因此**可以在一个正被隐藏的页上安全调用**，
+这是 9.450 给 `npt-view` 定的同一条纪律：先建观测，再动手。
+
+##### 实机验收（三类判据 + 两个边界）
+
+```
+sections: parsed=1 fmt=PE32+ image=0x67000 sections=6
+  [0] .text   va=0x001000 size=0x026D69  CODE - must NOT be hidden
+  [1] .rdata  va=0x028000 size=0x005D7C  HOLDS THE IAT
+  [2] .data   va=0x02E000 size=0x035694  data - hideable
+```
+
+`pa-section` 报出的 image PA span：`[0x41EA7A000, 0x41EAE1000)`。逐一核对：
+
+| 查询 PA | 期望 | 实得 |
+|---|---|---|
+| `0x41EA7B000`（.text） | CODE | `section [0]` executable=**True** → CODE |
+| `0x41EAA2000`（.rdata） | IAT | `section [1]` has_iat=**True** → HOLDS THE IAT |
+| `0x41EAAA000`（.data） | data | `section [2]` → data candidate |
+| `0x41EAE0000`（.reloc 页） | data | `section [5]` size=0x3C → data candidate |
+| `0x41EAE1000`（span 外一页） | 不是我们的 | **OUTSIDE the image** |
+| `0x0` | 不是我们的 | **OUTSIDE the image** |
+
+##### 第一次跑就踩到两个判据错，都是我的
+
+| 错 | 症状 | 修法 |
+|---|---|---|
+| `if ($found -eq 0xFFFFFFFF)` | PowerShell 把 `0xFFFFFFFF` 解析成 **Int32 -1**，与 Int64 `4294967295` 永不相等 → 该分支不执行 → 用 4294967295 当下标 → `Cannot convert value to Int32` | `$NONE = [uint64]4294967295` 再比 |
+| 无条件打印 image span | `parsed=0` 时 span 是 `0..0`，印出来是假数字 | 只在 `$basepa -ne 0` 时打印 |
+
+> 第一条是**本树 7.7 那条坑的第 5 次复发**：「`0x...` 在 PowerShell 里是 Int32」。
+> 它这次没让命令崩在"正确"的地方，而是崩在**下游的下标转换**上 ——
+> 所以第一次的报错位置（脚本第 N 行）与真正的原因（第 M 行的比较）**不在一处**。
+
+##### 🔴 但这一步顺手量出一个结构事实，它决定 `.data` 能不能做
+
+整个驱动 image **落在同一个 2MB 大页里**：
+
+```
+image PA span     [0x41EA7A000, 0x41EAE1000)
+2MB page base     0x41EA00000        2MB page end  0x41EC00000
+同一 2MB 页内:    True
+```
+
+而 `npt-view` 对这五个查询页**全部**返回 `large=1`（未拆）。于是：
+
+1. **隐藏 `.data` 的任何一页，都必须先拆这张 2MB 页**（`npt_split_2mb_to_4kb`）；
+2. 拆页会把 **`.text`（代码）和 `.rdata`（含 IAT）一起降成 4K 条目** —— 两者都必须保持
+   `present=1`，否则我们自己的取指和 `call [IAT]` 立刻断；
+3. 也就是说：**`.data` 隐藏不是一个独立动作，它和一次 2MB 页拆分绑在一起，
+   而那次拆分本身就是一个需要单独验证的结构改动。**
+
+**这是本轮最重要的产出：把一个「最后一项」量成了「两个必须同时成立的步骤」。**
+9.497 那次 `.data`（54 页 · 按段跨度算）的说法需要补一句：它不是 54 个独立实验，
+而是**一次拆页 + 54 次页级排除**，且第一步就会碰到代码页。
+
+##### 本轮边界（没有越过）
+
+- **没有做拆分实验**：`npt-remap` 能拆，但拆页改的是 NPT 结构，属于改变机器状态的实验，
+  按铁律需要确认。**本轮只建观测，不执行**。
+- 驱动卸载干净：`invmrun at unload = 0x0`，`sc stop` 4.12 秒，`WIN32_EXIT_CODE=0`。
+
+##### 产物与检查
+
+```
+构建   ALL SOURCE CHECKS PASS / ALL MAP CHECKS PASS / Build SUCCESS
+产物   29CD0F67E28D66BA  18:26:18
+命令面 C=50 PowerShell=50 Java=50（ioctl_parity 四边一致）
+客户端 73 条命令（command_parity PASS）
+```

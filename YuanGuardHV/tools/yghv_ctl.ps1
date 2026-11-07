@@ -22,6 +22,7 @@ Commands:
   harden-service
   unharden-service
   service-name                      (read-only: which name, exists?, start type, SDDL)
+  pa-section <hex_pa>               (read-only: which of our sections holds this PA)
   byovd-scan                        (local only: blocklist + KDU provider names, no driver needed)
   selftest
   selftest-abort
@@ -4061,6 +4062,84 @@ try {
                     default { ("code 0x{0:X}" -f $rc) }
                 }
                 Write-Host ("section-hide: index={0} REFUSED {1}" -f $e, $why)
+            }
+        }
+        'pa-section' {
+            # 9.508 (Tier 7.1): which of OUR OWN sections holds this physical page.
+            #
+            # usage: pa-section <hex_pa>
+            #
+            # WHY IT EXISTS: the .data hide needs to know what a page IS before
+            # touching it. `sections` answers in RVAs; the NPT works in PAs; only
+            # the kernel can join them, because only it knows where the image was
+            # loaded. Guessing which page is data is exactly how 9.458 crashed
+            # (hid its own IAT, then `call [IAT slot]` read 0 and jumped to 0).
+            #
+            # The answer is a CANDIDATE range, not a verdict - see the header note.
+            # Confirm with npt-view before hiding anything.
+            if ($null -eq $Arg1) { throw 'pa-section: usage: pa-section <hex_pa>' }
+            $pa = [Convert]::ToUInt64(("$Arg1" -replace '^0[xX]',''), 16)
+            $pa = $pa -band (-bnot 0xFFF)
+
+            $req = New-Object byte[] 8
+            [BitConverter]::GetBytes([uint64]$pa).CopyTo($req, 0)
+            # 6 header + 32 sections * 5 = 166 qwords, rounded up generously.
+            $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x831)) `
+                                    -InBytes $req -OutputLength 1408
+
+            $parsed = [BitConverter]::ToUInt64($out, 0)
+            $pflag  = [BitConverter]::ToUInt64($out, 8)
+            $nsec   = [BitConverter]::ToUInt64($out, 16)
+            $basepa = [BitConverter]::ToUInt64($out, 24)
+            $endpa  = [BitConverter]::ToUInt64($out, 32)
+            $found  = [BitConverter]::ToUInt64($out, 40)
+
+            Write-Host ("pa-section: pa=0x{0:X}  parsed={1}  sections={2}" -f $pa, $parsed, $nsec)
+            if ($parsed -eq 0) {
+                Write-Host '  PARSE FAILED - no image span, so this page cannot be attributed.'
+                return
+            }
+            if ($basepa -ne 0) {
+                Write-Host ("  image PA span = [0x{0:X}, 0x{1:X})" -f $basepa, $endpa)
+            }
+
+            # 9.508c: NOT `-eq 0xFFFFFFFF`. PowerShell parses that literal as
+            # Int32 -1, so an Int64 4294967295 never matches it and this branch
+            # silently did not run - the script then used 4294967295 as a section
+            # index and died on the cast. Compare against [uint64] 4294967295.
+            $NONE = [uint64]4294967295
+            if ($found -eq $NONE) {
+                if ($pa -ge $basepa -and $pa -lt $endpa) {
+                    Write-Host '  VERDICT: inside the image span but in NO parsed section'
+                    Write-Host '           (a gap between sections, or the section table does not cover it)'
+                } else {
+                    Write-Host '  VERDICT: OUTSIDE the image - not ours'
+                }
+                return
+            }
+
+            $b = 48 + [int]$found * 40
+            $lo   = [BitConverter]::ToUInt64($out, $b)
+            $hi   = [BitConverter]::ToUInt64($out, $b + 8)
+            $rva  = [BitConverter]::ToUInt64($out, $b + 16)
+            $sz   = [BitConverter]::ToUInt64($out, $b + 24)
+            $fl   = [BitConverter]::ToUInt64($out, $b + 32)
+
+            $ex = ($fl -band 1) -ne 0
+            $wr = ($fl -band 2) -ne 0
+            $ia = ($fl -band 4) -ne 0
+
+            # names are not in this reply; the index is, and `sections` prints names
+            Write-Host ("  section [{0}]  rva=0x{1:X}  size=0x{2:X}  PA=[0x{3:X}, 0x{4:X})" -f
+                $found, $rva, $sz, $lo, $hi)
+            Write-Host ("  flags: executable={0}  writable={1}  has_iat={2}" -f $ex, $wr, $ia)
+
+            if ($ex) {
+                Write-Host '  VERDICT: CODE - must NOT be hidden (present=0 stops our own fetch)'
+            } elseif ($ia) {
+                Write-Host '  VERDICT: HOLDS THE IAT - must NOT be hidden (we call through it)'
+            } else {
+                Write-Host '  VERDICT: data candidate - hideable IN PRINCIPLE; confirm with npt-view first'
             }
         }
         'npt-view' {

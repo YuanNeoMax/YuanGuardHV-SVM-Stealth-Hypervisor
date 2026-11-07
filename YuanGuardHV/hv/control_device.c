@@ -2811,6 +2811,107 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
         }
         break;
     }
+    case IOCTL_YGHV_PA_TO_SECTION: {
+        /*
+         * 9.508 (Tier 7.1): the join between "which section" and "which page".
+         *
+         * WHY THIS EXISTS AT ALL: 9.455 built the section report so the .data hide
+         * could tell data from code. That report speaks RVA. The NPT speaks PA. The
+         * translation needs the image's load address, which only the kernel has - so
+         * the hide would have been guessing, and guessing which page is data is the
+         * exact way 9.458 crashed (hid its own IAT, rip=0 from `call [IAT slot]`).
+         *
+         * READ ONLY. No NPT write, no allocation, no lock - so it may be called on a
+         * page that is mid-hide without changing the answer it is asked for.
+         */
+        extern PVOID yghv_pa_driver_start(void);
+        extern uint32_t yghv_pa_driver_size(void);
+        extern PHYSICAL_ADDRESS MmGetPhysicalAddress(void *BaseAddress);
+
+        uint8_t *base = (uint8_t *)yghv_pa_driver_start();
+        uint32_t size = yghv_pa_driver_size();
+        yghv_section_info_t si[YGHV_SECTIONS_MAX];
+        uint32_t nsec = 0, pflags = 0, iat_unplaced = 0, i;
+        int parsed = 0;
+        uint64_t base_pa = 0, want_pa = 0;
+        uint32_t found = (uint32_t)YGHV_PA2SEC_NONE;
+
+        if (out_len < YGHV_PA2SEC_HDR_QWORDS * sizeof(UINT64)) {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        if (in_len < sizeof(ULONG_PTR)) {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+
+        want_pa = (uint64_t)(*(ULONG_PTR *)buf) & ~(uint64_t)0xFFFULL;
+
+        if (base && size) {
+            parsed = yghv_sections_report(base, size, si, YGHV_SECTIONS_MAX,
+                                          &nsec, &pflags, &iat_unplaced);
+            if (parsed) {
+                base_pa = (uint64_t)MmGetPhysicalAddress((void *)base).QuadPart;
+                /*
+                 * The match is done on the arithmetic span, and the FIRST matching
+                 * section wins. Sections do not overlap in RVA space, so "first" is
+                 * "the only" for a well-formed image; a corrupt one gets an answer
+                 * rather than a walk past the table.
+                 */
+                for (i = 0; i < nsec; i++) {
+                    uint64_t lo = base_pa + (uint64_t)si[i].va;
+                    uint64_t hi = lo + (uint64_t)si[i].size;
+                    if (si[i].size && want_pa >= lo && want_pa < hi) {
+                        found = i;
+                        break;
+                    }
+                }
+            }
+        }
+
+        {
+            UINT64 *out = (UINT64 *)buf;
+            out[0] = (UINT64)(parsed ? 1 : 0);
+            out[1] = (UINT64)pflags;
+            out[2] = (UINT64)nsec;
+            out[3] = (UINT64)base_pa;
+            out[4] = (UINT64)(parsed ? (base_pa + (uint64_t)size) : 0);
+            out[5] = (UINT64)found;
+
+            if (parsed) {
+                for (i = 0; i < nsec; i++) {
+                    UINT64 *e = &out[YGHV_PA2SEC_HDR_QWORDS +
+                                     i * YGHV_PA2SEC_PER_ENTRY];
+                    uint64_t lo;
+                    uint64_t flags;
+
+                    if (YGHV_PA2SEC_HDR_QWORDS + (i + 1) * YGHV_PA2SEC_PER_ENTRY >
+                        out_len / sizeof(UINT64)) {
+                        break;
+                    }
+
+                    lo = base_pa + (uint64_t)si[i].va;
+                    flags = ((uint64_t)si[i].executable << 0) |
+                            ((uint64_t)si[i].writable   << 1) |
+                            ((uint64_t)si[i].has_iat    << 2);
+
+                    e[0] = (UINT64)lo;
+                    e[1] = (UINT64)(lo + (uint64_t)si[i].size);
+                    e[2] = (UINT64)si[i].va;
+                    e[3] = (UINT64)si[i].size;
+                    e[4] = flags;
+                }
+            }
+
+            info = (ULONG)(YGHV_PA2SEC_HDR_QWORDS * sizeof(UINT64) +
+                           (SIZE_T)nsec * YGHV_PA2SEC_PER_ENTRY * sizeof(UINT64));
+            if (info > out_len) {
+                info = out_len;
+            }
+            status = STATUS_SUCCESS;
+        }
+        break;
+    }
     case IOCTL_YGHV_NPT_VIEW: {
         /*
          * 9.450 (Tier 7.1): what would a GUEST see at this physical page.

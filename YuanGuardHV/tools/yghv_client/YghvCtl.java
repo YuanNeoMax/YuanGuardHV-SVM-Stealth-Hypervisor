@@ -100,6 +100,10 @@ public class YghvCtl {
     private static final int FN_SECTIONS = 0x82F;
     /* 9.456 (Tier 7.1): hide ONE data section, by index from FN_SECTIONS. */
     private static final int FN_SECTION_HIDE = 0x830;
+  /* 9.508 (Tier 7.1): which of the driver's own sections holds this PA.
+     Declared so the four-way parity check stays a real check; this client does
+     not issue it (the PowerShell client does). */
+  private static final int FN_PA_TO_SECTION = 0x831;
 
     private static native long openHandle();
     private static native void closeHandle(long handle);

@@ -404,6 +404,41 @@ typedef struct {
 #define YGHV_SECTIONS_MAX        32
 
 /*
+ * 9.508 (Tier 7.1): which of OUR OWN sections holds this physical page.
+ *
+ * The .data hide needs this before it may try anything. `sections` reports
+ * RVAs; the NPT works in PAs; only the kernel knows where the image was loaded,
+ * so only the kernel can join the two. This joins them and nothing else.
+ *
+ * Input:  one ULONG_PTR - the physical page to ask about. The low 12 bits are
+ *         ignored (asked per PAGE, like npt-view).
+ * Output: 6 header qwords, then 5 qwords per section the image parsed:
+ *   [0] parsed (1)         [1] PE flag (1=PE32, 2=PE32+)
+ *   [2] section count      [3] image base PA
+ *   [4] image PA span end  [5] index of the section containing the queried
+ *         page, or 0xFFFFFFFF when the page is outside the image (or nothing
+ *         parsed)
+ *   per section: [0] pa_lo  [1] pa_hi  [2] rva  [3] size  [4] flags
+ *                flags bit0 = executable (must NOT be hidden)
+ *                      bit1 = writable
+ *                      bit2 = contains the IAT (must NOT be hidden either)
+ *
+ * Read only: no NPT writes, no allocation, no locks. Safe at PASSIVE, and safe
+ * to call on a page that is mid-hide.
+ *
+ * THE SPAN IS ARITHMETIC. pa_lo = MmGetPhysicalAddress(base_va) + RVA, and
+ * pa_hi = pa_lo + size. A page inside that range is a CANDIDATE, not a verdict:
+ * confirm with npt-view before hiding anything. Saying so here rather than
+ * letting the caller assume the range is exact is the whole point of building
+ * an observation before an action.
+ */
+#define IOCTL_YGHV_PA_TO_SECTION \
+    YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x831, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
+#define YGHV_PA2SEC_HDR_QWORDS   6
+#define YGHV_PA2SEC_PER_ENTRY    5
+#define YGHV_PA2SEC_NONE         0xFFFFFFFFULL
+
+/*
  * 9.456 (Tier 7.1): hide ONE named data section, by walking the PE report.
  *
  * WHY NAMED, AND WHY ONE AT A TIME
