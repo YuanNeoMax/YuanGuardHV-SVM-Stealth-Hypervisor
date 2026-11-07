@@ -1393,6 +1393,78 @@ extern "C" LONG yghv_s206_exit_codes_observed(VOID)
 extern "C" { volatile LONG64 g_S206Exits = 0; }
 
 /*
+ * 9.525: HOW MANY CORES TO VIRTUALISE, read from the registry at prepare.
+ *
+ * This exists because the cost curve is superlinear (44.3x for 12 cores, not
+ * 11x - 9.524) and a two-point measurement cannot say where the knee is. This
+ * machine has 6 physical and 12 logical cores, so the question "what happens
+ * at 6" is the one that decides whether the fix is core pairing or contention,
+ * and changing a compile-time constant per sample would mean one rebuild per
+ * point.
+ *
+ * Absent, zero, or unreadable -> all cores: the default behaviour is
+ * UNCHANGED, which is the only acceptable default for a parameter a boot
+ * depends on.
+ */
+extern "C" ULONG yghv_s206_core_limit(ULONG available)
+{
+    UNICODE_STRING  path;
+    OBJECT_ATTRIBUTES attrs;
+    HANDLE          key = nullptr;
+    ULONG           value = 0;
+    ULONG           size  = sizeof(value);
+    NTSTATUS        st;
+
+    RtlInitUnicodeString(&path, L"\\Registry\\Machine\\System\\CurrentControlSet"
+                                L"\\Services\\yghvpa\\Parameters");
+    InitializeObjectAttributes(&attrs, &path,
+                               OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, nullptr, nullptr);
+
+    st = ZwOpenKey(&key, KEY_QUERY_VALUE, &attrs);
+    if (!NT_SUCCESS(st))
+    {
+        return available;   /* no Parameters key -> all cores */
+    }
+
+    {
+        UNICODE_STRING name;
+        RtlInitUnicodeString(&name, L"CoreCount");
+        st = ZwQueryValueKey(key, &name, KeyValuePartialInformation,
+                             nullptr, 0, &size);
+        /* The first call is expected to fail: it is how the size is learned. */
+        if (st == STATUS_BUFFER_OVERFLOW || st == STATUS_BUFFER_TOO_SMALL)
+        {
+            void *buf = ExAllocatePoolWithTag(NonPagedPool, size, 'mCvS');
+            if (buf != nullptr)
+            {
+                st = ZwQueryValueKey(key, &name, KeyValuePartialInformation,
+                                     buf, size, &size);
+                if (NT_SUCCESS(st))
+                {
+                    KEY_VALUE_PARTIAL_INFORMATION *kv =
+                        static_cast<KEY_VALUE_PARTIAL_INFORMATION *>(buf);
+                    if (kv->Type == REG_DWORD && kv->DataLength >= sizeof(ULONG))
+                    {
+                        value = *reinterpret_cast<ULONG *>(kv->Data);
+                    }
+                }
+                ExFreePoolWithTag(buf, 'mCvS');
+            }
+        }
+    }
+
+    ZwClose(key);
+
+    if (value == 0)
+    {
+        return available;   /* explicit 0 means "no limit" */
+    }
+    if (value > available) value = available;
+    return value;
+}
+
+
+/*
  * 9.521: HANDLER-COST INSTRUMENTATION.
  *
  * Two shared accumulators updated once per exit. The contention is real (~22,700
@@ -5416,7 +5488,8 @@ SvExecuteOnEachProcessor (
     //
     // Get a number of processors on this system.
     //
-    numOfProcessors = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
+    numOfProcessors = yghv_s206_core_limit(
+        KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS));   /* 9.525 */
 
     for (i = 0; i < numOfProcessors; i++)
     {
@@ -6238,7 +6311,8 @@ SvVirtualizeAllProcessors (
     // g_VmrunStopRequested and waiting on g_VmrunStopped.
     //
     {
-        ULONG numOfProcessors = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
+        ULONG numOfProcessors = yghv_s206_core_limit(
+            KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS));   /* 9.525 */
         ULONG created = 0;
 
         if (numOfProcessors > SVM206_MAX_THREADS)
