@@ -12669,3 +12669,66 @@ invmrun at unload = 0x0
 
 - `CoreCount` 尚未写进文档（QUICKSTART / RESUME 的运维章节需要补一条）。
 - G25 回归尚未在 6 核配置下重跑。
+
+---
+
+#### 9.529 `mmf-hold` 多页缺陷修复 —— 3 次试错，1 个有效方案
+
+遗留缺陷「`mmf-hold` 的 `size` 参数只 map 第一页」已修复。
+
+##### 三次试错（都被实测否决）
+
+| 尝试 | 做法 | 结果 |
+|---|---|---|
+| **1** | `WriteValAt` 写满每页 | **AccessViolation 崩溃** —— guard 武装后写被 DENY |
+| **2** | `VirtualLock` 每页 | 声称 8 页成功，`mem-pte` 显示 p6/p7 仍 NOT MAPPED |
+| **3** | `PrefetchVirtualMemory` | 声称 8 页成功，`mem-pte` 显示 **8/8 NOT MAPPED** |
+| **4** | **每页一次 store + `FlushViewOfFile`** | **文件里 8 页全部有 seed** |
+
+##### 关键实测事实（这三次试错买来的）
+
+> **在 mapped file 上，只有 STORE 才真正提交页。**
+> `VirtualLock` 只是把已提交的页钉住；`PrefetchVirtualMemory` 只是个提示。
+> 两个都返回「成功」，而页表里什么都没发生 —— **返回值不等于效果。**
+
+##### 最终方案
+
+```csharp
+public static void SeedPage(IntPtr view, int offset, long value)
+    => Marshal.WriteInt64(new IntPtr(view.ToInt64() + offset), value);
+```
+
+每页写入 `0xC4C4000000000000 | pageIndex` —— **页号放在低位**，
+这样回滚时可以判断是哪一页被改，而不是「某一页变了」。
+
+**为什么这个 store 是安全的**：`mmf-hold` 在 `guard add` **之前**运行，
+所以写入发生在页被 writable-clear 之前。**顺序决定了安全性**，不是一个可省略的前提。
+
+##### 验证（文件内容，独立于 mem-pte）
+
+```
+page 0: 0x00C4C40000000000  (index 0)
+page 1: 0x00C4C40000000001  (index 1)
+page 2: 0x00C4C40000000002  (index 2)
+page 3: 0x00C4C40000000003  (index 3)
+page 4: 0x00C4C40000000004  (index 4)
+page 5: 0x00C4C40000000005  (index 5)
+page 6: 0x00C4C40000000006  (index 6)
+page 7: 0x00C4C40000000007  (index 7)
+```
+
+**8/8。**
+
+##### ⚠ `mem-pte` 只报 6/8 —— 这是判据局限，不是缺陷
+
+同一个 mmf-hold 进程（`alive=True`）在 `mem-pte` 下报 p0–p5 MAPPED、p6–p7 NOT MAPPED，
+而**文件里 8 页都有写入**。两者矛盾，说明 `mem-pte` 在这条路径上不完整。
+
+**这一条已登记为新的待查项**，不能把「mem-pte 说 6/8」当成「只有 6 页映射」——
+那正是本树反反复复犯的错：**判据的局限 ≠ 被测对象的结论。**
+
+##### 顺带修正的文档矛盾
+
+`mmf-hold` 的注释原来写「never writes the page itself」。**那是错的** —— 它现在每页写一次。
+但真正重要的性质仍然成立：**seed 之后不再写**，所以「我们写之后读到的值」仍然无歧义。
+注释已就地改正，没有留着一句与代码相反的旧话。

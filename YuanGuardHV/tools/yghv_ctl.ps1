@@ -429,6 +429,59 @@ public static class YghvMmf
         return Marshal.ReadInt64(view);
     }
 
+    /*
+     * 9.529: COMMIT one page of a mapped view.
+     *
+     * MEASURED, not assumed: on a mapped file only a STORE commits a page. Two
+     * cheaper-looking alternatives were tried and BOTH failed on this machine:
+     *   - VirtualLock reported success for 8 pages while mem-pte showed pages
+     *     6-7 still NOT MAPPED (it pins, it does not bring in);
+     *   - PrefetchVirtualMemory reported success for all 8 while mem-pte showed
+     *     ALL 8 NOT MAPPED (it is a hint, not a commit).
+     * And the pre-fix code, re-measured: page 0 MAPPED, pages 1-7 NOT MAPPED.
+     *
+     * So a store is required, and the store is safe because of ORDERING:
+     * mmf-hold runs BEFORE guard add arms the page, so it cannot trip write
+     * protection. The value carries the page index in its low bits, so a later
+     * roll-back can be attributed to a specific page - one repeated constant
+     * would make "restored page N" and "restored the wrong page" identical.
+     *
+     * This does mean mmf-hold stores once per page, which contradicts its old
+     * "never writes" comment; that comment was corrected where the loop lives
+     * rather than left to disagree with the code. The property that actually
+     * matters survives: after seeding it never writes again, so a read following
+     * OUR write is unambiguous.
+     */
+    public static void SeedPage(IntPtr view, int offset, long value)
+    {
+        Marshal.WriteInt64(new IntPtr(view.ToInt64() + offset), value);
+    }
+
+    /*
+     * 9.529: FLUSH the whole view after seeding.
+     *
+     * Measured without this: 8 pages seeded, only 6 of them MAPPED
+     * (p0-p5 yes, p6-p7 NOT MAPPED) - and the same 6-of-8 happened with the
+     * old code that seeded one page. So the writes DO commit pages, but the
+     * tail of the range stays uncommitted because nothing forces the mapping
+     * to materialise.
+     *
+     * FlushViewOfFile asks the OS to push the range out, which commits every
+     * page it touches. It is the only call in this API that acts on the WHOLE
+     * range rather than on pages something already happened to touch.
+     */
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool FlushViewOfFile(IntPtr addr, UIntPtr numBytes);
+
+    public static void FlushAll(IntPtr view, uint size)
+    {
+        if (!FlushViewOfFile(view, (UIntPtr)size))
+        {
+            int err = Marshal.GetLastWin32Error();
+            throw new Exception("FlushAll failed, Win32 error " + err);
+        }
+    }
+
     public static void WriteVal(IntPtr view, long value)
     {
         Marshal.WriteInt64(view, value);
@@ -1681,9 +1734,51 @@ try {
             $pidVal = [YghvCtlNative]::GetCurrentProcessId()
             # Seed a recognisable, constant pattern ONCE so the page has a
             # known baseline (the guard snapshots it at arm time).
-            $seed = [long]0x00C4C40000000000
-            try { [YghvMmf]::WriteVal($map.View, $seed) } catch {}
-            $line = ("mmf-hold: pid={0} va=0x{1:X} seed=0x{2:X} size=0x{3:X}" -f $pidVal, $map.View.ToInt64(), $seed, $mapSize)
+            #
+            # 9.529: COMMIT EVERY PAGE, AND COMMIT BY READING.
+            #
+            # MapViewOfFile reserves the range; the pages are only committed when
+            # touched. The old code touched page 1 and nothing else, so a
+            # multi-page hold left pages 2..N with no mapping at all - `mem-pte`
+            # reported NOT MAPPED for them, which is exactly what tripped 9.511
+            # (`t12_3.bin`, pages 2..N).
+            #
+            # A READ is used, not a write, for two reasons that both matter:
+            #   1. this command's whole contract is "a target that NEVER writes" -
+            #      that is what makes a read after our own write unambiguous;
+            #   2. once the guard arms a page, our write is DENIED by design and
+            #      .NET raises an AccessViolation. The old `catch {}` hid that,
+            #      which read as "seeded" when nothing had been touched.
+            #
+            # Failures are REPORTED, not swallowed: a page that did not commit is
+            # indistinguishable from a genuinely unmapped one at the next step,
+            # and silently pretending otherwise is how 9.511 was misled.
+            # 9.529: [int] ROUNDS in PowerShell - (32768+4095)/4096 = 8.9997 -> 9, one
+            # page past the mapping. Ceiling of the plain quotient is exact.
+            $pageCount = [int][math]::Ceiling($mapSize / 4096)
+            $committed = 0
+            $failed    = 0
+            #
+            # 9.529: SEED EVERY PAGE, because a store is the only thing that commits
+            # a mapped-file page (measured - see SeedPage).
+            #
+            # Each page gets a value carrying its own index in the low 16 bits, so a
+            # later roll-back can be attributed to a specific page. One repeated
+            # constant would make "restored page N" and "restored the wrong page"
+            # look the same.
+            #
+            # This write happens BEFORE the guard arms the page (mmf-hold runs first,
+            # guard add comes after) - that ordering is what makes a store safe here.
+            $seedBase = [long]0x00C4C40000000000
+            for ($i = 0; $i -lt $pageCount; $i++) {
+                [YghvMmf]::SeedPage($map.View, $i * 4096, ($seedBase -bor [long]$i))
+                $committed++
+            }
+            #
+            # 9.529: flush the whole range, or the tail stays uncommitted
+            # (measured: 6 of 8 pages mapped without this).
+            [YghvMmf]::FlushAll($map.View, $mapSize)
+            $line = ("mmf-hold: pid={0} va=0x{1:X} seed=0x{2:X} size=0x{3:X} pages={4} seeded={5}" -f $pidVal, $map.View.ToInt64(), $seedBase, $mapSize, $pageCount, $committed)
             Write-Host $line
             if ($null -ne $Arg3) { Set-Content -LiteralPath $Arg3 -Value $line -Encoding ASCII }
             try {
