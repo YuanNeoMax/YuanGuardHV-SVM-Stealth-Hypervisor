@@ -753,8 +753,45 @@ int yghv_bp_add_ex(uint64_t gpa, uint64_t va, uint64_t rip,
         return -5;
     }
 
-    /* ---- DR mode: claim one of the four hardware slots ---- */
+    /* ---- DR mode: REFUSED (9.507) ------------------------------------------
+     *
+     * 9.506 measured that this mode cannot work, from three independent
+     * readings:
+     *
+     *   1. Arming only filled g_dr_shadow below - a kernel array. The VMCB
+     *      field StateSaveArea.Dr7 has NO WRITER anywhere in this tree, so the
+     *      L0-L3 enable bits are never set and the hardware never raises a
+     *      B0-B3 #DB for the armed address.
+     *   2. Even if it did, case VMEXIT_EXCEPTION_DB never calls
+     *      yghv_bp_on_dr (0 references in that case body; dumpbin counts 0
+     *      calls to its address in the built image). The guest DR6 is read
+     *      there only for telemetry, into g_S206DbgLog.
+     *   3. Consequently a DR entry could never record a hit.
+     *
+     * MEASURED CONSEQUENCE of leaving it as it was: `mem-bp dr <va> w` printed
+     * `dr OK`, the diagnostics printed `dr=3`, the target really wrote that
+     * page every 400 ms, and hits never moved. The natural reading of that is
+     * "the target did not touch the page" - which sends you looking for the
+     * wrong cause. A mechanism that cannot work must say so.
+     *
+     * What would make it real: (a) a writer for VMCB Dr7's L0-L3 bits, (b) a
+     * call to yghv_bp_on_dr from the #DB case - and 9.413/9.414/9.416 each
+     * proved that adding a call inside a VM-exit frame faults (0x139 / 0x7F) -
+     * and (c) shadow-versus-real DR consistency across 12 cores. That is a
+     * round of work, not a patch. Until then, refusing is the honest answer.
+     */
     if (mode == YGHV_BP_MODE_DR) {
+        InterlockedIncrement64(&g_bp_fail_drslot);
+        InterlockedIncrement64(&g_bp_refusals);
+        return -12;                     /* refused: mechanism not functional */
+    }
+
+    /* ---- DR mode body, deliberately UNREACHABLE (refused above).
+     * Kept so the design intent - four hardware slots, a shadow bank - stays
+     * readable, and so a future re-implementation starts from what was built
+     * rather than from nothing.
+     */
+    if (0 && mode == YGHV_BP_MODE_DR) {
         uint32_t s;
         uint32_t used = (uint32_t)InterlockedCompareExchange(&g_dr_used, 0, 0);
 

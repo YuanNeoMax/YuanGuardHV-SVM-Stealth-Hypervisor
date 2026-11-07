@@ -3565,6 +3565,7 @@ try {
                 -7 { 'FAILED (stage -7: INT3 needs a VA)' }
             -11 { 'REFUSED (stage -11: the breakpoint registry page is hidden, so registration cannot complete; arming is refused rather than leaving an armed page with no handler)' }
                 -8 { 'FAILED (stage -8: no DR slot free)' }
+                -12 { 'REFUSED (stage -12: DR mode is not functional - arming writes no VMCB Dr7, and no #DB path calls on_dr; see 9.506/9.507)' }
                 -9 { 'FAILED (stage -9: could not patch the instruction byte)' }
                 -10 { 'FAILED (stage -10: kinds is 0)' }
                 0  { 'FAILED (stage 0: bad arguments)' }

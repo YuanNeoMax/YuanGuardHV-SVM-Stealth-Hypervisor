@@ -11310,3 +11310,91 @@ last add raw: gpa=0x0 va=0xA541018000 ... mode=4
 | 1 | `mmf-hold` 的 `size` 参数只 map 第 1 页 | 传 `8192`/`12288` 时后几页是 NOT MAPPED（`WriteVal` 只写 base）。多页测试实际只有 1 页可用 |
 | 2 | `mem-bp add/del` 的 GPA vs VA | 传 VA 会 `stage -3: could not split 2MB page`；G25 脚本用的是 `mem-pte` 报的 PA。**参数名与语义不一致，没有任何提示** |
 | 3 | `mem-pte` 后几页 NOT MAPPED 时 `kind=` 为空 | 输出格式在失败路径上不完整 |
+
+---
+
+#### 9.507 `mem-bp dr` 改成拒绝 —— 并验证「拒绝」本身是干净的
+
+9.506 用三条独立读数证明 DR 模式不可能工作（武装不写 VMCB `Dr7`、`#DB` 分支不调
+`on_dr`、产物里对 `on_dr` 的 `call` 计 0）。它的对外表现是 `dr OK` + `dr=3`，
+而 `hits` 永远不动 —— **读起来像「目标没访问那页」，会把人送去查另一个原因。**
+本轮把它改成拒绝。
+
+##### 改法（两处，都不改行为：这条路径从未生效过）
+
+| 位置 | 改动 |
+|---|---|
+| `mem_bp.c` `yghv_bp_add_ex` | DR 分支在进循环之前 `return -12`，并 `g_bp_fail_drslot` / `g_bp_refusals` 各 +1。原实现保留在 `if (0 && ...)` 之下，注释写明「deliberately UNREACHABLE」，让设计意图（四个硬件槽 + 影子银行）仍可读 |
+| `yghv_ctl.ps1` | 加一行 `-12 { 'REFUSED (stage -12: DR mode is not functional ...)' }` |
+
+**`-12` 是新的返回码**，已与既有 `-1..-11` 逐一核对不冲突（`mem_bp.c` 现有负码：
+1,2,3,4,5,6,7,8,9,10,11）。选新码而不是复用 `-6`(bad mode) 的理由：`-6` 会被读成
+「参数写错了」，而这里是「参数对、机制不存在」。
+
+##### 产物核对（不信源码就信产物）
+
+`.map`：`yghv_bp_add_ex 000000014001a7e0`。反汇编的 mode 分派：
+
+```
+14001A876  cmp         esi,4                      ; esi = mode
+14001A879  je          14001A9AE                  ; mode==4 -> DR 分支
+...
+14001A9AE  lock inc    qword ptr [14004F000h]     ; g_bp_fail_drslot
+14001A9B6  lock inc    qword ptr [14004B018h]     ; g_bp_refusals
+14001A9BE  mov         eax,0FFFFFFF4h             ; = -12
+14001A9C3  jmp         14001AE4D                  ; 函数返回
+```
+
+`0FFFFFFF4h` 就是 -12。**DR 分支现在不做任何槽分配就返回。**
+
+##### 实机验收（两半都要）
+
+**该拒绝的拒绝了**：
+
+```
+mem-bp dr 0x7FF000000000 w
+  -> mem-bp: dr REFUSED (stage -12: DR mode is not functional - arming writes
+     no VMCB Dr7, and no #DB path calls on_dr; see 9.506/9.507)      25.5 s
+mem-bp
+  -> count=0  refusals=1  by mode: npf=0 int3=0 dr=0
+```
+
+**判据的另一半：拒绝必须不留痕。** `count=0`、`dr=0`，说明它没有先占一个槽再报错。
+
+**没坏的没坏**：
+
+```
+mem-engine pte   -> set to pte
+mem-bp add 0x15E04C000 0 w -> add OK
+mem-bp           -> count=1  by mode: npf=1 int3=0 dr=0
+```
+
+**加载/卸载**：
+
+```
+构建     ALL SOURCE CHECKS PASS / ALL MAP CHECKS PASS / Build SUCCESS
+产物     43A88E4471C245D7  18:02:03   部署 hash 一致
+sc start RUNNING 6.54 s -> sys-health degraded=0 total=0 fatal=0
+sc stop  STOPPED 6.41 s，WIN32_EXIT_CODE=0
+invmrun at unload = 0x0
+```
+
+##### 顺手修掉一个检查器的语义漂移
+
+`count_as_extent.ps1` 的自检把缺陷种在 `yghv_bp_on_dr` 里。现在那个函数**不可达**
+（被 9.507 弃用），但检查器仍然有意义 —— 它判的是**代码**，不是**可达性**。
+已在它的允许清单旁加一条 9.507 注释写清这一点，避免下一个人误读成
+「这个自检在测一个死函数，所以它也是死的」。
+
+> **两条判据的边界必须分开写：**
+> 「on_dr 的扫描写对了吗」→ 仍然由 `count_as_extent` 判（源码级）。
+> 「on_dr 会被执行到吗」→ 已由 9.506 判为**不会**，并由 9.507 让它不再被伪装成能。
+
+##### 这一条的方法学
+
+9.506 的错是「报成功」；9.507 的处置是「报拒绝」。
+**中间那一步很容易走错**：把 DR 分支整个删掉。没删，是因为
+`yghv_bp_dr_get` / `yghv_bp_dr_set` 这对访问器还在（`mem_bp.c:445-456`，
+影子 DR 银行的读接口），未来若有真实实现，设计材料应当留在这儿而不是从零重写。
+
+**但「保留代码」和「保留能骗人的入口」是两件事。** 保留前者，封掉后者，就是这一轮做的事。

@@ -171,7 +171,7 @@ DR7 没使能 -> 硬件不产生 B0-B3 的 #DB；即使产生，`case VMEXIT_EXC
 `yghv_bp_on_dr`（该 case 体内 0 次引用，产物里 `call 0x14001D230` 计 0）。
 
 **它对外报 `dr OK` 与 `dr=3`** —— 比死代码更糟，因为读起来是「装上了」。
-最小处置（下一轮）：让 `mem-bp dr` 拒绝而不是成功。真修需要写 VMCB Dr7 的 L0-L3 +
+**9.507 已处置**：`mem-bp dr` 现在返回 **`-12 REFUSED`**（实机验证：`REFUSED (stage -12: DR mode is not functional ...)`，且 count 保持 0、不留槽；NPF/INT3 不受影响）。真修需要写 VMCB Dr7 的 L0-L3 +
 在 VM-exit 帧里调 on_dr（9.413/9.414/9.416 三次证明那里加 call 会 0x139/0x7F），是独立一轮工作。
 
 **2. `mmf-hold` 的 `size` 参数只 map 第一页**

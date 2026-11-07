@@ -54,6 +54,10 @@ $ErrorActionPreference = 'Stop'
 #
 # Explicitly allowed today, and why:
 #   hv/mem_bp.c      scans the whole array (9.485, plus 9.498 for on_dr)
+#                    9.507 note: on_dr itself is now UNREACHABLE - DR arming is
+#                    refused (-12) because the mechanism cannot work. The source
+#                    still carries the fixed scan, so this checker and its
+#                    self-test keep their meaning; they judge CODE, not reachability.
 #   hv/mem_cache.c   fixed in 9.486
 #   hv/mem_time.c    fixed in 9.486
 #   hv/mem_view.c    fixed in 9.486
