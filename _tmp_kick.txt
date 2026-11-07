@@ -1,0 +1,61 @@
+extern "C" LONG yghv_s206_kick_parked_cores(VOID)
+{
+    LONG kicked = 0;
+
+    for (UINT32 i = 0; i < SVM206_MAX_VPD; i++)
+    {
+        PVIRTUAL_PROCESSOR_DATA vp = g_S206LiveVpd[i];
+
+        if (vp == NULL)
+            continue;
+
+        /*
+         * 9.462: OVERWRITE, DO NOT ASK "IS THE SLOT FREE".
+         *
+         * The first version skipped a core whose EventInj was non-zero, reasoning
+         * that a pending event would be taken anyway. Measured on the unload path:
+         * invmrun stayed at 0xc - all twelve cores still parked - and the machine
+         * bugchecked 0xD1 with PAGED_IP once the image was unmapped. A slot holding
+         * a stale or already-consumed event is exactly the case where "something
+         * is pending" and "the core will wake" are NOT the same statement.
+         * Overwriting with our own NMI makes the wake deterministic.
+         */
+        vp->GuestVmcb.ControlArea.EventInj = 0x402ULL;   /* NMI, vector 2 */
+        vp->GuestVmcb.ControlArea.VmcbClean = 0;
+        kicked += 1;
+    }
+    return kicked;
+}
+
+extern "C" LONG yghv_s206_apply_extra_intercepts(VOID)
+{
+    LONG applied = 0;
+    UINT32 m1 = (UINT32)InterlockedCompareExchange(&g_S206ExtraMisc1, 0, 0);
+    UINT32 m2 = (UINT32)InterlockedCompareExchange(&g_S206ExtraMisc2, 0, 0);
+
+    for (UINT32 i = 0; i < SVM206_MAX_VPD; i++)
+    {
+        PVIRTUAL_PROCESSOR_DATA vp = g_S206LiveVpd[i];
+
+        if (vp == NULL)
+            continue;
+        /*
+         * SET, NOT OR. The caller's mask is the whole truth for the extra bits:
+         * clear must be able to take a bit back out, and OR-ing only ever adds.
+         * The default bits (CPUID, MSR_PROT, SHUTDOWN, VMRUN, VMMCALL) are
+         * separate and are not in these two words, so replacing them cannot
+         * disarm anything the build needs.
+         */
+        vp->GuestVmcb.ControlArea.InterceptMisc1 =
+            (UINT32)((vp->GuestVmcb.ControlArea.InterceptMisc1 & ~S206_MISC1_EXTRA_MASK) | m1);
+        vp->GuestVmcb.ControlArea.InterceptMisc2 =
+            (UINT32)((vp->GuestVmcb.ControlArea.InterceptMisc2 & ~S206_MISC2_EXTRA_MASK) | m2);
+
+        /*
+         * 9.448e: AND INVALIDATE THE CACHED VMCB - the step that explains TWO
+         * reboots.
+         *
+         * VmcbClean is how the processor knows whether the control area it holds
+         * internally is still valid. Write an intercept word without clearing it
+         * and the CPU keeps USING THE OLD MASK: the new bits never take effect
+         * until something else happens to di
