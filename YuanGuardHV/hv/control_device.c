@@ -1651,6 +1651,32 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
         status = STATUS_INVALID_PARAMETER;
         break;
     }
+    case IOCTL_YGHV_VIRT_COUNTS: {
+        /*
+         * 9.543: reachability of the early-return path.
+         *
+         * SvVirtualizeProcessor already contains the reference implementation's
+         * RtlCaptureContext + early-return shape. Whether it is REACHED is what
+         * decides if iretq can be safe here, so it is counted rather than assumed.
+         */
+        extern void yghv_s206_virtualize_counts(UINT64 *entries, UINT64 *early);
+
+        if (out_len < YGHV_VIRT_COUNTS_OUT_QWORDS * sizeof(UINT64)) {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+
+        {
+            UINT64 *out = (UINT64 *)buf;
+            UINT64 entries = 0, early = 0;
+            yghv_s206_virtualize_counts(&entries, &early);
+            out[0] = entries;
+            out[1] = early;
+            info = YGHV_VIRT_COUNTS_OUT_QWORDS * sizeof(UINT64);
+            status = STATUS_SUCCESS;
+        }
+        break;
+    }
     case IOCTL_YGHV_HANDLER_COST: {
         /*
          * 9.521: how many TSC ticks one #VMEXIT costs inside the handler.

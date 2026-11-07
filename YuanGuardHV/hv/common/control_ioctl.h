@@ -564,6 +564,30 @@ typedef struct {
 #define YGHV_HANDLER_COST_OUT_QWORDS 3
 
 /*
+ * 9.543 (refactor step 3 diagnostic): is the RtlCaptureContext early-return path
+ * REACHABLE in the mode under test?
+ *
+ * SvVirtualizeProcessor already has the reference implementation's shape -
+ * RtlCaptureContext, "if not installed then VMRUN", then return - so a second pass
+ * through the function exits immediately and the C frame is properly unwound. That
+ * second pass is what makes iretq safe there and unsafe in a mode where it never
+ * happens.
+ *
+ * Output (2 qwords):
+ *   [0] times SvVirtualizeProcessor was entered
+ *   [1] times it returned via the early-return tail
+ *
+ * Stub mode: both climb, with [1] close to [0] (every VMRUN resume re-enters).
+ * Real-guest mode: [1] stays flat, because a Windows thread never comes back
+ * through this function - which is the actual difference between the modes.
+ *
+ * Read-only. PASSIVE only.
+ */
+#define IOCTL_YGHV_VIRT_COUNTS \
+    YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x836, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
+#define YGHV_VIRT_COUNTS_OUT_QWORDS 2
+
+/*
  * 9.456 (Tier 7.1): hide ONE named data section, by walking the PE report.
  *
  * WHY NAMED, AND WHY ONE AT A TIME

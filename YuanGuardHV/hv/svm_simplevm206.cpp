@@ -1443,6 +1443,34 @@ extern "C" LONG yghv_s206_exit_codes_observed(VOID)
 extern "C" { volatile LONG64 g_S206Exits = 0; }
 
 /*
+ * 9.543: DOES ANYTHING REACH THE EARLY-RETURN PATH?
+ *
+ * SvVirtualizeProcessor already contains the reference implementation's pattern:
+ * RtlCaptureContext, then "if not installed do the VMRUN", then return - so the
+ * second pass through the function exits immediately. That second pass is what
+ * makes the C frame survive; without it, iretq jumps out of a frame nobody
+ * returns through, which is what 0x139 was.
+ *
+ * The question this counts answers is whether that path is REACHABLE in the mode
+ * under test. Stub guests resume into SvVirtualizeProcessor on every VMRUN resume,
+ * so g_S206EarlyReturns climbs. A real Windows guest never comes back through this
+ * function at all, so it will stay flat - and that difference is the actual
+ * difference between the two modes, not the iretq instruction.
+ *
+ * Read-only telemetry: two increments, no branch, no structure change.
+ */
+extern "C" { volatile LONG64 g_S206VirtualizeEntries = 0; }
+extern "C" { volatile LONG64 g_S206EarlyReturns = 0; }
+
+extern "C" void yghv_s206_virtualize_counts(UINT64 *entries, UINT64 *early)
+{
+    *entries = (UINT64)InterlockedCompareExchange64(&g_S206VirtualizeEntries, 0, 0);
+    *early   = (UINT64)InterlockedCompareExchange64(&g_S206EarlyReturns, 0, 0);
+}
+
+
+
+/*
  * 9.525: HOW MANY CORES TO VIRTUALISE, read from the registry at prepare.
  *
  * This exists because the cost curve is superlinear (44.3x for 12 cores, not
@@ -5559,6 +5587,9 @@ SvVirtualizeProcessor (
     NT_ASSERT(ARGUMENT_PRESENT(Context));
     _Analysis_assume_(ARGUMENT_PRESENT(Context));
 
+    /* 9.543: how many times this function is entered at all. */
+    InterlockedIncrement64(&g_S206VirtualizeEntries);
+
     // YGHV C0 local patch (2026-09-18): Win10 19045 has no ExAllocatePool2
     // (Win11+); zeroing reproduces Pool2's guaranteed-zero return.
     contextRecord = static_cast<PCONTEXT>(ExAllocatePoolWithTag(
@@ -5602,6 +5633,16 @@ SvVirtualizeProcessor (
     // processor, SvIsSimpleSvmHypervisorInstalled returns TRUE, and this
     // function exits with STATUS_SUCCESS.
     //
+    /*
+     * 9.543: THE EARLY RETURN IS ALREADY HERE - counting it, not adding it.
+     *
+     * This is the reference implementation's exact shape: SvIsSimpleSvmHypervisor
+     * Installed() reads CPUID 40000000h, which our handler answers with the
+     * "SimpleSvm   " vendor string, so the second pass falls straight through to
+     * `return STATUS_SUCCESS` at the bottom. When that happens the C frame is
+     * resumed INTO and unwound normally - which is why iretq does not fault there
+     * and does fault in a mode where this never fires.
+     */
     if (SvIsSimpleSvmHypervisorInstalled() == FALSE)
     {
         SvDebugPrint("Attempting to virtualize the processor.\n");
@@ -5648,6 +5689,8 @@ Exit:
         //
         SvFreePageAlingedPhysicalMemory(vpData);
     }
+    /* 9.543: this return is the SECOND pass - the one the C frame survives. */
+    if (status == STATUS_SUCCESS) InterlockedIncrement64(&g_S206EarlyReturns);
     return status;
 }
 

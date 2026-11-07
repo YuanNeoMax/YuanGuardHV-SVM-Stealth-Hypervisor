@@ -27,6 +27,7 @@ Commands:
   npt-scan <hex_start> <pages> [clear]  (A/D over a range - the one-command measurement)
   exit-codes                        (per-code exit counters: which codes actually fire)
   handler-cost [reset]              (TSC ticks per #VMEXIT inside the handler)
+  virt-counts                       (is the early-return path reached? step-3 diagnostic)
   byovd-scan                        (local only: blocklist + KDU provider names, no driver needed)
   selftest
   selftest-abort
@@ -2902,6 +2903,36 @@ try {
             $o2 = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x827)) -InBytes $req2 -OutputLength 8
             $ours = [BitConverter]::ToUInt64($o2, 0)
             Write-Host ("npt-range: 0x{0:X} -> {1}" -f $pa, $(if($ours){'IS one of our NPT pages'}else{'not an NPT page'}))
+        }
+        'virt-counts' {
+            # 9.543: is SvVirtualizeProcessor's early-return path REACHED?
+            #
+            # That function already has the reference implementation's shape:
+            # RtlCaptureContext, then 'if not installed -> VMRUN', then return. On the
+            # second pass it exits immediately, so the C frame is unwound normally -
+            # which is exactly what makes iretq safe there and unsafe when it never
+            # happens.
+            #
+            # Stub mode   : entries climb, early-returns climb with them (every VMRUN
+            #               resume re-enters the function).
+            # Real guest  : entries stop climbing after startup, because a Windows
+            #               thread never comes back through this function.
+            #
+            # Read-only. No state is changed by this command.
+            $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x836)) -OutputLength 16
+
+            $entries = [BitConverter]::ToUInt64($out, 0)
+            $early   = [BitConverter]::ToUInt64($out, 8)
+
+            Write-Host ("virt-counts: entries={0}  early-returns={1}" -f $entries, $early)
+            if ($entries -eq 0) {
+                Write-Host '  the function was never entered - no core has virtualized yet.'
+            } elseif ($early -eq 0) {
+                Write-Host '  entered but NEVER returned early -> the C frame is never unwound.'
+                Write-Host '  In that state an iretq exit has no frame to return through.'
+            } else {
+                Write-Host ("  ratio early/entries = {0:N3}" -f ($early / [double]$entries))
+            }
         }
         'handler-cost' {
             # 9.521: how many TSC ticks ONE #VMEXIT costs inside SvHandleVmExit.
