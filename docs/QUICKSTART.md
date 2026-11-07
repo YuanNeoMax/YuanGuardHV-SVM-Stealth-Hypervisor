@@ -2,7 +2,7 @@
 
 > **30 秒版**：AMD SVM 管理程序驱动，Windows 自己是 guest。代码在 `D:\yuanguard`，
 > 分支 `main`，构建一条命令，加载一条命令。
-> **当前最新编号 9.514**，G25 已在当前代码上重跑 **17 项 ALL PASS**。
+> **当前最新编号 9.516**，G25 已在当前代码上重跑 **17 项 ALL PASS**。
 
 ---
 
@@ -51,7 +51,7 @@ Get-Content C:\Windows\yghv_progress.log | Select-String "invmrun at unload"
 |---|---|
 | 分支 / HEAD | `main` @ `31568c8`（9.499–9.513 已提交；本地领先 origin） |
 | 驱动 | `yghvpa` · **STOPPED** · 设备 `\\.\YuanGuardHV` |
-| 最新编号 | **9.514** |
+| 最新编号 | **9.516** |
 | 工作树 | 干净 |
 | 静态检查 | 10 个运行器 / 14 条 PASS（含 3 个自检），两个运行器全绿；客户端 **75** 条命令 |
 | 部署镜像 | `C:\yghv_pa.sys` = `90A964DA`（20:33:26），**与 `bin` 哈希一致** |
@@ -68,7 +68,7 @@ Get-Content C:\Windows\yghv_progress.log | Select-String "invmrun at unload"
 
 | # | 事项 | 为什么这个顺序 |
 |---|---|---|
-| **1** | **性能：`hlt` 在 guest 里不 park —— 原因未知，需先查 VMCB/固件** | 9.514 已实测：去掉 `pause` 改纯 `hlt` 后 **C1 仍是 0.00，退出率涨 39 倍（539→20,774/s）**，方案回滚。新增 `exit-codes` 实测两个非零码是 **VMMCALL + DR6_WRITE**（从未有 CPUID）。见 RESUME 8.4.3 |
+| **1** | **性能：第一步是独立测出「一次 VMRUN 往返多少 us」** | 9.516 已把桩改成纯 `hlt` 并保留：吞吐 **4.730s → 3.492s（快 26%）**，卸载 7.21s、invmrun=0x0。但每核 1,891 次/s = 一轮 529us，**这个数字仍无来源**；`% C1` 与 `CPU` 两个判据在 guest 里都不可信 |
 | 2 | **G25 17 项重跑** | 9.498 之后的改动（`on_dr` 上界、DR 拒绝、3 条新 IOCTL、72→75 条命令）**全部没被回归覆盖** |
 | 3 | **Tier 6.1 启动期控制验收** | 台账唯一悬空项。**需重启，窗口不可回滚** |
 
@@ -155,7 +155,7 @@ mmf-hold 寿命       : 3600 秒
 | 想知道什么 | 读哪个 | 大小 |
 |---|---|---|
 | **新会话第一步** | `docs/RESUME_PROMPT.md` | 49 KB |
-| 现在在哪、这一步做了什么 | `docs/YUANMOD_HANDOFF_CURRENT.md`（9.300–9.514） | 574 KB |
+| 现在在哪、这一步做了什么 | `docs/YUANMOD_HANDOFF_CURRENT.md`（9.300–9.516） | 584 KB |
 | 哪些功能做了 / 哪些不做 / 为什么 | `docs/TIER_LEDGER.md` | 7.6 KB |
 | **写内核代码前** | `docs/KERNEL_API_CHECKLIST.md` | 36 KB |
 | 目录总览 | `docs/INDEX.md` | — |

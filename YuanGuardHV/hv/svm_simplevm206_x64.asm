@@ -473,14 +473,9 @@ Sv206GuestTick:
     ; Genuinely freeing the core needs C-states (absent) or not-virtualising it
     ; (a different architecture). Chosen deliberately per operator direction.
 Sv206Spin:
-    hlt                         ; free on a C-state machine; a no-op here
-    mov     ecx, 1000000
-Sv206SpinLoop:
-    pause
-    dec     ecx
-    jnz     Sv206SpinLoop
-    mov     rax, 1              ; YGHV_CMD_HEARTBEAT - "awake, check the flag"
-    vmmcall                     ; the ONE intercepted instruction, now rare
+    hlt                         ; 9.516 re-test: park in C1, no pause loop
+    mov     rax, 1              ; YGHV_CMD_HEARTBEAT - report the wake
+    vmmcall                     ; the ONE intercepted instruction
     jmp     Sv206Spin
 
     ; Reached only when the handler set ExitVm and SvLV20 resumed us here with

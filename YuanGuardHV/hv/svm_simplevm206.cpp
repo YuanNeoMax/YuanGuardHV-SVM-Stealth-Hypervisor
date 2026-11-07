@@ -5093,7 +5093,7 @@ SvPrepareForVirtualization (
      * one more thing that can disagree with the thread it belongs to. The guest
      * here is a bounded spin, which has no interest in IF either way.
      */
-    VpData->GuestVmcb.StateSaveArea.Rflags = ContextRecord->EFlags;
+    VpData->GuestVmcb.StateSaveArea.Rflags = ContextRecord->EFlags | 0x200ULL; /* 9.516: IF=1, hlt must be wakeable */
     VpData->GuestVmcb.StateSaveArea.Rsp = ContextRecord->Rsp;
     /*
      * 9.443: THE GUEST IS OUR OWN STUB - NOT THE CALLER'S CONTINUATION.
