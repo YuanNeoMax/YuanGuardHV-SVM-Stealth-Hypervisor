@@ -25,6 +25,7 @@ Commands:
   pa-section <hex_pa>               (read-only: which of our sections holds this PA)
   npt-raw <hex_pa> [a|d|ad]          (raw NPT entry; A/D are the DECOY-read observer)
   npt-scan <hex_start> <pages> [clear]  (A/D over a range - the one-command measurement)
+  exit-codes                        (per-code exit counters: which codes actually fire)
   byovd-scan                        (local only: blocklist + KDU provider names, no driver needed)
   selftest
   selftest-abort
@@ -2783,6 +2784,72 @@ try {
             $o2 = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x827)) -InBytes $req2 -OutputLength 8
             $ours = [BitConverter]::ToUInt64($o2, 0)
             Write-Host ("npt-range: 0x{0:X} -> {1}" -f $pa, $(if($ours){'IS one of our NPT pages'}else{'not an NPT page'}))
+        }
+        'exit-codes' {
+            # 9.515: which exit codes are ACTUALLY firing, per code.
+            #
+            # `exit-mask` prints `distinct observed = 2` and never says which two
+            # (control_device.c:1747 states the reason: CPUID and VMMCALL are both
+            # armed by default, so the count of DISTINCT codes is 2 either way).
+            # That made "the rest is CPUID" an inference. This command replaces it
+            # with counters.
+            #
+            # Read-only. Prints only non-zero codes; the number of rows shown is
+            # stated so an empty result cannot be mistaken for a command that did
+            # not run.
+            $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x834)) -OutputLength 800
+
+            $base = [BitConverter]::ToUInt64($out, 0)
+            $n    = [BitConverter]::ToUInt64($out, 8)
+
+            if ($n -eq 0) {
+                Write-Host 'exit-codes: the driver returned no rows - the reply did not fit'
+                return
+            }
+
+            # Names for the codes this tree handles. Anything not listed is still
+            # printed (with its number) - an unlabelled code that is firing is
+            # exactly the kind of thing this command exists to reveal.
+            $names = @{
+                0x40='CR0_READ'; 0x41='CR1_READ'; 0x42='CR2_READ'; 0x43='CR3_READ'
+                0x44='CR4_READ'; 0x45='CR5_READ'; 0x46='CR6_READ'; 0x47='CR7_READ'
+                0x48='CR8_READ'; 0x49='CR9_READ'; 0x4A='CR10_READ'; 0x4B='CR11_READ'
+                0x4C='CR12_READ'; 0x4D='CR13_READ'; 0x4E='CR14_READ'; 0x4F='CR15_READ'
+                0x50='CR0_WRITE'; 0x51='CR1_WRITE'; 0x52='CR2_WRITE'; 0x53='CR3_WRITE'
+                0x54='CR4_WRITE'; 0x55='CR5_WRITE'; 0x56='CR6_WRITE'; 0x57='CR7_WRITE'
+                0x58='CR8_WRITE'; 0x59='CR9_WRITE'; 0x5A='CR10_WRITE'; 0x5B='CR11_WRITE'
+                0x5C='CR12_WRITE'; 0x5D='CR13_WRITE'; 0x5E='CR14_WRITE'; 0x5F='CR15_WRITE'
+                0x60='DR0_READ'; 0x61='DR1_READ'; 0x62='DR2_READ'; 0x63='DR3_READ'
+                0x64='DR6_READ'; 0x65='DR7_READ'; 0x66='DR8_READ'; 0x67='DR9_READ'
+                0x68='DR10_READ'; 0x69='DR11_READ'; 0x6A='DR12_READ'; 0x6B='DR13_READ'
+                0x6C='DR14_READ'; 0x6D='DR15_READ'; 0x6E='DR0_WRITE'; 0x6F='DR1_WRITE'
+                0x70='DR2_WRITE'; 0x71='DR3_WRITE'; 0x72='DR6_WRITE'; 0x73='DR7_WRITE'
+                0x74='DR8_WRITE'; 0x75='DR9_WRITE'; 0x76='DR10_WRITE'; 0x77='DR11_WRITE'
+                0x78='DR12_WRITE'; 0x79='DR13_WRITE'; 0x7A='DR14_WRITE'; 0x7B='DR15_WRITE'
+                0x7C='EXCP_BASE'; 0x7D='EXCP_DB'; 0x7E='EXCP_BP'; 0x7F='EXCP_UD'
+                0x80='INTR'; 0x81='VMMCALL'; 0x82='VMRUN'; 0x83='VMLOAD'
+                0x84='VMSAVE'; 0x85='STGI'; 0x86='CLGI'; 0x87='SKINIT'
+                0x88='ICEBP'; 0x89='INVD'; 0x8A='WBINVD'; 0x8B='PAUSE'
+                0x8C='HLT'; 0x8D='SHUTDOWN'
+            }
+
+            Write-Host ("exit-codes: base=0x{0:X}  rows={1}" -f $base, $n)
+            $shown = 0
+            $total = [uint64]0
+            for ($i = 0; $i -lt [int]$n; $i++) {
+                $v = [BitConverter]::ToInt64($out, 16 + $i * 8)
+                $code = [uint64]$base + [uint64]$i
+                if ($v -gt 0) { $total += [uint64]$v }
+                if ($v -le 0) { continue }
+                $nm = if ($names.ContainsKey([int]$code)) { $names[[int]$code] } else { '(unlabelled)' }
+                Write-Host ("  0x{0:X2}  {1,-12} {2}" -f $code, $nm, $v)
+                $shown++
+            }
+            Write-Host ("  summary: {0} non-zero code(s) of {1}   sum={2}" -f $shown, $n, $total)
+            if ($shown -eq 0) {
+                Write-Host '  NOTE: nothing has fired yet in this load. That is a reading,'
+                Write-Host '        not a default - it means no exit occurred since prepare.'
+            }
         }
         'exit-mask' {
             # 9.448: exit-coverage control and measurement.

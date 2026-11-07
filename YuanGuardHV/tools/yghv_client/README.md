@@ -107,6 +107,7 @@ yghv_ctl.ps1 service-name
 yghv_ctl.ps1 pa-section <hex_pa>
 yghv_ctl.ps1 npt-raw <hex_pa> [a|d|ad]
 yghv_ctl.ps1 npt-scan <hex_start> <pages> [clear]
+yghv_ctl.ps1 exit-codes
 ```
 
 `protect` sets the target, enumerates committed pages of the real Java process,

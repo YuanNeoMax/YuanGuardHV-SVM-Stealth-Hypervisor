@@ -110,6 +110,9 @@ public class YghvCtl {
   /* 9.511 (Tier 7.1): the raw-entry read batched over a page range.
      Declared so the four-way parity check stays a real check. */
   private static final int FN_NPT_RAW_SCAN = 0x833;
+  /* 9.515: per-exit-code counters (read-only instrumentation).
+     Declared so the four-way parity check stays a real check. */
+  private static final int FN_EXIT_CODES = 0x834;
 
     private static native long openHandle();
     private static native void closeHandle(long handle);

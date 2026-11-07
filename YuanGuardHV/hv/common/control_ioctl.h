@@ -508,6 +508,30 @@ typedef struct {
 #define YGHV_NPT_SCAN_HDR_QWORDS 2
 
 /*
+ * 9.515 (performance instrumentation): the per-exit-code counters.
+ *
+ * WHY: 9.513 found 22,816 exits/s of which vmmcall was 539/s. The remaining
+ * 22,277 were attributed to CPUID BY INFERENCE - a comment says CPUID and
+ * VMMCALL are the two armed codes, so "everything else must be CPUID". That is
+ * not a measurement, and it became load-bearing the moment 9.514 changed the
+ * stub and the exit rate rose 45x.
+ *
+ * The counters already existed (g_S206ExitByCode over [0x40, 0x8D], reachable
+ * via yghv_s206_exit_count_of). They had no command. This is that command.
+ *
+ * Output: 2 header qwords, then ONE qword per code in [0x40, 0x8D]:
+ *   [0] base code (0x40)   [1] number of entries that followed
+ *   entry i = counter for code (base + i)
+ *
+ * Read-only: no mask change, no VMCB write, no allocation. PASSIVE only.
+ */
+#define IOCTL_YGHV_EXIT_CODES \
+    YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x834, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
+#define YGHV_EXIT_CODES_HDR_QWORDS 2
+#define YGHV_EXIT_CODES_LO 0x40
+#define YGHV_EXIT_CODES_HI 0x8D
+
+/*
  * 9.456 (Tier 7.1): hide ONE named data section, by walking the PE report.
  *
  * WHY NAMED, AND WHY ONE AT A TIME

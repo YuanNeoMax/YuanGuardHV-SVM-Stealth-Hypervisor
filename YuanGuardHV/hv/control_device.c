@@ -1651,6 +1651,46 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
         status = STATUS_INVALID_PARAMETER;
         break;
     }
+    case IOCTL_YGHV_EXIT_CODES: {
+        /*
+         * 9.515: per-exit-code counters - the instrument that was missing.
+         *
+         * 9.513 measured 22,816 exits/s of which vmmcall was 539/s and called the
+         * rest "CPUID" BY INFERENCE (a comment says those are the two armed
+         * codes, therefore everything else must be the other one). That
+         * inference became load-bearing in 9.514, when a pure `hlt` stub was
+         * expected to park and instead raised the exit rate 45x with C1 still at
+         * zero. The question "which codes are actually firing" is answerable -
+         * the counters have been in the kernel since 9.448 and simply had no
+         * command. Read-only: nothing here changes a mask or a VMCB.
+         */
+        extern LONG64 yghv_s206_exit_count_of(UINT64 code);
+
+        if (out_len < YGHV_EXIT_CODES_HDR_QWORDS * sizeof(UINT64)) {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+
+        {
+            UINT64 *out = (UINT64 *)buf;
+            UINT64 base = YGHV_EXIT_CODES_LO;
+            UINT64 span = (YGHV_EXIT_CODES_HI - YGHV_EXIT_CODES_LO) + 1;
+            UINT64 cap = (out_len / sizeof(UINT64)) - YGHV_EXIT_CODES_HDR_QWORDS;
+            UINT64 n = 0, i;
+
+            for (i = 0; i < span && n < cap; i++) {
+                out[YGHV_EXIT_CODES_HDR_QWORDS + n] =
+                    (UINT64)yghv_s206_exit_count_of(base + i);
+                n++;
+            }
+
+            out[0] = base;
+            out[1] = n;
+            info = (ULONG)((YGHV_EXIT_CODES_HDR_QWORDS + n) * sizeof(UINT64));
+            status = STATUS_SUCCESS;
+        }
+        break;
+    }
     case IOCTL_YGHV_EXITMASK: {
         /*
          * 9.448: exit-coverage control and measurement.
