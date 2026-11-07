@@ -516,6 +516,56 @@ typedef struct _VIRTUAL_PROCESSOR_DATA
     DECLSPEC_ALIGN(PAGE_SIZE) VMCB HostVmcb;
     DECLSPEC_ALIGN(PAGE_SIZE) UINT8 HostStateArea[PAGE_SIZE];
 } VIRTUAL_PROCESSOR_DATA, *PVIRTUAL_PROCESSOR_DATA;
+/*
+ * 9.542: THE IRETQ FRAME, OVERLAID ON THE FREE TAIL OF StackContents.
+ *
+ * 9.541 tried to APPEND a field to HostStackLayout and crashed with
+ * 0x1E / C000001D (illegal instruction). Cause: HostStackLimit carries
+ * DECLSPEC_ALIGN(PAGE_SIZE), so any growth rounds the union up by a WHOLE PAGE and
+ * GuestVmcb / HostVmcb / HostStateArea each move one page later - while the asm
+ * addresses them with constants computed from the OLD layout (5FD0h, 6110h,
+ * KTRAP_FRAME_SIZE equ 190h). The static_assert failed and reported it; the assert
+ * was edited instead of read, and the crash followed.
+ *
+ * THIS VERSION ADDS NO MEMBER. StackContents is 11.6 KB that nothing in this tree
+ * references (no reads, no writes - only the definition). RSP points at
+ * GuestVmcbPa, i.e. at the top of TrapFrame, so the LAST bytes of StackContents are
+ * the free stack immediately below RSP. The frame overlays them:
+ *
+ *     StackContents[ .................... ][ Rip Cs Rflags Rsp Ss ]
+ *                                          ^ sizeof(StackContents) - sizeof(slot)
+ *
+ * sizeof(VIRTUAL_PROCESSOR_DATA): unchanged. Every offset: unchanged.
+ *
+ * ORDER IS THE ARCHITECTURAL IRETQ ORDER. A struct with the right fields in the
+ * wrong order loads CS out of what it believed was RSP - a fault that looks like
+ * memory corruption rather than like a layout mistake.
+ *
+ * NOTHING USES IT YET: step 1 is layout only, and the exit is still
+ * `mov rsp,rcx ; jmp rbx`. A slot that changes nothing is the only way to prove the
+ * layout before anything depends on it.
+ */
+typedef struct _S206_IRET_SLOT
+{
+    UINT64 Rip;
+    UINT64 Cs;
+    UINT64 Rflags;
+    UINT64 Rsp;
+    UINT64 Ss;
+} S206_IRET_SLOT, *PS206_IRET_SLOT;
+
+/*
+ * The address is COMPUTED from the array, never hand-written: if StackContents ever
+ * changes size, this follows it. A literal offset would silently point into the
+ * middle of something else - which is 9.541's failure mode in miniature.
+ */
+static PS206_IRET_SLOT Sv206IretSlot(PVIRTUAL_PROCESSOR_DATA vp)
+{
+    return reinterpret_cast<PS206_IRET_SLOT>(
+                &vp->HostStackLayout.StackContents[
+                    sizeof(vp->HostStackLayout.StackContents) - sizeof(S206_IRET_SLOT)]);
+}
+
 static_assert(sizeof(VIRTUAL_PROCESSOR_DATA) == KERNEL_STACK_SIZE + PAGE_SIZE * 3,
               "VIRTUAL_PROCESSOR_DATA Size Mismatch");
 
