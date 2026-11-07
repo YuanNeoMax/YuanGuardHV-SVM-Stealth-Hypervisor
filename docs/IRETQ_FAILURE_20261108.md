@@ -121,7 +121,91 @@ SvLV30:
 
 ---
 
-## 六、下一步（若要继续）
+## 六、★ 读完参考项目 asm 后的真正原因（本轮补）
+
+### 6.1 两边的栈布局对比
+
+**参考项目（svm.asm 文件头，第 24-32 行）：**
+
+`
++0x000  GPRs        (16 * 8  = 0x80)
++0x080  XMMs        (16 * 16 = 0x100)
++0x180  GuestVmcbPa (8)
++0x188  HostVmcbPa  (8)
++0x190  Self        (8)
++0x198  MachineFrame (0x28)   ← ★ 帧就在宿主栈上
++0x1C0  Storage     (0x20)
+`
+
+**入口：**
+`sm
+AsmSvmLaunchVm PROC
+    mov     rsp, rcx      ; rcX = vcore 的宿主栈
+    sub     rsp, 100h     ; 指向 XMM 区下方
+`
+
+**它的 RSP 从第一条指令起就指向「vcore 的宿主栈」，整个循环期间不变。
+所以 add rsp, 118h ; iretq 中那个 118h 是把 RSP 从 XMM 区推到 MachineFrame 的
+**编译期已知常量**：
+
+- RSP 在 XMM 区（+0x080）
+- MachineFrame 在 +0x198
+- 差 = 0x198 - 0x080 = **0x118** ✓
+
+**我们的（svm_simplevm206_x64.asm 第 113-119 行）：**
+
+`
+Rsp => 0xfd0  GuestVmcbPa     ; HostStackLayout
+       0xfd8  HostVmcbPa
+       0xfe0  Self
+       0xfe8  SharedVpData
+       0xff0  Padding1
+       0xff8  Reserved1
+`
+
+**入口：**
+`sm
+Sv206LaunchVm proc frame
+    mov     rax, rsp
+    mov     qword ptr [rcx - 5FD0h + 6110h], rax   ; 保存线程真实 RSP
+    mov     rsp, rcx                                ; rcX = HostStackLayout
+`
+
+**我们的 RSP 指向 HostStackLayout，那块内存里只有 6 个 qword（0xfd0..0xff8），
+**没有 MachineFrame**。我把帧放在了全局变量 g_S206IretFrame，用 lea rsp 指过去。
+
+### 6.2 为什么这必然触发 0x139
+
+**关键事实？** 我们的 RSP 在进入 asm 前**已经被 mov rsp, rcx 换成了宿主栈**，
+而**线程的原始 RSP 被存在 HostExitRsp** 里（0x6110 偏移）。
+
+iretq 一旦执行，就会把 RSP 换成帧里的 StateSaveArea.Rsp（guest 的栈），
+然后跳到 NRip。**它不会回到 Sv206LaunchVm 的调用者**
+（那个 C 栈帧至今仍挂在原地，带着 /GS cookie）。
+
+**参考项目为什么没这个问题？** 因为它的 AsmSvmLaunchVm 是 **PROC（有 frame）但
+从未"返回"过** —— 它靠 iretq 把 RSP 换成了 guest 的栈，而它的**调用者本身就是一个
+在 guest 里跑的线程上下文**，那个 C 帧在 iretq 之后就"随 guest 一起"继续了。
+
+**我们不同：我们的 Sv206LaunchVm 是被 Sv206VirtualizeC / Sv206CoreThread
+调用的，是一个真实的 C 调用链。iretq 把控制流瞬移走，那条链永远不展开，
+栈上留下悬空的 /GS cookie 与 SEH 链。**
+
+### 6.3 所以真正的结论
+
+> **不是 iretq 本身不行，是「在一条真实的 C 调用链里用 iretq 瞬移走」不行。**
+
+参考项目能这么做，是因为它的整个执行模型是「DPC 里 RtlCaptureContext 然后 VMRUN」，
+**那个 C 帧本来就是"故意不返回"的**（它靠 iretq 回到 guest 的 RIP，
+而 guest 的 RIP 就是捕获点之后那条指令 —— 相当于 C 帧"被 guest 接管"了）。
+
+**要照抄它，必须连这个执行模型一起照抄：**
+- 不是"在 DriverUnload 里设标志等 guest 停"
+- 而是"用 DPC 在每个核上 RtlCaptureContext + VMRUN，退出时 iretq 回到捕获点"
+
+**那就是重写整个启动/停止模型，不是改一个退出指令。**
+
+## 七、下一步（若要继续）
 
 按代价排序：
 
