@@ -1651,6 +1651,41 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
         status = STATUS_INVALID_PARAMETER;
         break;
     }
+    case IOCTL_YGHV_GUEST_START: {
+        /*
+         * 9.546: where the guest really started. Read-only record, first core wins.
+         */
+        extern void yghv_s206_guest_start_record(UINT64 *ripSet, UINT64 *rspSet,
+                                                  UINT64 *firstExitRip, UINT64 *realMode,
+                                                  UINT64 *writers, UINT64 *exitTaken);
+        extern void yghv_s206_guest_start_reset(VOID);
+
+        if (out_len < YGHV_GUEST_START_OUT_QWORDS * sizeof(UINT64)) {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+
+        {
+            UINT64 *out = (UINT64 *)buf;
+            UINT64 op = 0;
+            UINT64 ripSet = 0, rspSet = 0, firstExit = 0, realMode = 0;
+            UINT64 writers = 0, exitTaken = 0;
+
+            if (in_len >= sizeof(UINT64)) op = *(UINT64 *)buf;
+
+            yghv_s206_guest_start_record(&ripSet, &rspSet, &firstExit, &realMode,
+                                         &writers, &exitTaken);
+
+            out[0] = ripSet;    out[1] = rspSet;   out[2] = firstExit;
+            out[3] = realMode;  out[4] = writers;  out[5] = exitTaken;
+
+            if (op == 1) yghv_s206_guest_start_reset();
+
+            info = YGHV_GUEST_START_OUT_QWORDS * sizeof(UINT64);
+            status = STATUS_SUCCESS;
+        }
+        break;
+    }
     case IOCTL_YGHV_VIRT_COUNTS: {
         /*
          * 9.543: reachability of the early-return path.

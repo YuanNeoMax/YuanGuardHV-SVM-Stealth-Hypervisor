@@ -110,6 +110,7 @@ yghv_ctl.ps1 npt-scan <hex_start> <pages> [clear]
 yghv_ctl.ps1 exit-codes
 yghv_ctl.ps1 handler-cost [reset]
 yghv_ctl.ps1 virt-counts
+yghv_ctl.ps1 guest-start [reset]
 ```
 
 `protect` sets the target, enumerates committed pages of the real Java process,

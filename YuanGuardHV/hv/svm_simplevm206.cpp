@@ -1496,6 +1496,48 @@ extern "C" { volatile LONG64 g_S206VirtualizeEntries = 0; }
  * the conservative answer (first pass) rather than indexing past the array.
  */
 extern "C" { volatile LONG g_S206SecondPass[SVM206_MAX_VPD] = { 0 }; }
+
+/*
+ * 9.546: WHAT THE GUEST ACTUALLY STARTED AT.
+ *
+ * RealGuestMode sets the guest Rip from ContextRecord->Rip, which IS the output of
+ * RtlCaptureContext inside SvVirtualizeProcessor. So the guest should resume just
+ * after that call, fall through the CPUID probe and reach the early return. Measured
+ * early-returns is 0, so one of the assumptions is wrong and this records which.
+ *
+ * First-core-only: six cores writing one record would describe whichever core won
+ * the race, not the configuration. g_S206GuestRipSeen counts writers so the caller
+ * knows whether the record is a single core's or a collision.
+ */
+extern "C" { volatile LONG64 g_S206GuestRipSet = 0; }
+extern "C" { volatile LONG64 g_S206GuestRspSet = 0; }
+extern "C" { volatile LONG64 g_S206GuestFirstExitRip = 0; }
+extern "C" { volatile LONG g_S206RealModeAtSetup = 0; }   /* 9.546: LONG, used with 32-bit interlocked */
+extern "C" { volatile LONG g_S206GuestRipWriters = 0; }
+extern "C" { volatile LONG g_S206GuestFirstExitTaken = 0; }
+
+extern "C" void yghv_s206_guest_start_record(UINT64 *ripSet, UINT64 *rspSet,
+                                             UINT64 *firstExitRip, UINT64 *realMode,
+                                             UINT64 *writers, UINT64 *exitTaken)
+{
+    *ripSet        = (UINT64)InterlockedCompareExchange64(&g_S206GuestRipSet, 0, 0);
+    *rspSet        = (UINT64)InterlockedCompareExchange64(&g_S206GuestRspSet, 0, 0);
+    *firstExitRip  = (UINT64)InterlockedCompareExchange64(&g_S206GuestFirstExitRip, 0, 0);
+    *realMode      = (UINT64)(UINT32)InterlockedCompareExchange(&g_S206RealModeAtSetup, 0, 0);
+    *writers       = (UINT64)(UINT32)InterlockedCompareExchange(&g_S206GuestRipWriters, 0, 0);
+    *exitTaken     = (UINT64)(UINT32)InterlockedCompareExchange(&g_S206GuestFirstExitTaken, 0, 0);
+}
+
+extern "C" void yghv_s206_guest_start_reset(VOID)
+{
+    InterlockedExchange64(&g_S206GuestRipSet, 0);
+    InterlockedExchange64(&g_S206GuestRspSet, 0);
+    InterlockedExchange64(&g_S206GuestFirstExitRip, 0);
+    InterlockedExchange(&g_S206GuestRipWriters, 0);
+    InterlockedExchange(&g_S206GuestFirstExitTaken, 0);
+}
+
+
 extern "C" { volatile LONG64 g_S206SecondPassReads = 0; }
 
 extern "C" { volatile LONG64 g_S206FlagDisagrees = 0; }
@@ -3267,6 +3309,20 @@ SvHandleVmExit (
      * would have read zero while the total counter read 800 million.
      */
     S206ExitCount(VpData->GuestVmcb.ControlArea.ExitCode);
+
+    /*
+     * 9.546: the Rip the guest was FOUND at on its first exit.
+     *
+     * This is the direct evidence for "where did it actually resume": StateSaveArea
+     * .Rip at #VMEXIT is the instruction that caused the exit. If that address is not
+     * inside SvVirtualizeProcessor, the guest never resumed there and no amount of
+     * early-return wiring could have helped.
+     */
+    if (InterlockedIncrement(&g_S206GuestFirstExitTaken) == 1)
+    {
+        InterlockedExchange64(&g_S206GuestFirstExitRip,
+                              (LONG64)VpData->GuestVmcb.StateSaveArea.Rip);
+    }
 
     /*
      * 9.521: HANDLER COST, START.
@@ -5549,6 +5605,26 @@ SvPrepareForVirtualization (
     {
         VpData->GuestVmcb.StateSaveArea.Rip =
             reinterpret_cast<UINT64>(&Sv206GuestStub);
+    }
+
+    /*
+     * 9.546: record what the guest was actually handed (first writer wins).
+     *
+     * Without this, "the guest resumed at ContextRecord->Rip" is an assumption, and
+     * the whole early-return model rests on it. Recording the value makes it a
+     * reading - and if the real value is not what the code says it should be, that
+     * is the answer to why early-returns never climbs.
+     */
+    {
+        if (InterlockedIncrement(&g_S206GuestRipWriters) == 1)
+        {
+            InterlockedExchange64(&g_S206GuestRipSet,
+                                  (LONG64)VpData->GuestVmcb.StateSaveArea.Rip);
+            InterlockedExchange64(&g_S206GuestRspSet,
+                                  (LONG64)VpData->GuestVmcb.StateSaveArea.Rsp);
+            InterlockedExchange(&g_S206RealModeAtSetup,
+                                yghv_s206_real_guest_mode() ? 1 : 0);
+        }
     }
     VpData->GuestVmcb.StateSaveArea.GPat = __readmsr(IA32_MSR_PAT);
 

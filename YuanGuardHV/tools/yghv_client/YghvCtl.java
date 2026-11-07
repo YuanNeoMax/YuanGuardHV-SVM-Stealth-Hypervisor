@@ -119,6 +119,9 @@ public class YghvCtl {
   /* 9.543: SvVirtualizeProcessor entry/early-return counters (reachability).
      Declared so the four-way parity check stays a real check. */
   private static final int FN_VIRT_COUNTS = 0x836;
+  /* 9.546: where the guest actually started (stage-C diagnostic).
+     Declared so the four-way parity check stays a real check. */
+  private static final int FN_GUEST_START = 0x837;
 
     private static native long openHandle();
     private static native void closeHandle(long handle);

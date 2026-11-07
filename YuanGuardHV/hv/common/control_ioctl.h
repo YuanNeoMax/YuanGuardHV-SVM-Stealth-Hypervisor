@@ -588,6 +588,29 @@ typedef struct {
 #define YGHV_VIRT_COUNTS_OUT_QWORDS 4  /* 9.544: +secondPass +disagrees */
 
 /*
+ * 9.546 (refactor stage C diagnostic): what the guest actually started at.
+ *
+ * RealGuestMode hands the guest ContextRecord->Rip - the output of RtlCaptureContext
+ * inside SvVirtualizeProcessor - so the guest ought to resume just past that call,
+ * fall through the CPUID probe and reach the early return. Measured: early-returns
+ * stays 0. Recording the values decides between "it never started there", "it started
+ * there but never came back", and "it came back but the probe said not-installed".
+ *
+ * Output (6 qwords):
+ *   [0] Rip written into the VMCB       (first core only)
+ *   [1] Rsp written into the VMCB       (first core only)
+ *   [2] Rip seen on the FIRST #VMEXIT   (where the guest actually was)
+ *   [3] RealGuestMode at setup (0/1)
+ *   [4] number of cores that wrote [0]/[1] (1 = clean record, >1 = race)
+ *   [5] number of exits observed (1 = the first-exit record is valid)
+ *
+ * Read-only. PASSIVE only.
+ */
+#define IOCTL_YGHV_GUEST_START \
+    YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x837, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
+#define YGHV_GUEST_START_OUT_QWORDS 6
+
+/*
  * 9.456 (Tier 7.1): hide ONE named data section, by walking the PE report.
  *
  * WHY NAMED, AND WHY ONE AT A TIME

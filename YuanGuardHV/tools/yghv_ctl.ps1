@@ -28,6 +28,7 @@ Commands:
   exit-codes                        (per-code exit counters: which codes actually fire)
   handler-cost [reset]              (TSC ticks per #VMEXIT inside the handler)
   virt-counts                       (is the early-return path reached? step-3 diagnostic)
+  guest-start [reset]               (what Rip the guest started at / first exit Rip)
   byovd-scan                        (local only: blocklist + KDU provider names, no driver needed)
   selftest
   selftest-abort
@@ -2903,6 +2904,51 @@ try {
             $o2 = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x827)) -InBytes $req2 -OutputLength 8
             $ours = [BitConverter]::ToUInt64($o2, 0)
             Write-Host ("npt-range: 0x{0:X} -> {1}" -f $pa, $(if($ours){'IS one of our NPT pages'}else{'not an NPT page'}))
+        }
+        'guest-start' {
+            # 9.546: what Rip the guest was actually started at, and where it was
+            # found on its first #VMEXIT.
+            #
+            # WHY: RealGuestMode hands the guest ContextRecord->Rip, which is the output
+            # of RtlCaptureContext inside SvVirtualizeProcessor. If that were true, the
+            # guest would resume past that call, fall through the CPUID probe and reach
+            # the early return - so early-returns would climb. It stays 0, which means
+            # one of the assumptions is false, and this decides which:
+            #
+            #   ripSet points INSIDE yghv_pa   -> started where we think
+            #   ripSet points elsewhere        -> the VMCB got a different value
+            #   firstExitRip inside yghv_pa    -> it ran that code and exited from it
+            #   firstExitRip outside           -> it never ran our code at all
+            #
+            # usage: guest-start [reset]
+            $op = [uint64]0
+            if ($null -ne $Arg1 -and "$Arg1".ToLower() -eq 'reset') { $op = [uint64]1 }
+
+            $req = New-Object byte[] 8
+            [BitConverter]::GetBytes([uint64]$op).CopyTo($req, 0)
+            $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x837)) `
+                                    -InBytes $req -OutputLength 48
+
+            $ripSet   = [BitConverter]::ToUInt64($out, 0)
+            $rspSet   = [BitConverter]::ToUInt64($out, 8)
+            $exitRip  = [BitConverter]::ToUInt64($out, 16)
+            $realMode = [BitConverter]::ToUInt64($out, 24)
+            $writers  = [BitConverter]::ToUInt64($out, 32)
+            $exits    = [BitConverter]::ToUInt64($out, 40)
+
+            Write-Host ("guest-start: realGuestMode={0}  writers={1}  exits={2}" -f $realMode, $writers, $exits)
+            if ($ripSet -ne 0) {
+                Write-Host ("  guest Rip given     = 0x{0:X}" -f $ripSet)
+                Write-Host ("  guest Rsp given     = 0x{0:X}" -f $rspSet)
+            } else {
+                Write-Host '  no setup recorded yet.'
+            }
+            if ($exitRip -ne 0) {
+                Write-Host ("  first #VMEXIT Rip   = 0x{0:X}" -f $exitRip)
+            } else {
+                Write-Host '  no exit recorded yet.'
+            }
+            Write-Host '  compare both against the driver base from: pa-section 0x0'
         }
         'virt-counts' {
             # 9.543: is SvVirtualizeProcessor's early-return path REACHED?
