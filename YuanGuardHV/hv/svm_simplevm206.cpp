@@ -1460,12 +1460,39 @@ extern "C" { volatile LONG64 g_S206Exits = 0; }
  * Read-only telemetry: two increments, no branch, no structure change.
  */
 extern "C" { volatile LONG64 g_S206VirtualizeEntries = 0; }
+
+/*
+ * 9.544 STAGE A: THE EXPLICIT SECOND-PASS FLAG.
+ *
+ * The reference implementation decides "first pass or second pass" with a flag set
+ * by the first pass itself:
+ *     if (Vcpu->Virtualized) return;          // Type2-AMD-HV svm.c
+ * Ours decides it by probing CPUID 40000000h for the hypervisor vendor string -
+ * which answers a DIFFERENT question ("is a hypervisor present?") that happens to
+ * agree only while the guest never returns here (stub mode: entries=6, early=0, so
+ * the branch was never exercised in the agreeing case either).
+ *
+ * Stage A adds the flag but does NOT let it decide anything yet: the branch below
+ * still requires the probe to say "not installed" AND the flag to say "first pass".
+ * If the two ever disagree the OLD answer wins and g_S206FlagDisagrees records it,
+ * so a silent divergence shows up as a counter instead of as a changed boot path.
+ *
+ * The flag is set at exactly the point the probe would first have returned TRUE -
+ * right before VMRUN - which is where the reference implementation sets it too.
+ */
+extern "C" { volatile LONG g_S206SecondPass = 0; }
+extern "C" { volatile LONG64 g_S206FlagDisagrees = 0; }
+
+
 extern "C" { volatile LONG64 g_S206EarlyReturns = 0; }
 
-extern "C" void yghv_s206_virtualize_counts(UINT64 *entries, UINT64 *early)
+extern "C" void yghv_s206_virtualize_counts(UINT64 *entries, UINT64 *early,
+                                             UINT64 *secondPass, UINT64 *disagrees)
 {
-    *entries = (UINT64)InterlockedCompareExchange64(&g_S206VirtualizeEntries, 0, 0);
-    *early   = (UINT64)InterlockedCompareExchange64(&g_S206EarlyReturns, 0, 0);
+    *entries    = (UINT64)InterlockedCompareExchange64(&g_S206VirtualizeEntries, 0, 0);
+    *early      = (UINT64)InterlockedCompareExchange64(&g_S206EarlyReturns, 0, 0);
+    *secondPass = (UINT64)(UINT32)InterlockedCompareExchange(&g_S206SecondPass, 0, 0);
+    *disagrees  = (UINT64)InterlockedCompareExchange64(&g_S206FlagDisagrees, 0, 0);
 }
 
 
@@ -5643,6 +5670,35 @@ SvVirtualizeProcessor (
      * resumed INTO and unwound normally - which is why iretq does not fault there
      * and does fault in a mode where this never fires.
      */
+    /*
+     * 9.544 STAGE A: consult the explicit flag AS WELL AS the probe, and let the
+     * PROBE decide. Behaviour is therefore identical to before this change; the
+     * flag is only being brought up and watched.
+     *
+     * Why both: if CPUID and the flag ever disagree, taking the flag would change
+     * the boot path in a way nothing had measured. Taking the probe keeps the
+     * shipped behaviour and turns the disagreement into g_S206FlagDisagrees, which
+     * virt-counts exposes. A divergence that is visible is a fact; one that silently
+     * changes behaviour is a crash waiting to be blamed on something else.
+     */
+    {
+        BOOLEAN installed = SvIsSimpleSvmHypervisorInstalled();
+        LONG    secondPass = InterlockedCompareExchange(&g_S206SecondPass, 0, 0);
+
+        /* They should agree: installed <=> second pass. Record it when they do not. */
+        if ((installed != FALSE) != (secondPass != 0))
+        {
+            InterlockedIncrement64(&g_S206FlagDisagrees);
+        }
+        else if (secondPass != 0)
+        {
+            /* Agreed, and it IS the second pass: this is the reference shape. */
+            InterlockedIncrement64(&g_S206EarlyReturns);
+            status = STATUS_SUCCESS;
+            goto Exit;
+        }
+    }
+
     if (SvIsSimpleSvmHypervisorInstalled() == FALSE)
     {
         SvDebugPrint("Attempting to virtualize the processor.\n");
@@ -5659,6 +5715,17 @@ SvVirtualizeProcessor (
         // within the guest should be intercepted, ie, triggers #VMEXIT.
         //
         SvPrepareForVirtualization(vpData, sharedVpData, contextRecord);
+
+        /*
+         * 9.544: SET THE FLAG BEFORE VMRUN - the same place the reference
+         * implementation sets Virtualized.
+         *
+         * If the guest ever resumes into this function, it now sees "second pass" and
+         * returns through the normal epilogue instead of running setup again. In stub
+         * mode that resume never happens, so setting it changes nothing - which is
+         * exactly what the stage-A measurement is meant to confirm.
+         */
+        InterlockedExchange(&g_S206SecondPass, 1);
 
         //
         // Switch to the host RSP to run as the host (hypervisor), and then
@@ -5689,8 +5756,12 @@ Exit:
         //
         SvFreePageAlingedPhysicalMemory(vpData);
     }
-    /* 9.543: this return is the SECOND pass - the one the C frame survives. */
-    if (status == STATUS_SUCCESS) InterlockedIncrement64(&g_S206EarlyReturns);
+    /*
+     * 9.544: the unconditional increment is GONE. 9.543 put it here and it counted
+     * every successful return - including the first-pass setup path - which would
+     * have made "early returns" look healthy in exactly the mode where none happen.
+     * The count now increments only on the branch that actually is the second pass.
+     */
     return status;
 }
 

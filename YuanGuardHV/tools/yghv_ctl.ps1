@@ -2919,12 +2919,17 @@ try {
             #               thread never comes back through this function.
             #
             # Read-only. No state is changed by this command.
-            $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x836)) -OutputLength 16
+            $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x836)) -OutputLength 32
 
-            $entries = [BitConverter]::ToUInt64($out, 0)
-            $early   = [BitConverter]::ToUInt64($out, 8)
+            $entries    = [BitConverter]::ToUInt64($out, 0)
+            $early      = [BitConverter]::ToUInt64($out, 8)
+            $secondPass = [BitConverter]::ToUInt64($out, 16)
+            $disagrees  = [BitConverter]::ToUInt64($out, 24)
 
-            Write-Host ("virt-counts: entries={0}  early-returns={1}" -f $entries, $early)
+            # 9.544 STAGE A: disagrees must stay 0 while the CPUID probe still
+            # decides. A non-zero value means the explicit flag is not tracking the
+            # probe, and stage B (letting the flag decide) would change behaviour.
+            Write-Host ("virt-counts: entries={0}  early-returns={1}  secondPass={2}  disagrees={3}" -f $entries, $early, $secondPass, $disagrees)
             if ($entries -eq 0) {
                 Write-Host '  the function was never entered - no core has virtualized yet.'
             } elseif ($early -eq 0) {

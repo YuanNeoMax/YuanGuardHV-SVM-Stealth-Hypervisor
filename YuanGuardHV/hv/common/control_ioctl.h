@@ -585,7 +585,7 @@ typedef struct {
  */
 #define IOCTL_YGHV_VIRT_COUNTS \
     YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x836, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
-#define YGHV_VIRT_COUNTS_OUT_QWORDS 2
+#define YGHV_VIRT_COUNTS_OUT_QWORDS 4  /* 9.544: +secondPass +disagrees */
 
 /*
  * 9.456 (Tier 7.1): hide ONE named data section, by walking the PE report.
