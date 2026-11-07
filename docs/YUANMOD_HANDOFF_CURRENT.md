@@ -11782,6 +11782,11 @@ sys-health: degraded=0 total=0 fatal=0
 
 #### 9.512 ★★★★ 更正 9.511：「47 页从未被触及」是**错的** —— 而且它错在判据的时间窗口
 
+> **9.535 补注：本节里「藏 `g_npt` 页会递归死锁」的推断已被实测推翻。**
+> DECOY 模式 `present` 保持为 1，**根本不产生 #NPF**，所以不会有递归。
+> 真正的后果是那一页上的 **25 个控制流变量被一次清零**（含 `g_watchdog_stop`、
+> `g_os_guest_stop_requested`、`g_s203_threads[]`）。见 9.535。
+
 9.511 写下「54 页里只有 7 页被 guest 触及，47 页从未」。本轮重复同一测量，得到完全不同的数。
 
 ##### 同一台机器、同一份二进制、同一个判据，四组读数
@@ -12923,3 +12928,76 @@ CoreCount=12   ：覆盖优先，G25 应全绿
 - **「6 核 = 6 个核」被实测确认**（三配置对照），不再是从 `npt-view` 的单点推断。
 - **新记录一种判据污染的形态**：为测量而起的进程改了测量结果。
 - **T7/T9 的根因链完整**：配置 → 调度落点 → 是否经过 NPT → 读到什么。
+
+---
+
+#### 9.535 缺陷 B 的答案：藏 `g_npt` 页不是「递归死锁」，是**把 25 个控制流变量一次清零**
+
+9.532 的实验留下一个现象（藏 `g_npt` 页后用户态进程随机 AV）和一个没有答案的问题
+（到底破坏了什么）。本轮**只做只读分析**，不动任何页，答案是清楚的。
+
+##### 那一页上有什么
+
+`.bss` page 1（`g_npt` 所在的页）**共 75 个符号**。其中 **25 个参与控制流**：
+
+```
+g_persistent_mode          g_guest_code_page          g_resident_workload_page
+g_hook_rendezvous_thread   g_watchdog_stop            g_watchdog_thread
+g_guest_hb_va              g_guest_npt_va             g_trace_file
+g_os_guest_test_active     g_os_resident_mode         g_avic_eoi_apic_va
+g_msv_helper_stop          g_os_guest_stop_requested  g_os_guest_resident_thread
+g_os_guest_alive_thread    g_os_guest_watchdog_thread g_v96_apic_tpr_va
+g_v98_apic_shadow_va       g_v98_real_apic_va         g_os_resident_log_active
+g_v100_monitor_active      g_npt_test_active          g_npt
+g_s203_threads[]
+```
+
+##### 机制：DECOY 让这一页的**每一次读**都返回 0
+
+不是「递归死锁」，是**三个独立的坏后果同时发生**：
+
+| 变量 | 读到 0 之后 |
+|---|---|
+| `g_watchdog_stop` | watchdog 的退出条件变成「永不退出」|
+| `g_os_guest_stop_requested` | **停止请求永远读不到** —— 卸载靠它 |
+| `g_s203_threads[]` / `g_watchdog_thread` | 线程句柄变成 NULL，join 会失败 |
+| `g_guest_hb_va` / `g_guest_npt_va` | 桩入口地址变成 0 |
+
+**这解释了 9.532 的随机 AccessViolation**：不是 NPF 递归，而是**驱动自己在读这些变量时
+拿到零，然后用零去做地址/句柄操作**。故障发生在用户态可见的地方，
+因为驱动调用的 API（线程 join、句柄关闭）拿到了无效值。
+
+##### 9.512 的「递归死锁」推断是错的
+
+9.512 写的是「藏 `g_npt` 所在页 → 我们的读触发 NPF → 处理体读 `g_npt` → 又一个 NPF → 递归死锁」。
+
+**实测推翻了它**：9.532 里 `add OK`、机器继续运行、`sys-health` 报 `degraded=0`，
+**没有死锁**。DECOY 模式下 `present` 保持为 1，**根本不产生 #NPF** ——
+所以「递归」这件事从一开始就不可能发生。
+
+> **推断错在一个具体的技术点上**：DECOY 不产生 fault，所以不会有递归。
+> 真正的问题是「读回零值」，而那比死锁更隐蔽 —— **死锁看得见，读回零看不见。**
+
+##### 由此得出的一条通用结论
+
+`.bss` 那一页**不能藏，也不该藏**，理由不再是「会死锁」，而是：
+
+> **它是我们自己的控制台面板。藏它不是隐藏自己，是把自己所有的开关都关掉。**
+
+这与 9.512 对 `.data` 段的结论一致，但**理由更硬**：不是因为「冷页没价值」，
+而是因为**同一页上既有 NPF 依赖的 `g_npt`，又有卸载依赖的 `stop_requested`** ——
+任何按页为粒度的隐藏都无法把两者分开。
+
+##### 处置
+
+- **`sys-guard add` 不加拒绝规则**（9.532 的实现从设计上就错了：两边算的不是同一个地址空间）。
+- **改成文档结论**：这一页列为「不可藏」，并写清机制。
+- **不再做「藏 `g_npt` 页」的实验** —— 问题已经有答案，再做只会再损坏一次机器。
+
+##### 本轮净收益
+
+| 之前 | 现在 |
+|---|---|
+| 「藏它会递归死锁」（9.512，推断）| **不会死锁** —— DECOY 不产生 fault |
+| 「藏它会让进程随机 AV」（9.532，现象）| **机制已知：25 个控制流变量一次清零** |
+| 待查项 B | **已答，转入结论** |

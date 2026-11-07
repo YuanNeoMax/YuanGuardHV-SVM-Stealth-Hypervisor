@@ -2,7 +2,7 @@
 
 > **30 秒版**：AMD SVM 管理程序驱动，Windows 自己是 guest。代码在 `D:\yuanguard`，
 > 分支 `main`，构建一条命令，加载一条命令。
-> **当前最新编号 9.533**，G25 在 6 核默认下 **15/17 PASS（T7/T9 FAIL，见第 4 节）**。
+> **当前最新编号 9.535**，G25 在 6 核默认下 **15/17 PASS（T7/T9 FAIL，见第 4 节）**。
 
 ---
 
@@ -51,7 +51,7 @@ Get-Content C:\Windows\yghv_progress.log | Select-String "invmrun at unload"
 |---|---|
 | 分支 / HEAD | `main` @ `31568c8`（9.499–9.513 已提交；本地领先 origin） |
 | 驱动 | `yghvpa` · **STOPPED** · 设备 `\\.\YuanGuardHV` |
-| 最新编号 | **9.533** |
+| 最新编号 | **9.535** |
 | 工作树 | 干净 |
 | 静态检查 | 10 个运行器 / 14 条 PASS（含 3 个自检），两个运行器全绿；客户端 **75** 条命令 |
 | 部署镜像 | `C:\yghv_pa.sys` = `90A964DA`（20:33:26），**与 `bin` 哈希一致** |
@@ -155,7 +155,7 @@ mmf-hold 寿命       : 3600 秒
 | 想知道什么 | 读哪个 | 大小 |
 |---|---|---|
 | **新会话第一步** | `docs/RESUME_PROMPT.md` | 49 KB |
-| 现在在哪、这一步做了什么 | `docs/YUANMOD_HANDOFF_CURRENT.md`（9.300–9.533） | 660 KB |
+| 现在在哪、这一步做了什么 | `docs/YUANMOD_HANDOFF_CURRENT.md`（9.300–9.535） | 672 KB |
 | 哪些功能做了 / 哪些不做 / 为什么 | `docs/TIER_LEDGER.md` | 7.6 KB |
 | **写内核代码前** | `docs/KERNEL_API_CHECKLIST.md` | 36 KB |
 | 目录总览 | `docs/INDEX.md` | — |
