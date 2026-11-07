@@ -8,42 +8,59 @@
 
 ## 0. 一句话现状
 
-**裸机 SVM/NPT hypervisor：加载、虚拟化、隐藏页、保护、卸载 —— 全链路闭环。
-卸载路径在 29 次崩溃后于 9.445 首次干净成功；G25 17 项在 9.447 全绿。**
+**裸机 SVM/NPT hypervisor：加载、虚拟化、隐藏页、保护、卸载 —— 全链路闭环。**
+**卸载判据 `invmrun at unload = 0x0` 一直是干净的；性能已在 9.527 大幅改善。**
 
 | 能做什么 | 状态 |
 |---|---|
-| 加载驱动 | **可以**（`sc start` → RUNNING，0.8–6.5 秒）|
-| 虚拟化 12 核 + NPT | **可以**（`g_npt.pml4_pa` 有效、12 个 VCPU 全建好）|
-| 隐藏页 / decoy / 全功能回归 | **可以**（**G25 17 项 ALL PASS**，9.447 实测两次）|
+| 加载驱动 | **可以**（`sc start` → RUNNING，0.9–7 秒）|
+| 虚拟化 + NPT | **可以**，**默认只虚拟化物理核**（这台机器 6 个，12 逻辑核）|
+| 隐藏页 / decoy | **可以**，且在**虚拟化的核上**实测有效（`npt-view` 显示 frame 指向零页）|
 | Tier 9.1 无设备 CPUID 通道 | **可以**（设备可移除，门铃可达）|
-| Tier 9.2 控制通道认证 | **可以**（G41 13/13）|
-| **卸载驱动** | **可以**（`sc stop` → STOPPED，2.6–3.2 秒，`WIN32_EXIT_CODE=0`）|
+| Tier 9.2 控制通道认证 | **可以但默认 off**（G41 13/13；需 `sys-auth enforce`）|
+| **卸载驱动** | **可以**（`sc stop` → STOPPED，2.4–7 秒，`WIN32_EXIT_CODE=0`）|
 
-**已知代价**：比 9.445 之前的版本慢约 12 倍（12 个核持续在 guest 里跑循环）。见 8.4。
+##### 性能（9.527 实测，这是本树第一次真正的性能优化）
 
-**当前代码状态：可用，且已回归验证。**
+| 基准 | 优化前（12 逻辑核）| **优化后（6 物理核，默认）** |
+|---|---|---|
+| 单线程 | 7.6× | **1.1×** |
+| **12 线程** | **12.8×** | **1.2×** |
+
+改法：`yghv_s206_core_limit()` 默认从「全部逻辑核」改成**物理核数**
+（用 `KeQueryLogicalProcessorRelationship(RelationProcessorCore)` 数记录得来）。
+**代价是覆盖范围**：未虚拟化的 6 个逻辑核上 NPT 保护不生效。可用
+`HKLM\SYSTEM\CurrentControlSet\Services\yghvpa\Parameters\CoreCount`（REG_DWORD）覆盖。
+
+##### G25 回归：**15/17**（9.533 在 6 核默认下实测）
 
 ```
-s206 exits at unload   = 288,352,654     （2.88 亿次 VMEXIT，说明循环正常在跑）
-s206 vmmcall at unload = 287,973,382     （vmmcall 拦截正常）
-s206 invmrun at unload = 0               ← 归零：12 个核全部干净离开 VMRUN
+T1-T6, T8, T10-T12  PASS
+T7 FAIL  mechanism=UNKNOWN, the page is still visible to the guest
+T9 FAIL  no mechanism identified in T7
+```
+
+**这不是缺陷，是「部分虚拟化」的直接后果**：`mmf-read` 是短命外部进程，
+被 Windows 调度到 **native 的 6 个核**上就不经过 NPT，DECOY 对它不存在。
+**要 G25 全绿就设 `CoreCount=12`，代价是 11.6×。这是明确的取舍。**
+
+##### 卸载判据（唯一可信的「没坏」证据）
+
+```
+s206 invmrun at unload = 0x0
 WIN32_EXIT_CODE        = 0
-
-G25 (17 项):  OVERALL: ALL PASS          ← 9.447 实测两次
 ```
 
-**下一步待办**：
+##### 下一步待办
 
-1. **性能（operator 当前重点）** —— 桩里 100 万次 `pause` 空转把 `hlt` 的休眠烧掉了；
-   改法是去掉 pause 循环、把 `vmmcall` 紧跟 `hlt`。**必须用 `% C1 Time` 与吞吐基准验收**，
-   不能用「跑起来没崩」。见 8.4.3 / 8.4.5。
-2. **G25 重跑** —— 9.498 之后的改动（`on_dr` 上界、DR 拒绝、3 条新 IOCTL、72→75 条命令）
-   **全部没被回归覆盖**。
+1. **取舍决策**：默认 6 核（1.2×，T7/T9 失败）还是 12 核（11.6×，全绿）—— operator 定。
+2. **藏 `g_npt` 页的真实后果**（9.532 的失败实验留下）：不锁死，但让用户态进程随机 AV，
+   具体破坏了什么还不清楚，需要受控实验 + 回滚路径。
 3. Tier 6.1 启动期控制 —— 台账唯一悬空项，需重启，窗口不可回滚。
 
-已结案（不是待办）：`.data` 段隐藏（8.6.3，目标不成立）、`loader_stealth`（9.499）、
-`mem-bp dr`（9.507，已改成拒绝）。
+已结案（不是待办）：`.data` 段隐藏（目标不成立）、`loader_stealth`（9.499）、
+`mem-bp dr`（9.507 改成拒绝）、`mmf-hold` 多页（9.529）、
+`mem-pte` MISS/HIT（9.531）、`sys-guard` 拒绝规则（9.532 判为无法安全实现）。
 
 ---
 
@@ -107,16 +124,18 @@ dump 配置     CrashDumpEnabled=2, CrashDumpType 已删除, AlwaysKeepMemoryDum
 ## 3. 当前代码状态与第一件事
 
 ```
-HEAD = 31568c8  docs(9.512)  更正 9.511 错误结论（当前）
-       d21d8e3  feat(9.511)  npt-scan 批量 A 位 + 54 页实测
-       abc9ab4  feat(9.510)  npt-raw（A 位 = DECOY 读取判据）
-       b88a64a  docs(9.509)  .data 两步前置实机验通过
-       4345417  feat(9.508)  pa-section（PA → 段）
-       b6e33d1  fix(9.507)   mem-bp dr 拒绝（-12）
-       61ed8f2  fix(9.500-9.503) 服务名 / byovd 哈希 / .data 页数
-       94f8e70  docs(9.497)  G25 重跑 ALL PASS
-       1c1d4d6  fix(9.465)   VMMCALL 推进 RIP
-       b52434a  fix(9.445b)  卸载首次干净
+HEAD = 9c535b4  docs: 修正 QUICKSTART 抬头 G25 状态（当前）
+       8d1c628  fix(9.530-9.531)  mem-bp 地址类型 / mem-pte MISS-HIT 区分
+       0c99795  docs(9.533)      G25 在 6 核下 2 项 FAIL
+       aec8b7e  fix(9.529)       mmf-hold 多页提交
+       20d9c72  feat(9.527)      默认虚拟化物理核（12线程 12.8x->1.2x）
+       53e870a  feat(9.525)      CoreCount 运行时参数
+       8b8e0fd  feat(9.521-9.524) handler-cost / 三桩实测 / 单核实验
+       451adef  docs(9.520)      四个读数的分工
+       5dd3777  docs(9.519)      单核实验定论：hlt 确实在等
+       4abf8d5  fix(9.516)       纯 hlt 桩保留
+       31568c8  docs(9.512)      更正 9.511 错误结论
+       b52434a  fix(9.445b)      卸载首次干净
        f04d0ff  fix(9.445)   Sv206LaunchVm 自己保存线程 RSP
        23f34df  fix(9.444b)  exit 栈指针移入 VMCB
        d6af154  fix(9.444)   两步返回协议（失败，被 9.445 取代）
@@ -142,7 +161,8 @@ s206 vmmcall at unload = 0x11285c06 = 287,973,382
 s206 invmrun at unload = 0x0          ← 归零
 ```
 
-**G25 17 项在 9.497 于当前代码上重跑，`OVERALL: ALL PASS`** —— 卸载修好之后，
+**G25 在 9.497 的镜像上是 `OVERALL: ALL PASS`；9.533 在 6 核默认下重跑为 15/17
+（T7/T9 FAIL，原因见第 0 节 —— 部分虚拟化的必然结果，不是缺陷）。** 卸载修好之后，
 保护功能也确认完好；这一轮覆盖了 9.448 的 35 个 VMEXIT case 与 9.465 的 RIP 推进。
 （9.447 那两次跑的是 9.445b，不能当作当前代码的结论。）见第 11 节与 9.497。
 
@@ -392,7 +412,8 @@ yghv_ctl.ps1 unload-trace   → page PA / last step / value
 
 ### 8.2 G25 回归：已在当前代码上重跑全绿（9.497）
 
-**最后一次：2026-11-01 12:16–12:38，`OVERALL: ALL PASS`，17 项全 True。**
+**最后一次全绿：2026-11-01 12:16–12:38（9.497 镜像，12 核），17 项全 True。**
+**2026-11-08（9.533）在 6 核默认下重跑：15/17，T7/T9 FAIL —— 部分虚拟化的代价，见第 0 节。**
 那次跑在 9.465（`Rip = NRip`）与 9.448（VMEXIT 12→35）之后的镜像上 ——
 **9.447 那两次是在 9.445b 上跑的，不能拿来代表当前代码。** 见第 11 节与 9.497。
 
@@ -1193,7 +1214,7 @@ Get-Content D:\aaaaaavm\g25_result.txt | Select-String "OVERALL"
 
 | 测试 | 内容 | 结果 |
 |---|---|---|
-| **G25** | **17 项全功能回归** | **`OVERALL: ALL PASS`** —— **2026-11-01（9.497，当前代码）**，另在 9.445b 上跑过两次 |
+| **G25** | **17 项全功能回归** | **9.497 上 `ALL PASS`（12 核）；9.533 在 6 核默认下 15/17（T7/T9 因部分虚拟化失败）** |
 | **9.497 部署+冒烟** | **C:\yghv_pa.sys = B0532743 哈希一致 → start 0.42s / sys-health 26.9s / stop 3.92s** | **`invmrun=0x0`，WIN32_EXIT_CODE=0，无蓝屏** |
 | **9.445b** | **加载 → 运行 → 卸载，三轮连续** | **全部通过，无蓝屏** |
 | G33 | snapshot 非破坏 + drain 消费 | ALL PASS |
