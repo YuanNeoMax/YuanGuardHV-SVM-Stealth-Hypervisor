@@ -11578,3 +11578,103 @@ sys-guard verify -> 0 page(s) changed   （host 侧读该页哈希未变）
 
 > 所以下一轮的第一件事不是藏更多页，而是**先让 DECOY 的读取可见**。
 > 否则 54 页实验的成败只能靠「跑一天没蓝屏」来判断 —— 那不是判据，那是运气。
+
+---
+
+#### 9.510 `npt-raw`：让 DECOY 的读取可见 —— 而且这个判据能报「有人读」
+
+9.509 留下的原话是：「DECOY 工作时**不产生 NPF、没有计数器会动**，藏 54 页的成败只能靠跑一天没蓝屏」。本轮补上那个观测。
+
+##### 观测工具本来就在硬件里
+
+AMD 的 NPT 条目有 **A（accessed，bit5）** 与 **D（dirty，bit6）**，由 **CPU** 在遍历该条目时置位
+（`npt.h` 的位域里明明白白写着 `accessed:1; dirty:1`）。而 DECOY 页 **present 保持** ——
+所以 guest 读它时**会走 NPT**，**硬件就在那一瞬间把 A 置 1**。
+
+**我们从来不需要新机制，只需要一个能读原始条目的入口，以及一个能清 A/D 的入口**，
+好把「读过没有」变成「自 T 之后读过没有」。
+
+##### 新增 `npt-raw`（IOCTL 0x832，只读或只清 A/D）
+
+```
+npt-raw <hex_pa>          读
+npt-raw <hex_pa> a        清 accessed
+npt-raw <hex_pa> d        清 dirty
+npt-raw <hex_pa> ad       清两者
+npt-raw <hex_pa> p        传 present 位掩码 -> 驱动必须拒绝
+```
+
+**清位的边界是刻意的**：只有 `A|D` 允许清，其它掩码**拒绝并把掩码回显**（`out[1] = clr`）。
+这两个位是**历史**；present / writable / NX 是**可用性** —— 一条能顺手改掉后者的诊断命令，
+就是一次事故的开始。
+
+##### 实机验证（两个方向都验）
+
+**(1) 能读到原始条目，且拆页前后形状正确**
+
+```
+拆页前  npt-raw 0x420245000 -> before = 0x00000004202000E7  A=True D=True
+                                entry: present=True writable=True nx=False frame=0x420200000
+                                （frame 是 2MB 基址 = 大页，符合）
+拆页后  npt-raw 0x420245000 -> before = 0x0000000420245027  A=True D=False
+                                entry: present=True writable=True nx=False frame=0x420245000
+                                （frame == 自身 = 4K 叶子，符合）
+```
+
+**(2) 能清，且回读确认清掉了**
+
+```
+npt-raw 0x420245000 a
+  before = 0x...5027  A=True  D=False
+  after  = 0x...5007  A=False D=False
+  cleared mask = 0x20  (A=True D=False)
+```
+
+**(3) 「没人读」能报出来** —— DECOY 藏这一页、清 A、等 **60 秒**：
+
+```
+before = 0x000000002230D007  A=False D=False
+```
+
+**(4) ★ 「有人读」也能报出来** —— 这条才是判据的生死线。
+对 **`.text` 首页**（驱动每次执行都经过它）清 A，然后跑一条命令：
+
+```
+清 A 后     after = 0x0000000420218047  A=False D=True
+```
+
+但**第一次没置回来**，`sys-health` 跑完之后仍然是 `A=False`。原因是
+**TLB 命中时硬件不再遍历表，A 位就不写** —— 这是 AMD 的实际行为，不是实现错。
+
+**强制刷 TLB（`npt-remap` 置 `VmcbClean=0` + `TlbControl=1`）后再读：**
+
+```
+before = 0x0000000420218027  A=True D=False
+```
+
+**A 由 False 变 True，且 D 保持 False** —— 说明这是**执行**造成的，不是写，
+更不是 `npt-raw` 自己读条目造成的（读条目走的是 host 侧的表指针，不经过 NPT）。
+
+##### 因此这个判据成立，但有一个必须记住的前提
+
+> **读 A 之前必须刷新 TLB。** 不刷新，A 永远是上一次遍历留下的值，
+> 于是「没人读」和「读了但 TLB 命中」**读出同一个结果** —— 又是一个双义值。
+
+这是本树第 7.5 条（观测点三条件）的又一次应用：**那个过程会改写被观测值**。
+A 位唯一的写入者是 CPU 的页表遍历，而 TLB 命中会**抑制**那次遍历。
+
+##### 本轮结果
+
+```
+构建   ALL SOURCE CHECKS PASS / ALL MAP CHECKS PASS / Build SUCCESS
+产物   5E01C1013A59E311  19:49:51   部署 hash 一致
+命令面 C=51 PowerShell=51 Java=51    客户端 74 条
+启动   RUNNING 6.75 s
+卸载   STOPPED 5.77 s，WIN32_EXIT_CODE=0，invmrun at unload = 0x0
+```
+
+**9.509 那条「下一步要先让 DECOY 可见」现在完成了。**
+`.data` 54 页实验的判据从「跑一天没蓝屏」变成了「清 A → 刷新 → 等 → 读 A」。
+但**在藏 54 页之前，还必须先回答一个问题**：那 54 页里**哪几页在正常运行时会被读**？
+这个答案现在可以测了（逐页清 A、刷新、跑一段、读 A），但那是一次**有 54 个读数的实验**，
+不是一次改动。

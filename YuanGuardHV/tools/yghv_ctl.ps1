@@ -23,6 +23,7 @@ Commands:
   unharden-service
   service-name                      (read-only: which name, exists?, start type, SDDL)
   pa-section <hex_pa>               (read-only: which of our sections holds this PA)
+  npt-raw <hex_pa> [a|d|ad]          (raw NPT entry; A/D are the DECOY-read observer)
   byovd-scan                        (local only: blocklist + KDU provider names, no driver needed)
   selftest
   selftest-abort
@@ -4141,6 +4142,77 @@ try {
             } else {
                 Write-Host '  VERDICT: data candidate - hideable IN PRINCIPLE; confirm with npt-view first'
             }
+        }
+        'npt-raw' {
+            # 9.510 (Tier 7.1): the RAW NPT entry for one page - and the observer
+            # 9.509 said was missing.
+            #
+            # usage: npt-raw <hex_pa>            (read)
+            #        npt-raw <hex_pa> a          (clear accessed)
+            #        npt-raw <hex_pa> d          (clear dirty)
+            #        npt-raw <hex_pa> ad         (clear both)
+            #        npt-raw <hex_pa> p          (attempt to clear present -> REFUSED)
+            #
+            # WHY THIS MATTERS: a DECOY-hidden page keeps present=1, so a guest read
+            # raises no #NPF and no counter moves. But the CPU SETS the entry's
+            # A(accessed) bit when it walks it. So "was this hidden page read?"
+            # is answerable - read A, clear it, wait, read again.
+            #
+            # Clearing is restricted to A and D by the driver: anything else comes
+            # back as a refusal with the mask echoed, never applied.
+            if ($null -eq $Arg1) { throw 'npt-raw: usage: npt-raw <hex_pa> [a|d|ad]' }
+            $pa = [Convert]::ToUInt64(("$Arg1" -replace '^0[xX]',''), 16)
+            $pa = $pa -band (-bnot 0xFFF)
+
+            $clr = [uint64]0
+            $what = 'read'
+            if ($null -ne $Arg2) {
+                $what = "$Arg2".ToLower()
+                if ($what -match 'a') { $clr = $clr -bor (1L -shl 5) }
+                if ($what -match 'd') { $clr = $clr -bor (1L -shl 6) }
+                if ($clr -eq 0) {
+                    # not a|d: pass a mask outside A|D on purpose so the driver refuses
+                    # and echoes it - the refusal is what this command demonstrates.
+                    $clr = [uint64]1
+                }
+            }
+
+            $req = New-Object byte[] 16
+            [BitConverter]::GetBytes([uint64]$pa).CopyTo($req, 0)
+            [BitConverter]::GetBytes([uint64]$clr).CopyTo($req, 8)
+
+            $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x832)) `
+                                    -InBytes $req -OutputLength 32
+
+            $ok     = [BitConverter]::ToUInt64($out, 0)
+            $before = [BitConverter]::ToUInt64($out, 8)
+            $after  = [BitConverter]::ToUInt64($out, 16)
+            $done   = [BitConverter]::ToUInt64($out, 24)
+
+            if ($ok -eq 0) {
+                Write-Host ("npt-raw: pa=0x{0:X}  NOT REACHABLE  (requested clear=0x{1:X})" -f $pa, $clr)
+                if ($clr -ne 0) {
+                    Write-Host '  (a mask outside A|D is refused; 0x1 here means the driver echoed it)'
+                }
+                return
+            }
+
+            $acc  = ($after  -band (1L -shl 5)) -ne 0
+            $dty  = ($after  -band (1L -shl 6)) -ne 0
+            $prs  = ($after  -band 1L) -ne 0
+            $wrt  = ($after  -band 2L) -ne 0
+            $nx   = ($after  -band (([uint64]1 -shl 63))) -ne 0
+            $fr   = $after -band 0x000FFFFFFFFFF000
+            $accB = ($before -band (1L -shl 5)) -ne 0
+            $dtyB = ($before -band (1L -shl 6)) -ne 0
+
+            Write-Host ("npt-raw: pa=0x{0:X}  mode={1}" -f $pa, $what)
+            Write-Host ("  before = 0x{0:X16}  A={1} D={2}" -f $before, $accB, $dtyB)
+            Write-Host ("  after  = 0x{0:X16}  A={1} D={2}" -f $after, $acc, $dty)
+            Write-Host ("  entry: present={0} writable={1} nx={2} frame=0x{3:X}" -f $prs, $wrt, $nx, $fr)
+            if ($done -ne 0) { Write-Host ("  cleared mask = 0x{0:X}  (A={1} D={2})" -f $done,
+                (($done -band (1L -shl 5)) -ne 0), (($done -band (1L -shl 6)) -ne 0)) }
+            if ($done -eq 0 -and $clr -ne 0) { Write-Host '  clear NOT applied (write refused, or large page)' }
         }
         'npt-view' {
             # 9.450 (Tier 7.1): what would a GUEST see at this physical page.

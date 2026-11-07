@@ -439,6 +439,45 @@ typedef struct {
 #define YGHV_PA2SEC_NONE         0xFFFFFFFFULL
 
 /*
+ * 9.510 (Tier 7.1): the RAW NPT entry for one page - the evidence a npt-view
+ * verdict should be argued from.
+ *
+ * WHY IT EXISTS: a DECOY-hidden page stays present, so a guest read raises NO
+ * #NPF and no counter moves. 9.509 could only judge a 54-page hide by "ran
+ * without a BSOD". The hardware already recorded the missing fact - AMD's NPT
+ * entry has an A (accessed) bit at position 5 and a D (dirty) bit at position 6,
+ * set BY THE CPU when it walks that entry. So "was this hidden page ever read"
+ * was always answerable; it needed a way to read the raw entry, and to clear
+ * A/D so that "read since T" is answerable rather than "read ever".
+ *
+ * Input:
+ *   {ULONG_PTR pa}                 read only (low 12 bits ignored)
+ *   {ULONG_PTR pa, UINT64 clr}     clear those low bits on that leaf
+ *                                  (ONLY bit5 A and bit6 D accepted)
+ * Output (4 qwords):
+ *   [0] status: 1 ok, 0 = entry not reachable (or the clear mask was refused)
+ *   [1] entry BEFORE the optional clear (raw 64-bit)
+ *   [2] entry AFTER  (equals [1] when nothing was cleared)
+ *   [3] mask actually cleared (0 on a read-only call)
+ *
+ * A mask outside (A|D) is REFUSED, and the refused mask is echoed in [1] so the
+ * caller sees what it asked for. Those two bits are history; present / writable /
+ * NX are availability, and a command that can touch the second by accident is
+ * how a diagnostic becomes an outage.
+ *
+ * The clear writes the raw leaf through npt_write_entry(), which refuses large
+ * pages - so A/D on an unsplit 2MB entry is not silently applied to one 4K page.
+ *
+ * Read only when `clr` is 0. PASSIVE only (npt_get_entry walks tables).
+ */
+#define IOCTL_YGHV_NPT_RAW \
+    YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x832, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
+#define YGHV_NPT_RAW_OUT_QWORDS  4
+#define YGHV_NPT_BIT_ACCESSED    (1ULL << 5)
+#define YGHV_NPT_BIT_DIRTY       (1ULL << 6)
+#define YGHV_NPT_AD_MASK         (YGHV_NPT_BIT_ACCESSED | YGHV_NPT_BIT_DIRTY)
+
+/*
  * 9.456 (Tier 7.1): hide ONE named data section, by walking the PE report.
  *
  * WHY NAMED, AND WHY ONE AT A TIME

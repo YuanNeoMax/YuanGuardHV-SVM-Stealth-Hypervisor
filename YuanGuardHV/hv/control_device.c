@@ -2912,6 +2912,88 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
         }
         break;
     }
+    case IOCTL_YGHV_NPT_RAW: {
+        /*
+         * 9.510 (Tier 7.1): the raw entry, and optionally clearing A/D.
+         *
+         * WHY: a DECOY-hidden page stays PRESENT, so a guest read does not raise
+         * #NPF and every counter in this tree stays at zero whether it was read
+         * or not. 9.509 was left able to judge a 54-page hide only by "it ran
+         * a day without a BSOD", which is luck. The hardware already records
+         * exactly the missing fact: the NPT entry's A bit (bit 5) is set BY THE
+         * CPU when it walks that entry (npt.h carries accessed/dirty as
+         * bitfields). So the observation existed all along; what was missing
+         * was a way to READ it - and to CLEAR it, so that "accessed since T"
+         * is answerable rather than "accessed ever".
+         *
+         * THE CLEAR IS DELIBERATELY NARROW. Only A and D may be cleared; anything
+         * else is refused and echoed back. Those two bits are history; present /
+         * writable / NX are availability, and a command that could touch the
+         * second by accident is how a diagnostic becomes an outage.
+         *
+         * npt_write_entry() writes the raw leaf and REFUSES large pages, so A/D
+         * on an unsplit 2MB entry is not silently applied to one 4K page - it
+         * reports "not reachable" instead.
+         */
+        extern npt_mgr_t g_npt;
+        extern int npt_get_entry(npt_mgr_t *m, uint64_t g, uint64_t *out);
+        extern int npt_write_entry(npt_mgr_t *m, uint64_t g, uint64_t v);
+
+        if (out_len < YGHV_NPT_RAW_OUT_QWORDS * sizeof(UINT64)) {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        if (in_len < sizeof(ULONG_PTR)) {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+
+        {
+            UINT64 *out = (UINT64 *)buf;
+            UINT64 pa = (UINT64)(*(ULONG_PTR *)buf) & ~(UINT64)0xFFFULL;
+            UINT64 clr = 0;
+            UINT64 before = 0, after = 0;
+            int st;
+
+            if (in_len >= sizeof(ULONG_PTR) + sizeof(UINT64)) {
+                clr = *(UINT64 *)((UCHAR *)buf + sizeof(ULONG_PTR));
+            }
+
+            out[0] = 0; out[1] = 0; out[2] = 0; out[3] = 0;
+
+            if (clr & ~(UINT64)YGHV_NPT_AD_MASK) {
+                out[1] = clr;      /* echo the refused mask */
+                info = YGHV_NPT_RAW_OUT_QWORDS * sizeof(UINT64);
+                status = STATUS_SUCCESS;
+                break;
+            }
+
+            st = npt_get_entry(&g_npt, pa, &before);
+            if (st != STATUS_SUCCESS) {
+                info = YGHV_NPT_RAW_OUT_QWORDS * sizeof(UINT64);
+                status = STATUS_SUCCESS;
+                break;
+            }
+
+            after = before;
+            if (clr) {
+                UINT64 want = before & ~(clr & (UINT64)YGHV_NPT_AD_MASK);
+                if (NT_SUCCESS(npt_write_entry(&g_npt, pa, want))) {
+                    (void)npt_get_entry(&g_npt, pa, &after);
+                    out[3] = (clr & (UINT64)YGHV_NPT_AD_MASK);
+                } else {
+                    after = before;   /* write refused (large page / no leaf) */
+                }
+            }
+
+            out[0] = 1;
+            out[1] = before;
+            out[2] = after;
+            info = YGHV_NPT_RAW_OUT_QWORDS * sizeof(UINT64);
+            status = STATUS_SUCCESS;
+        }
+        break;
+    }
     case IOCTL_YGHV_NPT_VIEW: {
         /*
          * 9.450 (Tier 7.1): what would a GUEST see at this physical page.

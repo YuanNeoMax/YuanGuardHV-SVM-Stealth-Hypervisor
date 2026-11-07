@@ -104,6 +104,9 @@ public class YghvCtl {
      Declared so the four-way parity check stays a real check; this client does
      not issue it (the PowerShell client does). */
   private static final int FN_PA_TO_SECTION = 0x831;
+  /* 9.510 (Tier 7.1): the RAW NPT entry for one page (A/D readable,
+     clearable). Declared so the four-way parity check stays a real check. */
+  private static final int FN_NPT_RAW = 0x832;
 
     private static native long openHandle();
     private static native void closeHandle(long handle);
