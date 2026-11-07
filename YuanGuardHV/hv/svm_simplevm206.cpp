@@ -1465,6 +1465,75 @@ extern "C" ULONG yghv_s206_physical_cores(VOID)
     return count;
 }
 
+/*
+ * 9.539: OPT-IN "real Windows context as guest" MODE. DEFAULT OFF.
+ *
+ * The 2026-08 OS-as-guest conclusion ("platform limit, errata 1363") was drawn
+ * from experiments that all ran AFTER 9.443 replaced the guest with a perpetual
+ * stub. The reference implementations (Type2-AMD-HV, miniSVM) put the RUNNING
+ * Windows thread in the guest instead, and report it working. The intercept-bit
+ * comparison shows we already match them there - so the untried variable is the
+ * guest CONTEXT, not the VMCB configuration.
+ *
+ * This flag exists so that trying it cannot touch the shipping path: with it
+ * off, Sv206SetupGuest sets RIP to the stub exactly as before. With it on, RIP
+ * and RSP come from the captured Windows context.
+ *
+ * EXPECTED TO FAIL. 9.442 already established that a guest which is a real
+ * thread has no safe exit: the stop path would resume it mid-function with
+ * RCX/RBX destroyed and SVM already off. That is why this is a flag and not a
+ * new default.
+ */
+extern "C" int yghv_s206_real_guest_mode(VOID)
+{
+    static volatile LONG cached = -1;
+    UNICODE_STRING  path;
+    OBJECT_ATTRIBUTES attrs;
+    HANDLE          key = nullptr;
+    ULONG           value = 0;
+    ULONG           size  = sizeof(value);
+    NTSTATUS        st;
+    LONG            hit;
+
+    hit = InterlockedCompareExchange(&cached, -1, -1);
+    if (hit != -1) return (int)hit;
+
+    RtlInitUnicodeString(&path, L"\\Registry\\Machine\\System\\CurrentControlSet"
+                                L"\\Services\\yghvpa\\Parameters");
+    InitializeObjectAttributes(&attrs, &path,
+                               OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, nullptr, nullptr);
+
+    if (NT_SUCCESS(ZwOpenKey(&key, KEY_QUERY_VALUE, &attrs)))
+    {
+        UNICODE_STRING name;
+        RtlInitUnicodeString(&name, L"RealGuestMode");
+        st = ZwQueryValueKey(key, &name, KeyValuePartialInformation, nullptr, 0, &size);
+        if (st == STATUS_BUFFER_OVERFLOW || st == STATUS_BUFFER_TOO_SMALL)
+        {
+            void *buf = ExAllocatePoolWithTag(NonPagedPool, size, 'gEvR');
+            if (buf != nullptr)
+            {
+                st = ZwQueryValueKey(key, &name, KeyValuePartialInformation, buf, size, &size);
+                if (NT_SUCCESS(st))
+                {
+                    KEY_VALUE_PARTIAL_INFORMATION *kv =
+                        static_cast<KEY_VALUE_PARTIAL_INFORMATION *>(buf);
+                    if (kv->Type == REG_DWORD && kv->DataLength >= sizeof(ULONG))
+                    {
+                        value = *reinterpret_cast<ULONG *>(kv->Data);
+                    }
+                }
+                ExFreePoolWithTag(buf, 'gEvR');
+            }
+        }
+        ZwClose(key);
+    }
+
+    hit = (value != 0) ? 1 : 0;
+    InterlockedExchange(&cached, hit);
+    return (int)hit;
+}
+
 extern "C" ULONG yghv_s206_core_limit(ULONG available)
 {
     UNICODE_STRING  path;
@@ -5323,8 +5392,29 @@ SvPrepareForVirtualization (
      * stop flag no longer has to be set from an arbitrary exit (which 9.442 showed
      * was corruption, not a fix).
      */
-    VpData->GuestVmcb.StateSaveArea.Rip =
-        reinterpret_cast<UINT64>(&Sv206GuestStub);
+    /*
+     * 9.539: OPT-IN REAL-CONTEXT GUEST. Default OFF, and with it off this line
+     * is the same assignment as before - that is deliberate, because a mode that
+     * may crash must not be reachable by accident.
+     *
+     * Turned on, the guest is the captured Windows thread context instead of the
+     * stub. That is the configuration Type2-AMD-HV / miniSVM use and the one the
+     * 2026-08 experiments never tested (they all ran with the stub as guest).
+     *
+     * RSP comes along with it: a real thread dereferences its own stack, so the
+     * stub-era reasoning ("the stub never touches the stack, so handing it a host
+     * pointer is safe") does not hold here - the real RSP must be the real RSP.
+     */
+    if (yghv_s206_real_guest_mode())
+    {
+        VpData->GuestVmcb.StateSaveArea.Rip = ContextRecord->Rip;
+        VpData->GuestVmcb.StateSaveArea.Rsp = ContextRecord->Rsp;
+    }
+    else
+    {
+        VpData->GuestVmcb.StateSaveArea.Rip =
+            reinterpret_cast<UINT64>(&Sv206GuestStub);
+    }
     VpData->GuestVmcb.StateSaveArea.GPat = __readmsr(IA32_MSR_PAT);
 
     /*
