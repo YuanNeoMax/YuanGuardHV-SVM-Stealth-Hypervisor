@@ -1,175 +1,175 @@
-# Windows-as-Guest（真 guest 态）可行性规划
+# Windows-as-Guest：参考项目对照与真正的分歧点
 
-> 生成：2026-11-08。依据：仓库内 `YGHV_OS_AS_GUEST_SUMMARY_20260815.md`
-> （9.84–9.197 共 114 个实验）+ AMD 官方勘误表 56683。
-
----
-
-## 一、先给结论
-
-**在这台机器（AMD Ryzen 5 5500 / Family 19h / Zen 3）上，让真实 Windows 在 guest 态运行
-是不可行的。** 这不是「还没做好」，而是**平台级限制，AMD 官方标注「No fix planned」**。
-
-仓库里已经做过 **114 个实验**（9.84–9.197），把驱动层能想到的变量全部穷尽过。
+> 2026-11-08。**本文推翻此前「本机不可行」的结论。**
 
 ---
 
-## 二、官方勘误：这条结论不是我们自己下的
+## 一、反例存在
 
-**AMD Revision Guide 56683（Family 19h Models 00h-0Fh），勘误 #1363：**
+### Type2-AMD-HV（whosstyler，开源）
 
-> **Persistent Stream of APIC Register Accesses May Cause System to Hang or Reset**
+> **"Once loaded, every logical processor is put under VMRUN. Windows keeps running normally."**
+
+AMD SVM/NPT 实现，README 明确写了完整做法：
+
+| 环节 | 做法 |
+|---|---|
+| 接管 | `BroadcastVirtualize`：DPC 扇出到每个 CPU，各自 `RtlCaptureContext` 后进 VMRUN |
+| **中断** | **host 有独立 IDT**（拷贝 Windows 的，覆盖 0-20，NMI 保留原样）|
+| NPT | dual-NCR3 双树（`npt_main` 读 / `npt_hooks` 执行，解决 AMD 无 execute-only）|
+| MSR | 只影子化 EFER 和 VM_HSAVE_PA |
+| **拦截范围** | **只有 VMRUN / VMMCALL / 自己的 NPF。"Everything else passes through."** |
+
+**同样 AMD、同样 NPT、同样是 Windows 当 guest。**
+
+### 另两个参考
+
+- **miniSVM**（Vu2n）：Type-1 bare-metal，UEFI 阶段装好，"hosts whatever boots next"
+- **vmmcall.org**："Building a Windows Hypervisor for Systems Research"
+
+---
+
+## 二、真正的分歧点（关键发现）
+
+### 2.1 我们 8 月试的是什么
+
+`_ARCHIVE_HANDOFF_9.1-9.299.md` 9.174 节原文：
+
+> **step23（阻塞常驻 + INTR/NMI 拦截 + host ISR + 全部修复：GS selector/TSS
+> 隔离/GS MSR 虚拟化/ASID 卫生 FLUSH_ALL）实测：仍 <5s 硬冻结。**
 >
-> *"A persistent stream of APIC register accesses, such as a write to the Task Priority
-> Register (TPR) ... may cause the system to hang or reset."*
+> **决定性含义**：…… 对阻塞常驻（guest 内真实 Windows 调度器上下文切换）而言，
+> **INTR/NMI 拦截 + host ISR 也不能解冻**
 >
+> **剩余唯一未测驱动级方向**：**拦截 guest 的 CR3 写**
+
+### 2.2 所以两条路从来没被分开过
+
+| 配置 | 试过？ | 结果 |
+|---|---|---|
+| **INTR/NMI 拦截 + host ISR** | ✅ 试过（step23）| 仍冻结 |
+| **不拦截 INTR/NMI，让 guest 自己处理** | ❌ **从未试过** | — |
+
+**8 月的实验矩阵里，所有配置都在「拦截中断」这一侧。** 唯一 PASS 的 step20 也是
+「INTR/NMI 拦截 + host ISR」，只是 guest 是自旋桩、不执行真实 Windows 调度器。
+
+**「让 Windows 的 ISR 在 guest 态原生执行」这个配置，从未被测试。**
+
+### 2.3 而参考项目走的正是这条没试过的路
+
+Type2-AMD-HV 的 "Everything else passes through" 意味着：
+
+- **不拦截 INTR**：Windows 的 ISR 在 guest 态直接跑
+- **不拦截 APIC 访问**：guest 直接操作自己的 APIC（在虚拟机里它就是 native）
+- **没有 EOI/TPR 转发**：因此**没有持续的 APIC 寄存器访问流**
+
+---
+
+## 三、errata 1363 的含义需要重新界定
+
+**AMD 官方（Revision Guide 56683，Family 19h）：**
+
+> **#1363 — Persistent Stream of APIC Register Accesses May Cause System to Hang or Reset**
 > **No fix planned**
 
-**这台机器的 CPU 就是 Family 19h Zen 3。** 而「guest 态运行真实 Windows」必然持续访问 APIC
-（调度器、定时器、IPI 全都走它），正好命中这条勘误的触发条件。
+**关键在「Persistent Stream（持续的流）」这个词：**
 
----
-
-## 三、仓库已经验证过的 114 个实验（关键节点）
-
-### 3.1 第一阶段（9.84–9.102）：常驻线停线
-
-| 编号 | 做法 | 结果 |
-|---|---|---|
-| v93 | MSR_PROT + VM_CR 读 | 硬冻结 |
-| v96 | 持续写物理 APIC TPR | **PASS**（45–140s，TPR 写流单独不冻结）|
-| v97 | +HLT/MWAIT 拦截 | 硬冻结（更早）|
-| v98 | xAPIC MMIO 影子 + 转发 | 硬冻结 |
-| v99 | 全 12 核对称常驻 | 硬冻结（**排除「单核不对称」**）|
-| v102 | 全 32 异常 + HLT 拦截 | 无捕获，硬冻结 → **平台级停机判定** |
-
-### 3.2 第二阶段（9.149–9.156）：找到唯一解冻变量
-
-| 编号 | 做法 | 结果 |
-|---|---|---|
-| 9.149–9.151 | 核数 1–12 / 退出率 / C 状态 隔离矩阵 | 全冻结 → **排除这些变量** |
-| **9.152** | **独立 CR3（最小页表）合成 resident** | **稳定 5 分钟**，首个解冻变量 |
-| 9.155 | 修 host_stack 只映射 1/4 页 | 修复后 12 核 ACTIVE |
-
-**关键**：9.152 的「稳定」是**纯心跳 guest，中断全在宿主态服务，从不执行 guest 态 ISR** ——
-**它没有运行真实 Windows 内核代码。**
-
-### 3.3 第三阶段（9.157–9.175）：OS-as-guest 重开
-
-驱动层变量**全部穷尽**，全部无效：
-
-| 变量 | 编号 | 结果 |
-|---|---|---|
-| ASID / TLB 卫生（每核唯一 ASID + FLUSH_BY_ASID）| 9.159–9.161 | 无效 |
-| GS selector 镜像宿主 | 9.170 | 0x139 → 硬冻结 |
-| TSS 隔离 | 9.171 | 无效 |
-| FLUSH_ALL | 9.172 | 无效 |
-| GS base MSR 虚拟化 | 9.174 | 无效 |
-| CR3 写拦截 | 9.175 | 无效 |
-| 独立 CR3 深/浅拷贝克隆 | 9.177–9.179 | 深拷贝 0x7E / 浅拷贝冻结 |
-
-**9.177–9.179 的结论最关键**：
-> **OS-as-guest 架构上必须共享宿主页表**（进程切换会把 CR3 拉回真实页表）
-
-### 3.4 第四阶段（9.184–9.197）：APIC 虚拟化 B 路线
-
-| 实验 | 改动 | 结果 |
-|---|---|---|
-| B-0 | spin + 注入，**无** APIC 影子 | **硬冻结**（guest ISR 直接碰物理 APIC = errata 1363）|
-| B-1min | +RAM 影子 | 0x101（影子消除硬冻结，但时钟不被服务）|
-| B-1full | +写陷阱 + EOI/ICR/timer 转发 | **仍 0x101**（APIC 完整虚拟化不是瓶颈）|
-| D3-base | 控制组（无注入器）| **0x101** → **注入不是变量，基座本身不稳** |
-| D4-base | 深拷贝 + host ISR + APIC 影子 | **0x101** → 受控注入测试被阻断 |
-
-**D3-base / D4-base 是决定性的**：连控制组都 0x101，说明**不是某个功能没做好，
-而是基座本身站不住**。
-
-### 3.5 外部假说判别
-
-| 假说 | 判别 | 依据 |
-|---|---|---|
-| NPT 权限不全卡 ISR | **证伪** | 全用独立 CR3 + 全 RW identity NPT，仍 0x101 |
-| Host 饥饿（全核给 guest）| **证伪** | 单核 guest + 11 空闲宿主核，仍 0x101 |
-| 「9.152 稳定 = ISR 硬件可行」| **误读** | 9.152 不执行 guest 态 ISR |
-| 深拷贝慢/竞态 | **证实并已修** | D1c 0x50；D4 克隆期暂停 diag 后无 0x50 |
-
----
-
-## 四、对你的三个目标意味着什么
-
-| 目标 | 现行架构（桩当 guest）| 真 guest 态（Windows 在 guest） |
-|---|---|---|
-| **1. 扫描器看不到驱动** | ❌ 三处全可见 | ⚠️ **仍然不行** —— 扫描器跑在 guest 内，看到的是 guest 自己的模块列表，NPT 保护不了「guest 内进程互相可见」|
-| **2. 保护内存不被别的进程读** | ❌ NPT 无观察者 | ✅ **理论上成立**（NPT 对 guest 内一切生效）|
-| **3. NPT 隐藏机制** | ✅ 机制有效但无观察者 | ✅ 真正生效 |
-
-**注意：即使切到真 guest 态，目标 1 也不成立。** 目标 1 只能靠「摘链/改隐藏」实现，
-和 NPT 是两条不同的技术路线。
-
----
-
-## 五、如果一定要做，三条可选路
-
-### 路线 A：换硬件（唯一能真正实现的路）
-
-**条件**：换一台**不受 errata 1363 影响**的机器。
-
-候选：
-- **Intel VT-x 机器**（EPT 而非 NPT，不同的 APIC 虚拟化路径，无这条勘误）
-- **更新的 AMD**（Zen 4 / Zen 5，需先查各自 Revision Guide 是否已修 1363）
-
-**代价**：全部代码要重做（SVM → VMX），是**重写不是移植**。
-
-**建议顺序**（仓库文档 5.3 已给出）：
-```
-有界试点 → ASID/TLB 卫生 → 修卸载 → 独立 CR3 + APIC 虚拟化 → 阻塞常驻
-```
-
-### 路线 B：只做目标 1（不改架构）
-
-**目标 1 不需要真 guest 态。** 它有独立的技术路线：
-
-| 手段 | 现状 |
+| 方案 | 是否产生持续的 APIC 访问流 |
 |---|---|
-| 符号链接隐藏 | ✅ 已有（`link-hide`，5 秒窗口自恢复，9.453）|
-| `PsLoadedModuleList` 摘链 | ⚠️ 9.499 判「不做」，因为**只摘一个链表，其他列表还在** |
-| 服务/注册表项隐藏 | ❌ 无（删键会自断卸载路径）|
+| **host ISR 代管**（我们的 step23）| ✅ **是** —— 每次中断都要 host 转发 EOI/TPR 到物理 APIC |
+| **guest 自己处理**（参考项目）| ❌ **否** —— ISR 直接操作，无转发，无额外流 |
 
-**这条路可做，且不碰架构。** 但要接受「只能提高门槛，不能真正隐形」。
-
-### 路线 C：接受现状，把已有能力用足
-
-**现行架构能真正做到的事**（都已实测）：
-
-- 跨进程内存读写，比 API 快 **3.96×**
-- 页写保护（周期同步守卫，不翻转 NPT 权限）
-- `.pdata` 段 DECOY 隐藏（机制有效）
-- 干净卸载（`invmrun at unload = 0x0`）
-
-**性能已优化到 1.2×**（基线 1.0×），不会再好了。
+**所以 errata 1363 是「host 代管中断」方案的必然结果，不是「Windows-as-guest」的必然结果。**
 
 ---
 
-## 六、我的建议
+## 四、8 月结论的准确表述
 
-**走路线 B，暂不碰架构。**
+它写的是：
 
-理由：
+> 「**OS-as-Guest（真实 Windows 在 guest 态执行调度器/ISR）在本机不可行**」
 
-1. **目标 1 不必换架构**，有现成基础（`link-hide` 已有），投入产出比最高
-2. **目标 2/3 在本机是死路**，官方 errata 「No fix planned」，114 个实验已经证明
-3. **要目标 2/3 就必须换 Intel 机器**，那是重写，不是优化
+**但它的实验里，「guest 态执行 ISR」这个前提从未被满足过。**
 
-**如果将来换 Intel 机器**，那份 8 月的研究文档（`YGHV_OS_AS_GUEST_SUMMARY_20260815.md`）
-就是现成的施工图 —— 它记下了每一步的顺序和陷阱。
+- 拦截中断 → guest 不执行 ISR（host 代管）
+- 不拦截中断 → **从未测试**
+
+**它验证的是「host 代管中断的方案不行」，不是「Windows 当 guest 不行」。**
 
 ---
 
-## 七、我没做的事（诚实说明）
+## 五、可行路线
 
-- **没有重新跑那些实验**。114 个实验是 8 月做的，`docs/YGHV_OS_AS_GUEST_SUMMARY_20260815.md`
-  记录了完整的过程与 dump 名。重跑没有新信息，只会再蓝屏。
-- **没有验证 errata 1363 是否真的就是那次冻结的原因**。文档把它列为「硬件级解释」，
-  但**没有做「换 Intel 机器则通过」的对照实验** —— 那需要另一台机器。
-- **没能拿到 56683.pdf 原文页面**（PDF 抓取超时），只拿到搜索摘要里的官方表述
-  「Persistent Stream of APIC Register Accesses May Cause System to Hang or Reset / No fix planned」。
+### 5.1 关键配置：中断完全不拦截
+
+```
+VMCB.ControlArea.InterceptMisc1：
+  ✅ 拦截 VMRUN      （必需，APM Vol2 Table B-1）
+  ✅ 拦截 VMMCALL    （自己的 hypercall 通道）
+  ❌ 不拦截 INTR     ← 关键
+  ❌ 不拦截 NMI
+  ❌ 不拦截 HLT
+  ❌ 不拦截 APIC 访问（不做 MMIO 影子、不做 EOI/TPR 转发）
+  ❌ 不拦截异常      （或只拦截必要的）
+```
+
+### 5.2 需要的组件对照
+
+| 组件 | 我们现状 | 参考项目 | 差距 |
+|---|---|---|---|
+| 独立 host CR3 | ✅ | ✅ | — |
+| **独立 host IDT** | ❓ 需确认 | ✅（拷贝 + 覆盖 0-20，NMI 保留）| 可能要补 |
+| MSR 影子（EFER / VM_HSAVE_PA）| ⚠️ 部分 | ✅ | 要补全 |
+| 每 CPU 一个 VMCB | ✅ | ✅ | — |
+| DPC/IPI 扇出接管 | ✅（`KeIpiGenericCall`）| ✅ | — |
+| **不拦截中断的配置** | ❌ | ✅ | **这是要补的** |
+
+### 5.3 最小验证实验
+
+**只改拦截位，不改架构，保留现有桩方案作回退：**
+
+```
+1. 新增一个模式标志（不动现有 206-B 路径）
+2. guest 上下文 = RtlCaptureContext 捕获的真实 Windows RIP
+3. InterceptMisc1 只留 VMRUN | VMMCALL
+4. 不拦截 INTR / NMI / HLT / APIC
+5. 观察稳定性（目标：跑满 5 分钟）
+```
+
+**如果稳定 → 8 月结论被推翻，Windows-as-guest 在本机可行。**
+
+---
+
+## 六、风险与未验证项
+
+1. **参考项目未必在我们这台 CPU 上验证过。** Type2-AMD-HV 的 README 没说测试机型。
+   **「它能行」是推断，不是本机实测。**
+
+2. **8 月的文档是横向归纳版，细节可能在逐条记录里。** 我搜了「不拦截中断」「pass-through」
+   「仅拦截 VMRUN」等关键词，全部 0 命中；找到的是「**剩余唯一未测方向是 CR3 写拦截**」这句话
+   —— 说明当时**认为**中断这条路已经穷尽（因为它只试了「拦截」这一侧）。
+
+3. **NPT 仍需正确。** 9.177-9.179 说「OS-as-guest 必须共享宿主页表」，
+   而参考项目用 dual-NCR3 双树。这两者是否冲突需要核对源码。
+
+4. **曾经的 114 次蓝屏记录是资产，不是障碍** —— 它告诉我们哪些组合不行，
+   正好用来缩小这次的搜索空间。
+
+---
+
+## 七、下一步（按顺序）
+
+1. **拉 Type2-AMD-HV 源码**，对照它的：
+   - `HvInitialize` 完整启动序列
+   - VMCB 拦截位的具体设置
+   - host IDT 的构建方式
+2. **核对 9.177-9.179 的「必须共享宿主页表」与参考项目的 dual-NCR3 是否矛盾**
+3. **做最小实验**（只改拦截位 + 保留回退）
+
+---
+
+## 八、诚实说明
+
+- 本文的结论是「**有可能，值得一试**」，不是「**一定能成**」
+- 参考项目是间接证据（别人的机器、别人的实现），不是本机实测
+- 我上一版规划写「换 Intel 机器是唯一出路」，**那个结论下早了**
