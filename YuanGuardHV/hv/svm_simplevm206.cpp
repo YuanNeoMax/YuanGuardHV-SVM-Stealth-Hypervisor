@@ -3318,7 +3318,24 @@ SvHandleVmExit (
      * inside SvVirtualizeProcessor, the guest never resumed there and no amount of
      * early-return wiring could have helped.
      */
-    if (InterlockedIncrement(&g_S206GuestFirstExitTaken) == 1)
+    /*
+     * 9.548: PER-EXIT PROBE DISABLED - single-variable isolation test.
+     *
+     * 9.547 (from the dump): RealGuestMode dies at Sv206LaunchVm+0x1E on `vmsave`,
+     * P3=8 instruction-fetch, and vmrun HAD returned. 9.546 had just added an
+     * InterlockedIncrement on the FIRST LINE of this handler - every exit, at
+     * DISPATCH/HIGH_LEVEL, GIF already clear - and the crash appeared immediately
+     * after, in a mode that 9.539 had run for 30 seconds.
+     *
+     * Disabled rather than deleted so the experiment can be re-run either way. If
+     * RealGuestMode starts now, the probe was the cause; if it still dies at
+     * vmsave, the probe is exonerated.
+     *
+     * Cost of disabling: the first-exit Rip is no longer recorded. The setup-side
+     * record (cold path, once per core) is untouched, so `guest-start` still shows
+     * the Rip the guest was handed.
+     */
+    if (0 && InterlockedIncrement(&g_S206GuestFirstExitTaken) == 1)
     {
         InterlockedExchange64(&g_S206GuestFirstExitRip,
                               (LONG64)VpData->GuestVmcb.StateSaveArea.Rip);
