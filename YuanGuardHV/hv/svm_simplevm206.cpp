@@ -1406,6 +1406,65 @@ extern "C" { volatile LONG64 g_S206Exits = 0; }
  * UNCHANGED, which is the only acceptable default for a parameter a boot
  * depends on.
  */
+/*
+ * 9.526: COUNT PHYSICAL CORES, NOT LOGICAL PROCESSORS.
+ *
+ * Measured (12-thread benchmark, every logical processor loaded):
+ *   6 cores -> 1.7x     <- this machine, and the best point by far
+ *   12 cores -> 11.6x   <- what "all processors" gives you
+ *
+ * RelationProcessorCore returns ONE record per physical core, and each record
+ * carries a Mask listing all the SMT siblings that belong to it. Counting the
+ * records is therefore the physical core count, with no CPUID decoding and no
+ * assumption that SMT is 2-way.
+ *
+ * Returns 0 on failure, and every caller treats 0 as "use the supplied
+ * available count instead" - a topology query that fails must not silently
+ * reduce how much of the machine is virtualised.
+ */
+extern "C" ULONG yghv_s206_physical_cores(VOID)
+{
+    ULONG  len    = 0;
+    ULONG  count  = 0;
+    PUCHAR buf    = nullptr;
+    NTSTATUS st;
+
+    /* First call learns the required size and is expected to fail. */
+    st = KeQueryLogicalProcessorRelationship(nullptr, RelationProcessorCore,
+                                             nullptr, &len);
+    if (st != STATUS_BUFFER_TOO_SMALL && st != STATUS_INFO_LENGTH_MISMATCH)
+    {
+        return 0;
+    }
+
+    buf = (PUCHAR)ExAllocatePoolWithTag(NonPagedPool, len, 'pCvS');
+    if (buf == nullptr) return 0;
+
+    st = KeQueryLogicalProcessorRelationship(nullptr, RelationProcessorCore,
+                                             (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)buf,
+                                             &len);
+    if (NT_SUCCESS(st))
+    {
+        /*
+         * The array is a sequence of VARIABLE-LENGTH records - the EX type
+         * carries a Size field for exactly this reason, so advancing by
+         * sizeof() would walk off the last record and count garbage.
+         */
+        PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX it =
+            (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)buf;
+        PUCHAR end = buf + len;
+        while ((PUCHAR)it < end && it->Size != 0)
+        {
+            if (it->Relationship == RelationProcessorCore) count += 1;
+            it = (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)
+                 ((PUCHAR)it + it->Size);
+        }
+    }
+
+    ExFreePoolWithTag(buf, 'pCvS');
+    return count;
+}
+
 extern "C" ULONG yghv_s206_core_limit(ULONG available)
 {
     UNICODE_STRING  path;
@@ -1423,7 +1482,11 @@ extern "C" ULONG yghv_s206_core_limit(ULONG available)
     st = ZwOpenKey(&key, KEY_QUERY_VALUE, &attrs);
     if (!NT_SUCCESS(st))
     {
-        return available;   /* no Parameters key -> all cores */
+        /* 9.526: no Parameters key -> PHYSICAL cores, the measured optimum.
+         * 12-thread load: 6 cores 1.7x vs 12 cores 11.6x. Falling back to
+         * `available` here would keep the 11.6x behaviour as the default. */
+        ULONG phys = yghv_s206_physical_cores();
+        return (phys != 0 && phys < available) ? phys : available;
     }
 
     {
@@ -1457,7 +1520,9 @@ extern "C" ULONG yghv_s206_core_limit(ULONG available)
 
     if (value == 0)
     {
-        return available;   /* explicit 0 means "no limit" */
+        /* 9.526: 0 also means "no explicit override" -> physical cores. */
+        ULONG phys = yghv_s206_physical_cores();
+        return (phys != 0 && phys < available) ? phys : available;
     }
     if (value > available) value = available;
     return value;
