@@ -12732,3 +12732,76 @@ page 7: 0x00C4C40000000007  (index 7)
 `mmf-hold` 的注释原来写「never writes the page itself」。**那是错的** —— 它现在每页写一次。
 但真正重要的性质仍然成立：**seed 之后不再写**，所以「我们写之后读到的值」仍然无歧义。
 注释已就地改正，没有留着一句与代码相反的旧话。
+
+---
+
+#### 9.530–9.532 遗留缺陷 1b/2/3 修复 + 缺陷 4 的一次失败实验
+
+##### 已修：1b（`mem-pte` 报 6/8 是时序假象，不是缺陷）
+
+上一轮登记为「新缺陷」，本轮查明**不是缺陷**：同一进程稳定 5 秒后重测，
+**8/8 页全部 MAPPED**。之前的 6/8 是**验证时进程页尚未全部被访问**造成的时序假象。
+
+> 这一条本身值得记：**判据读数的抖动，先查时序，再怀疑代码。**
+
+##### 已修：2（`mem-bp` 的 GPA/VA 语义）
+
+usage 文本现在明说：
+- `add`/`del`/`int3` 要 **GPA（物理地址）**
+- `dr` 要 **VA（虚拟地址）**
+
+并补上了原因（NPF/INT3 走 CPU 翻译所以需要 GPA；DR 由硬件比对线性地址）和获取方法
+（`mem-pte <pid> <hex_va>` 的 PA 列）。
+
+##### 已修：3（`mem-pte` 的 NOT MAPPED 与 HIT 长得一样）
+
+原来两种都打印 `base=0x0 size=0 kind=none depth=0 attrs=-` —— **一次 MISS 被渲染成 HIT 的形状**。
+
+新的输出把三种情形分开：
+
+```
+pid 不存在      -> no tables: pid 99999 not found (cr3=0) - nothing was walked
+pid 存在未映射   -> no translation: cr3=0x1AD000 walked, one level was not present
+命中            -> cr3=... base=... size=... kind=... depth=... attrs=...
+```
+
+实测两条都正确。
+
+##### 缺陷 4：拒绝规则 —— **实验失败，已回滚**
+
+**我的实现**：`yghv_guard_refuse_npf_page()` 检查目标页是否与 `g_npt` /
+`g_S206Exits` / `g_decoy_pa` / `g_code_start` 同页，命中则清掉 `hide` 并计一次 `hide_fail`。
+
+**实测结果**：
+
+```
+sys-guard: add OK slot=0
+sys-guard: guarded=1 hidden=2 ... hide_fail=0     ← 拒绝规则没有触发
+```
+
+随后 PowerShell 进程反复抛出 **AccessViolationException**（堆栈落在
+`System.Diagnostics.StackTrace` / `ConcurrentDictionary` 等 CLR 内部路径），
+`sc stop` 最终仍然成功（`invmrun=0x0`），无蓝屏、未重启。
+
+**三个结论，每个都比原来的推断更有价值：**
+
+1. **拒绝规则没有生效。** `hide_fail=0` 证明 `yghv_guard_refuse_npf_page` 返回了 0
+   —— 也就是它认为目标页与那四个全局**不同页**。`g_npt` 的地址由
+   `MmGetPhysicalAddress` 算，而 `add_va` 的 `page` 来自调用方传入的 VA
+   —— **两边算的根本不是同一个东西**，这个比对从设计上就是错的。
+
+2. **藏 `g_npt` 所在页不会立刻锁死超管程序。** 实测 `add` 成功了，机器继续运行，
+   `sys-health` 报 `degraded=0`。**9.512 推断的「递归死锁」没有发生。**
+   发生的是**用户态进程随机故障** —— 那更像是该页被 DECOY 之后，
+   **guest 侧任何读它的代码都拿到零值**，而 Windows 自己的某些结构恰好用了那个零。
+
+3. **这是本轮最重要的负面结果：一次失败的实验推翻了一条从 9.512 起被当成事实的推断。**
+
+**处置**：代码已 `git checkout` 回滚。**不做这个拒绝规则**，
+理由改为「它无法安全实现」而不是「它没必要」——因为**我们不知道藏那一页真正破坏了什么**，
+只知道它破坏得比推断的更隐蔽。
+
+##### 本轮新增的待查项
+
+- **藏 `g_npt` 页的真实后果**：没有锁死，但让用户态进程随机 AV。要查清是哪些结构被零化了。
+  这需要一次**有意的、受控的**实验，且必须先有回滚路径。

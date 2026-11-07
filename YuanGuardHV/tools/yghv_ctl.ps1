@@ -1855,8 +1855,30 @@ try {
 
             Write-Host ("mem-pte: pid={0} va=0x{1:X} -> {2}" -f $tpid, $vaEcho,
                         $(if ($ok) { "PA=0x$('{0:X}' -f $pa)" } else { 'NOT MAPPED' }))
-            Write-Host ("         cr3=0x{0:X}  base=0x{1:X}  size={2}  kind={3}  depth={4}  attrs={5}" -f
-                        $cr3, $pageBase, $pageSize, $kindName, $levels, ($attrStr -join ''))
+            #
+            # 9.531: a NOT-MAPPED reply used to print the same field labels as a hit -
+            # "base=0x0 size=0 kind=none depth=0 attrs=-" - which reads like a resolved
+            # page whose values happen to be zero. They are not values: nothing was
+            # resolved, so every one of those fields is untouched-garbage-free zero.
+            #
+            # Printing them anyway is the same defect this tree keeps paying for:
+            # a MISS rendered in the shape of a HIT. When the walk found nothing, say
+            # that and say WHY (which translation level rejected it) - the stats line
+            # below already carries the level counters.
+            if ($ok) {
+                Write-Host ("         cr3=0x{0:X}  base=0x{1:X}  size={2}  kind={3}  depth={4}  attrs={5}" -f
+                            $cr3, $pageBase, $pageSize, $kindName, $levels, ($attrStr -join ''))
+            } else {
+                #
+                # cr3=0 is not a translation failure, it is a LOOKUP failure: the pid
+                # was not found, so no table was ever walked. Saying so separately
+                # keeps "not mapped" and "no such process" from reading alike.
+                if ($cr3 -eq 0) {
+                    Write-Host ("         no tables: pid {0} not found (cr3=0) - nothing was walked" -f $tpid)
+                } else {
+                    Write-Host ("         no translation: cr3=0x{0:X} walked, one level was not present" -f $cr3)
+                }
+            }
             Write-Host ("         stats: walks={0} 4K={1} 2M={2} 1G={3} np={4} badcr3={5} reads={6}" -f
                         $walks, $h4k, $h2m, $h1g, $np, $badcr3, $treads)
         }
@@ -3671,6 +3693,17 @@ try {
             #   mem-bp int3 <gpa> <hex_va> [kinds]     INT3 mode (needs the VA's PA)
             #   mem-bp dr <hex_va> [kinds]             DR mode
             #   mem-bp del <gpa> <rip|0>               remove one
+            #
+            # 9.530: `add`/`del`/`int3` take a PHYSICAL address (GPA), `dr` takes a
+            # VIRTUAL one. That is not an accident - NPF and INT3 operate on the page
+            # the CPU translates, so they need the GPA; DR is programmed with a linear
+            # address because that is what the hardware compares against.
+            #
+            # The gap this closes: passing a VA to `add` used to fail deep inside the
+            # split path with "stage -3: could not split 2MB page", which reads like
+            # a driver bug rather than "you gave the wrong kind of address". Get the
+            # GPA first:
+            #     mem-pte <pid> <hex_va>      -> PA column
             #   mem-bp clear [1|2|4]                   remove all / one mode
             #   mem-bp drain [max]                     drain the hit ring
             # kinds: r (read), w (write), x (execute); default w for npf, x for int3/dr
