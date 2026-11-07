@@ -106,6 +106,7 @@ yghv_ctl.ps1 byovd-scan
 yghv_ctl.ps1 service-name
 yghv_ctl.ps1 pa-section <hex_pa>
 yghv_ctl.ps1 npt-raw <hex_pa> [a|d|ad]
+yghv_ctl.ps1 npt-scan <hex_start> <pages> [clear]
 ```
 
 `protect` sets the target, enumerates committed pages of the real Java process,

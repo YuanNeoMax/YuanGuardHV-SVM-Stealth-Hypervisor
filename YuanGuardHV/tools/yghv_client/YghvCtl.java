@@ -107,6 +107,9 @@ public class YghvCtl {
   /* 9.510 (Tier 7.1): the RAW NPT entry for one page (A/D readable,
      clearable). Declared so the four-way parity check stays a real check. */
   private static final int FN_NPT_RAW = 0x832;
+  /* 9.511 (Tier 7.1): the raw-entry read batched over a page range.
+     Declared so the four-way parity check stays a real check. */
+  private static final int FN_NPT_RAW_SCAN = 0x833;
 
     private static native long openHandle();
     private static native void closeHandle(long handle);

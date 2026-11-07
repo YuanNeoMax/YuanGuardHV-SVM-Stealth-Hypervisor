@@ -478,6 +478,36 @@ typedef struct {
 #define YGHV_NPT_AD_MASK         (YGHV_NPT_BIT_ACCESSED | YGHV_NPT_BIT_DIRTY)
 
 /*
+ * 9.511 (Tier 7.1): the same raw-entry read, batched over a page range.
+ *
+ * WHY IT EXISTS: 9.510's observer was one page per call, so measuring the 54
+ * .data pages cost 109 round trips (~1.5 hours). A measurement that expensive
+ * does not get run, and a judgement nobody runs is not a judgement.
+ *
+ * Input:  {ULONG_PTR start, UINT64 count, UINT64 op}
+ *   op 0 = read only
+ *   op 1 = clear A|D on each page, then report the entry as it was BEFORE the
+ *          clear (so the caller learns what the hardware had recorded)
+ *
+ * Output: 2 header qwords, then ONE qword per page visited:
+ *   [0] pages actually visited   [1] pages requested
+ *   per page: the raw 64-bit entry
+ *
+ * THE CLAMP IS REPORTED, not hidden: out[0] < out[1] means the reply ran out of
+ * room. A scan that silently covered 40 of 54 pages would be read as "the other
+ * 14 were unreachable", which is a different and wrong claim.
+ *
+ * op is limited to read / clear-A|D on purpose. A batch that could clear
+ * PRESENT would hide 512 pages in one call with no per-page confirmation - the
+ * exact shape 9.456 refused for section-hide.
+ *
+ * PASSIVE only; walks tables. Read-only when op == 0.
+ */
+#define IOCTL_YGHV_NPT_RAW_SCAN \
+    YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x833, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
+#define YGHV_NPT_SCAN_HDR_QWORDS 2
+
+/*
  * 9.456 (Tier 7.1): hide ONE named data section, by walking the PE report.
  *
  * WHY NAMED, AND WHY ONE AT A TIME

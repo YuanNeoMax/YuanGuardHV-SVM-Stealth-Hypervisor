@@ -24,6 +24,7 @@ Commands:
   service-name                      (read-only: which name, exists?, start type, SDDL)
   pa-section <hex_pa>               (read-only: which of our sections holds this PA)
   npt-raw <hex_pa> [a|d|ad]          (raw NPT entry; A/D are the DECOY-read observer)
+  npt-scan <hex_start> <pages> [clear]  (A/D over a range - the one-command measurement)
   byovd-scan                        (local only: blocklist + KDU provider names, no driver needed)
   selftest
   selftest-abort
@@ -4213,6 +4214,84 @@ try {
             if ($done -ne 0) { Write-Host ("  cleared mask = 0x{0:X}  (A={1} D={2})" -f $done,
                 (($done -band (1L -shl 5)) -ne 0), (($done -band (1L -shl 6)) -ne 0)) }
             if ($done -eq 0 -and $clr -ne 0) { Write-Host '  clear NOT applied (write refused, or large page)' }
+        }
+        'npt-scan' {
+            # 9.511 (Tier 7.1): read (or clear) the A/D bits over a PAGE RANGE.
+            #
+            # usage: npt-scan <hex_start> <pages>          (read)
+            #        npt-scan <hex_start> <pages> clear    (clear A|D per page)
+            #
+            # WHY IT EXISTS: npt-raw is one page per call, so measuring the 54
+            # .data pages cost 109 round trips (~1.5 h). This does it in one.
+            #
+            # WHAT THE NUMBERS MEAN: A(accessed) is set BY THE CPU when it walks
+            # that NPT entry. A DECOY-hidden page stays present, so a guest read
+            # still walks it and still sets A - that is the whole observer.
+            # D(dirty) is set on a WRITE. Neither is set for our own accesses
+            # (we use host CR3), so a set bit means a GUEST touched the page.
+            #
+            # THE PREREQUISITE, and it is not optional: TLB hits SUPPRESS the walk,
+            # so a page already in the TLB will never re-set A. Clear A, then force
+            # a flush (npt-remap any page sets TlbControl=1), then observe.
+            if ($null -eq $Arg1 -or $null -eq $Arg2) {
+                throw 'npt-scan: usage: npt-scan <hex_start> <pages> [clear]' }
+            $start = [Convert]::ToUInt64(("$Arg1" -replace '^0[xX]',''), 16)
+            $start = $start -band (-bnot 0xFFF)
+            $pages = [uint64]::Parse($Arg2)
+            if ($pages -lt 1 -or $pages -gt 512) { throw 'npt-scan: pages must be 1..512' }
+
+            $op = [uint64]0
+            $what = 'read'
+            if ($null -ne $Arg3 -and "$Arg3".ToLower() -eq 'clear') { $op = [uint64]1; $what = 'clear' }
+
+            $req = New-Object byte[] 24
+            [BitConverter]::GetBytes([uint64]$start).CopyTo($req, 0)
+            [BitConverter]::GetBytes([uint64]$pages).CopyTo($req, 8)
+            [BitConverter]::GetBytes([uint64]$op).CopyTo($req, 16)
+
+            # 2 header + 512 entries = 514 qwords = 4112 bytes; ask for 8192.
+            $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x833)) `
+                                    -InBytes $req -OutputLength 8192
+
+            $visited = [BitConverter]::ToUInt64($out, 0)
+            $requested = [BitConverter]::ToUInt64($out, 8)
+
+            Write-Host ("npt-scan: start=0x{0:X}  pages={1}  mode={2}" -f $start, $pages, $what)
+            if ($visited -lt $requested) {
+                Write-Host ("  *** CLAMPED: visited {0} of {1} - the reply ran out of room" -f $visited, $requested)
+            }
+
+            if ($op -eq 1) {
+                Write-Host ("  cleared A|D on {0} page(s); the values below are what the hardware" -f $visited)
+                Write-Host '  had recorded BEFORE the clear.'
+            }
+
+            $accCount = 0
+            $dtyCount = 0
+            $unreach = 0
+            for ($i = 0; $i -lt [int]$visited; $i++) {
+                $e = [BitConverter]::ToUInt64($out, 16 + $i * 8)
+                $pa = $start + ([uint64]$i * 4096)
+                if ($e -eq 0) {
+                    $unreach++
+                    Write-Host ("  [0x{0:X}] --  NOT REACHABLE" -f $pa)
+                    continue
+                }
+                $a = ($e -band (1L -shl 5)) -ne 0
+                $d = ($e -band (1L -shl 6)) -ne 0
+                $p = ($e -band 1L) -ne 0
+                if ($a) { $accCount++ }
+                if ($d) { $dtyCount++ }
+                Write-Host ("  [0x{0:X}] A={1,-5} D={2,-5} present={3,-5} frame=0x{4:X}" -f
+                    $pa, $a, $d, $p, ($e -band 0x000FFFFFFFFFF000))
+            }
+
+            Write-Host ("  summary: visited={0}/{1}  A-set={2}  D-set={3}  unreachable={4}" -f
+                $visited, $requested, $accCount, $dtyCount, $unreach)
+            if ($accCount -eq 0 -and $op -eq 0) {
+                Write-Host '  NOTE: zero A-set. That is a claim, not a default - check the TLB'
+                Write-Host '        prerequisite above before believing it.'
+            }
         }
         'npt-view' {
             # 9.450 (Tier 7.1): what would a GUEST see at this physical page.

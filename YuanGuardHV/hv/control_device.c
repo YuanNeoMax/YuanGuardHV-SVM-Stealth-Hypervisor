@@ -2912,6 +2912,80 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
         }
         break;
     }
+    case IOCTL_YGHV_NPT_RAW_SCAN: {
+        /*
+         * 9.511 (Tier 7.1): the 9.510 observer, batched over a page range.
+         *
+         * 54 x snapshot + 1 x flush + 54 x read was ~1.5 hours of round trips.
+         * A measurement that costs 109 round trips does not get run - so it is
+         * one call now.
+         *
+         * op 0 reads; op 1 clears A|D and reports the entry as it was BEFORE the
+         * clear (that is the value that answers "was it read"). Nothing else is
+         * writable: a batch that could clear PRESENT would hide 512 pages in one
+         * call with no per-page confirmation, which is what 9.456 refused.
+         *
+         * The clamp is REPORTED (out[0] vs out[1]). A reply that silently covered
+         * 40 of 54 pages would be read as "the other 14 were unreachable".
+         */
+        extern npt_mgr_t g_npt;
+        extern int npt_get_entry(npt_mgr_t *m, uint64_t g, uint64_t *out);
+        extern int npt_write_entry(npt_mgr_t *m, uint64_t g, uint64_t v);
+
+        if (in_len < 2 * sizeof(ULONG_PTR) + sizeof(UINT64)) {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+        if (out_len < YGHV_NPT_SCAN_HDR_QWORDS * sizeof(UINT64)) {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+
+        {
+            UINT64 *in = (UINT64 *)buf;
+            UINT64 start = in[0] & ~(UINT64)0xFFFULL;
+            UINT64 want = in[1];
+            UINT64 op = in[2];
+            UINT64 cap = (out_len / sizeof(UINT64)) - YGHV_NPT_SCAN_HDR_QWORDS;
+            UINT64 n = 0, i;
+            UINT64 *out = (UINT64 *)buf;
+
+            if (op != 0 && op != 1) {
+                out[0] = 0;
+                out[1] = want;
+                info = YGHV_NPT_SCAN_HDR_QWORDS * sizeof(UINT64);
+                status = STATUS_SUCCESS;
+                break;
+            }
+
+            for (i = 0; i < want && n < cap; i++) {
+                UINT64 pa = start + (i << 12);
+                UINT64 entry = 0;
+
+                if (!NT_SUCCESS(npt_get_entry(&g_npt, pa, &entry))) {
+                    /*
+                     * Not reachable: record 0 for this page and MOVE ON. Skipping
+                     * and shortening the reply would shift every later page's index,
+                     * so the caller could not tell which page a value belonged to.
+                     */
+                    out[YGHV_NPT_SCAN_HDR_QWORDS + n] = 0;
+                } else if (op == 1) {
+                    out[YGHV_NPT_SCAN_HDR_QWORDS + n] = entry;   /* BEFORE the clear */
+                    (void)npt_write_entry(&g_npt, pa,
+                                          entry & ~(UINT64)YGHV_NPT_AD_MASK);
+                } else {
+                    out[YGHV_NPT_SCAN_HDR_QWORDS + n] = entry;
+                }
+                n++;
+            }
+
+            out[0] = n;
+            out[1] = want;
+            info = (ULONG)((YGHV_NPT_SCAN_HDR_QWORDS + n) * sizeof(UINT64));
+            status = STATUS_SUCCESS;
+        }
+        break;
+    }
     case IOCTL_YGHV_NPT_RAW: {
         /*
          * 9.510 (Tier 7.1): the raw entry, and optionally clearing A/D.
