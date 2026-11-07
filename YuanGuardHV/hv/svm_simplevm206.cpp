@@ -1480,7 +1480,24 @@ extern "C" { volatile LONG64 g_S206VirtualizeEntries = 0; }
  * The flag is set at exactly the point the probe would first have returned TRUE -
  * right before VMRUN - which is where the reference implementation sets it too.
  */
-extern "C" { volatile LONG g_S206SecondPass = 0; }
+/*
+ * 9.545: PER-CORE, not global.
+ *
+ * 9.544 measured disagreements on 4 of 6 cores between this flag and the CPUID
+ * probe, because one core setting a global flag made every later core look like a
+ * second pass while its own CPUID still said "no hypervisor".
+ *
+ * The reference implementation keeps this per-VCPU (if (Vcpu->Virtualized) return);
+ * this is the same idea without touching VIRTUAL_PROCESSOR_DATA, whose union rounds
+ * up by a whole page when it grows (9.541 -> 0x1E), moving every hard-coded asm
+ * offset with it.
+ *
+ * Indexed by KeGetCurrentProcessorNumber(), clamped, so an out-of-range core uses
+ * the conservative answer (first pass) rather than indexing past the array.
+ */
+extern "C" { volatile LONG g_S206SecondPass[SVM206_MAX_VPD] = { 0 }; }
+extern "C" { volatile LONG64 g_S206SecondPassReads = 0; }
+
 extern "C" { volatile LONG64 g_S206FlagDisagrees = 0; }
 
 
@@ -1489,10 +1506,23 @@ extern "C" { volatile LONG64 g_S206EarlyReturns = 0; }
 extern "C" void yghv_s206_virtualize_counts(UINT64 *entries, UINT64 *early,
                                              UINT64 *secondPass, UINT64 *disagrees)
 {
+    UINT64 marked = 0;
+    UINT32 i;
+
     *entries    = (UINT64)InterlockedCompareExchange64(&g_S206VirtualizeEntries, 0, 0);
     *early      = (UINT64)InterlockedCompareExchange64(&g_S206EarlyReturns, 0, 0);
-    *secondPass = (UINT64)(UINT32)InterlockedCompareExchange(&g_S206SecondPass, 0, 0);
     *disagrees  = (UINT64)InterlockedCompareExchange64(&g_S206FlagDisagrees, 0, 0);
+
+    /*
+     * 9.545: report HOW MANY CORES are marked, not the value of one global. With a
+     * single flag "1" was ambiguous - it could mean one core or all of them. The
+     * count is what distinguishes "only core 0 got virtualized" from "all six did".
+     */
+    for (i = 0; i < SVM206_MAX_VPD; i++)
+    {
+        if (InterlockedCompareExchange(&g_S206SecondPass[i], 0, 0) != 0) marked += 1;
+    }
+    *secondPass = marked;
 }
 
 
@@ -5683,7 +5713,16 @@ SvVirtualizeProcessor (
      */
     {
         BOOLEAN installed = SvIsSimpleSvmHypervisorInstalled();
-        LONG    secondPass = InterlockedCompareExchange(&g_S206SecondPass, 0, 0);
+        /*
+         * 9.545: read THIS core's flag. Out-of-range clamps to the conservative
+         * answer ("first pass") - an unmapped core must not be treated as already
+         * virtualized, or it would be skipped without ever running setup.
+         */
+        ULONG   thisCore = KeGetCurrentProcessorNumber();
+        LONG    secondPass;
+        if (thisCore >= SVM206_MAX_VPD) thisCore = SVM206_MAX_VPD - 1;
+        secondPass = InterlockedCompareExchange(&g_S206SecondPass[thisCore], 0, 0);
+        InterlockedIncrement64(&g_S206SecondPassReads);
 
         /* They should agree: installed <=> second pass. Record it when they do not. */
         if ((installed != FALSE) != (secondPass != 0))
@@ -5725,7 +5764,15 @@ SvVirtualizeProcessor (
          * mode that resume never happens, so setting it changes nothing - which is
          * exactly what the stage-A measurement is meant to confirm.
          */
-        InterlockedExchange(&g_S206SecondPass, 1);
+        /*
+         * 9.545: set THIS core's flag only. A global write here is what made the
+         * other five cores look like second passes before they had run setup.
+         */
+        {
+            ULONG coreForFlag = KeGetCurrentProcessorNumber();
+            if (coreForFlag >= SVM206_MAX_VPD) coreForFlag = SVM206_MAX_VPD - 1;
+            InterlockedExchange(&g_S206SecondPass[coreForFlag], 1);
+        }
 
         //
         // Switch to the host RSP to run as the host (hypervisor), and then

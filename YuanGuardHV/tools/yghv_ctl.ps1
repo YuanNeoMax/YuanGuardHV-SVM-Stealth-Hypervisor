@@ -2929,7 +2929,7 @@ try {
             # 9.544 STAGE A: disagrees must stay 0 while the CPUID probe still
             # decides. A non-zero value means the explicit flag is not tracking the
             # probe, and stage B (letting the flag decide) would change behaviour.
-            Write-Host ("virt-counts: entries={0}  early-returns={1}  secondPass={2}  disagrees={3}" -f $entries, $early, $secondPass, $disagrees)
+            Write-Host ("virt-counts: entries={0}  early-returns={1}  cores-marked={2}  disagrees={3}" -f $entries, $early, $secondPass, $disagrees)
             if ($entries -eq 0) {
                 Write-Host '  the function was never entered - no core has virtualized yet.'
             } elseif ($early -eq 0) {
