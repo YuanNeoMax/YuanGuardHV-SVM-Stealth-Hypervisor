@@ -138,7 +138,7 @@ SvLV30:
 `
 
 **入口：**
-`sm
+```asm
 AsmSvmLaunchVm PROC
     mov     rsp, rcx      ; rcX = vcore 的宿主栈
     sub     rsp, 100h     ; 指向 XMM 区下方
@@ -164,7 +164,7 @@ Rsp => 0xfd0  GuestVmcbPa     ; HostStackLayout
 `
 
 **入口：**
-`sm
+```asm
 Sv206LaunchVm proc frame
     mov     rax, rsp
     mov     qword ptr [rcx - 5FD0h + 6110h], rax   ; 保存线程真实 RSP
