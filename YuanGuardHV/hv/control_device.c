@@ -1651,6 +1651,44 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
         status = STATUS_INVALID_PARAMETER;
         break;
     }
+    case IOCTL_YGHV_HANDLER_COST: {
+        /*
+         * 9.521: how many TSC ticks one #VMEXIT costs inside the handler.
+         *
+         * Read and (optionally) reset in the same call: the reply carries the
+         * values from BEFORE the reset, so a caller can report a window and
+         * start the next one without a gap where samples are lost.
+         */
+        extern void yghv_s206_handler_tsc_read(UINT64 *total, UINT64 *count);
+        extern void yghv_s206_handler_tsc_reset(VOID);
+
+        if (out_len < YGHV_HANDLER_COST_OUT_QWORDS * sizeof(UINT64)) {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+
+        {
+            UINT64 *out = (UINT64 *)buf;
+            UINT64 total = 0, count = 0;
+            UINT64 op = 0;
+
+            if (in_len >= sizeof(UINT64)) {
+                op = *(UINT64 *)buf;
+            }
+
+            yghv_s206_handler_tsc_read(&total, &count);
+            out[0] = total;
+            out[1] = count;
+            out[2] = __rdtsc();
+
+            if (op == 1) {
+                yghv_s206_handler_tsc_reset();
+            }
+            info = YGHV_HANDLER_COST_OUT_QWORDS * sizeof(UINT64);
+            status = STATUS_SUCCESS;
+        }
+        break;
+    }
     case IOCTL_YGHV_EXIT_CODES: {
         /*
          * 9.515: per-exit-code counters - the instrument that was missing.

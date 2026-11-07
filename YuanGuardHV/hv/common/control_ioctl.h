@@ -532,6 +532,38 @@ typedef struct {
 #define YGHV_EXIT_CODES_HI 0x8D
 
 /*
+ * 9.521 (performance): the cost of ONE #VMEXIT inside the handler, in TSC ticks.
+ *
+ * WHY: 9.520 measured 22,700 exits/s across twelve cores and throughput 6.3x
+ * slower than unloaded. What was never measured is how long a single exit takes
+ * inside SvHandleVmExit - and every optimisation idea ("fewer exits", "cheaper
+ * exits", "merge interrupts") depends on that number. It had only been inferred
+ * from CPU utilisation, which cannot see inside a function.
+ *
+ * The pair is taken at the handler entry and at its single `Exit:` label, so no
+ * path escapes. The total INCLUDES the instrumentation itself (~2 TSC reads and
+ * one InterlockedAdd64 per exit); it is not corrected, because that correction
+ * was never measured either.
+ *
+ * Output (3 qwords):
+ *   [0] total TSC ticks accumulated
+ *   [1] sample count actually accumulated (NOT the exit count - the sanity gate
+ *       can skip a sample, so dividing by your own exit count would mix two
+ *       different denominators)
+ *   [2] current TSC, so the caller can compute a frequency instead of assuming
+ *       one: TSC ticks at a FIXED rate regardless of core P-state, so "cycles"
+ *       and "cycles at 3.6GHz" are only the same thing while the clock is pinned.
+ *
+ * in: {UINT64 op} - 0 = read, 1 = reset (read returns the values from BEFORE the
+ * reset, so one call can both report a window and start the next one).
+ *
+ * PASSIVE only.
+ */
+#define IOCTL_YGHV_HANDLER_COST \
+    YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x835, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
+#define YGHV_HANDLER_COST_OUT_QWORDS 3
+
+/*
  * 9.456 (Tier 7.1): hide ONE named data section, by walking the PE report.
  *
  * WHY NAMED, AND WHY ONE AT A TIME

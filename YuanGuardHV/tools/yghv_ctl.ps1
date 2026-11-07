@@ -26,6 +26,7 @@ Commands:
   npt-raw <hex_pa> [a|d|ad]          (raw NPT entry; A/D are the DECOY-read observer)
   npt-scan <hex_start> <pages> [clear]  (A/D over a range - the one-command measurement)
   exit-codes                        (per-code exit counters: which codes actually fire)
+  handler-cost [reset]              (TSC ticks per #VMEXIT inside the handler)
   byovd-scan                        (local only: blocklist + KDU provider names, no driver needed)
   selftest
   selftest-abort
@@ -2784,6 +2785,63 @@ try {
             $o2 = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x827)) -InBytes $req2 -OutputLength 8
             $ours = [BitConverter]::ToUInt64($o2, 0)
             Write-Host ("npt-range: 0x{0:X} -> {1}" -f $pa, $(if($ours){'IS one of our NPT pages'}else{'not an NPT page'}))
+        }
+        'handler-cost' {
+            # 9.521: how many TSC ticks ONE #VMEXIT costs inside SvHandleVmExit.
+            #
+            # usage: handler-cost            read the window since the last reset
+            #        handler-cost reset      read, then start a new window
+            #
+            # WHY IT EXISTS: 9.520 measured 22,700 exits/s across twelve cores and
+            # throughput 6.3x slower than unloaded. What was never measured is the
+            # cost of ONE exit inside the handler - and every optimisation idea
+            # depends on it. CPU utilisation cannot see inside a function.
+            #
+            # READ THIS BEFORE BELIEVING THE NUMBER:
+            #   * the total INCLUDES the instrumentation (2 TSC reads + 1 interlocked
+            #     add per exit). It is not subtracted - that correction was never
+            #     measured either, and an invented correction reads as precision.
+            #   * sample count is NOT exit count. The sanity gate can skip a sample,
+            #     so dividing by your own exit tally mixes two denominators.
+            #   * TSC ticks at a FIXED rate regardless of core P-state. This machine
+            #     runs a pinned 3600 MHz, so ticks == cycles here - and the command
+            #     computes the frequency from the reply rather than assuming it.
+            $op = [uint64]0
+            if ($null -ne $Arg1 -and "$Arg1".ToLower() -eq 'reset') { $op = [uint64]1 }
+
+            $req = New-Object byte[] 8
+            [BitConverter]::GetBytes([uint64]$op).CopyTo($req, 0)
+            $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x835)) `
+                                    -InBytes $req -OutputLength 24
+
+            $total = [BitConverter]::ToUInt64($out, 0)
+            $count = [BitConverter]::ToUInt64($out, 8)
+            $tsc   = [BitConverter]::ToUInt64($out, 16)
+
+            $mode = if ($op -eq 1) { 'reset' } else { 'read' }
+            Write-Host ("handler-cost: mode={0}  total={1} ticks  samples={2}" -f $mode, $total, $count)
+            Write-Host ("  tsc now = {0}" -f $tsc)
+
+            if ($count -eq 0) {
+                Write-Host '  no samples yet - no #VMEXIT has completed since the last reset.'
+                Write-Host '  That is a reading, not a default.'
+                return
+            }
+
+            $per = $total / $count
+            # ticks -> time needs the TSC frequency, which is NOT the core clock.
+            # Report per-exit ticks and let the caller divide by a measured rate.
+            Write-Host ("  per exit = {0:N0} ticks (this includes the instrumentation)" -f $per)
+            if ($per -lt 1000) {
+                Write-Host ("             = {0:N1} us at a 3.6 GHz TSC" -f ($per / 3600.0))
+            } elseif ($per -lt 1000000) {
+                Write-Host ("             = {0:N1} us at a 3.6 GHz TSC" -f ($per / 3600.0))
+            } else {
+                Write-Host ("             = {0:N2} ms at a 3.6 GHz TSC" -f ($per / 3600000.0))
+            }
+            $lifetime = 0.0
+            if ($count -gt 0) { $lifetime = ($total / 3.6e9) }
+            Write-Host ("  total CPU time inside the handler = {0:N3} s over {1:N0} exits" -f $lifetime, $count)
         }
         'exit-codes' {
             # 9.515: which exit codes are ACTUALLY firing, per code.

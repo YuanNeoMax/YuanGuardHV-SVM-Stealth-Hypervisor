@@ -113,6 +113,9 @@ public class YghvCtl {
   /* 9.515: per-exit-code counters (read-only instrumentation).
      Declared so the four-way parity check stays a real check. */
   private static final int FN_EXIT_CODES = 0x834;
+  /* 9.521: the cost of one #VMEXIT inside the handler, in TSC ticks.
+     Declared so the four-way parity check stays a real check. */
+  private static final int FN_HANDLER_COST = 0x835;
 
     private static native long openHandle();
     private static native void closeHandle(long handle);
