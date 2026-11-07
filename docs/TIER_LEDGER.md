@@ -180,16 +180,18 @@ DR7 没使能 -> 硬件不产生 B0-B3 的 #DB；即使产生，`case VMEXIT_EXC
 
 ---
 
-**3. 9.508：.data 隐藏的前置观测已就绪，但拆页这一步还没验**
+**3. 9.508/9.509：.data 隐藏的观测与两步前置都已实机验过**
 
 pa-section（IOCTL 0x831，只读）现在能回答「这个 PA 属于哪一段」，
 实测三类判据全对：.text 报 CODE、.rdata 报 holds-IAT、.data 报 data candidate，
 span 外一页报 OUTSIDE。
 
 **但它顺手量出一个结构约束**：整个 image 落在**同一个 2MB 大页**里，而该页 large=1。
-所以 .data 隐藏 = **先拆 2MB 页 + 再做页级排除**，而拆页会把 .text（代码）与
+**9.509 已验证这两步各自可做**：拆页后三页 large=1 -> large=0 且 frame==自身（identity 保持）、.text/.rdata/.data 全部 present=1 perm=RWX、拆后所有命令正常；单页 DECOY 隐藏后 present=1 frame!=pa、90 秒 degraded=0、无蓝屏，del 后回到 identity。所以 .data 隐藏 = **先拆 2MB 页 + 再做页级排除**，而拆页会把 .text（代码）与
 .rdata（含 IAT）一起降成 4K 条目。拆页本身是独立的结构改动，需要单独验证 ——
 不是「54 个页面各试一次」。
+
+**仍未验的**：54 页全藏能否长期存活；DECOY 工作时**不产生 NPF、无计数器会动**，所以「藏更多页」之前必须先有「谁读到了零」的判据 —— 否则成败只能靠「跑一天没蓝屏」。
 
 ---
 

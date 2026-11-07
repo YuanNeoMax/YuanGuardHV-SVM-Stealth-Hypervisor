@@ -11483,3 +11483,98 @@ image PA span     [0x41EA7A000, 0x41EAE1000)
 命令面 C=50 PowerShell=50 Java=50（ioctl_parity 四边一致）
 客户端 73 条命令（command_parity PASS）
 ```
+
+---
+
+#### 9.509 ★★★★ `.data` 隐藏的第一次实机实验：拆 2MB 页 + 单页 DECOY —— 两项都成立
+
+9.508 量出「整个 image 在同一 2MB 页内，而该页 `large=1`」，于是 `.data` 隐藏被重新定义
+成两步：**先拆页，再页级排除**。本轮把这两步各做了一次最小实验（**只藏 1 页，不是 54 页**）。
+
+本次加载的 image span：`[0x42027C000, 0x4202E3000)`，2MB 页基 `0x420200000`。
+
+##### 第一步：拆页（`npt-remap` 把一页映射到它自己）
+
+```
+npt-remap 0x4202AA000 0x4202AA000     -> ok=1  mode=main   40.9 s
+```
+
+**拆前三页（.text / .rdata / .data）都是 `large=1  frame=0x420200000`** —— 即整页大映射。
+
+**拆后三页全部变成 4K 条目，frame == 各自 PA：**
+
+| 页 | 拆前 | 拆后 |
+|---|---|---|
+| `.text`  0x42027D000 | `large=1 frame=0x420200000` | `large=0 frame=0x42027D000` |
+| `.rdata` 0x4202A4000 | 同上 | `large=0 frame=0x4202A4000` |
+| `.data`  0x4202AA000 | 同上 | `large=0 frame=0x4202AA000` |
+| 2MB 基址 0x420200000（image 之外） | — | `large=0 frame=0x420200000`（identity 未被破坏） |
+
+**这一步为什么在源码层面是安全的**（动手前算清，不是事后解释）：
+`npt_split_2mb_to_4kb` 的 `common` 掩码是 `0,1,2,3,4,5,6,8,63` 位 —— **含 NX(63) 与 User(2)**，
+而 bit7(HUGE) 不在其中，所以 512 个 4K 条目不会误标成大页；每个条目的 frame 是
+`base_pa + i<<12`，identity 映射逐页保持。
+
+**拆后立刻验证机器还活着**（这是唯一能证伪的判据）：
+
+```
+sys-health -> degraded=0 total=0 fatal=0
+sections   -> parsed=1 PE32+ 6 段（读 PE 头，走 .text + .rdata）
+byovd-scan -> verdict: hit=0 candidate=2 ...（走更长的字符串/哈希路径）
+```
+
+##### 第二步：单页隐藏（DECOY）
+
+```
+sys-guard add 0x4202AA000 1 0     -> add OK slot=0      51.4 s
+npt-view 0x4202AA000              -> present=1 frame=0x448DC000 large=0
+                                     VERDICT: HIDDEN (DECOY)
+```
+
+**判据成立的样子**：`present` 保持 1（不是 UNMAP），而 `frame` 不等于查询的 PA ——
+这正是 9.460 修正后的 DECOY 判据（第一版只认 `present=0`，把一次**成功**的隐藏读成失败）。
+
+**90 秒稳定性观察**（12 核全在 guest 里，任何 NPT 破坏都会立刻显形）：
+
+```
+sys-health -> degraded=0 total=0 fatal=0
+boot       -> 2026-11-07 17:52:55   （未重启）
+last 1001  -> 10-31 20:07          （无新蓝屏）
+sys-guard verify -> 0 page(s) changed   （host 侧读该页哈希未变）
+```
+
+**恢复**：`sys-guard del 0x4202AA000` → `del OK`；`npt-view` 回到 `frame=0x4202AA000 large=0`。
+**卸载**：`sc stop` 7.5 秒，`WIN32_EXIT_CODE=0`，`invmrun at unload = 0x0`。
+
+##### 这一轮真正确立的三件事
+
+1. **拆页可做**：`large=1 → large=0`，identity 保持，`.text`/`.rdata`/`.data` 全部仍是
+   `present=1 perm=RWX`，且拆后所有命令正常 —— **拆页本身不再是一个未知风险**。
+2. **单页 DECOY 隐藏可做**：`.data` 的一页被换成零页，`present` 保持，guest 读零，
+   而 host 读取（`sys-guard verify` 的哈希比对）不受影响 —— 因为 host 走自己的 CR3。
+3. **两者串起来是可行的路径**：`.data` 隐藏 = 拆页 + 逐页 DECOY。9.508 说的
+   「一次拆页 + 54 次页级排除」现在两步都有实测支撑。
+
+##### 但必须写清这一步**没有**证明什么
+
+- **没有证明「54 页全藏能活」。** 本次只藏 1 页、90 秒。`.data` 有 54 页，
+  其中 `size of raw data = 0x200`（512 字节初始化数据），其余 3.4KB/页 是 `.bss`
+  形态的零区。**藏全部 54 页会不会撞到我们自己正在用的状态，未测。**
+- **没有证明「guest 长期稳定」。** 90 秒不是 24 小时。DECOY 让 guest 读到零，
+  而 guest 就是 Windows 本身 —— 如果某个内核路径恰好读这一页，它会拿到零而不是真实值。
+  本次它没出事，只说明这 90 秒里没有路径读它。
+- **没有改任何代码。** 本轮全部用已有命令（`npt-remap` / `sys-guard` / `npt-view`），
+  所以不需要重建，产物仍是 `29CD0F67E28D66BA`。
+
+##### 下一步需要的判据（还不存在）
+
+要把「1 页 90 秒」推到「54 页可长期」，缺的不是命令，是**判据**：
+
+1. **哪些 `.data` 页在运行期真的被读？** 现在没有任何工具能回答。`mem-watch` 只能
+   watch 已登记页，而 `.data` 的页没有任何登记。
+2. **藏起来之后谁读到了零？** DECOY 模式下 guest 读零**不会产生 NPF**（`present` 保持），
+   所以**没有任何计数器会动** —— 这是一个「成功即无声」的机制，和 9.449 的
+   `-map` 假功能同一族：**它工作时你看不见它，它坏掉时你留不下证据**。
+
+> 所以下一轮的第一件事不是藏更多页，而是**先让 DECOY 的读取可见**。
+> 否则 54 页实验的成败只能靠「跑一天没蓝屏」来判断 —— 那不是判据，那是运气。
