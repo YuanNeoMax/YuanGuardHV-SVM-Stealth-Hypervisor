@@ -1359,6 +1359,53 @@ try {
             Write-Host ("clear: OK (active={0} pid={1} page_count={2})" -f
                 $st.active, $st.pid, $st.pageCount)
         }
+        'sync-stats' {
+            # 9.582 (ISSUES P1-3): the sync guard's counters, which had no door.
+            #
+            # WHY THIS EXISTS. yghv_protect_sync_diag() has been in the driver since
+            # 9.304 and IOCTL_YGHV_SET_SYNC already returns its eight qwords when the
+            # input length is zero - but the client never asked, so in practice the
+            # guard's behaviour was unobservable from user mode.
+            #
+            # The consequence showed up immediately when P1-3 was attempted: the
+            # question "does the target's own write get rolled back, and how often"
+            # could not be answered because nothing could read `hits`, and `hits` IS
+            # the rollback count. A criterion nobody can read is not a criterion.
+            #
+            # WHAT THE NUMBERS MEAN (from the driver's own comment block):
+            #   mode     master switch
+            #   polls    poll passes completed
+            #   hits     pages RESTORED - i.e. drift was found and undone
+            #   ms       configured interval
+            #   running  poll thread alive
+            #   refused  arm attempts rejected because the table was full
+            #   pages    pages currently guarded
+            #   cpu_100ns cumulative poll CPU time
+            #
+            # `hits` is the whole story for P1-3 and it is ALSO the ambiguity: the
+            # poll sees "the page changed", never who changed it. A target restoring
+            # its own write and a foreign writer being blocked increment the SAME
+            # counter. This command makes that limitation measurable rather than
+            # merely stated.
+            $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x814)) -OutputLength 64
+            $mode    = [BitConverter]::ToUInt64($out, 0)
+            $polls   = [BitConverter]::ToUInt64($out, 8)
+            $hits    = [BitConverter]::ToUInt64($out, 16)
+            $ms      = [BitConverter]::ToUInt64($out, 24)
+            $running = [BitConverter]::ToUInt64($out, 32)
+            $refused = [BitConverter]::ToUInt64($out, 40)
+            $pages   = [BitConverter]::ToUInt64($out, 48)
+            $cpu     = [BitConverter]::ToUInt64($out, 56)
+
+            Write-Host ("sync-stats: mode={0} running={1} interval={2}ms pages={3}" -f $mode, $running, $ms, $pages)
+            Write-Host ("  polls={0}  hits(restores)={1}  refused={2}" -f $polls, $hits, $refused)
+            if ($polls -gt 0) {
+                Write-Host ("  cpu={0:F3} ms total, {1:F1} us/poll" -f ($cpu / 10000.0), ($cpu / 10.0 / $polls))
+            }
+            if ($mode -ne 0 -and $pages -eq 0) {
+                Write-Host '  NOTE: the guard is on but no page is armed - hits can only stay 0.'
+            }
+        }
         'config' {
             if ($null -eq $Arg1) {
                 $c = Read-YghvConfig

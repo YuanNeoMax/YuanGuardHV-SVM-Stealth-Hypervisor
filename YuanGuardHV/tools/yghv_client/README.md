@@ -39,6 +39,7 @@ yghv_ctl.ps1 add-page <hex_va>
 yghv_ctl.ps1 remove-page <hex_va>
 yghv_ctl.ps1 start
 yghv_ctl.ps1 stop
+yghv_ctl.ps1 sync-stats
 yghv_ctl.ps1 target
 yghv_ctl.ps1 list-targets
 yghv_ctl.ps1 list-pages

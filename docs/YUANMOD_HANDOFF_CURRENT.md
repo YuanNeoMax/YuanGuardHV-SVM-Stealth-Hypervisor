@@ -29,7 +29,7 @@
 
 ---
 
-## 记录索引（9.581 重新测量，67 条）
+## 记录索引（9.582 重新测量，68 条）
 
 > 这是本文档自己的目录。**按标题扫一眼，找到要的那条，再跳过去读。**
 > 行数是该记录占的篇幅，用来判断"值不值得读全文"。
@@ -103,6 +103,7 @@
 | 9.579 P2-3 `.data` 段隐藏：先验判据，结果判据有三个缺陷 —— **不做全藏** | 109 |
 | 9.580 P2-3a：一个只刷 TLB、不改映射的命令 —— `.data` 隐藏的判据补上了 | 42 |
 | 9.581 P2-3b：`hidden` 计数与 NPT 实际状态的一致性检查 | 75 |
+| 9.582 P1-3：先给同步守卫开一扇门 —— 它此前**不可观测** | 79 |
 
 ---
 
@@ -3475,6 +3476,85 @@ P2-3b  hidden 与实际状态的一致性检查    ✅ 9.581
 ALL SOURCE CHECKS PASS（24 PASS / 0 FAIL）
 卸载 0.228 s，invmrun at unload = 0x0
 镜像 F9A565628E9FE5D7899DC1F54854D21C143A42A514FC02AA64388C6B2A4E1446
+```
+
+#### 9.582 P1-3：先给同步守卫开一扇门 —— 它此前**不可观测**
+
+P1-3 的问题是「同步守卫无法区分写入来源」。要研究一个判据的局限，
+**前提是那个判据的读数能拿到**。而这一轮发现：拿不到。
+
+##### 发现：`yghv_protect_sync_diag()` 存在，但客户端从没问过
+
+驱动里 `yghv_protect_sync_diag()` 从 9.304 就在，
+`IOCTL_YGHV_SET_SYNC`（0x814）在 `in_len == 0` 时返回它的 8 个 qword ——
+**但 `yghv_ctl.ps1` 没有任何命令去读它**。
+
+后果在试图研究 P1-3 时立刻显现：**「目标自己的写被回滚了多少次」这个问题答不了**，
+因为回滚计数（`hits`）读不到。**读不到的判据不是判据。**
+
+##### 新增：`sync-stats`
+
+```
+sync-stats: mode=1 running=1 interval=50ms pages=0
+  polls=2838  hits(restores)=0  refused=0
+  cpu=831.802 ms total, 293.1 us/poll
+  NOTE: the guard is on but no page is armed - hits can only stay 0.
+```
+
+八个数各有含义（驱动侧注释原文）：`mode` 总开关、`polls` 轮询次数、
+**`hits` = 页面被 restore 的次数**、`ms` 间隔、`running` 线程活着、
+`refused` 因表满被拒的武装、`pages` 当前守卫页数、`cpu_100ns` 累计轮询 CPU。
+
+**`hits` 就是 P1-3 的全部故事，而它同时也是那个歧义本身**：
+轮询只能看到「页变了」，看不到「谁改的」。目标恢复自己的写，
+和外部写入被挡住，**加的是同一个计数器**。这个命令让那条限制**可测量**，
+而不只是被写在一句话里。
+
+##### 实测的两个数（真 guest 模式下）
+
+```
+interval=50ms  polls=2838  cpu=831.8 ms   -> 293.1 us/poll
+interval=50ms  polls=3919  cpu=1185.4 ms  -> 302.5 us/poll
+```
+
+与 9.304 记录的「每页每轮 ≈2.97 µs」量级一致（当前 0 页守卫时是空轮询开销）。
+
+##### 未完成：武装路径
+
+要把 `hits` 从 0 变成非零，需要先让一页进入守卫。试了三条路都不通：
+
+| 尝试 | 结果 |
+|---|---|
+| `protect-page 236 0x188EE230000`（sync 开）| `0x490 ERROR_NOT_READY` |
+| 先 `config sync 0` 再 `protect-page` | 同样 `0x490` |
+| `mmf-hold` 创建的页 | 同上 |
+
+**`protect-page` 对 mmf 映射页有独立限制，本轮没查清。**
+驱动侧 `sync_arm` 的来源是「已经 `armed` 的 protect 页」（`protect.c:390`），
+所以顺序必须是 protect 先成功、sync 才接管 —— 而第一步就没过。
+
+##### 这一轮证明了什么
+
+```
+证明   : 同步守卫的 8 个计数器现在可读（新命令 sync-stats）
+证明   : 真 guest 模式下开 sync 是稳定的（mode=1 跑过 3900+ 轮，sys-health 干净）
+没证明 : 目标自写被回滚的比例 —— 需要先解决 protect-page 的武装阻塞
+没改   : 守卫的判定逻辑（仍只看"页变了"，不看"谁改的"）
+```
+
+##### 新增工具（未接上）
+
+- `tools/sync_selfwrite.cs` —— 目标进程自写探针，逐次记录
+  `survived` / `ROLLED BACK` 并汇总百分比。
+  **它需要一个「目标进程自己的地址空间」**，所以只能由目标进程运行；
+  本轮卡在武装，它还没被用上。编译已通过。
+
+##### 验证
+
+```
+ALL SOURCE CHECKS PASS（24 PASS / 0 FAIL）
+命令数 PowerShell=80 / Java=18（新增 sync-stats，command_parity 抓到 README 未登记并已补）
+卸载 0.059 s，invmrun at unload = 0x0
 ```
 
 ## 本次会话结束时状态

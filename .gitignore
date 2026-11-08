@@ -51,3 +51,6 @@ YuanGuardHV/svm_simplevm_port.asm
 # 9.577: build artifact of tools/bench_core.cs (compile it, do not ship a binary)
 tools/bench_core.exe
 .release/
+
+# 9.582: build artifact of tools/sync_selfwrite.cs (compile it, do not ship a binary)
+tools/sync_selfwrite.exe
