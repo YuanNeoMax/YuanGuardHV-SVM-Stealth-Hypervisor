@@ -24,6 +24,7 @@
 - [测试](#测试)
 - [文档索引](#文档索引)
 - [已知限制与路线图](#已知限制与路线图)
+- [版本与变更记录](#版本与变更记录)
 - [合规与法律声明](#合规与法律声明)
 
 ---
@@ -194,6 +195,22 @@ CLOCK_WATCHDOG_TIMEOUT_INTERRUPTS_DISABLED_nt!KiSystemCall64
 修法：`KeDelayExecutionThread(KernelMode, FALSE, -1ms)` 让出处理器。**CPU 100% → 21–29%。**
 
 ---
+
+## 已验证平台
+
+**只有下面这一台是真机验证过的。** 列出它是为了让读者能判断"我的机器像不像"，
+而不是暗示广泛兼容。
+
+| 项 | 值 | 验证内容 |
+|---|---|---|
+| CPU | AMD Ryzen 5 5500（Zen3 Cezanne，Family 19h Model 50h，6 物理核 / 12 逻辑核） | 全核虚拟化、NPT、SVM、`INVLPGB` 缺失 |
+| OS | Windows 10 Pro for Workstations 22H2（10.0.19045，x64） | 加载/卸载/功能全链 |
+| 加载条件 | `testsigning=Yes` + `nointegritychecks=Yes` | 自签名驱动可加载 |
+| 内存 | 16 GB | 512GB identity NPT 可用 |
+
+**未验证**：Zen1/Zen2/Zen4、Intel（本项目的代码是 AMD SVM 专用，不支持 VT-x）、
+Windows 11、Server 版本、嵌套虚拟化环境（VMware/Hyper-V 内的 SVM 暴露受限，
+VM 内路线已判定不可用）。
 
 ## 环境要求
 
@@ -401,6 +418,7 @@ csc /nologo /optimize+ /out:tools\bench_core.exe tools\bench_core.cs
 | `docs/WINDOWS_AS_GUEST_FINDINGS.md` | Windows-as-Guest 全部结论（唯一权威）|
 | **`docs/KERNEL_API_CHECKLIST.md`** | **★ 写内核代码前必读** —— 三次蓝屏换来的 API 契约核对清单 |
 | `docs/archive/` | 9.1–9.499 历史交接、2026-08 评审与研究、Tier 设计计划书 |
+| **[`CHANGELOG.md`](CHANGELOG.md)** | **版本级变更摘要** —— 两个版本之间发生了什么（含 Breaking 标注）|
 
 ---
 
@@ -439,6 +457,23 @@ csc /nologo /optimize+ /out:tools\bench_core.exe tools\bench_core.cs
 10. **`RealGuestMode` 语义已反转**：现在是"禁用开关"，不是"启用开关"。见[构建](#构建)一节。
 11. **路线图**：真实产品目标（Minecraft/Forge）目标选择/页选取流程化 → R1 私有内存剔除 →
     MSR/IO/处理器层隐藏（需裸机/KVM）→ 产品化整合。
+
+---
+
+## 版本与变更记录
+
+| 版本 | 主题 | 关键数据 |
+|---|---|---|
+| **v0.4.0**（当前）| 全核真 guest 成为默认 | 12 线程 **1.05×**、G25 **17/17**、卸载 0.07 s |
+| v0.3.0 | 周期同步守卫（绕开 Zen3 NPT TLB 限制）| 延迟 92 s → **2.3 s**，64 页 @20 polls/s 0.38% 单核 |
+| v0.2.0 | OS-as-guest 206 里程碑 | 页写保护全链 PASS |
+| v0.1.0 | 首个可用版本 | SVM + 多核 + 三种保护 |
+
+**完整摘要见 [`CHANGELOG.md`](CHANGELOG.md)**；逐条工程记录（编号 9.x）见
+[`docs/YUANMOD_HANDOFF_CURRENT.md`](docs/YUANMOD_HANDOFF_CURRENT.md)。
+
+> ⚠️ **v0.4.0 含破坏性变更**：`RealGuestMode` 的语义从"启用"反转为"禁用"。
+> 详见[构建](#构建)一节的运行时开关表。
 
 ---
 
