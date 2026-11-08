@@ -51,7 +51,15 @@ extern "C" void Sv206LeaveToHost(VOID);
 #define SVM206_MAX_THREADS 64
 static HANDLE g_S206CoreThreads[SVM206_MAX_THREADS] = { 0 };
 static volatile LONG g_S206CoresStarted = 0;
-static volatile LONG g_S206CoresExited = 0;
+/*
+ * 9.557: DEAD VARIABLE - kept only so nothing breaks, and labelled so it
+ * cannot mislead. Audit result: 0 writers and 0 readers. 9.555 repointed both
+ * accessors and the Sv206CoreThread increment at g_S206CoresExitedAsm, and the
+ * ASM exit path increments that alias directly.
+ *
+ * Do not use this. g_S206CoresExitedAsm is the live one.
+ */
+static volatile LONG g_S206CoresExited = 0;   /* DEAD - see the note above */
 
 /*
  * 9.555: the ASM half of the exit path needs to increment this.
@@ -63,7 +71,8 @@ static volatile LONG g_S206CoresExited = 0;
  * every unload burned its whole budget (~4 s, measured).
  *
  * A non-static alias rather than making the static non-static: the rest of
- * this file keeps using g_S206CoresExited, and the ASM gets a symbol it can
+ * 9.557: this file no longer uses g_S206CoresExited (the audit found zero
+ * writers and zero readers); everything points at the alias below. The ASM gets a
  * name without the two views drifting apart.
  */
 extern "C" { volatile LONG g_S206CoresExitedAsm = 0; }
@@ -1876,7 +1885,17 @@ extern "C" { volatile LONG g_VmrunStopRequested = 0; }
  * session lost 15 machines to confusing the two. */
 /* 9.416: non-static and extern "C" for the same reason as g_VmrunStopRequested -
  * the ASM loop increments it directly, without a call. */
-extern "C" { volatile LONG g_VmrunStopped = 0; }
+/*
+ * 9.557: NEVER INCREMENTED. Audit result: one writer, and it is the zero write
+ * in yghv_s206_vmrun_stop_clear; there is no InterlockedIncrement anywhere.
+ * 9.419 deleted the ASM-side check that used to count here, and the comment at
+ * the VMEXIT_VMMCALL case still claims this is incremented there - it is not.
+ *
+ * The stopped count comes from g_S206CoresExitedAsm now. Kept because
+ * yghv_s206_vmrun_stopped_for_trace still reads it and a diagnostic that reports
+ * a constant zero is honest as long as it is labelled as one.
+ */
+extern "C" { volatile LONG g_VmrunStopped = 0; }   /* DEAD - see the note above */
 
 /*
  * 9.414: called once per VMRUN-loop iteration, from SvLV10 in
@@ -4672,8 +4691,15 @@ tsc_policy_done:;
      * resuming an arbitrary kernel thread mid-function, which is exactly what the
      * old caller-continuation guest was.
      *
-     * g_VmrunStopped is incremented here so the unload waiter has a number that
-     * actually moves. It counts CORES THAT HAVE LEFT, not ticks.
+     * 9.557: THE NEXT TWO LINES WERE WRONG - corrected, not deleted, because the
+     * mistake is the useful part. This comment used to read "g_VmrunStopped is
+     * incremented here so the unload waiter has a number that actually moves."
+     * Nothing in this case increments g_VmrunStopped; 9.419 removed that and the
+     * audit (9.557) found the variable has no increment anywhere in the tree.
+     *
+     * What this case actually contributes to a stop is ExitVm: Sv206VmrunShouldExit
+     * reads the stop request, and ExitVm sends SvLV20 down the exit path, where
+     * Sv206LeaveToHost increments g_S206CoresExitedAsm as the core leaves for good.
      */
     case VMEXIT_VMMCALL /* 0x81 */:
         InterlockedIncrement64(&g_S206Vmmcalls);
