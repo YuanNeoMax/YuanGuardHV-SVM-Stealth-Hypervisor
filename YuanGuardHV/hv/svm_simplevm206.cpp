@@ -211,7 +211,10 @@ extern "C" UINT64 yghv_s206_last_hit(void) { return g_S206LastProtectHit; }
 // (bare-metal context, file I/O safe).
 extern "C" void yghv_trace(const char *msg);
 extern "C" void yghv_trace_u64(const char *label, UINT64 v);
-static volatile UINT64 g_S206DenyLog[192] = { 0 };
+/* 9.578: the two declarations above are what the P0-2 logging call uses.
+ * They already existed at file scope - an `extern "C"` inside a function body is
+ * a C2598 (linkage specification must be at global scope), which is what the
+ * first version of that change hit. */static volatile UINT64 g_S206DenyLog[192] = { 0 };
 static volatile ULONG g_S206DenyIdx = 0;
 /* 9.252: NPF-entry telemetry (write-fault NPFs reaching the handler) */
 static volatile UINT64 g_S206NpfLog[96] = { 0 };
@@ -1870,6 +1873,38 @@ extern "C" int yghv_s206_real_guest_mode(VOID)
         {
             disable = (value != 0) ? 1 : 0;
             InterlockedExchange(&g_S206RealGuestDisabled, disable);
+
+            /*
+             * 9.578 (ISSUES P0-2): SAY WHICH WAY THE OVERRIDE WENT.
+             *
+             * 9.577 inverted this value's meaning, so a machine carrying
+             * `RealGuestMode=1` from the OLD convention now runs STUB MODE and
+             * reports nothing about it. The observable symptom is
+             * `virt-counts: early-returns=0` - which is also the NORMAL reading in
+             * stub mode, so it cannot distinguish "you disabled it" from "it is off
+             * by default". A user upgrading has no way to tell which happened.
+             *
+             * So the decision is written to progress.log exactly once per load,
+             * together with the raw registry value that caused it. That turns an
+             * invisible semantic change into a line someone can read.
+             *
+             * Three cases, all distinguishable:
+             *   key absent  -> no line (default ON, nothing surprising)
+             *   key = 0     -> no line (explicitly enabled, same as default)
+             *   key != 0    -> one line naming the raw value
+             *
+             * PASSIVE_LEVEL is satisfied here: the only callers of this function
+             * are SvPrepareForVirtualization / Sv206CoreThread on their own
+             * PASSIVE paths, and yghv_trace's contract requires exactly that
+             * (see its comment: blocking I/O, no IRQL guard by design).
+             */
+            if (disable != 0)
+            {
+                yghv_trace("s206 real guest DISABLED by registry "
+                           "(RealGuestMode non-zero = stub mode; 9.577 inverted "
+                           "this meaning)");
+                yghv_trace_u64("s206 RealGuestMode raw", (UINT64)value);
+            }
         }
         hit = (disable != 0) ? 0 : 1;
     }
