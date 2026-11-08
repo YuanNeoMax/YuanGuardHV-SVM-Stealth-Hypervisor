@@ -2183,3 +2183,143 @@ memset           @ 0x27300
 > **但那是对 9.462 那个桩形态成立的经验，不是对「完全没有 vmmcall 的桩」成立的经验。**
 >
 > 一个机制在旧形态下有效，换成新形态后必须重新验证，**而我把注释当成了证据。**
+
+---
+
+## 2026-11-08 会话二：Windows-as-Guest 实验 + 两个隐蔽缺陷
+
+> 这 20 条记录的过程文档在 `archive/2026-11-08/`。
+> **结论已汇总到 `WINDOWS_AS_GUEST_FINDINGS.md`**，此处只留时间线与判据。
+
+#### 9.539 找到反例项目，8 月的「本机不可行」结论被推翻
+
+`Type2-AMD-HV`（开源，AMD SVM/NPT）：*"every logical processor is put under VMRUN,
+Windows keeps running normally"*。拦截位对照发现**两边一直一致**（
+`InterceptMisc2 = VMRUN|VMMCALL`，`InterceptMisc1` 不含 INTR/NMI）——
+**差别在 guest 上下文，不在配置**。
+
+#### 9.540 加 RealGuestMode 开关（默认关闭）+ 首次实测：**能跑**
+
+`sc start` 0.18 s → RUNNING，30 秒稳定，CPU 51-60%，12 线程 1.933 s（桩模式 3.104 s，**快 38%**）。
+**但 `sc stop` 卡在 STOP_PENDING，必须重启。**
+
+证据：`archive/2026-11-08/REALGUEST_EXPERIMENT_20261108.md`
+
+#### 9.541 `iretq` 出口实验失败：`0x139`
+
+照抄参考项目的 `iretq`，但**照抄了机制没照抄栈布局** ——
+参考项目的 MachineFrame 在宿主栈固定偏移，我放在全局变量里用 `lea rsp` 指过去，
+抛弃了宿主栈，C 帧无人展开。
+
+证据：`archive/2026-11-08/IRETQ_FAILURE_20261108.md`
+
+#### 9.542 帧槽位改用 overlay：结构体大小不变，零回归
+
+**同一天里唯一一次成功。** `StackContents` 尾部预留 0x28 字节，
+`static_assert` 保持原值通过 —— 那是"结构体没变"的编译期证明。
+
+#### 9.543 诊断：早退路径 `entries=6, early-returns=0`（从未执行过）
+
+`SvVirtualizeProcessor` 里有参考项目的早退结构，但桩**从不回到 C 函数**，
+所以那条分支一次都没跑。新增 `virt-counts` 命令（IOCTL 0x836）。
+
+#### 9.544–9.545 显式 secondPass 标志：`disagrees` 4 → 0
+
+全局标志在多核下语义错误（核 0 设置后其余核看起来都是二次进入）。改 per-core 数组后
+`cores-marked=6, disagrees=0`。
+
+#### 9.546 加 `guest-start` 诊断（IOCTL 0x837）
+
+记录 guest 实际拿到的 RIP/RSP 与首次 `#VMEXIT` 的 RIP。
+**桩模式读数正确**：`0xFFFFF80267E781BD` 就是 `Sv206GuestStub` 的真实内核 VA
+（低 16 位 `0x81BD` 与 map 一致）—— **我一度误判为"不是桩地址"，因为没查证。**
+
+#### 9.547 `vmsave` 取指失败：`0xD1` 的精确位置
+
+`Sv206LaunchVm+0x1E` = `vmsave rax`，`vmrun` 返回后第一条指令，`P3=8` 取指失败。
+
+#### 9.548 ★★★★ **阶段 C 达成：`early-returns` 0 → 6**
+
+关闭 9.546 的热路径探针后（`if (0 && ...)`），RealGuestMode 稳定运行，
+**6 个核全部走早退分支** —— 参考项目的模型在本机成立。
+
+**同时推翻 9.547 的判断**：那次"启动即崩"是**我自己的探针**造成的。
+`InterlockedIncrement` 加在 `SvHandleVmExit` 首行（每个 VMEXIT 都执行），
+诊断代码成了故障源。
+
+证据：`archive/2026-11-08/STAGE_C_SUCCESS_20261108.md`
+
+#### 9.549–9.550 根因确定：guest 不参与停止握手，DPC 方案不成立
+
+RealGuestMode 的 guest 跑完 `SvVirtualizeProcessor` 的 `return`，
+再执行 `Sv206CoreThread` 尾部**包括 `PsTerminateSystemThread`**，全在 guest 里。
+**`vmrun` 帧永久悬挂** → 等待超时 → 镜像 unmap → 取指 `vmsave` 失败。
+
+DPC 方案失败的原因：**结构上缺一个 host 执行流来接收 `vmrun` 的返回。**
+
+#### 9.551 `vmmcall` tick 失败：时机错在启动阶段
+
+在 `Sv206CoreThread` 尾部 tick 一次 `vmmcall`，但那时**停止标志还没置位**，
+VMEXIT 后继续 vmrun，反而让崩溃提前到启动阶段。
+
+#### 9.552 ★ 安全封禁：RealGuestMode 编译期固定关闭
+
+一次会话内 4 次 `0xD1` 蓝屏 + 机器启动出现 BIOS 引导异常。
+`yghv_s206_real_guest_mode()` 首行 `return 0`，
+**编译器优化为 `xor eax,eax ; ret`** —— 注册表写入 1 后驱动仍报 0。
+
+#### 9.553 9.551 失败分析（时机问题）
+
+#### 9.554 ★★ 推翻基础假设：`invmrun` 与 `g_S206CoresExited` 是两个计数器
+
+`invmrun=0x0` 一直是 `lock dec` 的效果，**不是"每个核安全走完退出协议"的证据**。
+停止等待用的 `g_S206CoresExited` 在 `Sv206LeaveToHost` 直接终止线程的路径上**永不递增**。
+
+#### 9.555 ASM 在 `Sv206LeaveToHost` 里 `lock inc g_S206CoresExitedAsm`
+
+单指令、不碰寄存器，9.445 的调用序列一字未动。
+**但卸载时间没变** —— 这成了找到真正原因的线索。
+
+#### 9.556 ★★★★ **卸载 4 秒 → 0.046 秒**
+
+`waitFor` 从 `KeQueryActiveProcessorCountEx()`（=12 逻辑 CPU）改为 VPD 数（=6）。
+**条件原本不可满足，每次卸载都在空转等超时。**
+
+```
+基线     : 1.88 / 1.93 / 2.07 / 2.19 / 2.84 / 3.19 / 4.12 s
+修复后   : 0.046 / 0.046 / 0.037 s
+```
+
+证据：`archive/2026-11-08/UNLOAD_4S_FIX_20261108.md`
+
+#### 9.557 审计等待循环与计数器 + 清理
+
+- 全树 2 处等待循环，**都不存在第二个 `active=12` 类缺陷**
+- 2 个死变量（`g_S206CoresExited` 0写0读、`g_VmrunStopped` 只清零）
+- **3 处注释描述的行为在代码里不存在** —— 与 `active=12` 是同一类病
+
+证据：`archive/2026-11-08/AUDIT_WAITS_COUNTERS_20261108.md`
+
+#### 9.558 docs 归档整理
+
+根目录 48 → 16 份；交接文档 602 KB → 100 KB（只留 9.500+，9.300–9.499 移入归档）；
+新增 `WINDOWS_AS_GUEST_FINDINGS.md`（唯一权威结论）与重写 `INDEX.md`。
+**切分用行数守恒断言验证，未丢任何记录。**
+
+#### 9.559 本段补录（交接文档之前停在 9.538）
+
+---
+
+## 本次会话结束时状态
+
+```
+驱动          : STOPPED
+镜像          : bin == 部署 = 18BB68C34F63970A
+桩模式        : 1.2×，卸载 0.046 s，invmrun at unload = 0x0
+RealGuestMode : 编译期封禁（9.552）
+台账          : 8 完成 / 9 不做 / 1 需重启（Tier 6.1）
+```
+
+**下一步唯一剩下的方向**：让 guest 在早退后 `jmp` 进 `Sv206GuestStub`
+而不是走完 C 函数终止线程。未验证，且那条路上已四次蓝屏。
+详见 `WINDOWS_AS_GUEST_FINDINGS.md` 第五节。
