@@ -534,6 +534,26 @@ Sv206GuestStub endp
 ; where every kernel API is legal.
 ;
 ; This thunk must not call anything: it only moves RSP and returns.
+; ---------------------------------------------------------------------------
+; 9.551: A CALLABLE VMMCALL.
+;
+; The only other `vmmcall` in this file is inside Sv206GuestStub - instructions the
+; GUEST executes, not something C can call. The real-guest path needs to tick once
+; from C so the stop handshake has an exit to answer, so it needs this.
+;
+; vmmcall is intercepted (it is in the prepared intercept set), so this raises
+; #VMEXIT on the current core. The handler then runs Sv206VmrunShouldExit exactly
+; as it does for a stub tick: if a stop was requested it sets ExitVm and the normal
+; exit protocol unwinds the VMRUN frame; if not, execution resumes at the
+; instruction after this one and this function returns.
+;
+; No stack use, no register saves: it is a leaf that does one instruction.
+; ---------------------------------------------------------------------------
+Sv206TickVmmcall proc
+    vmmcall
+    ret
+Sv206TickVmmcall endp
+
 Sv206LeaveToHost proc
     ;
     ; ARRIVE ON THE THREAD'S REAL STACK AND END THE THREAD FROM ASM.

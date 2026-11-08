@@ -1672,6 +1672,20 @@ extern "C" int yghv_s206_real_guest_mode(VOID)
     NTSTATUS        st;
     LONG            hit;
 
+    /*
+     * 9.552: PINNED OFF AT COMPILE TIME.
+     *
+     * The registry below is still read (the code path and its comments stay honest),
+     * but the answer is discarded. Four 0xD1 bugchecks in one session, every one on a
+     * driver code page, and the machine then came back with a BIOS "Remove disks or
+     * other media" prompt. A mode that a single `reg add` can arm must not stay
+     * armable while its stop path is not understood.
+     *
+     * The experiment and its measured result are kept: with the flag the early-return
+     * path fires (entries=6, early-returns=6); the stub path never reaches it (0).
+     */
+    return 0;
+
     hit = InterlockedCompareExchange(&cached, -1, -1);
     if (hit != -1) return (int)hit;
 
@@ -6636,6 +6650,29 @@ static LONG Sv206VirtualizeC(PSHARED_VIRTUAL_PROCESSOR_DATA SharedVpData)
     return (LONG)SvVirtualizeProcessor(SharedVpData);
 }
 
+/*
+ * 9.551: one intercepted instruction, called from the real-guest path only.
+ *
+ * Sv206TickVmmcall is a leaf in svm_simplevm206_x64.asm that executes a single
+ * `vmmcall` and returns. It exists because the only other `vmmcall` in this tree is
+ * inside Sv206GuestStub - instructions the GUEST runs, which C cannot call.
+ *
+ * Why the real-guest path needs it: that path returns out of SvVirtualizeProcessor
+ * inside the guest, so VMRUN never unwinds and g_S206CoresExited never rises from
+ * the host side. main.c waits on exactly that counter before DriverUnload returns;
+ * when it times out the image is unmapped under a live core and the next instruction
+ * after `vmrun` - `vmsave` - faults: 0xD1 at Sv206LaunchVm+0x1E, measured twice.
+ *
+ * A single tick gives the handler an exit to answer, which is the same protocol stub
+ * mode has used since 9.443.
+ */
+extern "C" void Sv206TickVmmcall(VOID);
+
+static VOID yghv_s206_real_guest_tick(VOID)
+{
+    Sv206TickVmmcall();
+}
+
 static VOID Sv206CoreThread(PVOID Context)
 {
     PSV206_CORE_THREAD_CONTEXT ctx =
@@ -6659,6 +6696,43 @@ static VOID Sv206CoreThread(PVOID Context)
      * allocation failure, so the status is recorded and the thread ends normally.
      */
     ctx->Status = Sv206VirtualizeC(ctx->SharedVpData);
+
+    /*
+     * 9.551: ON THE REAL-GUEST PATH, GIVE THE STOP HANDSHAKE SOMETHING TO ANSWER.
+     *
+     * Reaching this line means Sv206VirtualizeC returned. In stub mode that only
+     * happens after VMRUN unwound (the stub took its `vmmcall`, the handler set
+     * ExitVm, SvLV20 resumed past the loop), so the counter below is an honest "this
+     * core is out". In RealGuestMode it happens because the GUEST executed the
+     * function's own `return` - VMRUN never unwound, and the core is still inside
+     * the VMRUN loop with the image about to be unmapped under it.
+     *
+     * The difference matters because main.c waits for this counter to reach the core
+     * count before DriverUnload returns. Stub mode reaches it; real-guest mode
+     * incremented it from inside the guest and then terminated the thread there, so
+     * VMRUN stayed suspended - measured as 0xD1 at Sv206LaunchVm+0x1E (`vmsave`, the
+     * first instruction after `vmrun`).
+     *
+     * So on this path, tick once before terminating. That `vmmcall` is intercepted
+     * (it is in the prepared set), the handler runs Sv206VmrunShouldExit, and the
+     * EXISTING exit protocol takes the core out properly: ExitVm -> SvLV20 -> NRip,
+     * which is the stub's own loop head, and from there Sv206LeaveToHost ends the
+     * thread from the host side exactly as 9.445 designed.
+     *
+     * Opt-in on the same flag that created the need: with RealGuestMode off, the
+     * code below is the proven path byte-for-byte.
+     */
+    if (yghv_s206_real_guest_mode())
+    {
+        /*
+         * One vmmcall, nothing else. Not in a loop: if the handler decides not to
+         * stop yet it returns to the instruction after this one, and the loop would
+         * spin here on a core whose guest already finished - which is a livelock, not
+         * a fix. A single tick is enough because the stop request is already set by
+         * the time DriverUnload reaches the waiter.
+         */
+        yghv_s206_real_guest_tick();
+    }
 
     InterlockedIncrement(&g_S206CoresExited);
 
