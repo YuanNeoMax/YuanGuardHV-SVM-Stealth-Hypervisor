@@ -14,11 +14,6 @@
  * this target do not export __readcr3, so a call would leave an unresolved
  * __imp___readcr3 at link time.
  */
-static uint64_t yghv_time_readcr3(void) {
-    uint64_t v;
-    __asm__ __volatile__("mov %%cr3, %0" : "=r"(v));
-    return v;
-}
 
 /*
  * 9.366: PAGE-EXACT. Measured on the .map: g_time (8 slots x 84 B = 672) shared

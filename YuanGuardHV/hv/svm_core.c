@@ -33,10 +33,6 @@ static void yg_svm_vmsave(uint64_t vmcb_pa) {
     __asm__ volatile(".byte 0x0F, 0x01, 0xDB" : : "a"(vmcb_pa) : "memory");
 }
 
-static void yg_svm_vmload(uint64_t vmcb_pa) {
-    __asm__ volatile(".byte 0x0F, 0x01, 0xDA" : : "a"(vmcb_pa) : "memory");
-}
-
 /* --- Segment helpers --- */
 static uint16_t yg_read_cs(void) {
     uint16_t cs;

@@ -540,55 +540,36 @@ typedef struct _VIRTUAL_PROCESSOR_DATA
     DECLSPEC_ALIGN(PAGE_SIZE) UINT8 HostStateArea[PAGE_SIZE];
 } VIRTUAL_PROCESSOR_DATA, *PVIRTUAL_PROCESSOR_DATA;
 /*
- * 9.542: THE IRETQ FRAME, OVERLAID ON THE FREE TAIL OF StackContents.
+ * 9.577: THE 9.541/9.542 IRETQ EXPERIMENT IS DELETED, BUT ITS CONSTRAINT IS NOT.
  *
- * 9.541 tried to APPEND a field to HostStackLayout and crashed with
- * 0x1E / C000001D (illegal instruction). Cause: HostStackLimit carries
- * DECLSPEC_ALIGN(PAGE_SIZE), so any growth rounds the union up by a WHOLE PAGE and
- * GuestVmcb / HostVmcb / HostStateArea each move one page later - while the asm
- * addresses them with constants computed from the OLD layout (5FD0h, 6110h,
- * KTRAP_FRAME_SIZE equ 190h). The static_assert failed and reported it; the assert
- * was edited instead of read, and the crash followed.
+ * What was here: an `S206_IRET_SLOT` struct overlaid on the free tail of
+ * StackContents, and a helper that computed its address. 9.540/9.541 tried to exit
+ * the guest with `iretq` and that path is dead: the real-guest exit now goes
+ * through Sv206LeaveToHost on the thread's own stack (9.445, verified clean in
+ * 9.573-9.574), and nothing ever read the slot. Keeping a struct "for the future"
+ * while nothing reads it is how a layout claim turns into a comment nobody checked.
  *
- * THIS VERSION ADDS NO MEMBER. StackContents is 11.6 KB that nothing in this tree
- * references (no reads, no writes - only the definition). RSP points at
- * GuestVmcbPa, i.e. at the top of TrapFrame, so the LAST bytes of StackContents are
- * the free stack immediately below RSP. The frame overlays them:
+ * WHAT MUST SURVIVE, because it cost a bugcheck and the reason is not obvious:
  *
- *     StackContents[ .................... ][ Rip Cs Rflags Rsp Ss ]
- *                                          ^ sizeof(StackContents) - sizeof(slot)
+ *   DO NOT ADD A MEMBER TO VIRTUAL_PROCESSOR_DATA OR ITS UNIONS.
  *
- * sizeof(VIRTUAL_PROCESSOR_DATA): unchanged. Every offset: unchanged.
+ * HostStackLimit carries DECLSPEC_ALIGN(PAGE_SIZE), so ANY growth rounds the union up
+ * by a WHOLE PAGE and GuestVmcb / HostVmcb / HostStateArea each move one page later -
+ * while svm_simplevm206_x64.asm addresses them with constants computed from the OLD
+ * layout (5FD0h, 6110h, KTRAP_FRAME_SIZE equ 190h). 9.541 did exactly that and died
+ * with 0x1E / C000001D; the static_assert below reported it and the assert was
+ * edited instead of read.
  *
- * ORDER IS THE ARCHITECTURAL IRETQ ORDER. A struct with the right fields in the
- * wrong order loads CS out of what it believed was RSP - a fault that looks like
- * memory corruption rather than like a layout mistake.
- *
- * NOTHING USES IT YET: step 1 is layout only, and the exit is still
- * `mov rsp,rcx ; jmp rbx`. A slot that changes nothing is the only way to prove the
- * layout before anything depends on it.
+ * The static_assert is the enforcement. This paragraph is the explanation. Deleting
+ * the explanation would leave an assert whose message names a number, with nothing
+ * saying why the number is not negotiable.
  */
-typedef struct _S206_IRET_SLOT
-{
-    UINT64 Rip;
-    UINT64 Cs;
-    UINT64 Rflags;
-    UINT64 Rsp;
-    UINT64 Ss;
-} S206_IRET_SLOT, *PS206_IRET_SLOT;
 
 /*
  * The address is COMPUTED from the array, never hand-written: if StackContents ever
  * changes size, this follows it. A literal offset would silently point into the
  * middle of something else - which is 9.541's failure mode in miniature.
  */
-static PS206_IRET_SLOT Sv206IretSlot(PVIRTUAL_PROCESSOR_DATA vp)
-{
-    return reinterpret_cast<PS206_IRET_SLOT>(
-                &vp->HostStackLayout.StackContents[
-                    sizeof(vp->HostStackLayout.StackContents) - sizeof(S206_IRET_SLOT)]);
-}
-
 static_assert(sizeof(VIRTUAL_PROCESSOR_DATA) == KERNEL_STACK_SIZE + PAGE_SIZE * 3,
               "VIRTUAL_PROCESSOR_DATA Size Mismatch");
 
@@ -1101,6 +1082,9 @@ static volatile LONG64 g_S206CoreVmcbPa[SVM206_MAX_VPD] = { 0 };
 static volatile LONG   g_S206CoreVmcbSet = 0;
 static volatile LONG   g_S206ForceDevirtRounds = 0;
 static volatile LONG   g_S206ForceDevirtTouched = 0;
+/* 9.577: resolved once; 1 means the registry asked for the stub path.
+ * -1 = not read yet, so "absent key" is distinguishable from "key said 0". */
+static volatile LONG   g_S206RealGuestDisabled = -1;
 
 extern "C" VOID yghv_s206_register_vpd(PVOID vpData)
 {
@@ -1619,9 +1603,23 @@ extern "C" void yghv_s206_virtualize_counts(UINT64 *entries, UINT64 *early,
 /*
  * 9.526: COUNT PHYSICAL CORES, NOT LOGICAL PROCESSORS.
  *
+ * 9.577: NOTHING CALLS THIS ANY MORE, AND IT IS KEPT ON PURPOSE.
+ *
+ * The default is now all cores, and both fallbacks in yghv_s206_core_limit were
+ * changed to return `available`, so this has zero callers. It stays because it is
+ * the ONLY topology query in the tree that answers "how many physical cores does
+ * this machine have" -- and that is the number any future experiment about the
+ * core-count trade-off needs first. Deleting it would leave an operator with a
+ * registry switch and no way to ask the machine what a sensible value is.
+ *
+ * What is WRONG in the measurement below is the conclusion, not the numbers: the
+ * 11.6x was taken in STUB MODE, where the cost is the stub's own hlt/vmmcall spin.
+ * Real guest on 12 cores is 1.01-1.05x (9.575). Do not restore the old default on
+ * the strength of these two lines.
+ *
  * Measured (12-thread benchmark, every logical processor loaded):
- *   6 cores -> 1.7x     <- this machine, and the best point by far
- *   12 cores -> 11.6x   <- what "all processors" gives you
+ *   6 cores -> 1.7x     <- stub mode
+ *   12 cores -> 11.6x   <- stub mode
  *
  * RelationProcessorCore returns ONE record per physical core, and each record
  * carries a Mask listing all the SMT siblings that belong to it. Counting the
@@ -1847,7 +1845,34 @@ extern "C" int yghv_s206_real_guest_mode(VOID)
         ZwClose(key);
     }
 
-    hit = (value != 0) ? 1 : 0;
+    /*
+     * 9.577: DEFAULT IS NOW ON. The registry value is therefore a DISABLE switch,
+     * not an enable switch -- the meaning is INVERTED relative to 9.569 and earlier.
+     *
+     * That inversion is the whole point of the change and it must be read together
+     * with this code, not the old notes:
+     *
+     *   9.576 measured this mode as strictly better than the previous default --
+     *   12 cores, real guest, 1.01-1.05x throughput and G25 17/17, versus
+     *   6 cores, stub mode, 1.13-1.34x and 15/17. No measured configuration makes
+     *   the old default preferable, so a fresh load must not get it.
+     *
+     * Keeping the OLD convention would have made an absent key mean "off", so the
+     * value is now read as "disabled when explicitly non-zero". Consequence, stated
+     * because it is a behaviour change for anyone who already wrote the key: a
+     * machine carrying `RealGuestMode=1` from the old convention is now DISABLED by
+     * its own override. That errs toward the proven stub path rather than toward the
+     * newer one, which is the direction an accident should fall.
+     */
+    {
+        LONG disable = InterlockedCompareExchange(&g_S206RealGuestDisabled, -1, -1);
+        if (disable == -1)
+        {
+            disable = (value != 0) ? 1 : 0;
+            InterlockedExchange(&g_S206RealGuestDisabled, disable);
+        }
+        hit = (disable != 0) ? 0 : 1;
+    }
     InterlockedExchange(&cached, hit);
     return (int)hit;
 }
@@ -1869,11 +1894,20 @@ extern "C" ULONG yghv_s206_core_limit(ULONG available)
     st = ZwOpenKey(&key, KEY_QUERY_VALUE, &attrs);
     if (!NT_SUCCESS(st))
     {
-        /* 9.526: no Parameters key -> PHYSICAL cores, the measured optimum.
-         * 12-thread load: 6 cores 1.7x vs 12 cores 11.6x. Falling back to
-         * `available` here would keep the 11.6x behaviour as the default. */
-        ULONG phys = yghv_s206_physical_cores();
-        return (phys != 0 && phys < available) ? phys : available;
+        /* 9.577: no Parameters key -> ALL cores.
+         *
+         * The comment that used to be here said PHYSICAL cores was "the measured
+         * optimum" because 12 cores cost 11.6x on a 12-thread load. 9.575 re-measured
+         * it and that 11.6x belongs to STUB MODE: the cost was the stub's own
+         * hlt/vmmcall spin (1,255,119 exits against real guest's 27,914). With the
+         * guest being Windows itself, 12 cores costs 1.01-1.05x -- and 9.576 got
+         * G25 17/17 on all twelve where the 6-core default got 15/17.
+         *
+         * There is no measured configuration in which limiting the core count helps.
+         * The override stays (a machine with a different core count, or a specific
+         * problem, needs a way out) but the default is every processor the OS offers.
+         */
+        return available;
     }
 
     {
@@ -1907,9 +1941,10 @@ extern "C" ULONG yghv_s206_core_limit(ULONG available)
 
     if (value == 0)
     {
-        /* 9.526: 0 also means "no explicit override" -> physical cores. */
-        ULONG phys = yghv_s206_physical_cores();
-        return (phys != 0 && phys < available) ? phys : available;
+        /* 9.577: 0 means "no explicit override" -> ALL cores, same as an absent key.
+         * See the note at the top of this function: the 11.6x that justified the old
+         * physical-core default was a STUB-MODE measurement. */
+        return available;
     }
     if (value > available) value = available;
     return value;

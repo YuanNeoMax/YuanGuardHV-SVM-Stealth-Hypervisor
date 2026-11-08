@@ -831,10 +831,6 @@ static uint64_t yghv_protect_resolve_va_for(yghv_protect_target_t *t,
     return pa;
 }
 
-static uint64_t yghv_protect_resolve_va(uint64_t target_va) {
-    return yghv_protect_resolve_va_for(&g_protect.targets[0], target_va);
-}
-
 NTSTATUS yghv_protect_init(void) {
     yghv_protect_fake_init();
     ExInitializeFastMutex(&g_protect_lock);
@@ -2146,7 +2142,6 @@ static void yghv_protect_unmap_writable_page(PMDL mdl, uint8_t *map) {
         IoFreeMdl(mdl);
 }
 
-static void yghv_emit_u8(uint8_t *p, uint8_t v) { *p = v; }
 static void yghv_emit_u64(uint8_t *p, uint64_t v) {
     for (int i = 0; i < 8; i++) p[i] = (uint8_t)(v >> (i * 8));
 }

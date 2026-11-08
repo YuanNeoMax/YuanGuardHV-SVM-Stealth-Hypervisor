@@ -83,13 +83,6 @@ static uint32_t ch_rd32(const uint8_t *p) {
            ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
-static void ch_wr32(uint8_t *p, uint32_t v) {
-    p[0] = (uint8_t)v;
-    p[1] = (uint8_t)(v >> 8);
-    p[2] = (uint8_t)(v >> 16);
-    p[3] = (uint8_t)(v >> 24);
-}
-
 /* Write the ACK plus a status. Kept in one place so no exit path can forget the
  * ack - that omission is exactly what made two callers dead code in 9.370. */
 static void ch_ack(uint32_t status, uint32_t op,

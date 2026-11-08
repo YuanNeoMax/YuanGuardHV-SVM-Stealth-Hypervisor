@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
 YuanGuardHV control-device client (IOCTL validation tool).
 
@@ -2979,8 +2979,19 @@ try {
             if ($entries -eq 0) {
                 Write-Host '  the function was never entered - no core has virtualized yet.'
             } elseif ($early -eq 0) {
-                Write-Host '  entered but NEVER returned early -> the C frame is never unwound.'
-                Write-Host '  In that state an iretq exit has no frame to return through.'
+                # 9.577: THIS MESSAGE USED TO BE A DIAGNOSIS, AND IT WAS ONLY TRUE IN
+                # ONE MODE. `early-returns == 0` means "the guest is our stub", which
+                # is a NORMAL and CORRECT state -- the stub never returns into
+                # SvVirtualizeProcessor by construction. Printing "the C frame is never
+                # unwound" made the healthy stub configuration read as a defect, and
+                # it was reprinted on every stub-mode run for weeks.
+                #
+                # The real reading depends on which guest the build is running, and
+                # this command cannot see that flag, so it now names both meanings
+                # instead of asserting one.
+                Write-Host '  early-returns=0 -> the guest never returned into the C frame.'
+                Write-Host '  NORMAL in stub mode (Sv206GuestStub never returns by design).'
+                Write-Host '  In real-guest mode the same reading would mean the early-out never fired.'
             } else {
                 Write-Host ("  ratio early/entries = {0:N3}" -f ($early / [double]$entries))
             }

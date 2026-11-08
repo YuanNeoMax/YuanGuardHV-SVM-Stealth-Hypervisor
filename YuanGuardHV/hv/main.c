@@ -450,18 +450,6 @@ static NTSTATUS yghv_npt_map_ram(npt_mgr_t *m) {
     return STATUS_SUCCESS;
 }
 
-static void yghv_exclude_driver(PDRIVER_OBJECT d) {
-    uint64_t start = (uint64_t)d->DriverStart & ~(HV_PAGE_SIZE - 1);
-    uint64_t end = ((uint64_t)d->DriverStart + d->DriverSize + HV_PAGE_SIZE - 1) &
-                   ~(uint64_t)(HV_PAGE_SIZE - 1);
-
-    while (start < end) {
-        PHYSICAL_ADDRESS pa = MmGetPhysicalAddress((PVOID)start);
-        npt_exclude_pa(&g_npt, pa.QuadPart);
-        start += HV_PAGE_SIZE;
-    }
-}
-
 #if YGHV_R1_EXCLUDE_PRIVATE
 static void yghv_exclude_hv_private(PDRIVER_OBJECT d) {
     ULONG i;
@@ -2256,13 +2244,6 @@ static void yghv_avic_read_idtr(uint64_t *base, uint16_t *limit) {
     __asm__ volatile("sidt %0" : "=m"(idtr));
     *limit = idtr.limit;
     *base = idtr.base;
-}
-
-static void yghv_avic_load_idtr(uint64_t base, uint16_t limit) {
-    struct { uint16_t limit; uint64_t base; } __attribute__((packed)) idtr;
-    idtr.limit = limit;
-    idtr.base = base;
-    __asm__ volatile("lidt %0" : : "m"(idtr));
 }
 
 static void yghv_avic_restore_idt(svm_vcpu_t *vcpu) {

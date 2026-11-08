@@ -29,7 +29,7 @@
 
 ---
 
-## 记录索引（9.576 重新测量，62 条）
+## 记录索引（9.577 重新测量，63 条）
 
 > 这是本文档自己的目录。**按标题扫一眼，找到要的那条，再跳过去读。**
 > 行数是该记录占的篇幅，用来判断"值不值得读全文"。
@@ -98,6 +98,7 @@
 | 9.574 ★★★★★ 0x101 的根因：tick 循环不让出 CPU —— 全核 RealGuestMode 打通 | 63 |
 | 9.575 ★★★★★ 性能实测：真 guest 全核 **1.02×** —— 推翻了 11.6× 那个取舍 | 88 |
 | 9.576 ★★★★★ G25 全核真 guest：**17/17 全部通过** —— 那个取舍的代价被证伪 | 91 |
+| 9.577 默认值改为「全核 + 真 guest」，清理死代码，并修好一条误导读数 | 91 |
 
 ---
 
@@ -3067,6 +3068,97 @@ T3 把 `g_bp` 页藏了，于是 T12 的 `mem-bp add` 被安全护栏拒绝
 
 **但默认值这一轮仍然不动** —— 改默认是产品决定，需要 operator 明确同意，且要连带更新文档与回归口径。理由见 9.576 末节：
 "改默认"是一个产品决定，需要 operator 明确同意，且要连带更新文档与回归口径。
+
+#### 9.577 默认值改为「全核 + 真 guest」，清理死代码，并修好一条误导读数
+
+operator 指令：**保持真 guest、默认全核、用不上的删掉。**
+
+##### 一、默认值：真 guest 开、全核
+
+```c
+yghv_s206_real_guest_mode()  ->  默认返回 1
+yghv_s206_core_limit()       ->  默认返回 available（全部处理器）
+```
+
+**注册表语义反转了**，这一条必须读清楚：
+
+| 旧（9.569 及以前） | 新（9.577） |
+|---|---|
+| `RealGuestMode=1` = **打开** | `RealGuestMode=1` = **关闭**（退回桩模式）|
+| 键不存在 = 关 | 键不存在 = **开** |
+
+理由：9.576 测出旧默认在所有配置里都不是最优（12 核真 guest 1.01–1.05× + G25 17/17，
+对 6 核桩 1.13–1.34× + 15/17），所以全新加载不该拿到旧默认。
+
+**副作用要写下来**：一台机器上如果留着旧约定写下的 `RealGuestMode=1`，
+现在会**被它自己的覆盖关掉**。这个方向是有意选的 —— 事故应该倒向已验证的桩模式，
+而不是倒向较新的那条路。
+
+实测（注册表清空，完全走默认）：
+
+```
+virt-counts : entries=12  early-returns=12  cores-marked=12  disagrees=0
+sys-health  : degraded=0 total=0 fatal=0
+卸载        : 0.158 s，invmrun at unload = 0x0
+```
+
+反向开关也实测了：写 `RealGuestMode=1` → `early-returns=0`（退回桩模式），语义确认反转。
+
+##### 二、清理：删了 8 个，留了 2 个，理由都写进代码
+
+**删除（确认零引用，含汇编与宏）**
+
+| 文件 | 删除 | 说明 |
+|---|---|---|
+| `hv/protect.c` | `yghv_emit_u8` | 单行 store 包装，从未调用 |
+| `hv/protect.c` | `yghv_protect_resolve_va` | 只是 `_for` 版本的包装，`_for` 仍活跃 |
+| `hv/main.c` | `yghv_exclude_driver` | 从未调用 |
+| `hv/main.c` | `yghv_avic_load_idtr` | `read_idtr` 在用，`load_idtr` 没有 |
+| `hv/svm_core.c` | `yg_svm_vmload` | 从未调用 |
+| `hv/yghv_channel.c` | `ch_wr32` | `ch_rd32` 在用，写侧没有 |
+| `hv/mem_time.c` | `yghv_time_readcr3` | 从未调用 |
+| `hv/yghv_sentry.c` | `yghv_sentry_find_name` | `surface_add` 自己内联了那段比较 |
+| `hv/svm_simplevm206.cpp` | `Sv206IretSlot` + `S206_IRET_SLOT` | iretq 实验已死，无人读取 |
+
+**保留（不是漏掉）**
+
+| 保留 | 理由 |
+|---|---|
+| 18 个 `*_pad` 变量 | **它们是故意的页隔离**（`/* separation */`），删了会让两张表共页 —— 页布局检查会失败，历史上这类共页直接导致过崩溃 |
+| `yghv_selfmap_init_unsafe_do_not_call`<br>`yghv_watch_add_unsafe_do_not_call` | 注释明写「The code is kept as a record」，是 Phase 2b 的设计依据，删了等于删设计文档 |
+| `yghv_s206_physical_cores()` | 默认改成全核后**确实没人调用了**，但它是全树唯一能回答「这台机器几个物理核」的入口。留着，并在注释里写明：它记录的那两个数字（6 核 1.7× / 12 核 11.6×）是**桩模式**的，结论不成立 |
+
+##### 三、删掉的注释块，留下的约束
+
+`S206_IRET_SLOT` 上面那一大段注释里混着两件事：这个结构体为什么这么排（已无用），
+以及**为什么绝不许给 `VIRTUAL_PROCESSOR_DATA` 加成员**（9.541 的 0x1E 教训，仍然有效）。
+
+处理：删结构体，**把那条约束单独留下来**。`static_assert` 是执行者，
+这段文字是解释者 —— 只留 assert，下一个人会看到一个数字要求，不知道它为什么不可协商。
+
+##### 四、顺带修好一条一直在误导读数
+
+`virt-counts` 在 `early-returns=0` 时打印：
+
+```
+entered but NEVER returned early -> the C frame is never unwound.
+In that state an iretq exit has no frame to return through.
+```
+
+**这句话把健康的桩模式渲染成缺陷。** 桩的 guest 按构造就不会返回 C 函数，
+`0` 是正确读数——而它每次桩模式运行都会打出来，持续数周。
+
+改成按模式分别说明，不再断言单一结论：
+**这个命令看不到模式开关，所以它不该替读者下判断。**
+
+##### 五、验证
+
+```
+ALL SOURCE CHECKS PASS     （source 24 + map 1，0 FAIL）
+编译 Build SUCCESS         （5701F175B9C60F80）
+默认配置实测               entries=12 / early-returns=12，卸载 0.158 s，invmrun=0x0
+反向开关实测               RealGuestMode=1 -> early-returns=0（桩模式）
+```
 
 ## 本次会话结束时状态
 

@@ -138,24 +138,6 @@ uint64_t yghv_sentry_exit_count(void) {
 
 /* ---------- 7.6 surface inventory ---------- */
 
-static int yghv_sentry_find_name(const char *name) {
-    int i;
-    if (!name)
-        return -1;
-    for (i = 0; i < YGHV_SENTRY_MAX_SURFACE; i++) {
-        int j;
-        for (j = 0; j < YGHV_SENTRY_NAME_LEN; j++) {
-            if (g_surface[i].name[j] != name[j])
-                break;
-            if (!name[j])
-                return i;
-        }
-        if (j == YGHV_SENTRY_NAME_LEN && g_surface[i].name[YGHV_SENTRY_NAME_LEN - 1] == 0)
-            continue;
-    }
-    return -1;
-}
-
 int yghv_sentry_surface_add(const char *name) {
     int i, j, slot = -1;
 
