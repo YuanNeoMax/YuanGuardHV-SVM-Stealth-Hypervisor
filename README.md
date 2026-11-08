@@ -419,6 +419,7 @@ csc /nologo /optimize+ /out:tools\bench_core.exe tools\bench_core.cs
 | **`docs/KERNEL_API_CHECKLIST.md`** | **★ 写内核代码前必读** —— 三次蓝屏换来的 API 契约核对清单 |
 | `docs/archive/` | 9.1–9.499 历史交接、2026-08 评审与研究、Tier 设计计划书 |
 | **[`CHANGELOG.md`](CHANGELOG.md)** | **版本级变更摘要** —— 两个版本之间发生了什么（含 Breaking 标注）|
+| **[`docs/ISSUES.md`](docs/ISSUES.md)** | **★ 唯一的问题清单** —— P0–P3 分级 + 版本规划 + 判据纪律 |
 
 ---
 

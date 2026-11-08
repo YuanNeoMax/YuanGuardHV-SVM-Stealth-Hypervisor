@@ -13,6 +13,7 @@
 | **接手项目 / 知道现在什么状态** | **[`QUICKSTART.md`](QUICKSTART.md)** | 3 分钟上手、当前状态、下一步、八个坑、方法论 |
 | **知道为什么这么设计、踩过哪些雷** | [`RESUME_PROMPT.md`](RESUME_PROMPT.md) | 深一层：用户铁律、架构约束、观测手段、坑表（691 行）|
 | **知道哪些做了、哪些不做** | [`TIER_LEDGER.md`](TIER_LEDGER.md) | 唯一权威的完成度表：8 完成 / 9 不做 / 1 需重启 |
+| **知道还欠什么、下一版做什么** | **[`ISSUES.md`](ISSUES.md)** | **★ 唯一的问题清单**：P0–P3 分级 + 版本规划 + 判据纪律 |
 | **了解 Windows-as-Guest** | **[`WINDOWS_AS_GUEST_FINDINGS.md`](WINDOWS_AS_GUEST_FINDINGS.md)** | 全部结论：能跑、快 38%、停不下来、根因、已排除解法 |
 | **写内核代码前** | [`KERNEL_API_CHECKLIST.md`](KERNEL_API_CHECKLIST.md) | 三次蓝屏换来的 API 契约 |
 | **改文档之后** | `YuanGuardHV/tests/README.md`（代码树内，用路径而非链接）| `docs_check.ps1` 会拦住过期数字（构建期自动跑）|
@@ -64,5 +65,7 @@ HEAD          : main @ f011b40
 2. **本索引是唯一入口** —— 根目录与 `superpowers/` 下新增文档必须在此登记。
 3. **编号单调递增**，`9.1–9.499` 在归档，`9.500+` 在主文档。
 4. **`TIER_LEDGER.md` 只在实测之后才写「完成」** —— 写「完成」而实际不可用，比写「未做」更糟。
-5. **写数字前先量，写完再量一次。** 份数用 `ls | wc -l`，哈希用 `Get-FileHash`，
+5. **`ISSUES.md` 是唯一的问题清单。** `TIER_LEDGER`（Tier 完成度）、`RESUME_PROMPT` §8、
+   `README` 的已知限制是**历史视角**，新增待办只进 `ISSUES.md`，避免三处冲突。
+6. **写数字前先量，写完再量一次。** 份数用 `ls | wc -l`，哈希用 `Get-FileHash`，
    编号用 `grep -o '9\.[0-9]\{3\}' | sort -V | tail -1`。**整理动作本身会让旧数字失效。**
