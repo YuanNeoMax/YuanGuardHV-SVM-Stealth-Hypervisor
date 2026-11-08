@@ -6,19 +6,9 @@
 
 ---
 
-## 0. 文档地图（9.558 整理）
+## 0. 文档入口
 
-**根目录只放"现在还有用"的；过程记录全在 `archive/`。**
-
-| 想知道 | 读 |
-|---|---|
-| 文档总入口 | `INDEX.md` |
-| 当前状态 / 下一步 / 七个坑 | **本文件** |
-| Windows-as-Guest 的全部结论 | **`WINDOWS_AS_GUEST_FINDINGS.md`** |
-| 哪些做了 / 不做 / 为什么 | `TIER_LEDGER.md` |
-| 逐条变更（9.500+） | `YUANMOD_HANDOFF_CURRENT.md` |
-| 逐条变更（9.1–9.499） | `archive/_ARCHIVE_HANDOFF_9.1-9.299.md` |
-| 本次会话的 24 份过程记录 | `archive/2026-11-08/` |
+**→ 看 [`INDEX.md`](INDEX.md)。** 本文件只讲「现在什么状态、下一步做什么」。
 
 ---
 

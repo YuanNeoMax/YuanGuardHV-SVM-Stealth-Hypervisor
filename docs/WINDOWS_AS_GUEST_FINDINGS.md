@@ -134,7 +134,7 @@ guest 完成 SvVirtualizeProcessor 的早退（C 帧展开 ✅）
 
 ## 六、相关的 2026-08 研究（另一条线的结论）
 
-`YGHV_OS_AS_GUEST_SUMMARY_20260815.md` 记录了 114 个实验，
+`archive/YGHV_OS_AS_GUEST_SUMMARY_20260815.md` 记录了 114 个实验，
 结论是「OS-as-Guest 本机不可行，平台级限制（errata 1363）」。
 
 **本会话推翻了这个结论的适用范围**：
