@@ -54,6 +54,21 @@ static volatile LONG g_S206CoresStarted = 0;
 static volatile LONG g_S206CoresExited = 0;
 
 /*
+ * 9.555: the ASM half of the exit path needs to increment this.
+ *
+ * Sv206LeaveToHost terminates the thread from Assembly with
+ * `call PsTerminateSystemThread`, so control never returns to Sv206CoreThread
+ * line 6737 where this counter is otherwise incremented. The unload waiter in
+ * main.c compares it against the core count, so it was never satisfied and
+ * every unload burned its whole budget (~4 s, measured).
+ *
+ * A non-static alias rather than making the static non-static: the rest of
+ * this file keeps using g_S206CoresExited, and the ASM gets a symbol it can
+ * name without the two views drifting apart.
+ */
+extern "C" { volatile LONG g_S206CoresExitedAsm = 0; }
+
+/*
  * 9.445: WHERE THE EXIT STACK POINTER COMES FROM - AND WHY NOTHING HERE TRACKS IT.
  *
  * Four earlier attempts each maintained some piece of state to reconstruct the
@@ -1818,9 +1833,41 @@ extern "C" LONG yghv_s206_cores_started(VOID)
     return InterlockedCompareExchange(&g_S206CoresStarted, 0, 0);
 }
 
+/*
+ * 9.556: HOW MANY CORES ACTUALLY HOLD A VPD.
+ *
+ * The unload waiter in main.c compared g_S206CoresExited against
+ * KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS) - 12 here - while 206
+ * virtualizes six cores. An unsatisfiable bound is why every unload cost ~2-4 s no
+ * matter how correct the counter was (9.555 fixed the counter; the time did not
+ * move, which is what exposed the bound).
+ *
+ * This is the number the waiter should compare against: the cores that exist, not
+ * the logical CPUs the machine happens to have.
+ */
+extern "C" int yghv_s206_vpd_count(VOID)
+{
+    int n = 0;
+    UINT32 i;
+
+    for (i = 0; i < SVM206_MAX_VPD; i++)
+    {
+        if (g_S206LiveVpd[i] != NULL) n += 1;
+    }
+    return n;
+}
+
 extern "C" LONG yghv_s206_cores_exited(VOID)
 {
-    return InterlockedCompareExchange(&g_S206CoresExited, 0, 0);
+    /*
+     * 9.555: read the ALIAS, not the static.
+     *
+     * The exit path increments g_S206CoresExitedAsm from Assembly (Sv206LeaveToHost,
+     * immediately before terminating the thread). Reading the static here would
+     * report 0 forever on that path - an accessor that lies is worse than no
+     * accessor, because the next investigation would trust it.
+     */
+    return InterlockedCompareExchange(&g_S206CoresExitedAsm, 0, 0);
 }
 
 extern "C" { volatile LONG g_VmrunStopRequested = 0; }
@@ -2001,7 +2048,8 @@ extern "C" int yghv_s206_vmrun_stopped_count(VOID)
      * back through the entry trampoline. That is the only number that means what the
      * caller thinks it means.
      */
-    return (int)InterlockedCompareExchange(&g_S206CoresExited, 0, 0);
+    /* 9.555: ASM increments the alias; read the same object. */
+    return (int)InterlockedCompareExchange(&g_S206CoresExitedAsm, 0, 0);
 }
 
 /* 9.441: the exit counter's read-only door, for the pre-teardown snapshot and
@@ -6734,7 +6782,7 @@ static VOID Sv206CoreThread(PVOID Context)
         yghv_s206_real_guest_tick();
     }
 
-    InterlockedIncrement(&g_S206CoresExited);
+    InterlockedIncrement(&g_S206CoresExitedAsm);   /* 9.555: same object as the ASM inc */
 
     /*
      * Reached only on the early-out / error paths above. Terminate through a volatile

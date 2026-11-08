@@ -5120,7 +5120,32 @@ void DriverUnload(struct _DRIVER_OBJECT *d) {
             yghv_ut_mark_val(55, (uint64_t)yghv_s206_invmrun_count());
 
             stopped = yghv_s206_vmrun_stopped_count();
-            while ((ULONG)stopped < active && waited < 20000) {
+
+            /*
+             * 9.556: WAIT FOR THE CORES THAT EXIST, NOT FOR EVERY LOGICAL CPU.
+             *
+             * 9.555 made g_S206CoresExited honest - the ASM exit path now
+             * increments it before terminating the thread - and unload time was
+             * UNCHANGED (2.844 / 2.137 / 4.118 s). So the counter was never the
+             * problem; the bound was.
+             *
+             * `active` is KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS) = 12
+             * here, while 206 virtualizes SIX cores. `stopped` cannot reach 12, so
+             * the condition was unsatisfiable and the waiter always ran out its
+             * 20000 passes. This is why every unload cost ~2-4 s regardless of how
+             * correct any counter was.
+             *
+             * Comparing against the registered VPD count asks the question that
+             * has an answer. A count of 0 means no core ever virtualized, and the
+             * loop then leaves at once - the outcome 9.442 already calls normal.
+             */
+            {
+                extern int yghv_s206_vpd_count(void);
+                int vpds = yghv_s206_vpd_count();
+                ULONG waitFor = (vpds > 0) ? (ULONG)vpds : 0;
+                yghv_ut_mark_val(58, (uint64_t)waitFor);
+
+            while ((ULONG)stopped < waitFor && waited < 20000) {
                 volatile ULONG spin;
 
                 /*
@@ -5148,6 +5173,7 @@ void DriverUnload(struct _DRIVER_OBJECT *d) {
                 for (spin = 0; spin < 200000UL; spin++) { }
                 waited += 1;
                 stopped = yghv_s206_vmrun_stopped_count();
+            }
             }
 
             yghv_ut_mark_val(56, (uint64_t)(ULONG)stopped);

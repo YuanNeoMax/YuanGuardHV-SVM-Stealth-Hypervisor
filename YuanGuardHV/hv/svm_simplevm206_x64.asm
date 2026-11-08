@@ -20,6 +20,12 @@ extern SvHandleVmExit : proc
 ; vmsave. The stop-flag externs of 9.416 are gone: those variables are static
 ; again (9.419) because the inline check they served was proven useless (9.417).
 extern g_inVmrunCount : dword
+;
+; 9.555: incremented immediately before the thread is terminated below, so
+; the unload waiter in main.c has a condition that can actually be met.
+; It is a LONG (dword).
+;
+extern g_S206CoresExitedAsm : dword
 
 ;
 ;   @brief      Saves all general purpose registers to the stack.
@@ -594,6 +600,21 @@ Sv206LeaveToHost proc
     ; Rax holds PsTerminateSystemThread, placed there by SvHandleVmExit, so this file
     ; needs no kernel import.
     ;
+    ;
+    ; 9.555: THIS CORE HAS LEFT FOR GOOD - SAY SO BEFORE TERMINATING.
+    ;
+    ; Sv206CoreThread increments this after Sv206VirtualizeC returns, but this
+    ; path never returns: the call below ends the thread. So the unload waiter
+    ; (main.c:5123) compared a counter that could never reach the core count and
+    ; always ran its full budget - measured ~4 s of pure spin on every unload.
+    ;
+    ; lock inc with a memory operand: it touches NO register, so rax
+    ; (PsTerminateSystemThread) and rcx (STATUS_SUCCESS) are still exactly what
+    ; the call below needs. Placed before the stack adjustment so the sequence
+    ; 9.445 proved correct is byte-for-byte unchanged.
+    ;
+    lock inc dword ptr [g_S206CoresExitedAsm]
+
     sub     rsp, 28h
     xor     ecx, ecx                ; STATUS_SUCCESS
     call    rax                     ; terminate the thread - does not return
