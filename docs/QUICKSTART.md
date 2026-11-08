@@ -2,7 +2,23 @@
 
 > **30 秒版**：AMD SVM 管理程序驱动，Windows 自己是 guest。代码在 `D:\yuanguard`，
 > 分支 `main`，构建一条命令，加载一条命令。
-> **当前最新编号 9.537**，G25 在 6 核默认下 **15/17 PASS（T7/T9 FAIL，见第 4 节）**。
+> **当前最新编号 9.558**。桩模式 1.2×，卸载 **0.046 s**，`invmrun at unload = 0x0`。
+
+---
+
+## 0. 文档地图（9.558 整理）
+
+**根目录只放"现在还有用"的；过程记录全在 `archive/`。**
+
+| 想知道 | 读 |
+|---|---|
+| 文档总入口 | `INDEX.md` |
+| 当前状态 / 下一步 / 七个坑 | **本文件** |
+| Windows-as-Guest 的全部结论 | **`WINDOWS_AS_GUEST_FINDINGS.md`** |
+| 哪些做了 / 不做 / 为什么 | `TIER_LEDGER.md` |
+| 逐条变更（9.500+） | `YUANMOD_HANDOFF_CURRENT.md` |
+| 逐条变更（9.1–9.499） | `archive/_ARCHIVE_HANDOFF_9.1-9.299.md` |
+| 本次会话的 24 份过程记录 | `archive/2026-11-08/` |
 
 ---
 
