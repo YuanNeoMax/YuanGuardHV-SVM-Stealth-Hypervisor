@@ -29,7 +29,7 @@
 
 ---
 
-## 记录索引（9.579 重新测量，65 条）
+## 记录索引（9.581 重新测量，67 条）
 
 > 这是本文档自己的目录。**按标题扫一眼，找到要的那条，再跳过去读。**
 > 行数是该记录占的篇幅，用来判断"值不值得读全文"。
@@ -101,6 +101,8 @@
 | 9.577 默认值改为「全核 + 真 guest」，清理死代码，并修好一条误导读数 | 91 |
 | 9.578 v0.4.1：P0-2 配置不一致可见化 + P2-2 真 guest 下重测 mem-bench | 87 |
 | 9.579 P2-3 `.data` 段隐藏：先验判据，结果判据有三个缺陷 —— **不做全藏** | 109 |
+| 9.580 P2-3a：一个只刷 TLB、不改映射的命令 —— `.data` 隐藏的判据补上了 | 42 |
+| 9.581 P2-3b：`hidden` 计数与 NPT 实际状态的一致性检查 | 75 |
 
 ---
 
@@ -3357,6 +3359,123 @@ npt-view       : frame=0x42185D000  VISIBLE          ← 说"没藏"
 
 实验页已 `sys-guard del`，`sys-guard list` 回到 3 页，`.data` 那页 `VISIBLE`。
 驱动 STOPPED，`invmrun at unload = 0x0`。
+
+#### 9.580 P2-3a：一个只刷 TLB、不改映射的命令 —— `.data` 隐藏的判据补上了
+
+9.579 的硬阻塞是：**没有手段在「藏页之后」刷 TLB 而不破坏隐藏状态。**
+`npt-remap` 被当成 flush 用，它却会重写 leaf、把 DECOY 换成真实页 ——
+**测量动作毁掉了被测对象。**
+
+##### 新增：`npt-raw <pa> f`（可组合成 `af` / `df` / `adf`）
+
+```
+npt-raw <pa> af
+  before = 0x00000000ADA46027  A=True  D=False
+  after  = 0x00000000ADA46007  A=False D=False
+  entry: present=True writable=True frame=0xADA46000
+  cleared mask = 0x20  (A=True D=False)
+  TLB flushed on every live core - mapping untouched
+```
+
+**关键读数**：flush 之后 `frame` 仍然是 `0xADA46000`（零页），
+`npt-view` 仍报 `HIDDEN (DECOY)`。**隐藏状态完好，A 位确实被清了。**
+
+##### 实现
+
+- `yghv_s206_flush_npt_tlb()`：遍历 `g_S206LiveVpd`，每个 VMCB 写
+  `TlbControl=1` 然后 `VmcbClean=0`（顺序与全树一致 —— 9.448e 的教训：
+  只写控制字不清 VmcbClean，处理器继续用缓存的旧控制区）。
+- 用 `clr` 参数的 **bit 63** 作为 flush 标志，与 A/D 位不冲突。
+- **一次调用里完成「清 A + 刷 TLB」**，不是两条命令 ——
+  否则读者可能落在两者之间，而这正是 A 位判据要避免的歧义。
+
+##### 踩到的两个坑（都是"两个结果挤在一个字段"）
+
+1. **驱动侧**：`out[3]` 先写 A/D 掩码，后面又 `out[3] = flushed` **把它覆盖**。
+   症状：`af` 调用报 `cleared mask = 0`，客户端因此打印 "clear NOT applied"，
+   **而条目实际上被清了**。修法：`out[3]` 改成位域——
+   bit0..7 = 清了哪些 A/D，bit63 = 有 flush，bit32..47 = flush 了几个核。
+2. **客户端侧**：`$done` 同时承载 A/D 掩码和 flush 位，
+   `cleared mask` 那行会把 `0x8000000000000020` 打出来当掩码。
+   修法：拆成 `$flushed` 与 `$doneAD` 两个变量再打印。
+
+> 两处是同一个病的两面：**一个字段承载两个语义，读的人就无法分辨。**
+> 与 9.579 那个 `hidden` / `npt-view` 矛盾是同族。
+
+#### 9.581 P2-3b：`hidden` 计数与 NPT 实际状态的一致性检查
+
+9.579 记录的现象：remap 之后
+
+```
+sys-guard list : pa=0x4435000 ... hidden=1     <- 说藏着
+npt-view       : VERDICT: VISIBLE              <- 说没藏
+```
+
+**没有任何东西会报这个不一致**，于是"藏了多少页"在 remap 之后不可信。
+
+##### 新增：`sys-guard consistent`
+
+```
+sys-guard: consistency -> 1 mismatch(es) across 4 armed page(s)
+  A page whose `hidden` flag disagrees with its NPT entry.
+  Cause so far: npt-remap rewrites the leaf without telling the guard.
+  Any "how many pages are hidden" count is unreliable until this is 0.
+```
+
+**判定谓词**：`hidden` 标志 vs 条目是否真的指向别处
+
+| 实际状态 | 判据 |
+|---|---|
+| `present=0` | 隐藏（UNMAP）|
+| `present=1` 且 `frame != own` | 隐藏（DECOY）|
+| `present=1` 且 `frame == own` | 未隐藏 |
+
+**不修任何东西** —— 悄悄把页重新藏起来会让真实分歧消失，
+而这个函数存在的意义就是让它可见。
+
+##### 第一版误报，原因是 2MB 大页
+
+第一版对 3 个从未隐藏的页报了 **3 个 mismatch**。根因：
+
+```
+npt_get_entry 返回 2MB 基址 0x351A00000
+own 是该 4K 页          0x351B05000
+-> frame != own 恒为真 -> 全部误判为"隐藏"
+```
+
+**一个不是本页 leaf 的条目，回答不了关于本页的问题。**
+修法：`PS` 位（bit 7）为 1 时跳过 frame 比较（大页仍可判 UNMAP 的 `present=0`）。
+
+> 这与 9.579 那条「2MB 页让 54 个读数退化成一个恒等式」是同一个陷阱的第三次出现。
+
+##### 实测四场景
+
+| 场景 | mismatch | 结论 |
+|---|---|---|
+| 未武装 | 0（across 0）| 并明确打印「0 不等于检查过」|
+| 武装 3 页未藏 | **0**（across 3）| 无误报 |
+| 藏 1 页（DECOY）| **0**（across 4）| 状态一致 |
+| remap 覆盖 DECOY | **1**（across 4）| **精确抓到** |
+
+##### 现在 `.data` 全藏的条件已经齐了
+
+```
+P2-3a  只刷 TLB、不改映射的命令        ✅ 9.580
+P2-3b  hidden 与实际状态的一致性检查    ✅ 9.581
+```
+
+**P2-3c（54 页全藏）仍不做** —— 不是因为判据缺失，而是因为
+`9.535` 已经证明**那些页上就是驱动自己的 25 个控制流变量**，
+藏它们等于把驱动自己的读操作变成读零。判据补齐只是让"要不要做"这个问题可回答，
+而答案仍然是"不该做"。
+
+##### 验证
+
+```
+ALL SOURCE CHECKS PASS（24 PASS / 0 FAIL）
+卸载 0.228 s，invmrun at unload = 0x0
+镜像 F9A565628E9FE5D7899DC1F54854D21C143A42A514FC02AA64388C6B2A4E1446
+```
 
 ## 本次会话结束时状态
 

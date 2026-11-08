@@ -1234,6 +1234,58 @@ extern "C" LONG yghv_s206_apply_extra_intercepts(VOID)
     return applied;
 }
 
+/*
+ * 9.580 (ISSUES P2-3a): FLUSH EVERY CORE'S NPT TLB **WITHOUT TOUCHING ANY MAPPING**.
+ *
+ * WHY THIS EXISTS - it is a judgement instrument, not a performance knob.
+ *
+ * 9.510 established that the NPT entry's A bit answers "was this hidden page read?",
+ * and that reading it is only meaningful if the TLB is flushed first: with a warm
+ * TLB the hardware does not walk the table, so "nobody read it" and "somebody read
+ * it but the translation was cached" produce the SAME reading. That is the tree's
+ * oldest defect shape - a two-valued answer read as one.
+ *
+ * 9.579 then found that the only flush available (`npt-remap`) is not a flush at
+ * all: it REWRITES the leaf, so it silently replaced the DECOY frame with the real
+ * one and destroyed the very state being measured. The measurement corrupted the
+ * thing measured. That is why `.data` hiding was left undone rather than declared
+ * working.
+ *
+ * So this function does exactly one thing: set TlbControl=1 (the next VMRUN
+ * flushes this core's guest TLB) plus VmcbClean=0 (the processor must re-read the
+ * control area). It writes NO entry. A DECOY stays a DECOY; the A bit is then
+ * cleared separately by npt-raw and means what it says.
+ *
+ * NOT the same as a mapping change: no leaf is touched, so this cannot un-hide,
+ * re-hide, or alter permissions. If a caller needs a mapping change, that is
+ * npt-remap's job and it must re-apply the hide afterwards.
+ */
+extern "C" LONG yghv_s206_flush_npt_tlb(VOID)
+{
+    LONG flushed = 0;
+
+    for (UINT32 i = 0; i < SVM206_MAX_VPD; i++)
+    {
+        PVIRTUAL_PROCESSOR_DATA vp = g_S206LiveVpd[i];
+
+        if (vp == NULL)
+            continue;
+
+        /*
+         * ORDER MATTERS, and it is the same order every other site in this file
+         * uses: set the control word, THEN dirty the VMCB. Writing TlbControl
+         * without clearing VmcbClean is exactly the 9.448e defect (the processor
+         * keeps using the control area it cached), so the two are always written
+         * together and in this order.
+         */
+        vp->GuestVmcb.ControlArea.TlbControl = 1;
+        vp->GuestVmcb.ControlArea.VmcbClean = 0;
+        flushed += 1;
+    }
+
+    return flushed;
+}
+
 extern "C" VOID yghv_s206_set_extra_intercepts(UINT32 m1, UINT32 m2)
 {
     InterlockedExchange(&g_S206ExtraMisc1, (LONG)m1);

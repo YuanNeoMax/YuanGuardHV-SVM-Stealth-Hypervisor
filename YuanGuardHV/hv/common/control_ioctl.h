@@ -476,6 +476,19 @@ typedef struct {
 #define YGHV_NPT_BIT_ACCESSED    (1ULL << 5)
 #define YGHV_NPT_BIT_DIRTY       (1ULL << 6)
 #define YGHV_NPT_AD_MASK         (YGHV_NPT_BIT_ACCESSED | YGHV_NPT_BIT_DIRTY)
+/*
+ * 9.580 (ISSUES P2-3a): ask for a TLB flush in the same call, WITHOUT touching
+ * the mapping. Set as bit 63 of the `clr` argument so it cannot collide with A/D.
+ *
+ * WHY A FLAG RATHER THAN A NEW IOCTL: the A bit only means something after a
+ * flush, and "clear A then flush" has to happen in one round trip or a reader can
+ * land between them. A separate command would make that race the caller's problem.
+ *
+ * WHY IT MUST NOT REMAP: 9.579 used npt-remap as a flush and it replaced the DECOY
+ * frame with the real one - the measurement destroyed what it measured. This flag
+ * writes no entry; it only sets TlbControl=1 and dirties the VMCB.
+ */
+#define YGHV_NPT_FLUSH_TLB       (1ULL << 63)
 
 /*
  * 9.511 (Tier 7.1): the same raw-entry read, batched over a page range.

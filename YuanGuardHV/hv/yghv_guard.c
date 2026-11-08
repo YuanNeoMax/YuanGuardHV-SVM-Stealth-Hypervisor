@@ -964,6 +964,111 @@ uint32_t yghv_guard_verify_all(void) {
     return changed;
 }
 
+/*
+ * 9.581 (ISSUES P2-3b): DOES THE GUARD'S `hidden` FLAG STILL MATCH THE NPT ENTRY?
+ *
+ * WHY THIS EXISTS. 9.579 found two sources of truth disagreeing:
+ *
+ *     sys-guard list : pa=... hidden=1        <- the guard believes it is hidden
+ *     npt-view       : VISIBLE                <- the entry points at the real frame
+ *
+ * The cause is that `npt-remap` rewrites the leaf directly, and the guard is not
+ * told. Nothing detected the disagreement, so any "how many pages are hidden"
+ * report became untrustworthy after a remap - and a count nobody can trust is
+ * worse than no count, because it reads as a measurement.
+ *
+ * WHAT IT COMPARES, exactly: the slot's `hidden` flag against whether the leaf
+ * currently points somewhere OTHER than the page itself.
+ *
+ * WHY THAT IS THE RIGHT PREDICATE: a DECOY hide keeps present=1 and repoints the
+ * frame at the zero page; an UNMAP hide clears present. Both leave the frame
+ * different from the page's own address. So "frame == own pa" is precisely
+ * "not hidden", without needing to know which mechanism was used.
+ *
+ * WHAT IT DOES NOT DO: it does not repair anything. Silently re-hiding a page
+ * whose entry was rewritten would make a real divergence invisible - and the
+ * point of this function is to make it visible.
+ */
+extern int npt_get_entry(npt_mgr_t *m, uint64_t g, uint64_t *out);
+
+/* 9.581: how many slots are actually armed. Needed alongside the mismatch count
+ * so "0 mismatches" cannot be confused with "0 pages examined". */
+uint32_t yghv_guard_armed_count(void)
+{
+    uint32_t n = 0;
+    int i;
+
+    for (i = 0; i < YGHV_GUARD_MAX; i++)
+    {
+        if (InterlockedCompareExchange(&g_guard[i].active, 0, 0) == 1)
+            n += 1;
+    }
+    return n;
+}
+
+uint32_t yghv_guard_hidden_mismatch(void)
+{
+    extern npt_mgr_t g_npt;
+    uint32_t mismatched = 0;
+    int i;
+
+    for (i = 0; i < YGHV_GUARD_MAX; i++)
+    {
+        UINT64 entry = 0;
+        UINT64 frame;
+        UINT64 own;
+        int believesHidden;
+
+        if (InterlockedCompareExchange(&g_guard[i].active, 0, 0) != 1)
+            continue;
+
+        believesHidden = (g_guard[i].hidden != 0) ? 1 : 0;
+
+        /* An entry we cannot read is not evidence of agreement - skip rather
+         * than count it either way. A read failure reported as "consistent"
+         * would be the same class of defect this function exists to catch. */
+        if (!NT_SUCCESS(npt_get_entry(&g_npt, g_guard[i].gpa, &entry)))
+            continue;
+
+        frame = entry & 0x000FFFFFFFFFF000ULL;
+        own   = g_guard[i].gpa & 0x000FFFFFFFFFF000ULL;
+
+        /*
+         * 9.581: A 2MB ENTRY MUST NOT BE COMPARED AS IF IT WERE THIS PAGE'S LEAF.
+         *
+         * First version did `frame != own` unconditionally, and every unsplit
+         * 2MB page therefore looked hidden: npt_get_entry returns the 2MB BASE
+         * (0x351A00000) while own is the 4K page inside it (0x351B05000), so the
+         * comparison was false-by-construction. Measured: 3 false mismatches on
+         * 3 armed pages that had never been hidden - i.e. the checker's first run
+         * reported a defect that did not exist, on every page it looked at.
+         *
+         * That is the same shape as npt-raw's A/D problem: an entry that is not
+         * this page's leaf cannot answer a question about this page. A large page
+         * can still be UNMAP-hidden (present=0), so that half is checked; the
+         * frame half is skipped, and the page is counted as examined because the
+         * check that CAN be made was made.
+         */
+        {
+            int isLarge = (entry & (1ULL << 7)) != 0;   /* PAT bit doubles as PS */
+            int present = (entry & 1ULL) != 0;
+            int actuallyHidden;
+
+            if (!present)
+                actuallyHidden = 1;                     /* UNMAP */
+            else if (isLarge)
+                continue;                               /* cannot judge the frame */
+            else
+                actuallyHidden = (frame != own) ? 1 : 0; /* DECOY */
+
+            if (believesHidden != actuallyHidden)
+                mismatched += 1;
+        }
+    }
+
+    return mismatched;
+}
+
 uint32_t yghv_guard_list(yghv_guard_info_t *out, uint32_t max) {
     uint32_t n = 0;
     int i, j;

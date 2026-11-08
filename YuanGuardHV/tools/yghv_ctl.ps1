@@ -3500,7 +3500,9 @@ try {
                 'uncovered' { $op = 5 }
                 'hidecore'  { $op = 6 }
                 'why'       { $op = 7 }
-                default  { throw 'sys-guard: use arm|hidecore|add|del|verify|list|uncovered|why' }
+                # 9.581 (ISSUES P2-3b): does the `hidden` flag still match the entry?
+                'consistent' { $op = 8 }
+                default  { throw 'sys-guard: use arm|hidecore|add|del|verify|list|uncovered|why|consistent' }
             }
             if ($op -eq 0) {
                 if ($null -eq $Arg2) { throw 'sys-guard add: usage: sys-guard add <hex_pa> [hide] [hash] [tag]' }
@@ -3611,7 +3613,12 @@ try {
                 }
                 return
             }
-            $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x826)) -InBytes $req -OutputLength 8
+            # 9.581: op=8 replies with TWO qwords (mismatches, examined), so the
+            # request has to ask for 16 or the driver answers BUFFER_TOO_SMALL and
+            # the client reads zeros - which would look exactly like "no mismatch".
+            $outLen = 8
+            if ($op -eq 8) { $outLen = 16 }
+            $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x826)) -InBytes $req -OutputLength $outLen
             $rc = [BitConverter]::ToInt64($out, 0)
             switch ($op) {
                 0 { if ($rc -ge 0) { Write-Host ("sys-guard: add OK slot={0}" -f $rc) }
@@ -3620,6 +3627,18 @@ try {
                 2 { Write-Host ("sys-guard: verify -> {0} page(s) changed" -f $rc) }
                 4 { Write-Host ("sys-guard: armed {0} page(s)" -f $rc) }
                 6 { Write-Host ("sys-guard: hid {0} page(s)" -f $rc) }
+                8 {
+                    $examined = [BitConverter]::ToUInt64($out, 8)
+                    Write-Host ("sys-guard: consistency -> {0} mismatch(es) across {1} armed page(s)" -f $rc, $examined)
+                    if ($rc -gt 0) {
+                        Write-Host '  A page whose `hidden` flag disagrees with its NPT entry.'
+                        Write-Host '  Cause so far: npt-remap rewrites the leaf without telling the guard.'
+                        Write-Host '  Any "how many pages are hidden" count is unreliable until this is 0.'
+                    }
+                    elseif ($examined -eq 0) {
+                        Write-Host '  (nothing armed - 0 mismatches here means nothing was examined)'
+                    }
+                }
             }
             if ($op -eq 5) {
                 # 9.343 #3: pages in [start, start+len) with no guard entry.
@@ -4515,11 +4534,23 @@ try {
             $what = 'read'
             if ($null -ne $Arg2) {
                 $what = "$Arg2".ToLower()
+
+                # 9.580 (ISSUES P2-3a): 'f' asks for a TLB flush in the SAME call.
+                #
+                # WHY IT IS A SUFFIX AND NOT A SEPARATE COMMAND: the A bit only
+                # means anything after a flush, and "clear A then flush" has to be
+                # one round trip or a reader can land between the two. Combining
+                # them removes that race instead of documenting it.
+                #
+                # WHY IT IS NOT npt-remap: 9.579 used npt-remap as a flush and it
+                # REPLACED the DECOY frame with the real one - the measurement
+                # destroyed the thing it measured. This flag writes no entry.
+                if ($what -match 'f') { $clr = $clr -bor (1L -shl 63) }
                 if ($what -match 'a') { $clr = $clr -bor (1L -shl 5) }
                 if ($what -match 'd') { $clr = $clr -bor (1L -shl 6) }
                 if ($clr -eq 0) {
-                    # not a|d: pass a mask outside A|D on purpose so the driver refuses
-                    # and echoes it - the refusal is what this command demonstrates.
+                    # not a|d|f: pass a mask outside A|D on purpose so the driver
+                    # refuses and echoes it - the refusal is what this demonstrates.
                     $clr = [uint64]1
                 }
             }
@@ -4553,13 +4584,22 @@ try {
             $accB = ($before -band (1L -shl 5)) -ne 0
             $dtyB = ($before -band (1L -shl 6)) -ne 0
 
+            # 9.580: `done` carries TWO different things now - the A/D mask that was
+            # cleared, and (in bit 63) whether a flush happened. Splitting them here
+            # matters: before this, the "cleared mask" line would have printed
+            # 0x8000000000000020 for a plain "af" call and read as nonsense.
+            $flushed = ($done -band (1L -shl 63)) -ne 0
+            $doneAD  = $done -band 0x60
+
             Write-Host ("npt-raw: pa=0x{0:X}  mode={1}" -f $pa, $what)
             Write-Host ("  before = 0x{0:X16}  A={1} D={2}" -f $before, $accB, $dtyB)
             Write-Host ("  after  = 0x{0:X16}  A={1} D={2}" -f $after, $acc, $dty)
             Write-Host ("  entry: present={0} writable={1} nx={2} frame=0x{3:X}" -f $prs, $wrt, $nx, $fr)
-            if ($done -ne 0) { Write-Host ("  cleared mask = 0x{0:X}  (A={1} D={2})" -f $done,
-                (($done -band (1L -shl 5)) -ne 0), (($done -band (1L -shl 6)) -ne 0)) }
-            if ($done -eq 0 -and $clr -ne 0) { Write-Host '  clear NOT applied (write refused, or large page)' }
+            if ($doneAD -ne 0) { Write-Host ("  cleared mask = 0x{0:X}  (A={1} D={2})" -f $doneAD,
+                (($doneAD -band (1L -shl 5)) -ne 0), (($doneAD -band (1L -shl 6)) -ne 0)) }
+            if ($flushed) { Write-Host '  TLB flushed on every live core - mapping untouched' }
+            if ($doneAD -eq 0 -and $clr -ne 0 -and -not $flushed) {
+                Write-Host '  clear NOT applied (write refused, or large page)' }
         }
         'npt-scan' {
             # 9.511 (Tier 7.1): read (or clear) the A/D bits over a PAGE RANGE.

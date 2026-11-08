@@ -2066,6 +2066,27 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
                 info = 5 * sizeof(UINT64);
                 break;
             }
+            case 8: {
+                /*
+                 * 9.581 (ISSUES P2-3b): report where the guard's `hidden` flag
+                 * disagrees with the NPT entry.
+                 *
+                 * A SEPARATE OP RATHER THAN A CHANGE TO op=2 (verify_all): op=2's
+                 * reply is one qword and callers compare it against 0 to mean
+                 * "nothing changed". Adding a second meaning to that number would
+                 * silently redefine a value that existing scripts already branch on.
+                 *
+                 *   out[0] = pages whose `hidden` flag contradicts the entry
+                 *   out[1] = pages examined (so "0 mismatches" is distinguishable
+                 *            from "nothing was examined")
+                 */
+                extern uint32_t yghv_guard_hidden_mismatch(void);
+                extern uint32_t yghv_guard_armed_count(void);
+                out[0] = (UINT64)yghv_guard_hidden_mismatch();
+                out[1] = (UINT64)yghv_guard_armed_count();
+                info = 2 * sizeof(UINT64);
+                break;
+            }
             default:
                 out[0] = 0;
                 info = 8;
@@ -3177,6 +3198,16 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
 
             out[0] = 0; out[1] = 0; out[2] = 0; out[3] = 0;
 
+            /*
+             * 9.580: the flush flag is stripped BEFORE the A/D validation, so it
+             * can never be mistaken for a bit being cleared on the entry. It is a
+             * separate action that happens after the read/clear below, which keeps
+             * the "read A, clear A, flush, then look again" sequence in one call.
+             */
+            {
+                UINT64 wantFlush = clr & (UINT64)YGHV_NPT_FLUSH_TLB;
+                clr &= ~(UINT64)YGHV_NPT_FLUSH_TLB;
+
             if (clr & ~(UINT64)YGHV_NPT_AD_MASK) {
                 out[1] = clr;      /* echo the refused mask */
                 info = YGHV_NPT_RAW_OUT_QWORDS * sizeof(UINT64);
@@ -3196,7 +3227,7 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
                 UINT64 want = before & ~(clr & (UINT64)YGHV_NPT_AD_MASK);
                 if (NT_SUCCESS(npt_write_entry(&g_npt, pa, want))) {
                     (void)npt_get_entry(&g_npt, pa, &after);
-                    out[3] = (clr & (UINT64)YGHV_NPT_AD_MASK);
+                    out[3] |= (clr & (UINT64)YGHV_NPT_AD_MASK);
                 } else {
                     after = before;   /* write refused (large page / no leaf) */
                 }
@@ -3207,6 +3238,34 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
             out[2] = after;
             info = YGHV_NPT_RAW_OUT_QWORDS * sizeof(UINT64);
             status = STATUS_SUCCESS;
+
+            /*
+             * The flush runs LAST, after `after` has been read, so the value
+             * reported as `after` is the entry as it stood before the flush - not
+             * after. Reporting it the other way round would make the caller unable
+             * to tell "the clear did not stick" from "the flush re-set A".
+             */
+            /*
+             * 9.580: THE FLUSH RESULT GOES IN BITS 32..47, NOT IN out[3] ITSELF.
+             *
+             * First version wrote `out[3] = flushed`, which OVERWROTE the A/D mask
+             * set three lines above - so a combined "af" call reported
+             * `cleared mask = 0` and the client printed "clear NOT applied" while
+             * the entry had in fact been cleared. Two different results in one
+             * word, each clobbering the other.
+             *
+             * The packing is now explicit and documented on both sides:
+             *   out[3] bits  0..7  = which A/D bits were cleared
+             *   out[3] bit  63     = a flush was requested and performed
+             *   out[3] bits 32..47 = how many cores were flushed
+             */
+            if (wantFlush) {
+                extern LONG yghv_s206_flush_npt_tlb(VOID);
+                LONG flushed = yghv_s206_flush_npt_tlb();
+                out[3] |= (UINT64)YGHV_NPT_FLUSH_TLB;
+                out[3] |= ((UINT64)(ULONG)flushed & 0xFFFFULL) << 32;
+            }
+            }
         }
         break;
     }
