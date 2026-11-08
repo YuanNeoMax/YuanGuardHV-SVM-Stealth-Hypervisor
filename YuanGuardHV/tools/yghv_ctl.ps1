@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
 YuanGuardHV control-device client (IOCTL validation tool).
 
@@ -1618,6 +1618,24 @@ try {
             # (set-target <pid>); the page VA is resolved in the TARGET's
             # address space by the driver (KeStackAttachProcess), so the
             # controller never needs the target's CR3 itself.
+            #
+            # 9.584: THAT PARAGRAPH WAS THE BUG REPORT AND NOBODY READ IT.
+            #
+            # 9.582 recorded this command failing with "0x490 ERROR_NOT_READY" and
+            # concluded the driver "has a special restriction on mmf pages". It does
+            # not. 0x490 is 1168 = ERROR_NOT_FOUND, the only NTSTATUS that maps to it
+            # is STATUS_NOT_FOUND, and its one source on this path is protect.c:1099
+            # -- "pid is not in the target table". The requirement was written in the
+            # comment above and enforced nowhere the caller could see: a missing
+            # `set-target` produced a bare hex code that named the wrong thing.
+            #
+            # Measured 9.584, same page / same pid:
+            #   without set-target -> 0x490
+            #   with    set-target -> OK
+            #
+            # So the failure is TRANSLATED here, in the layer that knows the
+            # precondition. A caller who has not registered the target is told
+            # exactly that, instead of being handed a number to look up.
             if ($null -eq $Arg1 -or $null -eq $Arg2) {
                 throw 'protect-page: usage: protect-page <pid> <hex_va>'
             }
@@ -1627,8 +1645,19 @@ try {
             $buf = New-Object byte[] 16
             [BitConverter]::GetBytes($pidVal).CopyTo($buf, 0)
             [BitConverter]::GetBytes([uint64]$va).CopyTo($buf, 8)
-            Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x810)) `
-                -InBytes $buf | Out-Null
+            try {
+                Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x810)) `
+                    -InBytes $buf | Out-Null
+            }
+            catch {
+                # ERROR_NOT_FOUND == the target slot does not exist. Say so, and say
+                # what fixes it; do not let the caller rediscover it from a hex code.
+                if ("$_" -match '0x00000490') {
+                    throw ("protect-page: pid {0} is not a registered target (Win32 0x490 = ERROR_NOT_FOUND). " -f $pidVal) +
+                          ("Run 'set-target {0}' first, then repeat this command." -f $pidVal)
+                }
+                throw
+            }
             Write-Host ("protect-page: pid={0} va=0x{1:X} OK" -f $pidVal, $va)
         }
         'unprotect-page' {

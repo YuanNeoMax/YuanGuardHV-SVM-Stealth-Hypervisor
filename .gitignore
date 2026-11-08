@@ -60,3 +60,6 @@ reference/*.lib
 
 # 9.583: 静态检查的实测数字，由 run_source_checks.ps1 每次写出（不是手抄的）
 YuanGuardHV/tests/check_stats.txt
+
+# 9.584: build artifact of tools/selfwrite_hold.cs (compile it, do not ship a binary)
+tools/selfwrite_hold.exe
