@@ -340,7 +340,15 @@ else {
 # A missing stats file is a SKIP, not a failure: docs_check is itself one of the
 # scripts being counted, so it must be able to run standalone (and the self-test
 # runs it against a throwaway docs\ with no tests\ beside it at all).
-$statsPath = Join-Path $PSScriptRoot 'check_stats.txt'
+#
+# RESOLVED RELATIVE TO THE DOCS ROOT, not to $PSScriptRoot. $PSScriptRoot is the
+# checker's own directory -- the REAL repository -- so the first version read the
+# real check_stats.txt no matter what YGHV_DOCS_ROOT said. The self-test could then
+# plant any lie it liked in its copy and check 8 would compare the real file against
+# the real document and pass; the mutation was reported "asleep" while the check was
+# in fact reading a file the test never touched (measured, 9.583). A check that
+# cannot be pointed at a fixture is a check nobody can test.
+$statsPath = Join-Path (Split-Path -Parent $docsRoot) 'YuanGuardHV/tests/check_stats.txt'
 if (-not (Test-Path -LiteralPath $statsPath)) {
     Write-Host '[SKIP] docs: no tests/check_stats.txt yet (run run_source_checks.ps1), checker counts unverified'
 }
@@ -358,15 +366,37 @@ else {
             $p = Join-Path (Split-Path -Parent $docsRoot) $doc
             if (-not (Test-Path -LiteralPath $p)) { continue }
             $txt = ReadUtf8 $p
-            foreach ($m in [regex]::Matches($txt, '([0-9]+)\s*(?:\S*)\s*/\s*([0-9]+)\s*(?:\S*)\s*PASS')) {
+            $sawClaim = $false
+            # The pattern requires a WORD between the two numbers ("N <word> / M
+            # PASS"). Without it, QUICKSTART's G25 row "**15/17 PASS (T7/T9 FAIL)**" --
+            # a FUNCTIONAL test count -- matches and gets compared against the checker
+            # counts. Measured 9.583: that row was only ever "safe" because 15 happened
+            # to equal the current script count, which is luck, not scoping.
+            # "N <word> / M <word> PASS", where neither word may begin with a digit.
+            # That last restriction is what separates this from README's
+            # "25 17/17 ALL PASS" row (G25's functional count), which every looser
+            # version of this pattern matched first (measured, 9.583).
+            foreach ($m in [regex]::Matches($txt, '([0-9]+)\s+[^\s/0-9]\S*\s*/\s*([0-9]+)\s*[^\s/0-9]\S*\s*PASS')) {
                 $cs = [int]$m.Groups[1].Value
                 $cp = [int]$m.Groups[2].Value
-                # A claim of the FORM "N scripts / M PASS" only. Both numbers must
-                # match, so a document that merely quotes an old measurement in
-                # prose (there are several) is not forced to chase the runner.
-                if ($cs -eq $realScripts -and $cp -ne $realPasses) {
+                $sawClaim = $true
+                # BOTH numbers are checked. The first version compared only the PASS
+                # count, and only when the script count already matched -- so a
+                # document claiming the WRONG SCRIPT COUNT was skipped silently, and
+                # the self-test's mutation for this check could never fire. That is
+                # the same shape as every other defect in this tree: a criterion that
+                # only looks at the case it already agrees with.
+                if ($cs -ne $realScripts) {
+                    $problems.Add("$doc claims $cs scripts, check_stats.txt says $realScripts")
+                }
+                elseif ($cp -ne $realPasses) {
                     $problems.Add("$doc claims $cp PASS for $cs scripts, check_stats.txt says $realPasses")
                 }
+            }
+            # A document that states checker counts at all must state them in a form
+            # this check can read. Silence is not agreement.
+            if (-not $sawClaim -and $txt -match 'run_source_checks') {
+                $problems.Add("$doc mentions run_source_checks but states no checkable `"N <word> / M PASS`" figure")
             }
         }
     }

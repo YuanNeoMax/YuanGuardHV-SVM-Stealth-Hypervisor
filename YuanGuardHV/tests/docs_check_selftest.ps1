@@ -313,26 +313,52 @@ try {
 
     # 9. the checker-count claim (9.583)
     #
-    # Check 8 compares "N scripts / M PASS" in README and QUICKSTART against
-    # tests/check_stats.txt, which run_source_checks.ps1 writes. Both documents said
-    # 13/24 while the tree ran 13/29 -- every document had the number wrong, because
-    # it is retyped by hand. This mutation supplies a stats file and plants the old
-    # wrong claim, so the comparison is exercised rather than merely present.
-    $testsDir = Join-Path $work 'YuanGuardHV/tests'
-    New-Item -ItemType Directory -Path $testsDir -Force | Out-Null
-    WriteText (Join-Path $testsDir 'check_stats.txt') "scripts=13 passes=29 selftests=16`n"
+    # Check 8 compares "N scripts / M PASS" in README against tests/check_stats.txt,
+    # which run_source_checks.ps1 writes. Every document had that number wrong at
+    # some point because it is retyped by hand. This mutation supplies a stats file
+    # and plants a wrong PASS count, so the comparison is exercised, not just present.
+    #
+    # The script count is DERIVED from the stats file this mutation writes, and the
+    # README claim is located by that number -- never by a literal. The first version
+    # pinned '13' and silently stopped mutating the day the tree reached 15 checkers.
     # The copy holds docs\ only; docs_check looks for README.md BESIDE it (the
-    # repository root), so the mutation has to put one there. Without this the
-    # mutation threw "no README.md in the copy" -- the check was fine, the fixture
-    # was missing.
+    # repository root), so the mutation has to put one there.
     $readme = Join-Path $work 'README.md'
     Copy-Item -LiteralPath (Join-Path (Split-Path -Parent $realDocs) 'README.md') -Destination $readme -Force
     $rt = ReadText $readme
-    $c = [regex]::Match($rt, '13\s*(?:\S*)\s*/\s*([0-9]+)\s*(?:\S*)\s*PASS')
-    if (-not $c.Success) { throw 'selftest: README carries no "13 scripts / N PASS" claim to mutate' }
-    $g2 = $c.Groups[1]
-    $rt2 = $rt.Substring(0, $g2.Index) + '24' + $rt.Substring($g2.Index + $g2.Length)
-    WriteText $readme $rt2
+
+    # TWO DIFFERENT NUMBERS LIVE IN README, and they measure different things:
+    #
+    #   "15 scripts / 39 PASS"     check 8 -- what the runner reported
+    #   "tests/ ... (16 scripts)"  check 9 -- how many .ps1 exist on disk
+    #
+    # They are not equal and must not be conflated: 16 files, 15 of them registered
+    # in run_source_checks.ps1's list. The first version of this mutation used one
+    # number for both, so its fixture made check 9 complain and the assertion below
+    # was satisfied by the wrong complaint (measured, 9.583).
+    # The word between the number and the slash is REQUIRED. Without it this matched
+    # README's "G25 ... 25 17/17 ALL PASS" row first (a functional test count) and
+    # built the fixture around 25/17 instead of 15/39, so nothing was contradicted
+    # and the check was reported asleep. Same trap as check 8 itself.
+    $c = [regex]::Match($rt, '([0-9]+)\s+[^\s/0-9]\S*\s*/\s*([0-9]+)\s*[^\s/0-9]\S*\s*PASS')
+    if (-not $c.Success) { throw "selftest: README carries no matching scripts/PASS claim to mutate" }
+    $claimScripts = [int]$c.Groups[1].Value
+    $claimPasses = [int]$c.Groups[2].Value
+
+    $treeCount = $null
+    $tm = [regex]::Match($rt, 'tests/\s*[^0-9
+]*([0-9]+)')
+    if ($tm.Success) { $treeCount = [int]$tm.Groups[1].Value }
+
+    $testsDir = Join-Path $work 'YuanGuardHV/tests'
+    New-Item -ItemType Directory -Path $testsDir -Force | Out-Null
+    # Same script count as the claim, one fewer PASS -> ONLY check 8 can catch this.
+    WriteText (Join-Path $testsDir 'check_stats.txt') "scripts=$claimScripts passes=$($claimPasses - 1) selftests=0`n"
+    # Satisfy check 9 separately, using ITS number, so it stays silent and the
+    # failure below can only come from check 8.
+    if ($treeCount) {
+        1..$treeCount | ForEach-Object { WriteText (Join-Path $testsDir "fixture$_.ps1") "# fixture`n" }
+    }
     Assert-Caught 'checker-count claim' 'check_stats.txt says' (Invoke-Check)
     Remove-Item -LiteralPath (Join-Path $work 'YuanGuardHV') -Recurse -Force -ErrorAction SilentlyContinue
     Reset-Copy

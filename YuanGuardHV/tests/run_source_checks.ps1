@@ -72,6 +72,14 @@ $scripts = @(
     'stub_stack_contract.ps1',
     'docs_check.ps1',
     'docs_check_selftest.ps1',
+    # 9.583: a Win32 error NAME written next to the wrong hex code sent a whole round
+    # of investigation down the wrong axis. 9.582 recorded "0x490 ERROR_NOT_READY"
+    # and concluded "protect-page has a special restriction on mmf pages"; 0x490 is
+    # 1168 = ERROR_NOT_FOUND, whose only source on that path is protect.c:1099
+    # ("pid not in the target table"), which points at a missing `set-target`.
+    # The name is not a label -- it is the constant some `return` produced.
+    'win32_error_names.ps1',
+    'win32_error_names_selftest.ps1',
     'client_undefined_vars.ps1'
 )
 

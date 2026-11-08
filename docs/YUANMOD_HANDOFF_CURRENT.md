@@ -103,8 +103,8 @@
 | 9.579 P2-3 `.data` 段隐藏：先验判据，结果判据有三个缺陷 —— **不做全藏** | 109 |
 | 9.580 P2-3a：一个只刷 TLB、不改映射的命令 —— `.data` 隐藏的判据补上了 | 42 |
 | 9.581 P2-3b：`hidden` 计数与 NPT 实际状态的一致性检查 | 75 |
-| 9.582 P1-3：先给同步守卫开一扇门 —— 它此前**不可观测** | 79 |
-| 9.583 文档侧 5 处「能查却没人查」的过期值 —— 且新变异器 4 个全坏在同一个模式上 | 106 |
+| 9.582 P1-3：先给同步守卫开一扇门 —— 它此前**不可观测** | 99 |
+| 9.583 文档侧 5 处过期值 + 一个错误码名字写错导致的整轮误判 | 165 |
 
 ---
 
@@ -3526,11 +3526,31 @@ interval=50ms  polls=3919  cpu=1185.4 ms  -> 302.5 us/poll
 
 | 尝试 | 结果 |
 |---|---|
-| `protect-page 236 0x188EE230000`（sync 开）| `0x490 ERROR_NOT_READY` |
+| `protect-page 236 0x188EE230000`（sync 开）| `0x490` |
 | 先 `config sync 0` 再 `protect-page` | 同样 `0x490` |
 | `mmf-hold` 创建的页 | 同上 |
 
-**`protect-page` 对 mmf 映射页有独立限制，本轮没查清。**
+当时记的是「`0x490 ERROR_NOT_READY` [HIST]，`protect-page` 对 mmf 映射页有独立限制」。
+**两个判断都错**，9.583 查明：
+
+```
+0x490 = 1168 = ERROR_NOT_FOUND      （ERROR_NOT_READY = 0x15）
+经 RtlNtStatusToDosError 实测，只有 STATUS_NOT_FOUND (0xC0000225) 映射到 1168
+驱动里 STATUS_NOT_FOUND 在 add_page_for_pid 这条路上只有一个来源：
+    protect.c:1099   if (!t) return STATUS_NOT_FOUND;   ← 按 pid 查不到目标槽
+```
+
+所以真正的原因不是「mmf 页被特殊对待」，而是 **`set-target <pid>` 没有先做、或做了但 pid 对不上**。
+`yghv_protect_add_page_for_pid()` 的第一件事就是 `find_target_by_pid_locked(pid)`，
+查不到直接返回 —— 它**根本没有走到解析 VA 那一步**，mmf 与否完全无关。
+
+> **一个错误码的名字写错，把排查引向了错误的方向。** 「NOT_READY」暗示
+> 「时机不对 / 页还没准备好」，于是去试 `config sync 0`、去换 `mmf-hold` 的页；
+> 而「NOT_FOUND」直接说的是「这个 pid 不在表里」，一句话就能指向 `set-target`。
+>
+> 判据纪律的又一形态：**错误码不是给人看的标签，它是从代码里某一行返回的**。
+> 记下它之前，先把它翻译回那个 `return`。
+
 驱动侧 `sync_arm` 的来源是「已经 `armed` 的 protect 页」（`protect.c:390`），
 所以顺序必须是 protect 先成功、sync 才接管 —— 而第一步就没过。
 
@@ -3558,7 +3578,7 @@ ALL SOURCE CHECKS PASS（24 PASS / 0 FAIL）
 卸载 0.059 s，invmrun at unload = 0x0
 ```
 
-#### 9.583 文档侧三处「能查却没人查」的过期值 —— 其中一处让检查 6 变成自证
+#### 9.583 文档侧 5 处过期值 + 一个错误码名字写错导致的整轮误判
 
 收尾 P3 时按惯例复核，发现 `docs_check` 的 5 项**全部通过**，而文档里至少还有三处
 是错的。它们的共同点：**机器能查，但检查器没有去看**。
@@ -3664,6 +3684,65 @@ docs_check.ps1 第 9 项  →  比对 README 目录树里的 hv/ 与 tests/ 份�
 所以镜像哈希那条最终写成一对：**先写对的必须过，再写错的必须被抓** ——
 只有反向对照能证明「抓到」不是因为别的原因。
 
+##### 八、`0x490` 的根因：错误码的名字写错了，整轮排查方向就是错的
+
+收尾时顺手查了 P1-3b 那个「`protect-page` 对 mmf 页返回 `0x490`」。
+9.582 记的是 `0x490 ERROR_NOT_READY` [HIST]，并据此判断「protect 对 mmf 页有独立限制」。
+**两个判断都错**：
+
+```
+0x490 = 1168 = ERROR_NOT_FOUND      （ERROR_NOT_READY 是 21 / 0x15）
+RtlNtStatusToDosError 实测：0xC0000000..0xC0000FFF 里只有
+    STATUS_NOT_FOUND (0xC0000225) -> 1168
+而它在 add_page_for_pid 这条路上只有一个来源：
+    protect.c:1099   if (!t) return STATUS_NOT_FOUND;   ← 按 pid 查不到目标槽
+```
+
+`yghv_protect_add_page_for_pid()` 第一件事就是 `find_target_by_pid_locked(pid)`，
+查不到直接返回 —— **它根本没走到解析 VA 那一步**，mmf 与否完全无关。
+真正的原因是 `set-target <pid>` 没做、或做了但 pid 对不上。
+
+**错误码不是给人看的标签，它是从代码里某一行返回的。** 记下它之前先翻译回那个 `return`。
+「NOT_READY」暗示时机问题，于是去试 `config sync 0`、去换 `mmf-hold` 的页；
+「NOT_FOUND」直接说「这个 pid 不在表里」，一句话就指向 `set-target`。
+
+##### 九、为此新增一个检查器：`win32_error_names.ps1`
+
+机器能查的东西就该机器查。新检查器扫文档里所有「数字 + 错误码名」的配对
+（三种写法：`0x490 ERROR_X` / `ERROR_X = 0x15` / `0x490 = 1168 = ERROR_X`），
+名字表由 OS 现场提供，不是硬编码副本 —— 否则检查器会和错的文档达成一致。
+
+两条设计要点：
+
+- **`[HIST]` 标记**：记录必须能引用自己纠正过的那个错误
+  （否则这次纠错本身写不出来）。标了 `[HIST]` 的行算引用、不算声明，
+  单独计数上报，不能变成藏错的地方。
+- **`checked == 0` 直接判 FAIL**：检查器跑起来、打印 PASS、一个值都没比过，
+  在构建日志里和「文档没问题」完全一样。这条守卫第一次就抓到了自己
+  （只认一种写法时输出 `0 pair(s)`）。
+
+自检 5 条：2 个真错误必须被抓，3 条对照必须沉默
+（正确的配对、`[HIST]` 引用、以及**致盲守卫**——把文档里所有配对删光，
+必须报「this check is blind」而不是通过）。
+
+##### 十、`docs_check` 第 8 项本身有个更深的缺陷
+
+给第 8 项写变异时，它一直报「检查在睡觉」。查下去发现**不是变异器的问题**：
+
+```
+$statsPath = Join-Path $PSScriptRoot 'check_stats.txt'
+```
+
+`$PSScriptRoot` 是**检查器自己所在目录**，也就是真实仓库。
+所以无论 `YGHV_DOCS_ROOT` 指向哪个临时副本，第 8 项永远读真实仓库的那份 stats ——
+自检在副本里种什么谎都没用，它拿真文件比真文档，当然通过。
+
+**一个无法被指向 fixture 的检查，是一个没人能测的检查。** 改成相对 `$docsRoot` 解析。
+
+同一轮还暴露了另一处：第 8 项原来**只比 PASS 数、且只在脚本数已经相等时才比**，
+于是「脚本数写错」这种情形被静默跳过 —— 判据只检查它本来就同意的那一半。
+现在两个数都查，且文档提到 `run_source_checks` 却给不出可解析的数字也算失败。
+
 ## 本次会话结束时状态
 
 > 这一段曾被落在 9.564 而正文已经写到 9.582 —— 同一份文件里两个互相矛盾的状态，
@@ -3676,8 +3755,8 @@ docs_check.ps1 第 9 项  →  比对 README 目录树里的 hv/ 与 tests/ 份�
 默认配置      : 真 guest + 全核（9.577 起），12 线程 1.05-1.08×
 卸载          : 0.06-0.23 s，invmrun at unload = 0x0
 台账          : 8 完成 / 9 不做 / 1 需重启（Tier 6.1）
-静态检查      : 13 脚本 / 24 条 PASS（含 9 条自检）
-文档检查      : docs_check PASS —— 57 md / 32 链接 / 68 记录
+静态检查      : 15 脚本 / 39 条 PASS（含 25 条自检）
+文档检查      : docs_check PASS —— 57 md / 32 链接 / 69 记录 / 9 项
 最新编号      : 9.583
 ```
 
