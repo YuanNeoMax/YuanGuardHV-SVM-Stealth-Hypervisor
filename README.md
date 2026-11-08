@@ -133,7 +133,7 @@ yuanguard/
 | **性能：VMEXIT 削减** | 修复 `VMEXIT_VMMCALL` 不推进 RIP 的真 bug，退出率 **1418 万/秒 → 738/秒（降 19,200 倍）** | ✅ |
 | **构建期检查** | `exit_rip_contract.ps1`：38 个 VMEXIT case 的 RIP 契约（三类断言）+ **自检**（每次构建注入缺陷证明能失败）| ✅ |
 | **缺陷 C** | `DriverUnload` 补 `yghv_trace_close()`（progress.log 句柄泄漏，A/B 因果证明） | ✅ |
-| **全仓审查（9.474–9.496）** | 逐文件审查 33 个 `.c`；**修 21 个缺陷**（含 guard 槽竞态、断点表静默失效 ×5 表、非分页池泄漏 ×2、IOCTL 无 out_len 写回复、`mem-bench` 无界扫描致卸载卡死）；**新增 5 个构建期检查器**（每个都做过注入验证）；**Tier 清单定案**（8 完成 / 8 不做附理由 / 1 需重启） | ✅ |
+| **全仓审查（9.474–9.496）** | 逐文件审查 33 个 `.c`；**修 21 个缺陷**（含 guard 槽竞态、断点表静默失效 ×5 表、非分页池泄漏 ×2、IOCTL 无 out_len 写回复、`mem-bench` 无界扫描致卸载卡死）；**新增 5 个构建期检查器**（每个都做过注入验证）；**Tier 清单定案**（8 完成 / 9 不做附理由 / 1 需重启；9.499 把 `loader_stealth` 从「完成」改判为「不做」） | ✅ |
 | 旧 B 路线 | 整机进 guest 的 APIC 虚拟化实验 | ⛔ 已由 206 通路取代（历史见 docs） |
 
 > **发布**：[v0.3.0](https://github.com/YuanNeoMax/YuanGuardHV-SVM-Stealth-Hypervisor/releases/tag/v0.3.0)
@@ -335,22 +335,18 @@ run.bat state      # 用法与 PowerShell 客户端一致
 
 ## 文档索引
 
+**先读 [`docs/INDEX.md`](docs/INDEX.md)** —— 按问题索引，根目录 7 份，其余在 `archive/`。
+
 | 文档 | 内容 |
 |---|---|
-| `docs/YUANMOD_HANDOFF_CURRENT.md` | 全程交接与决策记录（最高优先级，**当前至 9.496**） |
-| **`docs/QUICKSTART.md`** | **★★ 跨会话快速承接** —— 三分钟上手 / 当前状态 / 下一步 / 七个坑 |
-| `docs/RESUME_PROMPT.md` | 深一层的基线/雷区/方法论/加速查证 |
-| **`docs/TIER_LEDGER.md`** | **Tier 清单最终台账** —— 8 完成 / 8 不做(附理由) / 1 需重启 |
-| **`docs/INDEX.md`** | **docs 目录索引** —— 22 个文件按用途分成入口/必读/归档/计划/专题五组 |
+| **`docs/INDEX.md`** | **★ 唯一入口** —— 按「你想知道什么」索引全部文档 |
+| **`docs/QUICKSTART.md`** | **★★ 跨会话快速承接** —— 三分钟上手 / 当前状态 / 下一步 / 八个坑 |
+| `docs/RESUME_PROMPT.md` | 深一层：铁律 / 架构约束 / 观测手段 / 方法论（691 行）|
+| **`docs/TIER_LEDGER.md`** | **Tier 清单最终台账** —— 8 完成 / 9 不做（附理由）/ 1 需重启 |
+| `docs/YUANMOD_HANDOFF_CURRENT.md` | 逐条变更记录 9.500–9.563（**当前至 9.563**，开头有 53 条索引）|
+| `docs/WINDOWS_AS_GUEST_FINDINGS.md` | Windows-as-Guest 全部结论（唯一权威）|
 | **`docs/KERNEL_API_CHECKLIST.md`** | **★ 写内核代码前必读** —— 三次蓝屏换来的 API 契约核对清单 |
-| `docs/YUANMOD_NEXT_WINDOW_PROMPT.md` | 新窗口接手提示词（基线/雷区/候选） |
-| `docs/TASKS.md` | 任务清单与 P0 复核结论 |
-| `docs/YGHV_OS_AS_GUEST_RESEARCH_20260814.md` | OS-as-guest 研究 |
-| `docs/YGHV_OS_AS_GUEST_SUMMARY_20260815.md` | OS-as-guest 阶段性总结 |
-| `docs/YGHV_SIMPLEVM_LEVERAGE_20260918.md` | SimpleSvm/HelloAmdHv 构型复审 + C0/C1 实机验证方案（含本机 CPU 权威记录） |
-| `docs/YGHV_STEALTH_AUDIT_20260813.md` | 隐藏矩阵与反侦查审计 |
-| `docs/YGHV_FULL_REVIEW_20260814.md` | 全面代码审查报告（YGHV-REV-001..043） |
-| `docs/YGHV_HOOK_LOCK_AND_0x5AA_REDESIGN_20260813.md` | hook lock 与 0x5AA 重设计 |
+| `docs/archive/` | 9.1–9.499 历史交接、2026-08 评审与研究、Tier 设计计划书、S8 旧清单 |
 
 ---
 

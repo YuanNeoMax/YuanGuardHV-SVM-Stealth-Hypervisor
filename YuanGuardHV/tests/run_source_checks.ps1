@@ -59,6 +59,19 @@ $scripts = @(
     # reads a different part of the file. This one requires every sc operand to
     # be a variable, and it carries a self-test that plants the original bug.
     'service_name_check.ps1',
+    # 9.564: the DOCUMENTS had no gate at all. Eleven checkers read sources; not one
+    # read docs\, and that is exactly the artifact that drifted -- five stale numbers
+    # found in INDEX.md on the day it was written (9.563), plus two records with no body.
+    # LINK INTEGRITY + index row counts + latest number + archive counts, all
+    # measured, none assumed. Its self-test plants four real defects in a throwaway
+    # copy and requires each to be caught.
+    # 9.567: the stub that the real-guest path would jump into must not touch RSP.
+    # 9.444 cost a bugcheck (0x1E in KiSwapContext) by leaving the guest on a foreign
+    # stack; the stub's own comment claims it never touches the stack, and nothing
+    # enforced that sentence until now. Static, self-tested, offline.
+    'stub_stack_contract.ps1',
+    'docs_check.ps1',
+    'docs_check_selftest.ps1',
     'client_undefined_vars.ps1'
 )
 

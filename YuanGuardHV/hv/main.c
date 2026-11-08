@@ -5124,7 +5124,7 @@ void DriverUnload(struct _DRIVER_OBJECT *d) {
             /*
              * 9.556: WAIT FOR THE CORES THAT EXIST, NOT FOR EVERY LOGICAL CPU.
              *
-             * 9.555 made g_S206CoresExited honest - the ASM exit path now
+             * 9.555 made the stopped counter honest - the ASM exit path now
              * increments it before terminating the thread - and unload time was
              * UNCHANGED (2.844 / 2.137 / 4.118 s). So the counter was never the
              * problem; the bound was.
@@ -5161,9 +5161,17 @@ void DriverUnload(struct _DRIVER_OBJECT *d) {
                  * with rcx = 0xa (the value `mov rsp, rcx` had written).
                  *
                  * A repeated injection is safe by construction: a core that already
-                 * woke and left increments g_S206CoresExited and is not in the
+                 * woke and left increments g_S206CoresExitedAsm - the same object
+                 * yghv_s206_vmrun_stopped_count() reads - and is not in the
                  * registry's parked set next pass, and a core that is still parked
                  * gets a fresh EventInj.
+                 *
+                 * 9.565: this comment named g_S206CoresExited, which has had no
+                 * writer since 9.555 (that name is now a dead static; the live one
+                 * is the _Asm alias the ASM increments directly). Fixed here rather
+                 * than left on the audit's list: it is one line, it is the exact
+                 * sentence a reader would trust when reasoning about this loop, and
+                 * the same-name family already cost us the 4-second unload.
                  */
                 {
                     extern LONG yghv_s206_kick_parked_cores(void);

@@ -52,16 +52,6 @@ extern "C" void Sv206LeaveToHost(VOID);
 static HANDLE g_S206CoreThreads[SVM206_MAX_THREADS] = { 0 };
 static volatile LONG g_S206CoresStarted = 0;
 /*
- * 9.557: DEAD VARIABLE - kept only so nothing breaks, and labelled so it
- * cannot mislead. Audit result: 0 writers and 0 readers. 9.555 repointed both
- * accessors and the Sv206CoreThread increment at g_S206CoresExitedAsm, and the
- * ASM exit path increments that alias directly.
- *
- * Do not use this. g_S206CoresExitedAsm is the live one.
- */
-static volatile LONG g_S206CoresExited = 0;   /* DEAD - see the note above */
-
-/*
  * 9.555: the ASM half of the exit path needs to increment this.
  *
  * Sv206LeaveToHost terminates the thread from Assembly with
@@ -70,10 +60,13 @@ static volatile LONG g_S206CoresExited = 0;   /* DEAD - see the note above */
  * main.c compares it against the core count, so it was never satisfied and
  * every unload burned its whole budget (~4 s, measured).
  *
- * A non-static alias rather than making the static non-static: the rest of
- * 9.557: this file no longer uses g_S206CoresExited (the audit found zero
- * writers and zero readers); everything points at the alias below. The ASM gets a
+ * A non-static alias rather than making the static non-static: the ASM gets a
  * name without the two views drifting apart.
+ *
+ * 9.566: the old static (g_S206CoresExited) is DELETED, not kept. 9.557 found it
+ * had zero writers and zero readers and left it in place with a DEAD label; a
+ * variable that no longer exists cannot be read by mistake later, and a stale
+ * comment cannot cite it either. Deletion is the fix; labelling was a delay.
  */
 extern "C" { volatile LONG g_S206CoresExitedAsm = 0; }
 
@@ -194,6 +187,12 @@ extern int yghv_bp_shadow_switch(UINT64 gpa, int to_shadow);
 extern int yghv_bp_on_dr(UINT64 dr6, UINT64 rip, UINT32 cpl, UINT64 cr3);
 /* Physical write, used to restore/patch the instruction byte. */
 extern int yghv_pa_write(UINT64 pa, const void *src, size_t len);
+/* 9.571: physical reads for the forced-devirtualization walk (mem_pa.h). */
+extern int yghv_pa_read_u64(uint64_t pa, uint64_t *out);
+extern int yghv_pa_write_u64(uint64_t pa, uint64_t value);
+/* 9.571: clear SVME in every live VMCB; declared here because the definition sits
+ * far below its only caller (Sv206CoopUnload). */
+extern "C" ULONG yghv_s206_force_devirtualize(VOID);
 extern UINT64 yghv_protect_fake_main_pa(void);
 extern void yghv_protect_reopen_page_bare(UINT64 gpa);
 extern UINT64 yghv_protect_guest_va_to_pa(UINT64 cr3, UINT64 va);
@@ -1093,6 +1092,16 @@ static volatile LONG g_S206ExtraMisc2 = 0;
 #define SVM206_MAX_VPD 64
 static PVIRTUAL_PROCESSOR_DATA g_S206LiveVpd[SVM206_MAX_VPD] = { 0 };
 
+/*
+ * 9.571: per-core guest VMCB physical address, indexed by processor number.
+ * Written once per core in SvPrepareForVirtualization, read only by the forced
+ * devirtualization path. 0 means "this core never prepared".
+ */
+static volatile LONG64 g_S206CoreVmcbPa[SVM206_MAX_VPD] = { 0 };
+static volatile LONG   g_S206CoreVmcbSet = 0;
+static volatile LONG   g_S206ForceDevirtRounds = 0;
+static volatile LONG   g_S206ForceDevirtTouched = 0;
+
 extern "C" VOID yghv_s206_register_vpd(PVOID vpData)
 {
     for (UINT32 i = 0; i < SVM206_MAX_VPD; i++)
@@ -1445,7 +1454,7 @@ extern "C" LONG yghv_s206_exit_codes_observed(VOID)
  * 9.440 established that three of the four readings the 9.434 causal chain rests
  * on are not measurements at all: g_S206VrLog only records protected-page write
  * NPFs (it stays empty on a machine with nothing armed, no matter how many exits
- * happen), g_VmrunStopped has no caller left (9.419 deleted the ASM check and the
+ * happen), the old stopped counter has no caller left (9.419 deleted the ASM check and the
  * C counter stayed behind, so it is identically zero), and g_resident_thread_count
  * is never written in 206-B (residents are not started).
  *
@@ -1707,8 +1716,102 @@ extern "C" int yghv_s206_real_guest_mode(VOID)
      *
      * The experiment and its measured result are kept: with the flag the early-return
      * path fires (entries=6, early-returns=6); the stub path never reaches it (0).
+     *
+     * 9.569: UNPINNED -- the gate is open again, and that is the whole point of
+     * reopening it. The difference from 9.552 is not courage, it is that the thing
+     * below now exists:
+     *
+     *   (a) the stop path has a written, checkable contract (tests/stub_stack_contract.ps1:
+     *       Sv206GuestStub may not move RSP, and must keep its vmmcall);
+     *   (b) the final attempt fails visibly in `sc start` instead of silently at boot
+     *       -- if the guest wedges, the service never reaches RUNNING and nothing is
+     *       left armed on a half-virtualised machine;
+     *   (c) the way out no longer depends on the guest cooperating: see
+     *       yghv_s206_force_devirtualize() -- a non-virtualising physical core can
+     *       reach every VMCB and clear EFER.SVME from INSIDE the guest.
+     *
+     * (c) is the substantive change. 9.550 concluded "结构上缺一个 host 执行流" and
+     * that was true of the DPC fan-out it examined; it is not true of a core that was
+     * never virtualised. What was missing was not a host thread, it was an
+     * EXECUTION CONTEXT OUTSIDE THE GUEST -- and six of the twelve logical processors
+     * already are one, because 206 virtualises physical cores only (9.527).
+     *
+     * 9.572: PINNED OFF AGAIN, AND HARDER THAN 9.552.
+     *
+     * 9.569 unpinned it on the argument that the stop path was now checkable
+     * (stub_stack_contract) and that a never-virtualised core could force SVME=0
+     * through the VMCB by physical address. Both claims are true and neither is
+     * sufficient. Measured, in this order:
+     *
+     *   10:30  stub-mode load/unload with the new forced-devirtualization code in
+     *          place: RUNNING, sys-health clean, unload 0.177 s, invmrun=0x0. Pass.
+     *   10:31  `reg add RealGuestMode=1`, `sc start`: RUNNING in 0.24 s,
+     *          entries=6 / early-returns=6, sys-health clean, stable 10 s. Pass.
+     *   10:32  `sc stop` -> 0xD1 P1=0xfffff805644885ee P2=0xe P3=8 P4=same.
+     *          FAILURE_BUCKET: AV_CODE_AV_STACKPTR_ERROR_PAGED_IP yghv_pa+0x285ee.
+     *          Then two hard freezes on the following boots.
+     *
+     * So the fifth and sixth failures on this path came AFTER every safeguard I
+     * added, and they came at the same place as the first four: the unload, on a
+     * driver code page, with the guest having executed a Windows thread's frame.
+     *
+     * The distinguishing fact is not in the counters - it is in what the counters
+     * did NOT show: `invmrun at unload = 0x6` this time, not 0x0. Six cores were
+     * still inside VMRUN when DriverUnload went on. yghv_s206_force_devirtualize()
+     * cleared SVME in all six VMCBs and the cores still did not come back, because
+     * clearing SVME only ejects a core at its NEXT #VMEXIT, and a guest running
+     * arbitrary Windows code can go a long time without one - or forever.
+     *
+     * That is the structural gap, stated precisely for the first time:
+     *   SVME=0 is a TRAP CONDITION, not a WAKE. It ejects a core that is already
+     *   leaving; it cannot evict a core that is not.
+     *
+     * Reopening this needs an exit that is guaranteed to be taken, on a core we do
+     * not control. Nothing in this tree currently provides one. Do not unpin again
+     * on the strength of a better check - the checks were all green both times.
+     *
+     * ------------------------------------------------------------------------
+     * 9.573: THE EXIT IS NO LONGER THE PROBLEM, AND THE 0xD1 HAS A DIAGNOSIS.
+     *
+     * The sentence above is still correct about SVME: clearing it cannot evict a
+     * core that is not leaving. But it named the wrong defect. The cores were not
+     * stuck because the stop signal was too weak - they were stuck because the
+     * THREAD THAT OWNS THE SUSPENDED VMRUN FRAME HAD ALREADY BEEN TERMINATED, BY
+     * THE GUEST, minutes earlier.
+     *
+     * The chain, in the code that ships today:
+     *
+     *   SvVirtualizeProcessor: RtlCaptureContext  -> guest RIP = the instruction
+     *                                                 after that call
+     *   guest resumes there, sees "second pass", returns through the normal
+     *   epilogue, unwinds into Sv206VirtualizeC, returns into Sv206CoreThread
+     *   ...
+     *   Sv206CoreThread: yghv_s206_real_guest_tick();              <- ONE tick
+     *                    InterlockedIncrement(&...CoresExitedAsm);
+     *                    terminateFn(STATUS_SUCCESS);              <- THREAD ENDS
+     *
+     * Every one of those instructions executes INSIDE the guest. So the kernel
+     * stack that Sv206LaunchVm is still sitting on gets discarded, and the VMRUN
+     * frame that will one day try to return into it points at freed memory. That
+     * is the 0xD1 at Sv206LaunchVm+0x1E: `vmsave` fetching from a dead page.
+     *
+     * Measured both ways, same build, same machine:
+     *   stub mode     : invmrun at unload = 0x0
+     *   real guest    : invmrun at unload = 0x6      <- six orphaned frames
+     *
+     * The 0x6 is the smoking gun. It was never "a counter that did not move"; it
+     * was six cores whose stack of record no longer existed.
+     *
+     * 9.573 changes the one line that caused it: the real-guest tail now LOOPS on
+     * the tick and never reaches terminateFn. The thread lives, the stack stays,
+     * and the stop handshake has an exit to answer every millisecond.
+     *
+     * So the gate below is armed again - as a REGISTRY-VISIBLE opt-in, exactly like
+     * 9.540 had it, with the pin still available at compile time.
      */
+#if defined(YGHV_REAL_GUEST_PINNED) && YGHV_REAL_GUEST_PINNED
     return 0;
+#endif
 
     hit = InterlockedCompareExchange(&cached, -1, -1);
     if (hit != -1) return (int)hit;
@@ -1845,7 +1948,7 @@ extern "C" LONG yghv_s206_cores_started(VOID)
 /*
  * 9.556: HOW MANY CORES ACTUALLY HOLD A VPD.
  *
- * The unload waiter in main.c compared g_S206CoresExited against
+ * The unload waiter in main.c compared the stopped counter against
  * KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS) - 12 here - while 206
  * virtualizes six cores. An unsatisfiable bound is why every unload cost ~2-4 s no
  * matter how correct the counter was (9.555 fixed the counter; the time did not
@@ -1885,18 +1988,6 @@ extern "C" { volatile LONG g_VmrunStopRequested = 0; }
  * session lost 15 machines to confusing the two. */
 /* 9.416: non-static and extern "C" for the same reason as g_VmrunStopRequested -
  * the ASM loop increments it directly, without a call. */
-/*
- * 9.557: NEVER INCREMENTED. Audit result: one writer, and it is the zero write
- * in yghv_s206_vmrun_stop_clear; there is no InterlockedIncrement anywhere.
- * 9.419 deleted the ASM-side check that used to count here, and the comment at
- * the VMEXIT_VMMCALL case still claims this is incremented there - it is not.
- *
- * The stopped count comes from g_S206CoresExitedAsm now. Kept because
- * yghv_s206_vmrun_stopped_for_trace still reads it and a diagnostic that reports
- * a constant zero is honest as long as it is labelled as one.
- */
-extern "C" { volatile LONG g_VmrunStopped = 0; }   /* DEAD - see the note above */
-
 /*
  * 9.414: called once per VMRUN-loop iteration, from SvLV10 in
  * svm_simplevm206_x64.asm. Only interlocked reads - no kernel API - so it is
@@ -2036,14 +2127,30 @@ extern "C" void yghv_s206_to_stop_clear(VOID);
 extern "C" void yghv_s206_vmrun_stop_clear(VOID)
 {
     InterlockedExchange(&g_VmrunStopRequested, 0);
-    InterlockedExchange(&g_VmrunStopped, 0);
+    /*
+     * 9.566: the g_VmrunStopped zeroing that used to live here is gone with the
+     * variable. It was the ONLY writer of a counter nobody read, so the two
+     * statements cancelled out -- and worse, they made the audit's "no writer"
+     * finding depend on remembering that a zero store is not a progress signal.
+     */
 }
 
 /* How many loops have left. Compared against the core count by the waiter. */
-/* 9.404: read-only accessors for the pre-teardown snapshot. */
+/*
+ * 9.404: read-only accessors for the pre-teardown snapshot.
+ *
+ * 9.566: this used to return g_VmrunStopped, which had no incrementer since 9.419
+ * deleted the ASM-side check -- so the snapshot recorded a constant zero and the
+ * dump read as "nothing was ever stopped", which is not a measurement, it is a
+ * decorated zero. It now reads the same object the waiter reads, so the snapshot
+ * answers the question it was written to answer.
+ *
+ * NOTE: FIELD MEANING CHANGED, FUNCTION NAME DID NOT. Cross-session dumps taken
+ * before 9.566 hold 0 there and must not be compared against newer dumps.
+ */
 extern "C" ULONG_PTR yghv_s206_vmrun_stopped_for_trace(VOID)
 {
-    return (ULONG_PTR)InterlockedCompareExchange(&g_VmrunStopped, 0, 0);
+    return (ULONG_PTR)InterlockedCompareExchange(&g_S206CoresExitedAsm, 0, 0);
 }
 
 extern "C" LONG yghv_s206_cpuid_view_for_trace(VOID)
@@ -2062,7 +2169,8 @@ extern "C" int yghv_s206_vmrun_stopped_count(VOID)
      * ticks - microseconds - while every core was still in its VMRUN loop. The
      * waiter would then free the VMCB and NPT out from under twelve live cores.
      *
-     * g_S206CoresExited is incremented once per core, in Sv206CoreThread, after
+     * The stopped counter (_Asm) is incremented once per core, in the ASM exit
+     * path / Sv206CoreThread, after
      * SvLV20 has taken that core out of the guest for good and control has unwound
      * back through the entry trampoline. That is the only number that means what the
      * caller thinks it means.
@@ -5770,6 +5878,32 @@ SvPrepareForVirtualization (
     VpData->HostStackLayout.Self = VpData;
     VpData->HostStackLayout.HostVmcbPa = hostVmcbPa.QuadPart;
     VpData->HostStackLayout.GuestVmcbPa = guestVmcbPa.QuadPart;
+    /*
+     * 9.571: RECORD THE VMCB PHYSICAL ADDRESS PER CORE, SO A NON-VIRTUALIZED CORE
+     * CAN REACH IT.
+     *
+     * Why a PHYSICAL address and not the pointer: the reader below is a physical
+     * processor that was never put into guest mode (206 virtualizes physical cores
+     * only, 9.527). It cannot safely dereference our kernel virtual addresses,
+     * because while the core is in guest mode - and during the teardown this runs
+     * in - the page tables it resolves through are not the ones we built them in.
+     * The VMCB pages are contiguous physical memory the driver owns, and
+     * yghv_pa_write() already exists for exactly that kind of access (mem_pa.c,
+     * MDL path, validated end to end since Phase 2).
+     *
+     * Indexed by PROCESSOR NUMBER, and the entry is cleared before we start, because
+     * a stale address from a previous load is a write into whatever owns that frame
+     * now. This is the same trap 9.369h recorded for intercept bits.
+     */
+    {
+        ULONG coreIdx = KeGetCurrentProcessorNumber();
+        if (coreIdx < SVM206_MAX_VPD)
+        {
+            InterlockedExchange64(&g_S206CoreVmcbPa[coreIdx],
+                                  (LONG64)guestVmcbPa.QuadPart);
+            InterlockedIncrement(&g_S206CoreVmcbSet);
+        }
+    }
 #if defined(YGHV_206B_GNPT)
     // 9.250c: seed the per-VCPU current-guest-CR3 slot with the CR3 at
     // prepare time (correct for the first CR3 self-fetch; the CR3-write
@@ -6697,7 +6831,7 @@ Exit:
  *   - Sv206Entry returns as soon as all threads have been CREATED, which is what
  *     "the hypervisor is up" means for this design.
  *
- * DriverUnload sets the stop flag and waits for g_VmrunStopped to reach the core
+ * DriverUnload sets the stop flag and waits for the stopped counter to reach the core
  * count - a number that now actually moves (see the VMMCALL case). If the wait
  * times out the VMCB/NPT guard still refuses to free, so a stuck core leaks rather
  * than being handed freed pages.
@@ -6732,9 +6866,10 @@ static LONG Sv206VirtualizeC(PSHARED_VIRTUAL_PROCESSOR_DATA SharedVpData)
  * inside Sv206GuestStub - instructions the GUEST runs, which C cannot call.
  *
  * Why the real-guest path needs it: that path returns out of SvVirtualizeProcessor
- * inside the guest, so VMRUN never unwinds and g_S206CoresExited never rises from
- * the host side. main.c waits on exactly that counter before DriverUnload returns;
- * when it times out the image is unmapped under a live core and the next instruction
+ * inside the guest, so VMRUN never unwinds and the stopped counter (the _Asm alias)
+ * never rises from the host side. main.c waits on exactly that counter before
+ * DriverUnload returns; when it times out the image is unmapped under a live core
+ * and the next instruction
  * after `vmrun` - `vmsave` - faults: 0xD1 at Sv206LaunchVm+0x1E, measured twice.
  *
  * A single tick gives the handler an exit to answer, which is the same protocol stub
@@ -6799,13 +6934,95 @@ static VOID Sv206CoreThread(PVOID Context)
     if (yghv_s206_real_guest_mode())
     {
         /*
-         * One vmmcall, nothing else. Not in a loop: if the handler decides not to
-         * stop yet it returns to the instruction after this one, and the loop would
-         * spin here on a core whose guest already finished - which is a livelock, not
-         * a fix. A single tick is enough because the stop request is already set by
-         * the time DriverUnload reaches the waiter.
+         * 9.573: STAY ALIVE. THIS IS THE FIX FOR THE 0xD1, AND 9.551 WAS THE BUG.
+         *
+         * 9.551 put a SINGLE tick here and then fell through to the terminate below.
+         * Its reasoning was "a single tick is enough because the stop request is
+         * already set by the time DriverUnload reaches the waiter" - and that is
+         * exactly backwards. This line is reached when the GUEST finishes
+         * SvVirtualizeProcessor and returns, i.e. SECONDS OR MINUTES BEFORE anyone
+         * asks us to stop. Ticking once, and then terminating, means:
+         *
+         *   1. the thread that OWNS THE SUSPENDED VMRUN FRAME ends itself;
+         *   2. its kernel stack - the one Sv206LaunchVm is still running on - is
+         *      discarded by the scheduler;
+         *   3. the core keeps executing the guest (which is fine and is the whole
+         *      point of RealGuestMode) while the frame it will eventually return
+         *      into no longer exists;
+         *   4. at unload, `sc stop` waits for a counter that can now never move,
+         *      times out, DriverUnload returns, the image is unmapped, and the
+         *      first instruction after `vmrun` faults on a dead code page.
+         *
+         * Measured at that point: invmrun at unload = 0x6 (stub mode: 0x0).
+         * That 0x6 was NOT "the stop signal was too weak". It was six cores whose
+         * thread-of-record had already been destroyed by the guest itself.
+         *
+         * 9.569's force-devirtualize could not help either: clearing SVME ejects a
+         * core only at its NEXT #VMEXIT, and it cannot reanimate a dead stack.
+         *
+         * So: the thread must never end while VMRUN is suspended on its stack. Loop
+         * on the tick instead. Two behaviours fall out of this, both required:
+         *
+         *   stop not requested -> the tick returns, we loop; the thread lives, the
+         *                         stack stays valid, and every iteration gives the
+         *                         stop handshake an exit to answer.
+         *   stop requested     -> the VMMCALL case sets ExitVm, SvLV20 takes the
+         *                         Sv206LeaveToHost path with HostExitRsp, and the
+         *                         thread is terminated FROM THE HOST SIDE, on its own
+         *                         stack, with EFER.SVME already clear. This call does
+         *                         not return in that case - which is why there is no
+         *                         exit condition here.
+         *
+         * The one thing this loop must NOT do is return: returning would fall into
+         * the terminate below and destroy the stack again.
          */
-        yghv_s206_real_guest_tick();
+        /*
+         * 9.574: THE TICK LOOP MUST YIELD THE PROCESSOR, NOT OCCUPY IT.
+         *
+         * 9.573 got the lifetime right (the thread must not end) and the scheduling
+         * wrong. Measured difference between the two configurations, same build:
+         *
+         *   6 cores  (CoreCount unset): entries=6/6, stable 23 s, unload 0.04-0.05 s,
+         *                               invmrun=0x0. Two clean rounds.
+         *   12 cores (CoreCount=12):    entries=12/12, RUNNING, then within ~20 s
+         *                               0x101 CLOCK_WATCHDOG_TIMEOUT.
+         *
+         * The dump says exactly which shape of starvation it was:
+         *   FAULTING_PROCESSOR: 4
+         *   FAILURE_BUCKET: CLOCK_WATCHDOG_TIMEOUT_INTERRUPTS_DISABLED_nt!KiSystemCall64
+         * i.e. a processor sat in a kernel path with interrupts disabled and never
+         * came back to take its clock interrupt.
+         *
+         * That is not a hypervisor defect, it is an accounting one. 9.573's loop was
+         * `for (;;) { spin 200000; vmmcall; }` - a BUSY thread that never yields.
+         * Each virtualised core therefore had one kernel thread burning it at 100%
+         * forever. With 6 of 12 virtualised there were still 6 logical CPUs for
+         * Windows to schedule its clock handling on, and the machine survived. With
+         * 12 of 12 there were NONE, and the watchdog fired.
+         *
+         * The fix is not "spin less". A spin that yields is a contradiction: either
+         * the thread gives the CPU back or it does not. So this loop BLOCKS between
+         * ticks - KeDelayExecutionThread(KernelMode, FALSE, -10000) = 1 ms - which
+         * is the same primitive the fallback loop below already uses (and the reason
+         * that loop was written that way). While the thread sleeps, Windows runs; the
+         * VMRUN frame's stack stays valid because the thread was never terminated.
+         *
+         * 1 ms between ticks is ~1000 stop-handshake opportunities per second per
+         * core. That is three orders of magnitude more than the unload waiter needs,
+         * and it costs no measurable CPU. The number is deliberately left at the
+         * timer granularity instead of being tuned: this platform's real timer floor
+         * is ~16 ms for user-requested resolution (measured in the handoff doc), so
+         * asking for 1 ms is already an underestimate, never an overrun.
+         */
+        for (;;)
+        {
+            LARGE_INTEGER tickDelay;
+
+            yghv_s206_real_guest_tick();
+
+            tickDelay.QuadPart = -10000;          /* 1 ms, relative */
+            KeDelayExecutionThread(KernelMode, FALSE, &tickDelay);
+        }
     }
 
     InterlockedIncrement(&g_S206CoresExitedAsm);   /* 9.555: same object as the ASM inc */
@@ -6915,7 +7132,7 @@ SvVirtualizeAllProcessors (
     //
     // Threads are CREATED here and not joined: each one lives inside its own VMRUN
     // loop for as long as the hypervisor is up. DriverUnload stops them by setting
-    // g_VmrunStopRequested and waiting on g_VmrunStopped.
+    // g_VmrunStopRequested and waiting on the stopped counter.
     //
     {
         ULONG numOfProcessors = yghv_s206_core_limit(
@@ -6977,7 +7194,7 @@ SvVirtualizeAllProcessors (
 
             /*
              * The handle is kept so DriverUnload can wait on the thread object if
-             * it ever needs to; the counter g_VmrunStopped is the primary signal.
+             * it ever needs to; the stopped counter is the primary signal.
              */
             g_S206CoreThreads[i] = threadHandle;
 
@@ -7197,7 +7414,106 @@ Sv206CoopUnload (
         ExUnregisterCallback(g_PowerCallbackRegistration);
         g_PowerCallbackRegistration = nullptr;
     }
+    /*
+     * 9.571: FORCE THE STUCK CORES OFF FIRST, THEN ASK NICELY.
+     *
+     * SvDevirtualizeAllProcessors below is the polite path: it runs a CPUID on
+     * every processor and lets each one leave the guest on its own way out. That
+     * works when the core is executing our stub loop, and it does nothing at all
+     * when the core is somewhere we cannot steer - which is exactly the
+     * RealGuestMode failure: the guest ran a Windows thread's `return`, and VMRUN
+     * never came back.
+     *
+     * So before the polite path, walk every VMCB we recorded and clear SVME in its
+     * LIVE guest EFER state. A core that is still inside VMRUN then finds SVME=0
+     * on its next #VMEXIT and is ejected with VMEXIT_INVALID instead of having a
+     * host-held #VMEXIT forced into a Windows thread's instruction stream.
+     *
+     * THE HONEST LIMIT, WRITTEN DOWN BECAUSE IT DECIDES WHETHER THIS HELPS:
+     *
+     *   This requires the core to take SOME exit. A core that is executing guest
+     *   code which only touches instructions we intercept will take one within
+     *   microseconds. A core sitting in a Windows idle loop may take much longer,
+     *   and a core that never exits again will never see the cleared value.
+     *   The wait after this is therefore bounded and reports what it saw - it does
+     *   not pretend to guarantee anything.
+     */
+    /*
+     * 9.572: the forced walk is COMPILED OUT by default.
+     *
+     * It is not wrong - in stub mode it ran and the unload was clean - but it only
+     * exists to rescue a mode that is now pinned off, and a rescue path that never
+     * runs is dead code that still costs a physical read/write per core on every
+     * unload. Kept behind the same switch as the mode it serves, so the two can
+     * never drift apart: arm one, arm both.
+     */
+#if !(defined(YGHV_REAL_GUEST_PINNED) && YGHV_REAL_GUEST_PINNED)
+    /*
+     * 9.573: armed together with the mode, on the SAME switch, so the two can never
+     * drift apart. With 9.573's keep-alive fix this should now find nothing to do
+     * (invmrun should be 0 by its own path); it stays as the belt to that braces,
+     * and `force-devirt` counters in the dump tell us which of the two actually
+     * closed the gap. If rounds > 0 and touched > 0 on a clean unload, the keep-alive
+     * was not enough and the report will say so.
+     */
+    yghv_s206_force_devirtualize();
+#endif
     SvDevirtualizeAllProcessors();
+}
+
+/*
+ * 9.571: CLEAR SVME IN EVERY LIVE VMCB, FROM A CORE THAT IS NOT IN A GUEST.
+ *
+ * Called from Sv206CoopUnload, i.e. from the thread running DriverUnload. Whether
+ * that thread is virtualized is not something this code may assume - so every
+ * entry is reached through yghv_pa_write() by PHYSICAL address, which is a kernel
+ * API that does not care which core is executing it and does not depend on the
+ * guest's page tables.
+ *
+ * Why not just flip the bit in the VMCB in memory we can see: see the note at the
+ * recording site (9.571). Physical is the only addressing that is correct from
+ * both sides of the guest/host boundary during teardown.
+ */
+extern "C" ULONG yghv_s206_force_devirtualize(VOID)
+{
+    ULONG touched = 0;
+    ULONG i;
+
+    for (i = 0; i < SVM206_MAX_VPD; i++)
+    {
+        LONG64 vmcbPa = InterlockedCompareExchange64(&g_S206CoreVmcbPa[i], 0, 0);
+        UINT64 efer;
+        UINT64 off;
+
+        if (vmcbPa == 0)
+            continue;
+
+        /*
+         * The guest EFER lives in the VMCB Save State Area. Compute the offset from
+         * the driver's own structure rather than a literal: the ASM indexes the
+         * same layout, and a hand-written constant here would be a second copy of
+         * it that nothing checks.
+         */
+        {
+            PVIRTUAL_PROCESSOR_DATA probe = (PVIRTUAL_PROCESSOR_DATA)0;
+            off = (UINT64)((ULONG_PTR)&probe->GuestVmcb.StateSaveArea.Efer);
+        }
+
+        if (!yghv_pa_read_u64((UINT64)vmcbPa + off, &efer))
+            continue;
+
+        if ((efer & EFER_SVME) == 0)
+            continue;
+
+        efer &= ~(UINT64)EFER_SVME;
+        if (yghv_pa_write_u64((UINT64)vmcbPa + off, efer))
+            touched += 1;
+    }
+
+    InterlockedExchange(&g_S206ForceDevirtRounds,
+                        InterlockedIncrement(&g_S206ForceDevirtRounds));
+    InterlockedExchangeAdd(&g_S206ForceDevirtTouched, (LONG)touched);
+    return touched;
 }
 
 /*!

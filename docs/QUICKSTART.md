@@ -2,7 +2,7 @@
 
 > **30 秒版**：AMD SVM 管理程序驱动，Windows 自己是 guest。代码在 `D:\yuanguard`，
 > 分支 `main`，构建一条命令，加载一条命令。
-> **当前最新编号 9.558**。桩模式 1.2×，卸载 **0.046 s**，`invmrun at unload = 0x0`。
+> **当前最新编号 9.563**。桩模式 1.2×，卸载 **0.046 s**，`invmrun at unload = 0x0`。
 
 ---
 
@@ -47,7 +47,8 @@ Get-Content C:\Windows\yghv_progress.log | Select-String "invmrun at unload"
 #   必须看到：s206 invmrun at unload = 0x0     （12 个核全部干净离开）
 ```
 
-**卸载判据 `invmrun=0x0` 是唯一可信的"没坏"证据。** 卸载耗时约 5 秒。
+**卸载判据 `invmrun=0x0` 是唯一可信的"没坏"证据。** 卸载耗时 **0.046 s**（9.556；
+此前 1.88–4.12 秒是「等待条件不可满足，每次都在空转等超时」）。
 
 ---
 
@@ -55,12 +56,12 @@ Get-Content C:\Windows\yghv_progress.log | Select-String "invmrun at unload"
 
 | 项 | 值 |
 |---|---|
-| 分支 / HEAD | `main` @ `31568c8`（9.499–9.513 已提交；本地领先 origin） |
+| 分支 / HEAD | `main` @ `aebcc33`（9.499–9.562 已提交；本地领先 origin） |
 | 驱动 | `yghvpa` · **STOPPED** · 设备 `\\.\YuanGuardHV` |
-| 最新编号 | **9.537** |
+| 最新编号 | **9.563** |
 | 工作树 | 干净 |
-| 静态检查 | 10 个运行器 / 14 条 PASS（含 3 个自检），两个运行器全绿；客户端 **75** 条命令 |
-| 部署镜像 | `C:\yghv_pa.sys` = `90A964DA`（20:33:26），**与 `bin` 哈希一致** |
+| 静态检查 | **14 个检查脚本 / 25 条 PASS**（含 **11** 条自检），两个运行器全绿（9.567 实测：source 24 + map 1）；客户端 **PowerShell 79 / Java 18** 条命令、IOCTL **56** 个 |
+| 部署镜像 | `C:\yghv_pa.sys` = `18BB68C34F63970A`，**与 `bin` 哈希一致**（9.563 复测）|
 | **最近一次卸载** | `invmrun at unload = 0x0`，无蓝屏（9.513）|
 | **性能（9.527 已优化）** | 默认只虚拟化 **6 个物理核**：单线程 **1.1×**、12 线程 **1.2×**（优化前 7.6× / 12.8×）。可用 `CoreCount` 覆盖 |
 | **G25** | **15/17 PASS（T7/T9 FAIL）** —— 9.533 在 6 核默认下实测；12 核配置应全绿 |
@@ -75,7 +76,7 @@ Get-Content C:\Windows\yghv_progress.log | Select-String "invmrun at unload"
 | # | 事项 | 为什么这个顺序 |
 |---|---|---|
 | **1** | **取舍决策（operator）：三选一，不是二选一** | 9.537 补测了中间点 —— **6 核 1.2×（T7 FAIL）/ 11 核 ≈4×（T7 PASS）/ 12 核 11.6×**。11 核留 1 个空闲逻辑核给 Windows，所以代价停在 4× 而非 11.6×（那个台阶是「一个核都不剩」）|
-| 2 | **G25 17 项重跑** | 9.498 之后的改动（`on_dr` 上界、DR 拒绝、3 条新 IOCTL、72→75 条命令）**全部没被回归覆盖** |
+| 2 | **G25 17 项重跑** | 9.498 之后的改动（`on_dr` 上界、DR 拒绝、3 条新 IOCTL、72→**79** 条命令、IOCTL 49→**56**）**全部没被回归覆盖** |
 | 3 | **Tier 6.1 启动期控制验收** | 台账唯一悬空项。**需重启，窗口不可回滚** |
 
 **已结案（不是待办）**：`.data` 段隐藏（目标不成立，见 RESUME 8.6.3）、
@@ -160,12 +161,12 @@ mmf-hold 寿命       : 3600 秒
 
 | 想知道什么 | 读哪个 | 大小 |
 |---|---|---|
-| **新会话第一步** | `docs/RESUME_PROMPT.md` | 49 KB |
-| 现在在哪、这一步做了什么 | `docs/YUANMOD_HANDOFF_CURRENT.md`（9.300–9.537） | 690 KB |
-| 哪些功能做了 / 哪些不做 / 为什么 | `docs/TIER_LEDGER.md` | 7.6 KB |
+| **新会话第一步** | `docs/INDEX.md`（按问题索引）| 3.5 KB |
+| 现在在哪、这一步做了什么 | `docs/YUANMOD_HANDOFF_CURRENT.md`（9.500–9.563，开头有 53 条索引）| 113 KB |
+| 哪些功能做了 / 哪些不做 / 为什么 | `docs/TIER_LEDGER.md` | 14.9 KB |
 | **写内核代码前** | `docs/KERNEL_API_CHECKLIST.md` | 36 KB |
-| 目录总览 | `docs/INDEX.md` | — |
-| 考古（9.1–9.299） | `docs/_ARCHIVE_HANDOFF_9.1-9.299.md` | 523 KB |
+| 目录总览 | `docs/RESUME_PROMPT.md`（深一层：铁律/约束/观测）| 33.6 KB |
+| 考古（9.1–9.299） | `docs/archive/_ARCHIVE_HANDOFF_9.1-9.299.md` | 1027 KB |
 
 ---
 

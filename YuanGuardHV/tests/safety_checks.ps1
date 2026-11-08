@@ -39,14 +39,31 @@ if ($protectText -match 'STATUS_DEVICE_BUSY') {
     throw 'Safety check FAIL: protect.c must not return STATUS_DEVICE_BUSY'
 }
 
+# 9.564: the 9.561 docs reorganisation moved three of these into docs\archive\,
+# and this checker then died on `Get-Content` instead of checking anything.
+# A path is now resolved, not assumed: try docs\ then docs\archive\, and treat
+# "not found anywhere" as a FAILURE. Guarding it with `-ErrorAction SilentlyContinue`
+# would have turned this into the tree's oldest defect shape - a check that reads
+# nothing and reports PASS (9.500: four commands that never worked because no
+# checker looked at that part of the file).
 $checkFiles = @(
-    (Join-Path $root '..\docs\YUANMOD_NEXT_WINDOW_PROMPT.md'),
-    (Join-Path $root '..\docs\TASKS.md'),
-    (Join-Path $root '..\docs\YGHV_HOOK_LOCK_AND_0x5AA_REDESIGN_20260813.md'),
-    (Join-Path $root '..\docs\YUANMOD_HANDOFF_CURRENT.md'),
-    (Join-Path $root 'tools\yghv_client\README.md')
+    'docs\YUANMOD_NEXT_WINDOW_PROMPT.md',
+    'docs\TASKS.md',
+    'docs\YGHV_HOOK_LOCK_AND_0x5AA_REDESIGN_20260813.md',
+    'docs\YUANMOD_HANDOFF_CURRENT.md',
+    'tools\yghv_client\README.md'
 )
-foreach ($file in $checkFiles) {
+foreach ($rel in $checkFiles) {
+    $file = $null
+    foreach ($prefix in @($root, (Join-Path $root '..'))) {
+        $candidate = Join-Path $prefix $rel
+        if (Test-Path -LiteralPath $candidate) { $file = $candidate; break }
+        $archived = Join-Path $prefix ($rel -replace '^docs\\', 'docs\archive\')
+        if (Test-Path -LiteralPath $archived) { $file = $archived; break }
+    }
+    if (-not $file) {
+        throw "Safety check FAIL: none of the documented paths exists for '$rel'"
+    }
     $text = Get-Content -LiteralPath $file -Raw
     if ($text -match 'ERROR_BUSY\s*\(0x5AA\)') {
         throw "Safety check FAIL: '$file' still labels 0x5AA as ERROR_BUSY"
