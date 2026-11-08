@@ -75,9 +75,36 @@ $scripts = @(
     'client_undefined_vars.ps1'
 )
 
+# 9.583: COUNT THE PASSES INSTEAD OF LETTING PEOPLE WRITE THE NUMBER DOWN.
+#
+# Every document in this tree stated "13 scripts / 24 PASS" and every one of them
+# was wrong the moment a checker was added -- docs_check had already made it
+# 14/30. A number a human retypes is a number that drifts, which is the exact
+# finding 9.583 was opened for (a stale image hash, a stale record count, a status
+# block stuck 18 records behind).
+#
+# So the runner writes the real figures to a file, and docs_check reads THAT file
+# and compares it against what the documents claim. No human types the number.
+$passCount = 0
+$selfTestCount = 0
 foreach ($script in $scripts) {
     Write-Host "[RUN] $script"
-    & (Join-Path $PSScriptRoot $script)
+    # A CHILD PROCESS, not `& $script`: every checker reports with Write-Host, which
+    # goes to the host and NOT through stream redirection, so `& $s 2>&1` returned
+    # an empty string and the first version of this block counted 0 passes for 13
+    # scripts that had just printed 29 of them. docs_check.ps1 records the same
+    # trap from the other side (its self-test could not read its child's reason).
+    $raw = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot $script) 2>&1
+    $code = $LASTEXITCODE
+    $raw | ForEach-Object { Write-Host $_ }
+    if ($code -ne 0) { throw "$script exited $code" }
+    $passCount += @($raw | Where-Object { "$_" -match '^\[PASS\]' }).Count
+    $selfTestCount += @($raw | Where-Object { "$_" -match '^\[PASS\].*self-test' }).Count
 }
+
+$statsPath = Join-Path $PSScriptRoot 'check_stats.txt'
+$line = "scripts=$($scripts.Count) passes=$passCount selftests=$selfTestCount"
+[IO.File]::WriteAllText($statsPath, $line, (New-Object Text.UTF8Encoding($false)))
+Write-Host "check stats: $line  (written to $statsPath)"
 
 Write-Host 'ALL SOURCE CHECKS PASS'

@@ -134,9 +134,9 @@ YuanGuardHV/
 │   ├── yghv_guard.c          隐藏表完整性（SHA-256）
 │   ├── yghv_sentry.c         攻击面清单与 escape 记录
 │   └── common/               头文件（33 个）
-├── tests/                    构建期检查器（15 个脚本 + 2 个运行器）
+├── tests/                    构建期检查器（14 个脚本 + 2 个运行器）
 ├── tools/
-│   ├── yghv_ctl.ps1          PowerShell 客户端（79 条命令）
+│   ├── yghv_ctl.ps1          PowerShell 客户端（80 条命令）
 │   └── yghv_client/          Java 客户端（18 条命令）
 └── docs/                     见 docs/INDEX.md
 tools/                        独立工具
@@ -256,7 +256,7 @@ build.bat
 
 流程（`build.bat`）：
 
-1. 先运行 `tests\run_source_checks.ps1`（**13 个脚本 / 24 条 PASS**，含 9 条自检），失败即中止；
+1. 先运行 `tests\run_source_checks.ps1`（**13 个脚本 / 31 条 PASS**，含 18 条自检），失败即中止；
 2. clang-cl 编译 `hv\*.c` / `hv\*.cpp` + `svm_trampoline.S`；
 3. MSVC link 链接为 `bin\yuanguard_hv.sys`，**同时产出 `bin\yuanguard_hv.map`**；
 4. 运行 `tests\run_map_checks.ps1`（页布局检查，必须链接后跑）；
@@ -373,12 +373,19 @@ powershell -NoProfile -ExecutionPolicy Bypass -File $ctl mem-read <pid> <hex_va>
 | `service_name_check.ps1` | 每个 `sc` 调用必须用变量作服务名，不许写字面量 |
 | `client_undefined_vars.ps1` | 客户端读到的每个变量名都被赋过值 |
 | **`stub_stack_contract.ps1`** | **`Sv206GuestStub` 体内禁 push/pop/call/ret/lea rsp/[rsp]**，且必须仍有 `vmmcall` |
-| **`docs_check.ps1`** | **文档门**：相对链接、索引行数、空记录、最新编号、归档份数 |
+| **`docs_check.ps1`** | **文档门**：相对链接、索引行数、空记录、最新编号、归档份数、状态块自洽、镜像哈希、检查器数量 |
 | `page_layout_check.ps1` | 隐藏表不与 guard 状态共页、岛内读区域页对齐（链接后跑）|
 
 > **每个检查器都必须能失败。** 三个曾报假 PASS（正则够不到目标文本）。
-> 现在 9 条自检会在每次构建时往副本注入真缺陷，要求必须抓到。
-> `docs_check` 另有 1 条反向对照：代码里假装的链接必须**不被**报。
+> 现在 **9 个变异 + 2 条反向对照**在每次构建时跑：往副本注入真缺陷要求抓到，
+> 同时要求两条「本来就该通过」的输入保持沉默。
+> `docs_check` 的反向对照有两条：代码里假装的链接必须**不被**报；
+> INDEX 声称的镜像哈希若正好是真实值，必须**通过**（只测「能抓到」不算测过）。
+>
+> **文档里的数字不靠人抄。** `run_source_checks.ps1` 把实测的
+> `scripts= / passes= / selftests=` 写进 `tests/check_stats.txt`，
+> `docs_check` 拿它比对 README / QUICKSTART 里的「N 脚本 / M PASS」。
+> 加一条检查 → 数字变了 → 文档没跟上就构建失败。9.583 加完当场被它拦了一次。
 
 ### G25 功能验证（17 项，实机）
 

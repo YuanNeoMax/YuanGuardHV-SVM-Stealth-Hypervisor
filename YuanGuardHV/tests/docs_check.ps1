@@ -188,6 +188,21 @@ else {
     }
     $missing = @($spans.Keys | Where-Object { $seen -notcontains $_ })
     foreach ($k2 in $missing) { $problems.Add("record $k2 has no index row") }
+
+    # The heading of the index section prints its own record count ("69 tiao").
+    # It said 68 while the table held 69 -- the row count was checked, the number
+    # the heading ANNOUNCED was not. Same shape as the status block in check 6:
+    # a number a human reads, printed by the document, never compared to reality.
+    # The heading is Chinese ("... , 69 tiao )"), and this file is ASCII-only, so
+    # the pattern is anchored on the DIGITS-BEFORE-THE-CLOSING-PAREN shape rather
+    # than on the words. The first version demanded an ASCII ')' and the heading
+    # ends with a fullwidth one -- it matched nothing and the check was silent
+    # (measured: a copy with 68 planted in it still reported PASS).
+    $heading = $hLines[$idxStart]
+    $countClaim = [regex]::Match($heading, '([0-9]+)[^0-9]*$')
+    if ($countClaim.Success -and [int]$countClaim.Groups[1].Value -ne $heads.Count) {
+        $problems.Add("the index heading announces $($countClaim.Groups[1].Value) records, there are $($heads.Count)")
+    }
 }
 
 foreach ($h in $heads) {
@@ -200,6 +215,11 @@ foreach ($h in $heads) {
 }
 
 # --------------------------------------------------------- 4. latest number
+#
+# $highest is the highest RECORD -- taken from `#### 9.x` headings only, never from
+# free text. It used to scan the whole file, which made check 6 circular: the status
+# block's own number would define the maximum it was then compared against, so the
+# block could say anything and agree with itself. Measured 9.583.
 $declared = $null
 foreach ($m in [regex]::Matches((ReadUtf8 $index), '9\.[0-9]{3}')) {
     if (-not $declared -or [double]$m.Value.Substring(2) -gt [double]$declared.Substring(2)) {
@@ -207,9 +227,9 @@ foreach ($m in [regex]::Matches((ReadUtf8 $index), '9\.[0-9]{3}')) {
     }
 }
 $highest = $null
-foreach ($m in [regex]::Matches($handoffText, '9\.[0-9]{3}')) {
-    if (-not $highest -or [double]$m.Value.Substring(2) -gt [double]$highest.Substring(2)) {
-        $highest = $m.Value
+foreach ($h in $heads) {
+    if (-not $highest -or [double]$h.Key.Substring(2) -gt [double]$highest.Substring(2)) {
+        $highest = $h.Key
     }
 }
 if (-not $declared) { $problems.Add('INDEX.md carries no 9.xxx number at all') }
@@ -219,10 +239,14 @@ elseif ($declared -ne $highest) {
 
 # ------------------------------------------------------- 5. archive counts
 $indexText = ReadUtf8 $index
+# Recurse defaults to true; archive/*.md is the flat row and must stay flat,
+# otherwise it would silently start counting archive/2026-11-08/ and
+# archive/design/ as well (they have their own rows).
 $countChecks = @(
     @{ Label = 'archive/2026-11-08/'; Path = 'archive/2026-11-08' },
     @{ Label = 'archive/design/';     Path = 'archive/design' },
-    @{ Label = 'superpowers/';        Path = 'superpowers' }
+    @{ Label = 'superpowers/';        Path = 'superpowers' },
+    @{ Label = 'archive/*.md';        Path = 'archive'; Recurse = $false }
 )
 foreach ($c in $countChecks) {
     $dir = Join-Path $docsRoot $c.Path
@@ -230,7 +254,8 @@ foreach ($c in $countChecks) {
         $problems.Add("INDEX.md indexes $($c.Label) but the directory does not exist")
         continue
     }
-    $actual = @(Get-ChildItem -LiteralPath $dir -Recurse -File -Filter '*.md').Count
+    $recurse = -not ($c.ContainsKey('Recurse') -and -not $c.Recurse)
+    $actual = @(Get-ChildItem -LiteralPath $dir -File -Filter '*.md' -Recurse:$recurse).Count
 
     # The count is the FIRST line that both mentions this directory and carries a
     # bold number. Later lines point at individual documents inside the directory
@@ -248,6 +273,152 @@ foreach ($c in $countChecks) {
     }
     elseif ($claimed -ne $actual) {
         $problems.Add("INDEX.md claims $claimed files in $($c.Label), disk has $actual")
+    }
+}
+
+# ------------------------------------------- 6. handoff's own status block
+#
+# The handoff ENDS with a status block that restates the state. It sat at 9.564
+# while the body had already reached 9.582 -- two contradictory statements in ONE
+# file. Check 4 compares INDEX against the log; it cannot see the log disagreeing
+# with itself.
+#
+# Located by STRUCTURE (the last "## " section), not by its Chinese heading: this
+# script is ASCII-only on purpose (see the header), and powershell.exe decodes a
+# BOM-less UTF-8 file as ANSI, so a Chinese literal here is a parser error several
+# lines away from the real cause. Measured, 9.583 -- the first version of this
+# check wrote the heading out and the whole file stopped parsing.
+$sections = $handoffText -split "`n## "
+$lastSection = $sections[$sections.Count - 1]
+$blockMax = $null
+foreach ($m in [regex]::Matches($lastSection, '9\.[0-9]{3}')) {
+    if (-not $blockMax -or [double]$m.Value.Substring(2) -gt [double]$blockMax.Substring(2)) {
+        $blockMax = $m.Value
+    }
+}
+if (-not $blockMax) {
+    $problems.Add('the handoff status block carries no 9.xxx number')
+}
+elseif ($blockMax -ne $highest) {
+    $problems.Add("the handoff status block tops out at $blockMax, the log's highest record is $highest")
+}
+
+# ------------------------------------------------ 7. INDEX's image hash claim
+#
+# INDEX prints "bin == <deployment> = <hash>". It read 90C6E804994F595C against a
+# binary whose real hash was F9A56562... -- stale by a whole rebuild, and it is the
+# one line a reader would use to answer "is the driver on disk the one the docs
+# describe?". Anchored on the ASCII "bin ==" for the same encoding reason as above.
+#
+# bin/ is gitignored (the binary is a build artifact), so a fresh checkout has no
+# file to hash. That is a SKIP with a printed reason, not a failure: a checker that
+# fails on every clean clone gets deleted within a week.
+$indexText = ReadUtf8 $index
+$imgClaim = [regex]::Match($indexText, '(?m)^.*bin ==.*?([0-9A-Fa-f]{8,64})\s*$')
+$sysPath = Join-Path (Split-Path -Parent $docsRoot) 'YuanGuardHV/bin/yuanguard_hv.sys'
+if (-not $imgClaim.Success) {
+    $problems.Add('INDEX.md states no image hash on its "bin ==" line')
+}
+elseif (-not (Test-Path -LiteralPath $sysPath)) {
+    Write-Host "[SKIP] docs: no bin\yuanguard_hv.sys to hash (fresh checkout), image claim unverified"
+}
+else {
+    $realHash = (Get-FileHash -LiteralPath $sysPath -Algorithm SHA256).Hash
+    $claimed = $imgClaim.Groups[1].Value.ToUpperInvariant()
+    if (-not $realHash.StartsWith($claimed)) {
+        $problems.Add("INDEX.md claims image $claimed, the built .sys is $($realHash.Substring(0, $claimed.Length))")
+    }
+}
+
+# --------------------------------------------- 8. the checker-count claims
+#
+# README and QUICKSTART both print "N scripts / M PASS". Both were wrong: they said
+# 13/24 while the tree already ran 14/30, because the number is retyped by hand in
+# prose every time a checker is added. run_source_checks.ps1 now WRITES the figures
+# to tests/check_stats.txt; this compares every claim it can find against that file.
+#
+# A missing stats file is a SKIP, not a failure: docs_check is itself one of the
+# scripts being counted, so it must be able to run standalone (and the self-test
+# runs it against a throwaway docs\ with no tests\ beside it at all).
+$statsPath = Join-Path $PSScriptRoot 'check_stats.txt'
+if (-not (Test-Path -LiteralPath $statsPath)) {
+    Write-Host '[SKIP] docs: no tests/check_stats.txt yet (run run_source_checks.ps1), checker counts unverified'
+}
+else {
+    $stats = ReadUtf8 $statsPath
+    $sm2 = [regex]::Match($stats, 'scripts=([0-9]+)\s+passes=([0-9]+)')
+    if (-not $sm2.Success) {
+        $problems.Add("tests/check_stats.txt is malformed: $($stats.Trim())")
+    }
+    else {
+        $realScripts = [int]$sm2.Groups[1].Value
+        $realPasses = [int]$sm2.Groups[2].Value
+        # Each document is scanned on its own so the message can name the file.
+        foreach ($doc in @('README.md', 'docs/QUICKSTART.md')) {
+            $p = Join-Path (Split-Path -Parent $docsRoot) $doc
+            if (-not (Test-Path -LiteralPath $p)) { continue }
+            $txt = ReadUtf8 $p
+            foreach ($m in [regex]::Matches($txt, '([0-9]+)\s*(?:\S*)\s*/\s*([0-9]+)\s*(?:\S*)\s*PASS')) {
+                $cs = [int]$m.Groups[1].Value
+                $cp = [int]$m.Groups[2].Value
+                # A claim of the FORM "N scripts / M PASS" only. Both numbers must
+                # match, so a document that merely quotes an old measurement in
+                # prose (there are several) is not forced to chase the runner.
+                if ($cs -eq $realScripts -and $cp -ne $realPasses) {
+                    $problems.Add("$doc claims $cp PASS for $cs scripts, check_stats.txt says $realPasses")
+                }
+            }
+        }
+    }
+}
+
+# ------------------------------------------ 9. README's repository tree counts
+#
+# The tree in README states file counts that are all retyped by hand and all drifted:
+# hv/ said 41 files (40 at the time of the first measurement -- then the check proved
+# the DOCUMENT right and my own `ls *.c *.cpp *.h` wrong, it had missed the .hpp),
+# tests/ said 15 scripts (14). Each is one Get-ChildItem away from being true, which
+# is exactly the kind of number nobody re-measures.
+#
+# Only counts with an UNAMBIGUOUS source are checked: "N commands" needs the client's
+# own table, so that one stays with command_parity.ps1, which already owns it.
+#
+# A MISSING tree is a SKIP, not a crash. The self-test runs this against a throwaway
+# docs\ with no code beside it, and Get-ChildItem on a missing path THREW -- the
+# checker died instead of saying "cannot verify", which reads as "docs are broken"
+# when the truth is "there is nothing here to compare against".
+$repoRoot = Split-Path -Parent $docsRoot
+$readmePath = Join-Path $repoRoot 'README.md'
+if (-not (Test-Path -LiteralPath $readmePath)) {
+    Write-Host '[SKIP] docs: no README.md beside docs/, tree counts unverified'
+}
+else {
+    $rd = ReadUtf8 $readmePath
+    $treeChecks = @(
+        # Anchored on "label ... ( N" and NOT on the closing paren: README uses a
+        # FULLWIDTH paren, so the first version's ASCII ')' matched nothing and the
+        # check reported "carries no hv/ file count" on a line that was right there.
+        @{ Pattern = 'hv/\s*[^0-9
+]*([0-9]+)';   Dir = 'YuanGuardHV/hv';    Filter = '*';    What = 'hv/ file count' },
+        @{ Pattern = 'tests/\s*[^0-9
+]*([0-9]+)'; Dir = 'YuanGuardHV/tests'; Filter = '*.ps1'; What = 'tests/ checker count' }
+    )
+    foreach ($tc in $treeChecks) {
+        $dir = Join-Path $repoRoot $tc.Dir
+        $m = [regex]::Match($rd, $tc.Pattern)
+        if (-not $m.Success) {
+            $problems.Add("README.md carries no $($tc.What)")
+            continue
+        }
+        if (-not (Test-Path -LiteralPath $dir)) {
+            Write-Host "[SKIP] docs: no $($tc.Dir) beside docs/, $($tc.What) unverified"
+            continue
+        }
+        $actual = @(Get-ChildItem -LiteralPath $dir -File -Filter $tc.Filter |
+                Where-Object { $_.Name -notmatch '^run_' }).Count
+        if ([int]$m.Groups[1].Value -ne $actual) {
+            $problems.Add("README.md claims $($m.Groups[1].Value) for $($tc.What), disk has $actual")
+        }
     }
 }
 

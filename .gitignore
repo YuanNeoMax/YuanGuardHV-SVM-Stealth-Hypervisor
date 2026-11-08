@@ -54,3 +54,9 @@ tools/bench_core.exe
 
 # 9.582: build artifact of tools/sync_selfwrite.cs (compile it, do not ship a binary)
 tools/sync_selfwrite.exe
+
+# 9.583: reference/ 下的第三方二进制库（1.1 MB，无构建引用；说明见 reference/README.md）
+reference/*.lib
+
+# 9.583: 静态检查的实测数字，由 run_source_checks.ps1 每次写出（不是手抄的）
+YuanGuardHV/tests/check_stats.txt
