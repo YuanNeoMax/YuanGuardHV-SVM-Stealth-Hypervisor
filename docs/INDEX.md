@@ -25,11 +25,11 @@
 
 ```
 驱动          : STOPPED
-镜像          : bin == 部署 = 4026001F8D99B350
-桩模式        : 1.2×，卸载 0.046 s，invmrun at unload = 0x0
-RealGuestMode : 编译期封禁（9.552）
+镜像          : bin == 部署 = 90C6E804994F595C
+默认配置      : 真 guest + 全核（9.577），12 线程 1.05-1.08×
+卸载          : 0.07 s，invmrun at unload = 0x0
 台账          : 8 完成 / 9 不做 / 1 需重启（Tier 6.1 启动期验收）
-HEAD          : main @ aebcc33（9.560 起未提交）
+HEAD          : main @ f011b40
 最新编号      : 9.577
 ```
 

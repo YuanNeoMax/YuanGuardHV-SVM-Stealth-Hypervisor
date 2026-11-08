@@ -27,7 +27,7 @@
 | 单线程 | 7.6× | **1.1×** |
 | **12 线程** | **12.8×** | **1.2×** |
 
-改法：`yghv_s206_core_limit()` 默认从「全部逻辑核」改成**物理核数**
+改法（**9.577 已推翻，见下方更正**）：`yghv_s206_core_limit()` 默认从「全部逻辑核」改成**物理核数**
 （用 `KeQueryLogicalProcessorRelationship(RelationProcessorCore)` 数记录得来）。
 **代价是覆盖范围**：未虚拟化的 6 个逻辑核上 NPT 保护不生效。可用
 `HKLM\SYSTEM\CurrentControlSet\Services\yghvpa\Parameters\CoreCount`（REG_DWORD）覆盖。
@@ -42,7 +42,22 @@ T9 FAIL  no mechanism identified in T7
 
 **这不是缺陷，是「部分虚拟化」的直接后果**：`mmf-read` 是短命外部进程，
 被 Windows 调度到 **native 的 6 个核**上就不经过 NPT，DECOY 对它不存在。
-**要 G25 全绿就设 `CoreCount=12`，代价是 11.6×。这是明确的取舍。**
+**9.577 更正：那个 11.6× 是桩模式的数字，真 guest 没有这个代价。**
+
+9.575 重测（固定工作量、带正确性门的编译基准）：
+
+| 配置 | 12 线程吞吐 | G25 |
+|---|---|---|
+| 6 核桩模式（**9.527-9.576 的旧默认**）| 1.13-1.34× | 15/17 |
+| 12 核桩模式 | 4.0-4.4× | — |
+| **12 核真 guest（9.577 起的默认）** | **1.01-1.08×** | **17/17** |
+
+根因：桩模式每核每秒几万次 `vmmcall` 空转（实测 1,255,119 次退出），
+真 guest 的 guest 是 Windows 自己（27,914 次）。**"减核换性能"优化的是桩的空转，
+不是 hypervisor。**
+
+所以 `CoreCount` 不再是"要功能就得牺牲性能"的旋钮 —— 默认全核，
+它现在只用于**退回部分核**（例如排查某核上的问题）。
 
 ##### 卸载判据（唯一可信的「没坏」证据）
 
@@ -420,8 +435,8 @@ yghv_ctl.ps1 unload-trace   → page PA / last step / value
 | 项 | 状态 |
 |---|---|
 | 卸载 4 秒 → 0.046 秒 | ✅ 9.555+9.556 |
-| RealGuestMode 能跑（`early-returns` 0→6）| ✅ 9.548，**但停不下来，已封禁 9.552** |
-| RealGuestMode 停止 | ❌ 根因已知，唯一剩下的方向见 `WINDOWS_AS_GUEST_FINDINGS.md` |
+| RealGuestMode 能跑（`early-returns` 0→6）| ✅ 9.548 |
+| **RealGuestMode 停止** | ✅ **9.573+9.574 已解决，9.577 起是默认** —— 根因是 guest 把承载 VMRUN 帧的栈销毁了（0xD1），以及 tick 循环不让出 CPU（0x101）。判据 `invmrun at unload = 0x0` |
 
 ## 9. 关键文件
 
