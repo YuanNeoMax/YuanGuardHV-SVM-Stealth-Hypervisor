@@ -955,7 +955,8 @@ static volatile LONG64 g_DrApplyFailures = 0;  /* walk failed entirely */
 #define S206_BP_KIND_EXEC 0x4u
 
 static volatile LONG64 g_DrHits = 0;           /* #DB consumed for a DR breakpoint */
-static volatile LONG64 g_DrInjected = 0;       /* #DB handed to the guest */
+static volatile LONG64 g_DrInjected = 0;       /* #DB reflected to the guest */
+static volatile LONG64 g_DrStale = 0;          /* DR6 bit with no entry: cleared + RF */
 
 /*
  * 9.396: A STOP FLAG THE VMRUN LOOP CAN ACTUALLY SEE.
@@ -4707,6 +4708,12 @@ tsc_policy_done:;
              * ours?" - every site that sets TF sets that field with it
              * (4045, 4103, 4165, 4238, 4324, 4652 before this change). */
             int dbConsumed = 0;
+            /* 9.588: TF is cleared only for a #DB OUR OWN TF produced. dbConsumed
+             * also covers a DR slot of ours firing, and that one is a different
+             * exception: a guest single-stepping itself can trip our data
+             * breakpoint on the same instruction, and clearing TF there would
+             * silently end its single-step. Kept separate on purpose. */
+            int dbTfOurs = 0;
             if (VpData->GuestVmcb.ControlArea.GuestPaOfGhcb != 0) {
                 UINT64 slot = VpData->GuestVmcb.ControlArea.GuestPaOfGhcb;
                 /* 9.275: bit0 set = fake-write shadow (C6) — restore the
@@ -4784,6 +4791,7 @@ tsc_policy_done:;
                 }
                 VpData->GuestVmcb.ControlArea.GuestPaOfGhcb = 0;
                 dbConsumed = 1;
+                dbTfOurs = 1;
             }
 
             /*
@@ -4848,9 +4856,38 @@ tsc_policy_done:;
                 }
 
                 if (!dbConsumed) {
-                    VpData->GuestVmcb.ControlArea.EventInj =
-                        (1ULL << 31) | (3ULL << 8) | 0x01ULL;   /* #DB, no error code */
-                    InterlockedIncrement64(&g_DrInjected);
+                    /*
+                     * A B0-B3 bit with no entry behind it is OUR stale enable:
+                     * remove/clear reprogram every core, so this is the narrow
+                     * race in between. It cannot be the guest's breakpoint - a
+                     * guest write to DR7 lands in the physical register and VMRUN
+                     * reloads Dr7 from the VMCB on the next entry, so a guest
+                     * enable never survives long enough to fire.
+                     *
+                     * Clear the bits and skip exactly one instruction (RF). Do
+                     * NOT inject: there is no breakpoint left to report, and an
+                     * injected #DB for an execution breakpoint would return to
+                     * the same instruction and fault again - a spin, not a
+                     * delivered exception.
+                     */
+                    if ((dbDr6 & 0xFULL) != 0) {
+                        VpData->GuestVmcb.StateSaveArea.Dr6 &= ~0xFULL;
+                        VpData->GuestVmcb.StateSaveArea.Rflags |= 0x10000ULL; /* RF */
+                        VpData->GuestVmcb.ControlArea.VmcbClean = 0;
+                        InterlockedIncrement64(&g_DrStale);
+                    } else {
+                        /*
+                         * No breakpoint of ours is involved, so this #DB is the
+                         * guest's own: its single-step trap (DR6.BS) or a spurious
+                         * exception. Reflect it in the architectural encoding -
+                         * vector 1, type 3 = exception, valid, and NO error code
+                         * because #DB pushes none. The old code swallowed every
+                         * one of these.
+                         */
+                        VpData->GuestVmcb.ControlArea.EventInj =
+                            (1ULL << 31) | (3ULL << 8) | 0x01ULL;
+                        InterlockedIncrement64(&g_DrInjected);
+                    }
                 }
             }
 
@@ -4861,10 +4898,15 @@ tsc_policy_done:;
              * instruction raises it again - which is why this used to be
              * unconditional. But an unconditional clear also eats the guest's own
              * TF: a debugger single-stepping inside the guest would lose the flag
-             * on its first step. Our own paths set TF and set GuestPaOfGhcb with
-             * it, so "we consumed it" and "it was ours" are the same question.
+             * on its first step. Every one of our paths sets TF and sets
+             * GuestPaOfGhcb with it, so dbTfOurs tracks exactly those.
+             *
+             * It is NOT the same question as dbConsumed. A guest single-stepping
+             * itself can trip one of our DATA breakpoints on the same instruction
+             * its TF would have trapped on; consuming our breakpoint must not end
+             * its single-step, so the two flags stay separate.
              */
-            if (dbConsumed)
+            if (dbTfOurs)
                 VpData->GuestVmcb.StateSaveArea.Rflags &= ~0x100ULL; /* clear TF */
             // 9.254: do NOT touch RIP. A TF-induced #DB is a TRAP — the saved
             // RIP already points at the next instruction. APM: NRIP for

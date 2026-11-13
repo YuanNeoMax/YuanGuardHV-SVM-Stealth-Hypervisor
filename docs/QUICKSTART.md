@@ -61,7 +61,7 @@ Get-Content C:\Windows\yghv_progress.log | Select-String "invmrun at unload"
 | 最新编号 | **9.588** |
 | 工作树 | 干净 |
 | 静态检查 | **17 个源级脚本 / 49 条 PASS**（含 **33** 条自检）+ 1 个 map 脚本，两个运行器全绿（9.588 实测）；客户端 **PowerShell 80 / Java 18** 条命令、IOCTL **56** 个 |
-| 构建产物 | `bin/yuanguard_hv.sys` = `5FDEEDB3472B030D`（9.588 构建）|
+| 构建产物 | `bin/yuanguard_hv.sys` = `A8452F9BAECA7AE8`（9.588 构建）|
 | 部署镜像 | `C:\yghv_pa.sys` = `BCC4FECDEA8DCEE5` —— **与当前 `bin` 不同**：9.588 的构建尚未部署，验收要的那一步（`mem-bp dr` 真正命中）还没做 |
 | **最近一次卸载** | `invmrun at unload = 0x0`，无蓝屏（9.513）|
 | **性能（9.575-9.577 实测）** | 默认 **真 guest + 全部 12 个逻辑核**：12 线程 **1.05-1.08×**。旧默认（6 核桩模式）是 1.13-1.34× 且 G25 只有 15/17；现在 G25 **17/17**。可用 `CoreCount` / `RealGuestMode` 覆盖 |

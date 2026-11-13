@@ -4116,7 +4116,7 @@ map 里六个新符号全部落地：`Sv206WriteDr`、`SvDrApplyOnCore`、
 
 ```
 驱动          : STOPPED
-镜像          : bin == 5FDEEDB3472B030D
+镜像          : bin == A8452F9BAECA7AE8
                 部署 C:\yghv_pa.sys 仍是 BCC4FECDEA8DCEE5（9.588 的构建还没部署，两者不再相同）
 默认配置      : 真 guest + 全核（9.577 起），12 线程 1.05-1.08×
 卸载          : 0.06-0.23 s，invmrun at unload = 0x0

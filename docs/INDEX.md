@@ -26,7 +26,7 @@
 
 ```
 驱动          : STOPPED
-镜像          : bin == 5FDEEDB3472B030D
+镜像          : bin == A8452F9BAECA7AE8
                 部署 C:\yghv_pa.sys 仍是 BCC4FECDEA8DCEE5（9.588 的构建还没部署）
 默认配置      : 真 guest + 全核（9.577 起），12 线程 1.05-1.08×
 卸载          : 0.07 s，invmrun at unload = 0x0
