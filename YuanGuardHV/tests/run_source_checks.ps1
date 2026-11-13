@@ -80,7 +80,18 @@ $scripts = @(
     # The name is not a label -- it is the constant some `return` produced.
     'win32_error_names.ps1',
     'win32_error_names_selftest.ps1',
-    'client_undefined_vars.ps1'
+    'client_undefined_vars.ps1',
+    # 9.586: a whitespace-only rewrite of an UNTOUCHED file makes the real change
+    # invisible in review. Measured: hv/svm_simplevm206_x64.asm arrived as a 1301
+    # line diff for a +37 line addition, because the editor converted its 632 LF
+    # lines to CRLF on save -- 669 lines of pure churn. The diff was not wrong, it
+    # was unreadable, and unreadable is what gets approved without being read.
+    # Six of 192 tracked files carried both CRLF and LF inside one file; five were
+    # normalised, and this check is what keeps the sixth from being joined by a seventh.
+    # A file may be all-CRLF or all-LF; mixing the two inside one file may not happen.
+    # Its self-test plants a mixed-EOL file AND a clean one, because a checker that
+    # fails on everything also "catches" the defect.
+    'eol_check.ps1'
 )
 
 # 9.583: COUNT THE PASSES INSTEAD OF LETTING PEOPLE WRITE THE NUMBER DOWN.
@@ -95,24 +106,134 @@ $scripts = @(
 # and compares it against what the documents claim. No human types the number.
 $passCount = 0
 $selfTestCount = 0
+$failures = @()
+
+# 9.586: docs_check must NOT compare the documents against the counts during the LOOP.
+#
+# Two ordering defects compounded here:
+#
+#   a. In-loop, docs_check reads check_stats.txt from the PREVIOUS run -- so the very
+#      run that adds a checker judges the documents against the numbers from before
+#      that checker existed, and passes documents that are already wrong. Measured
+#      twice in a row (9.586): README's script count, then README's PASS count.
+#   b. When a checker fails, its [PASS] lines disappear and the measured total DROPS
+#      (measured: 41 -> 40 with docs_check red). A document then cannot be right for
+#      both a green and a red run: the number it states is changed by its own verdict.
+#
+# The fix is ORDERING, not arithmetic. The count comparison runs once, at the end,
+# against the counts this run measured, and only when everything else is green --
+# so the numbers a document is judged against are the ones a full pass produces.
+# The flag makes docs_check skip just that comparison in the loop; links, records,
+# index rows, archive counts and the image hash are all still checked there.
+#
+# Set per script, NOT once around the loop: docs_check_selftest.ps1 plants a stale
+# count in a throwaway copy and requires docs_check to CATCH it, and a flag inherited
+# from the runner silenced exactly that check -- the self-test then reported the
+# mutation asleep (measured, 9.586). The deferral belongs to the runner's own call,
+# not to every child that happens to run docs_check.
 foreach ($script in $scripts) {
+    if ($script -eq 'docs_check.ps1') { $env:YGHV_DEFER_DOC_COUNTS = '1' }
+    else { $env:YGHV_DEFER_DOC_COUNTS = $null }
     Write-Host "[RUN] $script"
     # A CHILD PROCESS, not `& $script`: every checker reports with Write-Host, which
     # goes to the host and NOT through stream redirection, so `& $s 2>&1` returned
     # an empty string and the first version of this block counted 0 passes for 13
     # scripts that had just printed 29 of them. docs_check.ps1 records the same
     # trap from the other side (its self-test could not read its child's reason).
-    $raw = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot $script) 2>&1
-    $code = $LASTEXITCODE
+    # 9.586: A CHILD THAT WRITES TO STDERR KILLS THIS SCRIPT WHILE $ErrorActionPreference
+    # IS 'Stop'. powershell.exe's own error text ("docs_check: 1 documentation
+    # inconsistency(ies)") arrives through the 2>&1 merge as an ErrorRecord, and under
+    # 'Stop' PowerShell throws on it BEFORE the next statement can read $LASTEXITCODE.
+    # Measured 9.586: the run died with a NativeCommandError at this exact line and
+    # never reached the failure list -- so the exit code was 1, the reason was the
+    # generic 'NativeCommandError', and the FAIL lines the child had printed were the
+    # only evidence of WHAT failed. Every checker that reports a failure on stderr
+    # therefore produced an unreadable suite failure.
+    #
+    # 'Continue' for the duration of the call: the error record is still captured into
+    # $raw (and printed), but it no longer terminates the runner.
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    $raw = @()
+    $code = 0
+    try {
+        $raw = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot $script) 2>&1
+        $code = $LASTEXITCODE
+        if ($null -eq $code) { $code = 0 }
+    }
+    catch {
+        $code = 1
+        $raw = @("$script could not be run: $($_.Exception.Message)")
+    }
+    finally {
+        $ErrorActionPreference = $prevEap
+    }
     $raw | ForEach-Object { Write-Host $_ }
-    if ($code -ne 0) { throw "$script exited $code" }
+    # 9.586: KEEP GOING AFTER A FAILURE, then report them all at the end.
+    #
+    # This used to `throw` on the first non-zero child, which meant the stats file
+    # below was never written -- and docs_check is one of the scripts being counted.
+    # So the ONE check that compares documents against the measured numbers could
+    # not be satisfied by running the suite: a document claiming a stale count made
+    # the run die before the real count reached check_stats.txt, and the only way
+    # forward was to guess the number and edit the document anyway. Measured 9.586:
+    # README said 16 checkers, disk had 17, and fixing it required correcting the
+    # document from a count the runner refused to publish.
+    #
+    # The measurement must land on disk whether or not a checker is unhappy with it.
+    if ($code -ne 0) { $failures += "$script exited $code" }
     $passCount += @($raw | Where-Object { "$_" -match '^\[PASS\]' }).Count
     $selfTestCount += @($raw | Where-Object { "$_" -match '^\[PASS\].*self-test' }).Count
 }
 
+
+$env:YGHV_DEFER_DOC_COUNTS = $null
 $statsPath = Join-Path $PSScriptRoot 'check_stats.txt'
 $line = "scripts=$($scripts.Count) passes=$passCount selftests=$selfTestCount"
 [IO.File]::WriteAllText($statsPath, $line, (New-Object Text.UTF8Encoding($false)))
 Write-Host "check stats: $line  (written to $statsPath)"
+
+# 9.586: RE-RUN docs_check NOW THAT THE NUMBERS EXIST.
+#
+# docs_check compares README/QUICKSTART's "N scripts / M PASS" against this file,
+# and it runs INSIDE the loop above -- i.e. it reads the PREVIOUS run's stats. So
+# adding a checker made the docs stale in a way the same run could never see: the
+# gate compared the documents against 15/39 while measuring 16/41, and reported
+# PASS on documents that were about to be wrong. The suite only failed on the NEXT
+# invocation, one edit later, when the author had already moved on.
+#
+# Measured 9.586: exactly that happened twice in a row (16 checkers vs README's
+# number, then 15/39 vs the new 16/41). A gate that reports on the run before this
+# one is not a gate. This second pass costs one child process and makes the numbers
+# the documents are judged against the numbers this run just produced.
+#
+# Not counted in passCount/selftests -- it is the same script, and adding its
+# output twice would make the stats file describe a suite that does not exist.
+if ($failures.Count -eq 0 -and $scripts -contains 'docs_check.ps1') {
+    Write-Host '[RUN] docs_check.ps1 (second pass: against the counts just measured)'
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    $raw = @()
+    $code = 0
+    try {
+        $raw = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'docs_check.ps1') 2>&1
+        $code = $LASTEXITCODE
+        if ($null -eq $code) { $code = 0 }
+    }
+    catch {
+        $code = 1
+        $raw = @("docs_check.ps1 could not be run: $($_.Exception.Message)")
+    }
+    finally {
+        $ErrorActionPreference = $prevEap
+    }
+    $raw | ForEach-Object { Write-Host $_ }
+    if ($code -ne 0) { $failures += 'docs_check.ps1 exited ' + $code + ' on the second pass (README/QUICKSTART disagree with the counts measured by THIS run)' }
+}
+
+if ($failures.Count -gt 0) {
+    foreach ($f in $failures) { Write-Host "[FAIL] $f" }
+    throw "$($failures.Count) source check(s) failed"
+}
 
 Write-Host 'ALL SOURCE CHECKS PASS'

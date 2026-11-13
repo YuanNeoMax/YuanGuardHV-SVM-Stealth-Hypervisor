@@ -112,8 +112,8 @@ public static class SelfWriteHold
         // Give the harness time to arm the page and switch the guard on. This wait is
         // part of the protocol, not padding: writing before the page is armed measures
         // an unguarded page and would report 100% survived for the wrong reason.
-        Console.WriteLine("holder: waiting 25s for the harness to arm this page...");
-        Thread.Sleep(25000);
+        Console.WriteLine("holder: waiting 60s for the harness to arm this page...");
+        Thread.Sleep(60000);
 
         Console.WriteLine("target va=0x{0:X} pid={1} starting {2} writes every {3}ms",
             p.ToInt64(), pid, iterations, intervalMs);

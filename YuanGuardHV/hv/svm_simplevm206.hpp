@@ -486,7 +486,8 @@ static_assert(sizeof(EVENTINJ) == 8,
 #if defined(SVM_EXIT_NPF) && (SVM_EXIT_NPF != 0x400)
 #error "svm_defs.h SVM_EXIT_NPF disagrees with svm_simplevm206.hpp VMEXIT_NPF"
 #endif
-#if defined(SVM_EXIT_CPUID) && (SVM_EXIT_CPUID != 0x72)
+
+#if defined(SVM_EXIT_CPUID) && (SVM_EXIT_CPUID != 0x72)
 #error "svm_defs.h SVM_EXIT_CPUID disagrees with svm_simplevm206.hpp VMEXIT_CPUID"
 #endif
 

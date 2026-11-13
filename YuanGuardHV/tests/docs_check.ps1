@@ -323,9 +323,30 @@ elseif (-not (Test-Path -LiteralPath $sysPath)) {
     Write-Host "[SKIP] docs: no bin\yuanguard_hv.sys to hash (fresh checkout), image claim unverified"
 }
 else {
-    $realHash = (Get-FileHash -LiteralPath $sysPath -Algorithm SHA256).Hash
     $claimed = $imgClaim.Groups[1].Value.ToUpperInvariant()
-    if (-not $realHash.StartsWith($claimed)) {
+    # Get-FileHash is not available in every PowerShell host (the build script's
+    # child powershell.exe lacked it, measured 9.584). Fall back to .NET's SHA256
+    # so the check runs everywhere; a hash check that crashes is worse than one
+    # that reports SKIP.
+    $realHash = $null
+    try {
+        $realHash = (Get-FileHash -LiteralPath $sysPath -Algorithm SHA256).Hash
+    }
+    catch {
+        try {
+            $sha = [System.Security.Cryptography.SHA256]::Create()
+            $bytes = [IO.File]::ReadAllBytes($sysPath)
+            $realHash = ([BitConverter]::ToString($sha.ComputeHash($bytes)) -replace '-', '')
+        }
+        catch {
+            Write-Host "[SKIP] docs: cannot hash $([IO.Path]::GetFileName($sysPath)) (no Get-FileHash), image claim unverified"
+            $realHash = $null
+        }
+    }
+    if ($null -eq $realHash) {
+        # already reported SKIP above
+    }
+    elseif (-not $realHash.StartsWith($claimed)) {
         $problems.Add("INDEX.md claims image $claimed, the built .sys is $($realHash.Substring(0, $claimed.Length))")
     }
 }
@@ -348,8 +369,18 @@ else {
 # the real document and pass; the mutation was reported "asleep" while the check was
 # in fact reading a file the test never touched (measured, 9.583). A check that
 # cannot be pointed at a fixture is a check nobody can test.
+# 9.586: DEFERRED BY THE RUNNER. run_source_checks.ps1 sets YGHV_DEFER_DOC_COUNTS while
+# it is still measuring, because the counts file it would read here is the PREVIOUS
+# run's -- so the run that adds a checker would judge the documents against numbers
+# from before that checker existed and pass on documents that are already wrong
+# (measured twice in a row, 9.586). The runner clears the flag and re-runs this
+# script once the real counts are on disk; that second pass is where check 8 speaks.
+# Deferring, not skipping: the runner fails the build if it never gets the second pass.
 $statsPath = Join-Path (Split-Path -Parent $docsRoot) 'YuanGuardHV/tests/check_stats.txt'
-if (-not (Test-Path -LiteralPath $statsPath)) {
+if ($env:YGHV_DEFER_DOC_COUNTS) {
+    Write-Host '[SKIP] docs: checker counts deferred to the runner second pass (YGHV_DEFER_DOC_COUNTS)'
+}
+elseif (-not (Test-Path -LiteralPath $statsPath)) {
     Write-Host '[SKIP] docs: no tests/check_stats.txt yet (run run_source_checks.ps1), checker counts unverified'
 }
 else {

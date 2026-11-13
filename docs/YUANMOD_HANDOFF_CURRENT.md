@@ -29,7 +29,7 @@
 
 ---
 
-## 记录索引（9.583 重新测量，69 条）
+## 记录索引（9.586 重新测量，72 条）
 
 > 这是本文档自己的目录。**按标题扫一眼，找到要的那条，再跳过去读。**
 > 行数是该记录占的篇幅，用来判断"值不值得读全文"。
@@ -105,6 +105,9 @@
 | 9.581 P2-3b：`hidden` 计数与 NPT 实际状态的一致性检查 | 75 |
 | 9.582 P1-3：先给同步守卫开一扇门 —— 它此前**不可观测** | 99 |
 | 9.583 文档侧 5 处过期值 + 一个错误码名字写错导致的整轮误判 | 165 |
+| 9.584 P1-3b 与 P1-3c 实测结案：错误码翻译回 return，pid 才是根因 | 15 |
+| 9.585 P1-1 `mem-bp dr` 第三次尝试：instrument 打在了 206-B 不走的层 | 26 |
+| 9.586 行尾门 + 一个「报告上一轮」的假门：本轮卫生全部结案 | 76 |
 
 ---
 
@@ -3743,6 +3746,123 @@ $statsPath = Join-Path $PSScriptRoot 'check_stats.txt'
 于是「脚本数写错」这种情形被静默跳过 —— 判据只检查它本来就同意的那一半。
 现在两个数都查，且文档提到 `run_source_checks` 却给不出可解析的数字也算失败。
 
+#### 9.584 P1-3b 与 P1-3c 实测结案（提交 38b7410）
+
+两件事一起做完了，都是"先能看见，再谈结论"：
+
+**P1-3b**：`protect-page` 对 mmf 页返回 `0x490 Error = 1168 = ERROR_NOT_FOUND`，
+曾被读成"mmf 页不支持"。实测把它翻译回 `return`：`yghv_protect_add_page_for_pid()`
+第一件事是 `find_target_by_pid_locked(pid)`，查不到就直接返回 —— 它根本没走到解析
+VA 那一步。补上 `set-target <pid>` 后，同一页同一 pid 立即 `OK`。**根因是缺 pid，不是 mmf。**
+
+**P1-3c**：守卫能否区分写入来源。`set-target` → `protect-page` → `start` →
+`wpm-write`，`hits` 0→1（外来写被回滚）；目标自写 10/10 存活、`hits` 不变。
+结论：**守卫实际能区分**，但机制未明 —— 代码不检查写入者 CR3，怀疑 COW 或缓存一致性。
+
+`hits` 同时是这条限制本身：轮询只看到"页变了"，看不到"谁改的"。
+
+#### 9.585 P1-1 `mem-bp dr`：第三次尝试仍未通，但这次知道为什么了
+
+9.507 把 DR 模式改成 `REFUSED`，理由是三个部件缺失。9.585 试图一次补齐
+（写 VMCB `Dr7` 的 L0-L3 位、在 #DB 路径调 `yghv_bp_on_dr`、用 `KeIpiGenericCall`
+把 `DRx` 写到所有核）。**实测 hits 仍然恒为 0**，代码最终回滚。
+
+查下去发现 instrument 打在了**错的层**，三条独立证据：
+
+1. `vmexit.c` 新增的 `yghv_bp_on_dr()` 调用在 `svm_dispatch_exit()` 的
+   `case SVM_EXIT_EXCEPTION_DB` 里。而 `svm_dispatch_exit` 只被
+   `svm_core.c`（resident loop）和 `svm_trampoline.S` 调用。
+2. 出货构建是 `YGHV_BAREMETAL_STEP=206 YGHV_206B_COEXIST=1 YGHV_206B_GNPT=1`，
+   `main.c` 明写此模式下 resident/hook 测试序列**必须跳过**，改由 `Sv206Entry`
+   走 `Sv206LaunchVm`；真正处理 VMEXIT 的是 `svm_simplevm206.cpp` 的
+   `case VMEXIT_EXCEPTION_DB`，它没有调 `yghv_bp_on_dr`。
+3. `mem_bp.c` 写的是 `g_vcpus[vi]->vmcb->state.dr7`，而 206 路径用自己的
+   `VpData->GuestVmcb`；`g_vcpus` 在 `svm_simplevm206.cpp` 里 **0 引用**。
+   所以 Dr7 写进了另一套 VMCB。
+
+镜像也印证了这一点：`bin/yuanguard_hv.sys` 里 `yghv_write_dr` 与 `yghv_bp_on_dr`
+的符号计数**都是 0** —— 这次改动连镜像都没进过。
+
+**教训**：判断"这个函数会被调用吗"不能看它被声明在哪里，要看它在**哪条构建路径**
+的上游。206-B 是唯一出货路径，任何不以它为根的调用链都是死代码。
+下次动 P1-1，第一步是先确认 206 的 #DB case 里有没有调用点，而不是先写 Dr7。
+
+#### 9.586 行尾门 + 一个「报告上一轮」的假门（本轮）
+
+同一天里两件互不相干的事，事后看是同一类缺陷：**一个判据只看它本来就同意的那一半。**
+
+##### 一、9.585 的代码从未进过镜像（补最后一层证据）
+
+9.585 已经用调用链证明 instrument 打在错的层上。这一轮补的是镜像层：
+`bin/yuanguard_hv.sys` 里 `yghv_write_dr` 与 `yghv_bp_on_dr` 的符号计数**都是 0**。
+改动连编译产物都没进去过 —— 之前三轮「实测 hits 恒为 0」，测的是一个不含该代码的镜像。
+
+三处改动（`mem_bp.c` / `vmexit.c` / `svm_simplevm206_x64.asm`）已 `git stash`，
+可随时 pop；工作区回到与 HEAD 一致的状态。
+
+##### 二、行尾：+37 行的改动被撑成 1301 行 diff
+
+`hv/svm_simplevm206_x64.asm` 的 `yghv_write_dr` 只加了 37 行，diff 却是 1301 行 ——
+编辑器存盘时把文件里 632 行 LF 全改成了 CRLF，669 行是纯 churn。
+`git diff --ignore-all-space` 一屏能看完真实改动，但**没人会先跑它**。
+
+这是通病不是个例：192 个跟踪文件里，53 个纯 CRLF、138 个纯 LF、**6 个混用**。
+混用才是事故来源。归一了 5 个（`mem_view.c`、`control_plane.h`、`.gitignore` → CRLF；
+`mem_share.c`、`yghv_stealth_check.ps1` → LF），
+剩 `docs/archive/_ARCHIVE_HANDOFF_9.1-9.299.md`（1MB，crlf=11056 lf=6316）——
+历史归档的字节即产物，不归一，进 allow list 并附理由。
+
+新增 `tests/eol_check.ps1`：任何被跟踪文本文件不得同时含 CRLF 与裸 LF，也不得有孤立 CR。
+CRLF 还是 LF 由各文件自决，**文件内部一致**才是判据。首次运行就抓到真缺陷：
+`svm_simplevm206.hpp` offset 22270 / line 489 有一个 `\r` 后面缺 `\n`
+（`#endif\r\n\r#if defined(SVM_EXIT_CPUID)...`），已修。
+
+##### 三、更值钱的那个：`run_source_checks.ps1` 一直在报告上一轮
+
+加检查器时它接连报假 PASS，两次：
+
+1. 新检查器登记后 `docs_check` 说 README 写 16、盘上 17 —— 但这一轮的 `check_stats.txt`
+   还是上一轮的 15，所以**这一轮永远看不见自己造成的不一致**，下一次运行才失败。
+2. 把数字改对、再跑，`docs_check` 在循环里读到的仍是旧的 15/39，于是继续 PASS；
+   而它自己失败时那一条 `[PASS]` 消失，总数从 41 掉到 40 ——
+   **文档无论写哪个数都自相矛盾**：它写的数被它自己的判决改变。
+   实测依次出现 41 → 40 → 26（把它的自检也排除时）。
+
+两处都修了，修的是**顺序**不是算术：
+
+- 循环里先不比对计数（`YGHV_DEFER_DOC_COUNTS`，逐脚本设置，只对运行器自己那一次生效）；
+- 全部跑完后把本轮实测值写入 `check_stats.txt`，再**第二遍**跑 `docs_check` ——
+  文档被比对的数字就是这一轮刚测出来的数字。第二遍不计入 pass 数（同一个脚本，计两次会让
+  统计文件描述一个不存在的套件）；
+- 失败不再 `throw` 立即中断，改为收集后统一报 —— 否则统计文件根本不落盘，
+  而 `docs_check` 正是被统计的一员：想修文档就得先猜一个 runner 拒绝公布的数。
+
+还有一个 PowerShell 陷阱：子进程往 stderr 写东西时，`$ErrorActionPreference='Stop'`
+会在读 `$LASTEXITCODE` 之前就把它当终止错误抛出，运行器以 `NativeCommandError`
+挂掉 —— **失败原因丢失，只剩退出码 1**。改成调用期间临时 `Continue`。
+
+##### 四、两个一直「睡」的变异
+
+`docs_check_selftest.ps1` 的第 4、7 号变异都在改「第一处」匹配的 9.5xx 数字，
+而校验器取的是**最大**值。INDEX 里同时有 9.583 / 9.585 / 9.577，
+handoff 状态块里 9.585 出现两次 —— 改掉第一处，最大值原封不动，
+于是这两个变异长期报 PASS，而它们对应的检查其实一直是醒的。
+改成改掉**该最大值的每一处**后，两个变异才真正落地。
+
+> 一个「什么都抓不到」的自检和一个「其实不用抓」的自检，报告长得一模一样。
+> 这就是为什么 docs_check 的反向对照（代码里的假链接必须不报、真哈希必须通过）不是装饰。
+
+##### 五、现在的数（由运行器写，不靠人抄）
+
+```
+scripts=16  passes=41  selftests=26
+ALL SOURCE CHECKS PASS
+ALL MAP CHECKS PASS
+```
+
+反证做过了：把 README 改回 15/39，同一次运行立刻
+`[FAIL] README.md claims 15 scripts, check_stats.txt says 16` 并以 1 退出。
+
 ## 本次会话结束时状态
 
 > 这一段曾被落在 9.564 而正文已经写到 9.582 —— 同一份文件里两个互相矛盾的状态，
@@ -3751,16 +3871,21 @@ $statsPath = Join-Path $PSScriptRoot 'check_stats.txt'
 
 ```
 驱动          : STOPPED
-镜像          : bin == 部署 = F9A565628E9FE5D7
+镜像          : bin == 部署 = BCC4FECDEA8DCEE5
 默认配置      : 真 guest + 全核（9.577 起），12 线程 1.05-1.08×
 卸载          : 0.06-0.23 s，invmrun at unload = 0x0
 台账          : 8 完成 / 9 不做 / 1 需重启（Tier 6.1）
-静态检查      : 15 脚本 / 39 条 PASS（含 25 条自检）
-文档检查      : docs_check PASS —— 57 md / 32 链接 / 69 记录 / 9 项
-最新编号      : 9.583
+静态检查      : 16 脚本 / 41 条 PASS（含 26 条自检）
+文档检查      : docs_check PASS —— 57 md / 32 链接 / 72 记录 / 9 项
+最新编号      : 9.586
 ```
 
-**下一步的唯一方向是 P0-1（Tier 6.1 启动期验收），它需要重启**；
+**P1-1 的结论变了，但没结案。** 9.585 证明三次失败有一个共同原因：
+instrument 打在 `svm_dispatch_exit` / resident 路径上，而出货镜像跑的是 206-B，
+它有自己的 #DB case、自己的 VMCB，且 `g_vcpus` 在那边 0 引用。
+**下一次动 P1-1 的第一步不是写 Dr7，是先确认 206 的 #DB case 里有调用点。**
+
+**P0-1（Tier 6.1 启动期验收）仍需重启**，是台账上唯一悬空项，不进 0.4.x。
 其余 P1/P2 已在 9.579–9.582 逐条判定，结论是「判据已补齐，但答案仍是不要做」。
 见 `ISSUES.md`。
 

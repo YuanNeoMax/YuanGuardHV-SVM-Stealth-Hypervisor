@@ -134,7 +134,7 @@ YuanGuardHV/
 │   ├── yghv_guard.c          隐藏表完整性（SHA-256）
 │   ├── yghv_sentry.c         攻击面清单与 escape 记录
 │   └── common/               头文件（33 个）
-├── tests/                    构建期检查器（16 个脚本 + 2 个运行器）
+├── tests/                    构建期检查器（17 个脚本 + 2 个运行器）
 ├── tools/
 │   ├── yghv_ctl.ps1          PowerShell 客户端（80 条命令）
 │   └── yghv_client/          Java 客户端（18 条命令）
@@ -256,7 +256,7 @@ build.bat
 
 流程（`build.bat`）：
 
-1. 先运行 `tests\run_source_checks.ps1`（**15 个脚本 / 39 条 PASS**，含 25 条自检），失败即中止；
+1. 先运行 `tests\run_source_checks.ps1`（**16 个脚本 / 41 条 PASS**，含 26 条自检），失败即中止；
 2. clang-cl 编译 `hv\*.c` / `hv\*.cpp` + `svm_trampoline.S`；
 3. MSVC link 链接为 `bin\yuanguard_hv.sys`，**同时产出 `bin\yuanguard_hv.map`**；
 4. 运行 `tests\run_map_checks.ps1`（页布局检查，必须链接后跑）；
@@ -358,7 +358,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File $ctl mem-read <pid> <hex_va>
 
 ## 测试
 
-### 构建期检查器（`tests\`，16 个脚本 + 2 个运行器）
+### 构建期检查器（`tests\`，17 个脚本 + 2 个运行器）
 
 | 脚本 | 检查什么 |
 |---|---|
@@ -375,6 +375,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File $ctl mem-read <pid> <hex_va>
 | **`stub_stack_contract.ps1`** | **`Sv206GuestStub` 体内禁 push/pop/call/ret/lea rsp/[rsp]**，且必须仍有 `vmmcall` |
 | **`docs_check.ps1`** | **文档门**：相对链接、索引行数、空记录、最新编号、归档份数、状态块自洽、镜像哈希、检查器数量、目录树份数 |
 | **`win32_error_names.ps1`** | **错误码名门**：文档里「数字 + `ERROR_*`」的配对必须与 OS 表一致（`[HIST]` 引用除外）|
+| **`eol_check.ps1`** | **行尾门**：同一文件不许混用 CRLF 与裸 LF，也不许有孤立 CR（混排会把 +37 行的真实改动撑成 1301 行 diff）|
 | `page_layout_check.ps1` | 隐藏表不与 guard 状态共页、岛内读区域页对齐（链接后跑）|
 
 > **每个检查器都必须能失败。** 三个曾报假 PASS（正则够不到目标文本）。

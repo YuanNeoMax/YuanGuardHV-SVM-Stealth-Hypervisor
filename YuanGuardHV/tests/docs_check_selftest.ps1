@@ -156,12 +156,19 @@ try {
 
     # 4. wrong latest number in INDEX
     $t = ReadText $indexPath
-    $newest = [regex]::Match($t, '9\.5[6-9][0-9]')
-    if (-not $newest.Success) { throw 'selftest: cannot locate a 9.5xx number in INDEX.md to mutate' }
-    # Every occurrence: replacing only the first would leave the real number
-    # somewhere else in the file, and the checker takes the MAXIMUM it finds --
-    # so a single-site mutation would prove nothing.
-    $t2 = $t -replace [regex]::Escape($newest.Value), '9.500'
+    # THE MAXIMUM, not the first match. The checker compares the HIGHEST number it
+    # can find in INDEX against the highest record heading, so a mutation has to
+    # remove every occurrence of that maximum -- replacing some other 9.5xx number
+    # leaves the real claim standing and the check reports "asleep" while being
+    # perfectly awake. Measured 9.586: the earlier version took the FIRST match
+    # (9.583, a changelog line) and INDEX meanwhile carried 9.585 in two places, so
+    # the mutation never touched the number under test.
+    $idxNums = @([regex]::Matches($t, '9\.5[0-9]{2}') | ForEach-Object { $_.Value })
+    if ($idxNums.Count -eq 0) { throw 'selftest: cannot locate a 9.5xx number in INDEX.md to mutate' }
+    $newest = ($idxNums | Sort-Object { [double]$_.Substring(2) })[-1]
+    $idxStale = '9.' + ([double]$newest.Substring(2) - 1)
+    # String.Replace (not -replace) replaces EVERY occurrence, which is the point.
+    $t2 = $t.Replace($newest, $idxStale)
     WriteText $indexPath $t2
     Assert-Caught 'stale latest number' 'highest number' (Invoke-Check)
     Reset-Copy
@@ -256,7 +263,13 @@ try {
         if (-not $n -or [double]$m.Value.Substring(2) -gt [double]$n.Value.Substring(2)) { $n = $m }
     }
     if (-not $n) { throw 'selftest: the final section carries no 9.xxx number' }
-    $newBlock = $blockText.Substring(0, $n.Index) + $stale + $blockText.Substring($n.Index + $n.Length)
+    # EVERY occurrence of the maximum, for the same reason as mutation 4: the block
+    # may legitimately name the current record more than once, and one surviving
+    # copy keeps blockMax at the true value so the check looks asleep while working.
+    # Measured 9.586: the block named 9.585 twice ("record count" and "latest
+    # number"), the single-site replacement left the second one, and this mutation
+    # had been reporting PASS on a working check.
+    $newBlock = $blockText.Replace($n.Value, $stale)
     $t2 = $t.Substring(0, $block.Index) + $newBlock
     WriteText $handoffPath $t2
     Assert-Caught 'stale status block' 'status block' (Invoke-Check)
@@ -280,7 +293,14 @@ try {
     New-Item -ItemType Directory -Path $binDir -Force | Out-Null
     $fakeSys = Join-Path $binDir 'yuanguard_hv.sys'
     [IO.File]::WriteAllBytes($fakeSys, [byte[]](1..64))
-    $realHash = (Get-FileHash -LiteralPath $fakeSys -Algorithm SHA256).Hash
+    # Same Get-FileHash fallback as docs_check.ps1 (measured 9.584: the build
+    # script's child powershell.exe lacked the cmdlet).
+    $realHash = $null
+    try { $realHash = (Get-FileHash -LiteralPath $fakeSys -Algorithm SHA256).Hash }
+    catch {
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        $realHash = ([BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadAllBytes($fakeSys))) -replace '-', '')
+    }
 
     $t = ReadText $indexPath
     $claim = [regex]::Match($t, '(?m)^.*bin ==.*?([0-9A-Fa-f]{8,64})\s*$')
