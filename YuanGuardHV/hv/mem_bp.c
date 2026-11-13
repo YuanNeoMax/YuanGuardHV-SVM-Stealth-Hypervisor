@@ -28,6 +28,26 @@ extern npt_mgr_t g_npt;
 extern int yghv_guard_is_hidden(uint64_t gpa);
 
 /*
+ * 9.588 (P1-1): the hardware half of DR mode lives in svm_simplevm206.cpp.
+ *
+ * DR mode needs three things this file cannot do on its own: a writer for the
+ * per-core VMCB Dr7 L0-L3 bits, a writer for the PHYSICAL DR0-DR3 (SVM keeps no
+ * Dr0-DR3 in the VMCB, so the addresses can only live in the registers), and a
+ * #DB path that recognises the B0-B3 bits. All three are in the 206-B unit,
+ * the only translation unit that can walk the cores.
+ *
+ * Compiled out of every non-206 build, exactly like the other yghv_s206_*
+ * symbols in protect.c and control_device.c: without the guard the default
+ * build fails to link (LNK2019) instead of silently arming nothing.
+ */
+#if defined(YGHV_BAREMETAL_STEP) && (YGHV_BAREMETAL_STEP == 206)
+extern int yghv_s206_dr7_apply_all(void);
+#define YGHV_BP_DR_HW() yghv_s206_dr7_apply_all()
+#else
+#define YGHV_BP_DR_HW() (0)
+#endif
+
+/*
  * 9.344: put this table on a page of its OWN.
  *
  * THIS IS THE THIRD TIME the same mistake appeared, and the fix is structural
@@ -311,9 +331,13 @@ static volatile LONG64 g_bp_fail_drslot;
 static volatile LONG64 g_bp_fail_patch;
 static volatile LONG64 g_bp_shadow_switches;   /* 9.373: leaf flips done */
 
-/* Virtual DR bank (9.327). The guest's DR0-DR3 accesses are intercepted, so
- * these values are what the target sees; the real DRs are ours. COLD: only the
- * DR0-DR3 intercept handlers and IOCTL read these. */
+/* Virtual DR bank (9.327; premise corrected 9.588). The original note claimed
+ * the guest's DR0-DR3 accesses were intercepted, so the target saw this bank.
+ * That was never true: InterceptDrRead/InterceptDrWrite have no writer and no
+ * VMEXIT_DR* case exists anywhere in this tree. The bank is now what the
+ * HARDWARE is programmed with - g_dr_shadow[s] goes into a physical DRn and the
+ * Ln/RW/LEN bits for it go into every core's VMCB Dr7. See
+ * yghv_bp_dr_snapshot below; g_dr_used says which slots are live. COLD. */
 static uint64_t g_dr_shadow[YGHV_BP_DR_SLOTS];
 static volatile LONG g_dr_used;
 
@@ -409,6 +433,87 @@ int yghv_bp_is_armed(uint64_t gpa) {
     return yghv_bp_find(gpa, 0) >= 0 ? 1 : 0;
 }
 
+/*
+ * 9.588 (P1-1): compute the Dr7 value and the four addresses the hardware must
+ * be programmed with, from the live table.
+ *
+ * The only caller is the per-core walk in svm_simplevm206.cpp. The table is read
+ * here rather than there so g_bp stays private to this file.
+ *
+ * ENCODING, and why each choice is the conservative one:
+ *
+ *   bit 10         always 1. Architecturally reserved, reads back as 1.
+ *   bit 8 (LE)     set when any DATA breakpoint is armed; without LE the data
+ *                  comparison is not exact.
+ *   Ln    (2n)     local enable, set when slot n is in use. G (2n+1) stays 0 -
+ *                  a global enable would survive into a host-side task switch.
+ *   R/Wn  (16+4n)  00 execute, 01 write, 11 read-or-write. 10 means r/w in I/O
+ *                  space and is not usable for a linear address.
+ *   LENn  (18+4n)  always 00 = one byte.
+ *
+ * LEN is the decision worth spelling out. A data breakpoint compares correctly
+ * only when the address is aligned to its length, and the caller hands us a byte
+ * address inside an arbitrary instruction or structure - so any length above one
+ * is a coin flip on alignment, and a misaligned DR7 write is architecturally
+ * UNPREDICTABLE, not merely wrong. One byte is legal at every address, and any
+ * store whose range covers that byte still fires, so a target writing a 4-byte
+ * field trips it - which is the whole point of mem-bp dr <va> w.
+ *
+ * Returns the number of slots armed (0 = nothing armed; Dr7 is then the bare
+ * 0x400 baseline).
+ */
+int yghv_bp_dr_snapshot(uint64_t *dr7_out, uint64_t *addr_out) {
+    uint64_t dr7 = 0x400;
+    uint32_t used;
+    int s, i, n = 0, data = 0;
+
+    if (!dr7_out || !addr_out)
+        return 0;
+
+    used = (uint32_t)InterlockedCompareExchange(&g_dr_used, 0, 0);
+
+    for (s = 0; s < YGHV_BP_DR_SLOTS; s++) {
+        uint32_t kinds = 0;
+
+        addr_out[s] = 0;
+        if (!(used & (1u << s)))
+            continue;
+
+        addr_out[s] = g_dr_shadow[s];
+
+        /* The kind lives on the entry, not the slot. Find it the way every
+         * other DR lookup does: scan the table and judge each slot by its own
+         * active flag (9.485 - g_bp_count is a census, not an extent). */
+        for (i = 0; i < YGHV_BP_MAX; i++) {
+            if (InterlockedCompareExchange(&g_bp[i].active, 0, 0) &&
+                g_bp[i].mode == YGHV_BP_MODE_DR &&
+                g_bp[i].dr_slot == (uint32_t)s) {
+                kinds = g_bp[i].kinds;
+                break;
+            }
+        }
+
+        dr7 |= (1ULL << (s * 2));               /* Ln */
+
+        if (kinds & YGHV_BP_EXEC) {
+            /* R/W=00: instruction execution. LEN is ignored for this kind. */
+        } else if (kinds & YGHV_BP_READ) {
+            dr7 |= (3ULL << (16 + s * 4));      /* R/W=11: read or write */
+            data = 1;
+        } else {
+            dr7 |= (1ULL << (16 + s * 4));      /* R/W=01: write only */
+            data = 1;
+        }
+        n++;
+    }
+
+    if (data)
+        dr7 |= 0x100;                           /* LE */
+
+    *dr7_out = dr7;
+    return n;
+}
+
 int yghv_bp_dr_slot_for_va(uint64_t va) {
     int i;
     /*
@@ -440,6 +545,38 @@ int yghv_bp_dr_slot_for_va(uint64_t va) {
             return (int)g_bp[i].dr_slot;
     }
     return -1;
+}
+
+/*
+ * 9.588: what the #DB handler needs to know about the breakpoint that fired.
+ *
+ * yghv_bp_on_dr returns a TABLE INDEX, not a slot number, and the handler needs
+ * both: the slot to clear the matching DR6 bit, the kinds to decide whether the
+ * breakpoint faulted (execution, needs RF) or trapped (data, done). Neither is
+ * derivable from DR6 alone - DR7's R/W field would say "exec" for a slot set to
+ * 00, but 00 is also what an unused slot reads as, so it cannot distinguish
+ * "unarmed" from "execution".
+ */
+int yghv_bp_dr_slot_at(int idx) {
+    if (idx < 0 || idx >= YGHV_BP_MAX)
+        return -1;
+    if (!InterlockedCompareExchange(&g_bp[idx].active, 0, 0))
+        return -1;
+    if (g_bp[idx].mode != YGHV_BP_MODE_DR)
+        return -1;
+    if (g_bp[idx].dr_slot >= YGHV_BP_DR_SLOTS)
+        return -1;
+    return (int)g_bp[idx].dr_slot;
+}
+
+uint32_t yghv_bp_dr_kinds_at(int idx) {
+    if (idx < 0 || idx >= YGHV_BP_MAX)
+        return 0;
+    if (!InterlockedCompareExchange(&g_bp[idx].active, 0, 0))
+        return 0;
+    if (g_bp[idx].mode != YGHV_BP_MODE_DR)
+        return 0;
+    return g_bp[idx].kinds;
 }
 
 uint64_t yghv_bp_dr_get(int slot) {
@@ -669,8 +806,9 @@ int yghv_bp_add_ex(uint64_t gpa, uint64_t va, uint64_t rip,
             return -9;
         }
         /* Remember the byte BEFORE patching, so a failure here cannot leave
-         * an instruction we cannot restore. */
-        g_dr_shadow[0] = g_dr_shadow[0];    /* no-op, keeps the compiler quiet */
+         * an instruction we cannot restore. (9.588: the no-op self-assignment
+         * that used to sit here was there to keep g_dr_shadow referenced; it is
+         * now genuinely used by the DR path, so it is gone.) */
 
         for (i = 0; i < YGHV_BP_MAX; i++) {
             if (InterlockedCompareExchange(&g_bp[i].active, 0, 0))
@@ -753,51 +891,69 @@ int yghv_bp_add_ex(uint64_t gpa, uint64_t va, uint64_t rip,
         return -5;
     }
 
-    /* ---- DR mode: REFUSED (9.507) ------------------------------------------
+    /* ---- DR mode: real, as of 9.588 (P1-1) -------------------------------
      *
-     * 9.506 measured that this mode cannot work, from three independent
-     * readings:
+     * WHAT THIS USED TO BE. 9.507 refused every DR request with -12 because
+     * 9.506 had measured three independent breaks: no writer for the VMCB Dr7
+     * L0-L3 bits, no call to yghv_bp_on_dr from the #DB case, and therefore no
+     * recorded hit. "mem-bp dr <va> w" printed "dr OK", diagnostics printed
+     * dr=3, the target really wrote that page every 400 ms, and hits never
+     * moved - which reads like "the target did not touch the page" and sends you
+     * looking for the wrong cause.
      *
-     *   1. Arming only filled g_dr_shadow below - a kernel array. The VMCB
-     *      field StateSaveArea.Dr7 has NO WRITER anywhere in this tree, so the
-     *      L0-L3 enable bits are never set and the hardware never raises a
-     *      B0-B3 #DB for the armed address.
-     *   2. Even if it did, case VMEXIT_EXCEPTION_DB never calls
-     *      yghv_bp_on_dr (0 references in that case body; dumpbin counts 0
-     *      calls to its address in the built image). The guest DR6 is read
-     *      there only for telemetry, into g_S206DbgLog.
-     *   3. Consequently a DR entry could never record a hit.
+     * WHAT CHANGED. All three breaks are closed, and each is named here so a
+     * later reader can check it rather than trust it:
      *
-     * MEASURED CONSEQUENCE of leaving it as it was: `mem-bp dr <va> w` printed
-     * `dr OK`, the diagnostics printed `dr=3`, the target really wrote that
-     * page every 400 ms, and hits never moved. The natural reading of that is
-     * "the target did not touch the page" - which sends you looking for the
-     * wrong cause. A mechanism that cannot work must say so.
+     *   (a) yghv_bp_dr_snapshot() above now computes Dr7, and
+     *       yghv_s206_dr7_apply_all() walks every core from PASSIVE and writes
+     *       it into that core's GuestVmcb.StateSaveArea.Dr7, plus the addresses
+     *       into the physical DR0-DR3. VMRUN reloads DR from the VMCB, so one
+     *       write per core is enough and it persists across exits.
+     *   (b) the #DB case in svm_simplevm206.cpp now tests DR6's B0-B3 bits and
+     *       calls yghv_bp_on_dr. The old objection - "9.413/9.414/9.416 proved
+     *       that adding a call inside a VM-exit frame faults (0x139 / 0x7F)" -
+     *       does not apply: 9.419 established all three were inside the VMRUN
+     *       LOOP body, while the #DB case has always called four C functions, so
+     *       that shape is already proven there.
+     *   (c) consistency across 12 cores is what the walk provides; a partial walk
+     *       fails the arm rather than leaving half the cores armed.
      *
-     * What would make it real: (a) a writer for VMCB Dr7's L0-L3 bits, (b) a
-     * call to yghv_bp_on_dr from the #DB case - and 9.413/9.414/9.416 each
-     * proved that adding a call inside a VM-exit frame faults (0x139 / 0x7F) -
-     * and (c) shadow-versus-real DR consistency across 12 cores. That is a
-     * round of work, not a patch. Until then, refusing is the honest answer.
+     * ORDER, and why it is this order. The slot is claimed and re-read BEFORE the
+     * hardware is touched (the 9.359 discipline from the NPF branch): if the claim
+     * did not land, programming the registers would leave a live breakpoint with
+     * no entry to report it. On the other side, a failed hardware programming
+     * rolls the slot back, because a slot that records hits nobody armed is the
+     * mirror image of the same defect.
+     *
+     * THE VA IS THE KEY. "mem-bp dr" passes gpa=0 - the CLI sends the VA in the
+     * va field and leaves the GPA zero (yghv_ctl.ps1, 9.530: NPF/INT3 take a GPA
+     * because they act on the page the CPU translates; DR takes a VA because that
+     * is what the hardware compares against). So "page" is 0 here and must not be
+     * used as a validity test; the VA is the only key.
      */
     if (mode == YGHV_BP_MODE_DR) {
-        InterlockedIncrement64(&g_bp_fail_drslot);
-        InterlockedIncrement64(&g_bp_refusals);
-        return -12;                     /* refused: mechanism not functional */
-    }
-
-    /* ---- DR mode body, deliberately UNREACHABLE (refused above).
-     * Kept so the design intent - four hardware slots, a shadow bank - stays
-     * readable, and so a future re-implementation starts from what was built
-     * rather than from nothing.
-     */
-    if (0 && mode == YGHV_BP_MODE_DR) {
         uint32_t s;
-        uint32_t used = (uint32_t)InterlockedCompareExchange(&g_dr_used, 0, 0);
+        uint32_t used;
+        uint64_t dr7 = 0;
+        uint64_t addr[YGHV_BP_DR_SLOTS];
+
+        if (!va) {
+            InterlockedIncrement64(&g_bp_fail_va);
+            return -7;
+        }
 
         if (yghv_bp_dr_slot_for_va(va) >= 0)
             return 1;                   /* idempotent */
 
+        /* 9.355: register nothing while the registry page itself is hidden -
+         * writes would land in the decoy and be discarded. Same refusal, same
+         * counter, as the NPF branch. */
+        if (yghv_guard_is_hidden(MmGetPhysicalAddress(&g_bp[0]).QuadPart)) {
+            InterlockedIncrement64(&g_bp_fail_table);
+            return -11;
+        }
+
+        used = (uint32_t)InterlockedCompareExchange(&g_dr_used, 0, 0);
         for (s = 0; s < YGHV_BP_DR_SLOTS; s++) {
             if (!(used & (1u << s)))
                 break;
@@ -808,9 +964,12 @@ int yghv_bp_add_ex(uint64_t gpa, uint64_t va, uint64_t rip,
         }
 
         for (i = 0; i < YGHV_BP_MAX; i++) {
+            int claimed = i;
+
             if (InterlockedCompareExchange(&g_bp[i].active, 0, 0))
                 continue;
-            g_bp[i].gpa = page;
+
+            g_bp[i].gpa = va & ~(uint64_t)0xFFFULL;
             g_bp[i].va = va;
             g_bp[i].rip = va;
             g_bp[i].kinds = kinds;
@@ -819,11 +978,36 @@ int yghv_bp_add_ex(uint64_t gpa, uint64_t va, uint64_t rip,
             g_bp[i].dr_slot = s;
             g_bp[i].hits = 0;
             InterlockedExchange(&g_bp[i].active, 1);
-            InterlockedIncrement(&g_bp_count);
+
+            /* 9.359: read back. A registry page mapped elsewhere, or a reordered
+             * store, shows up here - not as a breakpoint that silently never
+             * fires. */
+            if (InterlockedCompareExchange(&g_bp[claimed].active, 0, 0) != 1 ||
+                g_bp[claimed].va != va) {
+                InterlockedExchange(&g_bp[claimed].active, 0);
+                RtlZeroMemory(&g_bp[claimed], sizeof(g_bp[claimed]));
+                InterlockedIncrement64(&g_bp_fail_table);
+                return -11;
+            }
+
             InterlockedOr(&g_dr_used, (LONG)(1u << s));
             g_dr_shadow[s] = va;
+
+            /* The entry is visible now, so recompute from the table and hand the
+             * result to every core. */
+            if (yghv_bp_dr_snapshot(&dr7, addr) <= 0 || YGHV_BP_DR_HW() <= 0) {
+                g_dr_shadow[s] = 0;
+                InterlockedAnd(&g_dr_used, (LONG)~(1u << s));
+                InterlockedExchange(&g_bp[claimed].active, 0);
+                RtlZeroMemory(&g_bp[claimed], sizeof(g_bp[claimed]));
+                InterlockedIncrement64(&g_bp_fail_drslot);
+                return -13;
+            }
+
+            InterlockedIncrement(&g_bp_count);
             return 1;
         }
+
         InterlockedIncrement64(&g_bp_fail_table);
         return -5;
     }
@@ -839,6 +1023,7 @@ int yghv_bp_remove(uint64_t gpa, uint64_t rip) {
     uint64_t page = gpa & ~(uint64_t)0xFFFULL;
     int slot = yghv_bp_find(page, rip);
     int i;
+    int dr_reprogram = 0;   /* 9.588: a DR slot was released, the cores need it */
 
     if (slot < 0) {
         /* Also try INT3, whose key is the VA not the page. */
@@ -906,16 +1091,29 @@ int yghv_bp_remove(uint64_t gpa, uint64_t rip) {
             g_dr_shadow[s] = 0;
             InterlockedAnd(&g_dr_used, (LONG)~(1u << s));
         }
+        dr_reprogram = 1;
     }
 
     InterlockedExchange(&g_bp[slot].active, 0);
     InterlockedDecrement(&g_bp_count);
     RtlZeroMemory(&g_bp[slot], sizeof(g_bp[slot]));
+
+    /*
+     * 9.588: the DR slot is gone, so the cores must be told. The snapshot is
+     * recomputed from the table, which makes this a plain re-program rather than
+     * an undo - the same call disarms the last slot and re-arms the rest. Without
+     * it the hardware keeps a breakpoint whose entry no longer exists: it fires,
+     * yghv_bp_on_dr finds nothing, and the guest loses the #DB.
+     */
+    if (dr_reprogram)
+        (void)YGHV_BP_DR_HW();
+
     return 1;
 }
 
 int yghv_bp_clear_mode(uint32_t mode) {
     int i, n = 0;
+    int dr_released = 0;    /* 9.588: at least one DR slot was freed */
 
     if (KeAreAllApcsDisabled())
         return 0;
@@ -954,6 +1152,7 @@ int yghv_bp_clear_mode(uint32_t mode) {
                 g_dr_shadow[s] = 0;
                 InterlockedAnd(&g_dr_used, (LONG)~(1u << s));
             }
+            dr_released = 1;
         }
 
         InterlockedExchange(&g_bp[i].active, 0);
@@ -961,6 +1160,13 @@ int yghv_bp_clear_mode(uint32_t mode) {
         RtlZeroMemory(&g_bp[i], sizeof(g_bp[i]));
         n++;
     }
+
+    /* 9.588: same reason as in remove - once a DR slot is free the cores have
+     * to learn about it, or the hardware keeps firing for an entry that is
+     * gone. One re-program at the end of the sweep covers every slot it freed. */
+    if (dr_released)
+        (void)YGHV_BP_DR_HW();
+
     return n;
 }
 /* ---------- fault handlers ---------- */

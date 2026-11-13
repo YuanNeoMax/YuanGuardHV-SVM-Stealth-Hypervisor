@@ -35,6 +35,18 @@ extern "C" void Sv206GuestStub(VOID);
 extern "C" void Sv206LeaveToHost(VOID);
 
 /*
+ * 9.588 (P1-1): write one physical debug-address register.
+ *
+ *   Sv206WriteDr(UINT32 slot, UINT64 value)   slot 0..3 -> DR0..DR3
+ *
+ * Defined in svm_simplevm206_x64.asm because MSVC has no __writedrN intrinsic
+ * and x64 has no inline asm. SVM keeps Dr7/Dr6 in the VMCB but keeps NO Dr0-Dr3
+ * there, so the breakpoint ADDRESSES have to live in the real registers; only
+ * the enable/kind bits can travel in the VMCB.
+ */
+extern "C" void Sv206WriteDr(UINT32 slot, UINT64 value);
+
+/*
  * 9.443: per-core VMRUN threads.
  *
  * Each core gets its own system thread (see Sv206CoreThread). These hold the thread
@@ -185,6 +197,12 @@ extern int yghv_bp_int3_orig(UINT64 va, UINT8 *out);
 extern int yghv_bp_shadow_switch(UINT64 gpa, int to_shadow);
 /* Tier 4.4 (9.327, DR mode): which breakpoint fired, per DR6. */
 extern int yghv_bp_on_dr(UINT64 dr6, UINT64 rip, UINT32 cpl, UINT64 cr3);
+/* 9.588: the DR7 + addresses mem_bp wants programmed (see mem_bp.c). */
+extern int yghv_bp_dr_snapshot(uint64_t *dr7_out, uint64_t *addr_out);
+/* 9.588: kinds owning a DR slot, so the #DB handler can tell an execution
+ * breakpoint (fault, needs RF) from a data one (trap, consuming is enough). */
+extern int yghv_bp_dr_slot_at(int idx);
+extern uint32_t yghv_bp_dr_kinds_at(int idx);
 /* Physical write, used to restore/patch the instruction byte. */
 extern int yghv_pa_write(UINT64 pa, const void *src, size_t len);
 /* 9.571: physical reads for the forced-devirtualization walk (mem_pa.h). */
@@ -918,6 +936,26 @@ static volatile LONG   g_TscInterceptArmed = 0;      /* is the intercept bit set
  * switch keeps the default boot path identical to what the 13/13 suite verified.
  */
 static volatile LONG   g_BpInt3Intercept = 0;
+
+/* 9.588 (P1-1): DR-mode breakpoints.
+ *
+ * Two populations are counted, because they answer different questions. The
+ * apply counters say whether the per-core walk reached every core - a partial
+ * walk leaves some cores armed and others not, which is both a correctness
+ * problem and a detection signal. The hit counters say whether the mechanism
+ * fires once armed, which is exactly the number 9.506 measured as permanently
+ * zero for as long as DR mode existed. */
+static volatile LONG64 g_DrApplyHits = 0;      /* cores the walk programmed */
+static volatile LONG64 g_DrApplyMisses = 0;    /* cores that could not be resolved */
+static volatile LONG64 g_DrApplyFailures = 0;  /* walk failed entirely */
+/* Kinds, mirroring mem_bp.h's YGHV_BP_* - this is a vendored translation unit
+ * that re-declares what it needs rather than including our headers (see the
+ * note above the protect.c prototypes), so the one value used here is spelled
+ * out. 0x4 is YGHV_BP_EXEC. */
+#define S206_BP_KIND_EXEC 0x4u
+
+static volatile LONG64 g_DrHits = 0;           /* #DB consumed for a DR breakpoint */
+static volatile LONG64 g_DrInjected = 0;       /* #DB handed to the guest */
 
 /*
  * 9.396: A STOP FLAG THE VMRUN LOOP CAN ACTUALLY SEE.
@@ -4664,6 +4702,11 @@ tsc_policy_done:;
                 }
             }
             VpData->GuestVmcb.ControlArea.TlbControl = 1;
+            /* 9.588: set when this #DB was one WE caused and have now handled.
+             * GuestPaOfGhcb is our TF marker, so it also settles "is this #DB
+             * ours?" - every site that sets TF sets that field with it
+             * (4045, 4103, 4165, 4238, 4324, 4652 before this change). */
+            int dbConsumed = 0;
             if (VpData->GuestVmcb.ControlArea.GuestPaOfGhcb != 0) {
                 UINT64 slot = VpData->GuestVmcb.ControlArea.GuestPaOfGhcb;
                 /* 9.275: bit0 set = fake-write shadow (C6) — restore the
@@ -4740,8 +4783,89 @@ tsc_policy_done:;
                         yghv_bp_rearm_bare(slot & ~1ULL);
                 }
                 VpData->GuestVmcb.ControlArea.GuestPaOfGhcb = 0;
+                dbConsumed = 1;
             }
-            VpData->GuestVmcb.StateSaveArea.Rflags &= ~0x100ULL; /* clear TF */
+
+            /*
+             * 9.588 (P1-1): DR-mode breakpoints, and the #DB that is not ours.
+             *
+             * WHAT WAS WRONG BEFORE. This case consumed EVERY #DB: it cleared TF
+             * and resumed. A guest that single-stepped itself, or that used its
+             * own DR0-DR3, never saw a debug exception. And DR-mode breakpoints
+             * could not work at all, because nothing ever programmed Dr7 - see
+             * the long note in mem_bp.c (9.506/9.507, closed here).
+             *
+             * THE TEST IS DR6, AND THE BITS ARE OURS TO CLEAR. The processor sets
+             * bit n of DR6 for a breakpoint that hit in DRn and leaves it set;
+             * clearing is the handler's job. We clear it for the slots we own,
+             * because the guest never sees this exception - leaving the bit set
+             * would make the guest's next real #DB blame the wrong register.
+             *
+             * EXECUTION BREAKPOINT vs DATA BREAKPOINT. An instruction breakpoint
+             * raises #DB as a FAULT: the saved RIP still points AT the
+             * instruction, so resuming without RF faults again forever. RF
+             * suppresses breakpoint checking for exactly one instruction and the
+             * processor clears it itself. A data breakpoint raises #DB as a TRAP:
+             * the store already happened, RIP has moved on, and consuming it is
+             * the whole job.
+             *
+             * EVERYTHING ELSE BELONGS TO THE GUEST. If our TF marker is clear and
+             * no slot of ours fired, this #DB is the guest's own (its DRs, or its
+             * TF) and is reflected in the architectural encoding: vector 1, type
+             * 3 = exception, valid, and NO error code because #DB pushes none.
+             * The old code never reflected it at all.
+             */
+            {
+                UINT64 dbDr6 = VpData->GuestVmcb.StateSaveArea.Dr6;
+                int dbIdx;
+
+                if (!dbConsumed && (dbDr6 & 0xFULL) != 0) {
+                    dbIdx = yghv_bp_on_dr(dbDr6,
+                                          VpData->GuestVmcb.StateSaveArea.Rip,
+                                          (UINT32)VpData->GuestVmcb.StateSaveArea.Cpl,
+                                          VpData->HostStackLayout.Padding1);
+                } else {
+                    dbIdx = -1;
+                }
+
+                if (dbIdx >= 0) {
+                    int dbSlot = yghv_bp_dr_slot_at(dbIdx);
+                    UINT32 dbKinds = yghv_bp_dr_kinds_at(dbIdx);
+
+                    dbConsumed = 1;
+                    InterlockedIncrement64(&g_DrHits);
+
+                    if (dbSlot >= 0) {
+                        /* DR6 puts B0-B3 in bits 0-3, one bit per register - NOT
+                         * at 2*n like DR7's enable bits. Clear only OUR bit: the
+                         * others may belong to the guest. */
+                        VpData->GuestVmcb.StateSaveArea.Dr6 &= ~(1ULL << dbSlot);
+                        /* execution breakpoints faulted - one free instruction */
+                        if (dbKinds & S206_BP_KIND_EXEC)
+                            VpData->GuestVmcb.StateSaveArea.Rflags |= 0x10000ULL; /* RF */
+                    }
+                    VpData->GuestVmcb.ControlArea.VmcbClean = 0;
+                }
+
+                if (!dbConsumed) {
+                    VpData->GuestVmcb.ControlArea.EventInj =
+                        (1ULL << 31) | (3ULL << 8) | 0x01ULL;   /* #DB, no error code */
+                    InterlockedIncrement64(&g_DrInjected);
+                }
+            }
+
+            /*
+             * 9.588: clear TF ONLY when we consumed this #DB ourselves.
+             *
+             * TF raises #DB as a trap, so if we leave TF set the very next
+             * instruction raises it again - which is why this used to be
+             * unconditional. But an unconditional clear also eats the guest's own
+             * TF: a debugger single-stepping inside the guest would lose the flag
+             * on its first step. Our own paths set TF and set GuestPaOfGhcb with
+             * it, so "we consumed it" and "it was ours" are the same question.
+             */
+            if (dbConsumed)
+                VpData->GuestVmcb.StateSaveArea.Rflags &= ~0x100ULL; /* clear TF */
             // 9.254: do NOT touch RIP. A TF-induced #DB is a TRAP — the saved
             // RIP already points at the next instruction. APM: NRIP for
             // exception VMEXITs = RIP+1 (ONE BYTE), so the old RIP=NRip
@@ -6578,6 +6702,119 @@ extern "C" int yghv_s206_bp_int3_apply_all(VOID)
      * has now cost two machines.
      */
     return 0;
+}
+
+/*
+ * 9.588 (P1-1): program the DR registers of every core.
+ *
+ * WHAT THE HARDWARE ACTUALLY NEEDS, and why it is split in two
+ *
+ *   SVM keeps Dr7 and Dr6 in the VMCB StateSaveArea, but keeps NO Dr0-Dr3
+ *   there - the state save area has exactly one 64-bit Dr7 and one Dr6. So VMRUN
+ *   reloads the CONTROL half of the debug registers from the VMCB and leaves the
+ *   ADDRESS half exactly as the host had it. Both halves therefore have to be
+ *   written, in two different places, from the same walk:
+ *
+ *     address  -> physical DR0-DR3 (svm_simplevm206_x64.asm, no intrinsic)
+ *     Ln/RW/LEN-> this core's VMCB StateSaveArea.Dr7, which VMRUN reloads
+ *
+ *   Writing DR7 physically would be pointless: VMRUN overwrites it from the VMCB
+ *   on the way in, and the host's own DR7 is restored from HSAVE on the way out.
+ *   That asymmetry is also why our breakpoints cannot leak into the host: host
+ *   DR7 keeps its L bits clear, so the addresses we planted are inert there.
+ *
+ * WHY THE WALK IS SAFE HERE (and why the #BP walk was not)
+ *
+ *   9.374 disabled yghv_s206_bp_int3_apply_all after two 0x139s, and the lesson
+ *   recorded there is precise: walking cores from PASSIVE is fine, what is not
+ *   fine is changing the state of a PAGE another process is executing at that
+ *   moment. A DR breakpoint touches no page and no instruction byte - it only
+ *   writes registers that belong to each core's own VM context. So the condition
+ *   that made the #BP walk unsafe does not arise.
+ *
+ *   The walk is still the reason this is done from PASSIVE: KeSetSystemGroup-
+ *   AffinityThread is a PASSIVE-only call, and each core must be programmed from
+ *   its own context for the writes to land in the right registers.
+ */
+typedef struct _S206_DR_APPLY_CONTEXT {
+    UINT64 Dr7;
+    UINT64 Addr[4];     /* YGHV_BP_DR_SLOTS; 0 = untouched slot */
+} S206_DR_APPLY_CONTEXT, *PS206_DR_APPLY_CONTEXT;
+
+static
+NTSTATUS
+SvDrApplyOnCore (
+    _In_opt_ PVOID Context
+    )
+{
+    int registers[4];   // EAX, EBX, ECX, and EDX
+    UINT64 high, low;
+    PVIRTUAL_PROCESSOR_DATA vpData;
+    PS206_DR_APPLY_CONTEXT ctx = (PS206_DR_APPLY_CONTEXT)Context;
+    int s;
+
+    if (!ARGUMENT_PRESENT(Context)) {
+        InterlockedIncrement64(&g_DrApplyMisses);
+        return STATUS_SUCCESS;
+    }
+
+    __cpuidex(registers, CPUID_FAKE_VPD, CPUID_FAKE_VPD);
+    if (registers[2] != 'SSV1') {
+        InterlockedIncrement64(&g_DrApplyMisses);
+        return STATUS_SUCCESS;
+    }
+
+    high = registers[3];
+    low = registers[0] & MAXUINT32;
+    vpData = reinterpret_cast<PVIRTUAL_PROCESSOR_DATA>(high << 32 | low);
+    if (!vpData) {
+        InterlockedIncrement64(&g_DrApplyMisses);
+        return STATUS_SUCCESS;
+    }
+
+    /*
+     * Addresses first, then the bits that enable them. The order matters if this
+     * core ever ran the guest in between, which it cannot - we are pinned and in
+     * host context - but enabling before the address is planted would arm a slot
+     * pointing at whatever the host left there.
+     */
+    for (s = 0; s < 4; s++) {
+        Sv206WriteDr((UINT32)s, ctx->Addr[s]);
+    }
+
+    vpData->GuestVmcb.StateSaveArea.Dr7 = ctx->Dr7;
+    vpData->GuestVmcb.ControlArea.VmcbClean = 0;
+
+    InterlockedIncrement64(&g_DrApplyHits);
+    return STATUS_SUCCESS;
+}
+
+/*
+ * 9.588 (P1-1): recompute the DR state from mem_bp's table and push it to every
+ * core. Called from mem_bp.c on arm, on remove and on clear, so it is a
+ * re-program rather than an "arm" - with no breakpoints left it writes the
+ * baseline Dr7 and four zero addresses, which is exactly the disarm.
+ *
+ * Returns 1 when the walk completed on every core, 0 otherwise. A partial walk
+ * must be reported as a failure rather than assumed: half the cores armed is
+ * both wrong and visible to the guest.
+ */
+extern "C" int yghv_s206_dr7_apply_all(VOID)
+{
+    S206_DR_APPLY_CONTEXT ctx;
+    UINT64 dr7 = 0;
+    NTSTATUS st;
+
+    RtlZeroMemory(&ctx, sizeof(ctx));
+    (void)yghv_bp_dr_snapshot(&dr7, ctx.Addr);
+    ctx.Dr7 = dr7;
+
+    st = SvExecuteOnEachProcessor(SvDrApplyOnCore, &ctx, nullptr);
+    if (!NT_SUCCESS(st)) {
+        InterlockedIncrement64(&g_DrApplyFailures);
+        return 0;
+    }
+    return 1;
 }
 
 static

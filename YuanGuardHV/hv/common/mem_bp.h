@@ -15,11 +15,13 @@
  *         REALLY IS modified (a target that checksums its own code sees it),
  *         and we must restore the original byte before resuming.
  *
- *   DR    program the debug registers. x86 gives four, and a DR access by the
- *         guest is intercepted (VMCB dr_read/dr_write_intercepts) so we can
- *         present a virtual DR bank. DR breakpoints are exact on the address
- *         and cost nothing until they fire, but they consume the four
- *         hardware slots.
+ *   DR    program the debug registers. x86 gives four. The addresses go into
+ *         the PHYSICAL DR0-DR3 and the enable/kind/length bits go into each
+ *         core's VMCB Dr7 (corrected 9.588: an earlier note claimed the guest's
+ *         DR access was intercepted instead — InterceptDrRead/Write have no
+ *         writer and no VMEXIT_DR* case exists, so nothing was ever virtualised).
+ *         DR breakpoints are exact on the address and cost nothing until they
+ *         fire, but they consume the four hardware slots.
  *
  * The three share one table so they share the hit ring, stats and drain
  * interface. A page can carry a NPF breakpoint while a specific instruction
@@ -160,13 +162,41 @@ int yghv_bp_int3_orig(uint64_t va, uint8_t *out);
 int yghv_bp_on_dr(uint64_t dr6, uint64_t rip, uint32_t cpl, uint64_t cr3);
 
 /*
- * 9.327: the virtual DR bank. The guest's DR0-DR3 accesses are intercepted;
- * these return what the guest should see, so a DR-mode breakpoint is invisible
- * in the register set the target can read.
+ * 9.327: the DR bank. These read and write the addresses that are programmed
+ * into the physical DR0-DR3 (9.588 changed nothing about the interface, only
+ * about who consumes it — the hardware does now, not a virtual register set).
  */
 int yghv_bp_dr_slot_for_va(uint64_t va);
 uint64_t yghv_bp_dr_get(int slot);
 int yghv_bp_dr_set(int slot, uint64_t value);
+
+/*
+ * 9.588 (P1-1): snapshot the live DR breakpoints for the hardware.
+ *
+ * dr7_out  receives the full DR7 value: the 0x400 baseline, LE when a data
+ *          breakpoint is armed, and per slot the local enable plus its R/W and
+ *          LEN encoding. LEN is always 00 — see the note at the definition, a
+ *          length above one is only valid at an aligned address and these are
+ *          byte addresses.
+ * addr_out receives four linear addresses, one per DR slot, 0 where unused.
+ *
+ * Returns the number of slots armed. The only caller is the per-core walk in
+ * svm_simplevm206.cpp; it lives here because g_bp is private to mem_bp.c.
+ */
+int yghv_bp_dr_snapshot(uint64_t *dr7_out, uint64_t *addr_out);
+
+/*
+ * 9.588: what fired, for the #DB handler. Both take the TABLE INDEX that
+ * yghv_bp_on_dr returned (not a slot number) and return -1 / 0 for an index
+ * that is stale by the time it is read.
+ *
+ *   slot_at  the DR slot, so DR6's bit for it can be cleared
+ *   kinds_at YGHV_BP_EXEC for an execution breakpoint (raises #DB as a FAULT,
+ *            so resuming needs RF set), otherwise a data one (raises it as a
+ *            TRAP, so consuming is the whole job)
+ */
+int yghv_bp_dr_slot_at(int idx);
+uint32_t yghv_bp_dr_kinds_at(int idx);
 
 /*
  * Drain recorded hits. Each entry is 6 qwords:

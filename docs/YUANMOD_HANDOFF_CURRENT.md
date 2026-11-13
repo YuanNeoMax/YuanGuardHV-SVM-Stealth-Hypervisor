@@ -29,7 +29,7 @@
 
 ---
 
-## 记录索引（9.587 重新测量，73 条）
+## 记录索引（9.588 重新测量，74 条）
 
 > 这是本文档自己的目录。**按标题扫一眼，找到要的那条，再跳过去读。**
 > 行数是该记录占的篇幅，用来判断"值不值得读全文"。
@@ -109,6 +109,7 @@
 | 9.585 P1-1 `mem-bp dr` 第三次尝试：instrument 打在了 206-B 不走的层 | 26 |
 | 9.586 行尾门 + 一个「报告上一轮」的假门：本轮卫生全部结案 | 76 |
 | 9.587 引用门 + 补上 CHANGELOG 缺失的 v0.4.2：本轮卫生全部结案 | 144 |
+| 9.588 P1-1 `mem-bp dr` 真正接上硬件：地址进物理 DR0-3，控制位进每核 VMCB Dr7 | 99 |
 
 ---
 
@@ -4008,6 +4009,105 @@ ALL MAP CHECKS PASS
 9.586 加的第二遍 docs_check 正是在这种时刻起作用的：它拿**本轮刚测出**的数字
 判文档，而不是上一轮的。把 README/QUICKSTART 改成 17/47/31 后复跑全绿。
 
+#### 9.588 P1-1 `mem-bp dr` 真正接上硬件（本轮）
+
+同一件事的第四次尝试，也是第一次打在正确的层上。9.585 的结论是
+「instrument 打在了 206-B 不走的 resident 路径」，本轮把三处缺口补齐，
+**全部落在出货镜像真正执行的那一层**。
+
+##### 一、三个缺口，三条证据
+
+1. **VMCB Dr7 全树无写者**。`grep -rn Dr7 YuanGuardHV/hv/` 只命中注释、
+   字段声明与 `svm_core.c` 的 `state->dr7 = 0x400;`；`svm_simplevm206.cpp`
+   里 `Dr7` 出现 **0 次**。所以 L0-L3 从来没被置起过。
+2. **#DB 从不调 `yghv_bp_on_dr`**。声明在 `svm_simplevm206.cpp` 顶部，
+   调用点计数 0。所以即使命中也不会被记录。
+3. **地址半根本放不进 VMCB**。SVM 的 `StateSaveArea` 只有 `Dr7 (+0x160)`
+   与 `Dr6 (+0x168)`，**没有 Dr0-Dr3**，VMRUN/VMLOAD/VMSAVE 都不搬运它们。
+   这一条是设计的分水岭：控制半（enable/kind/length）进 VMCB，
+   地址半（DR0-DR3）只能写物理寄存器。
+
+第 3 条顺带推翻了 `mem_bp.h` 与 `mem_bp.c` 里两处从 9.327 沿袭下来的
+注释前提：「guest 的 DR 访问被 VMCB 的 dr_read/dr_write_intercepts 拦截，
+所以看到的是我们的影子银行」。`InterceptDrRead`/`InterceptDrWrite`
+在全树 **0 引用**，`SvHandleVmExit` 里也没有任何 `VMEXIT_DR*` case。
+影子银行不是「guest 看到的世界」，它就是「硬件被编程成什么」。
+
+还有一条旧论据要一起作废：9.506 的注释写「9.413/9.414/9.416 证明
+在 VM-exit 帧里加调用会 0x139/0x7F」。9.419 已经证明那三次都在
+**VMRUN 循环体内**，而 `#DB` case 本身一直在调四个 C 函数
+（`yghv_protect_fake_main_pa` / `yghv_protect_fake_restore` /
+`yghv_guard_hiding_armed` / `yghv_guard_rehide_bare`）。两条路径不是一回事。
+
+##### 二、改动落点
+
+| 文件 | 改动 |
+|---|---|
+| `svm_simplevm206_x64.asm` | 新增 `Sv206WriteDr` leaf：`ecx`=槽号 0-3、`rdx`=地址，`mov drN, rdx` |
+| `common/mem_bp.h` | 新增 `yghv_bp_dr_snapshot` / `yghv_bp_dr_slot_at` / `yghv_bp_dr_kinds_at` |
+| `mem_bp.c` | 实现 snapshot；把 `return -12` 与 `if (0 && ...)` 死体换成真实实现；remove/clear 之后重新编程硬件 |
+| `svm_simplevm206.cpp` | 新增 `SvDrApplyOnCore` + `yghv_s206_dr7_apply_all`；#DB case 加 Dr6 B0-B3 分流与异常注入 |
+| `tools/yghv_ctl.ps1` | 撤掉 `-12` 的「机制不可用」文案，新增 `-13`（编程失败），dr 帮助文字改正 |
+
+**为什么地址必须写物理寄存器**：MSVC 没有调试寄存器 intrinsic
+（`__writedr0..3` / `__readdr7` 实测 C3861 六个错误，WDK 10.0.26100 头文件），
+x64 MSVC 又没有 inline asm，所以只能是一条 asm leaf。写物理 DR7 则无意义 ——
+VMRUN 会用 VMCB 覆盖它，host 侧从 HSAVE 恢复；而且我们的位不会漏进 host，
+因为 host DR7 的 L 位是 0。
+
+##### 三、写的过程中抓到两个自己的错
+
+1. **`1ULL << (slot * 2)`**。DR7 的 Ln 在 2n，但 **DR6 的 B0-B3 在 bit 0-3**，
+   不是 2n。第一版在 #DB 里按 2n 去清 B 位，B3 会清到 bit6 上 ——
+   看起来像「清掉了」，实际什么都没清。
+2. **LEN 字段**。数据断点只有对齐到长度时才比较得对，而调用方给的是任意
+   地址；长度 >1 是对齐的赌博，且 misaligned 的 DR7 在架构上是
+   **UNPREDICTABLE** 而不只是错。所以 LEN 恒为 00（一字节）：任何地址都
+   合法，覆盖该字节的 store 仍然触发。
+
+还有一个语义决定：**执行断点是 fault**（RIP 仍指向那条指令，必须置 RF
+`0x10000` 才能前进），**数据断点是 trap**（store 已经完成，消费即可）。
+所以只有命中 EXEC 槽时才置 RF。
+
+##### 四、这个 per-core walk 为什么安全，而 #BP 的 walk 不安全
+
+9.374 永久禁用了 `yghv_s206_bp_int3_apply_all`（两次 0x139 都追到那个
+per-core walk），教训是「walk 核只在没人执行被改状态时安全」。这条理由
+**不适用于 DR**：DR 断点不碰任何被执行的页、指令字节或页表，只写每核自己
+的物理 DR0-3 与该核 VMCB 的 Dr7，两者都只被那一核在 host 上下文里用。
+所以 `SvDrApplyOnCore` 可以走 `SvExecuteOnEachProcessor`（pin + migrate，PASSIVE）。
+
+顺序也是刻意的：**先写地址、再写 Dr7 的位**，然后才 `VmcbClean = 0`。
+反过来会出现一个窗口，L 位已置而地址还是上一条断点的值。
+
+撤除时不再单独写一套「撤销」代码：`yghv_bp_dr_snapshot` 每次都从表
+**重算**，所以 apply 是幂等的 —— 一次调用既解掉最后一条，也重装其余。
+不做这一步的话，硬件会留着一条入口已经不存在的断点：它会触发、
+`yghv_bp_on_dr` 找不到，guest 就丢掉这次的 #DB。
+
+##### 五、现在的数（实跑）
+
+```
+YGHV_BAREMETAL_STEP=206 YGHV_206B_COEXIST=1 YGHV_206B_GNPT=1 build.bat
+ALL SOURCE CHECKS PASS
+ALL MAP CHECKS PASS
+[YuanGuardHV] Build SUCCESS
+SHA256 = 5fdeedb3472b030dc462545b7b8fd4488b1c92d7dab7a627ef6659d41ba06199
+```
+
+map 里六个新符号全部落地：`Sv206WriteDr`、`SvDrApplyOnCore`、
+`yghv_s206_dr7_apply_all`、`yghv_bp_dr_snapshot`、`yghv_bp_dr_slot_at`、
+`yghv_bp_dr_kinds_at`。`grep "return -12" mem_bp.c` 已 0 命中。
+
+顺带清掉一处行尾事故：`mem_bp.h` 与 `yghv_ctl.ps1` 的工作区副本是纯 CRLF，
+而仓库里存的是纯 LF —— 任何编辑都变成整文件 diff（`yghv_ctl.ps1` 量出
+5105/5096）。转成 LF 后真实改动是 38/8 与 13/4。`eol_check.ps1` 抓不到这个，
+它只管「同一文件内不许混用」。
+
+**还没做的一步：上机验证。** 验收要求 `mem-bp dr <va> w` 之后目标真写该页、
+`hits` 从 0 涨起来，那需要加载这一版镜像。`bin` 现在是与已部署的
+`BCC4FECDEA8DCEE5` 不同的新构建，部署位没有动。
+
 ## 本次会话结束时状态
 
 > 这一段曾被落在 9.564 而正文已经写到 9.582 —— 同一份文件里两个互相矛盾的状态，
@@ -4016,13 +4116,14 @@ ALL MAP CHECKS PASS
 
 ```
 驱动          : STOPPED
-镜像          : bin == 部署 = BCC4FECDEA8DCEE5
+镜像          : bin == 5FDEEDB3472B030D
+                部署 C:\yghv_pa.sys 仍是 BCC4FECDEA8DCEE5（9.588 的构建还没部署，两者不再相同）
 默认配置      : 真 guest + 全核（9.577 起），12 线程 1.05-1.08×
 卸载          : 0.06-0.23 s，invmrun at unload = 0x0
 台账          : 8 完成 / 9 不做 / 1 需重启（Tier 6.1）
 静态检查      : 17 脚本 / 49 条 PASS（含 33 条自检）
-文档检查      : docs_check PASS —— 57 md / 32 链接 / 73 记录 / 9 项
-最新编号      : 9.587
+文档检查      : docs_check PASS —— 57 md / 32 链接 / 74 记录 / 9 项
+最新编号      : 9.588
 ```
 
 **P1-1 的结论变了，但没结案。** 9.585 证明三次失败有一个共同原因：

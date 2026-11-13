@@ -3871,9 +3871,18 @@ try {
             #         no per-access exit cost. The code byte REALLY changes (a target
             #         that checksums its own code sees it).
             #   dr    one of the four hardware debug registers. Exact per address,
-            #         free until it fires, but only four slots. The guest's DR access
-            #         is intercepted, so the target sees our shadow bank, not the real
-            #         breakpoint.
+            #         free until it fires, but only four slots.
+            #
+            #         9.588 (P1-1) corrected what this actually does. The old note
+            #         said the guest's DR access was intercepted so it saw a shadow
+            #         bank - never true: nothing writes InterceptDrRead/InterceptDrWrite
+            #         and no VMEXIT_DR* case exists. What happens now is real: the
+            #         address goes into a physical DRn and the Ln/RW/LEN bits go into
+            #         every core's VMCB Dr7, so a guest that writes DR7 itself sees
+            #         our bits, and clearing them disarms the breakpoint. Kind is
+            #         honoured (r/w/x) and LEN is always one byte - see the note at
+            #         yghv_bp_dr_snapshot. The guest still cannot read DR0-DR3 to
+            #         find the address, because those are only visible to the host.
             #
             # usage:
             #   mem-bp                                 diagnostics (mode breakdown)
@@ -4009,7 +4018,7 @@ try {
                 -7 { 'FAILED (stage -7: INT3 needs a VA)' }
             -11 { 'REFUSED (stage -11: the breakpoint registry page is hidden, so registration cannot complete; arming is refused rather than leaving an armed page with no handler)' }
                 -8 { 'FAILED (stage -8: no DR slot free)' }
-                -12 { 'REFUSED (stage -12: DR mode is not functional - arming writes no VMCB Dr7, and no #DB path calls on_dr; see 9.506/9.507)' }
+                -13 { 'FAILED (stage -13: could not program the hardware debug registers on every core)' }
                 -9 { 'FAILED (stage -9: could not patch the instruction byte)' }
                 -10 { 'FAILED (stage -10: kinds is 0)' }
                 0  { 'FAILED (stage 0: bad arguments)' }

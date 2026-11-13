@@ -627,6 +627,61 @@ Sv206LeavePark:
     jmp     Sv206LeavePark
 Sv206LeaveToHost endp
 
+; ---------------------------------------------------------------------------
+; Sv206WriteDr
+;
+;   VOID Sv206WriteDr(UINT32 slot, UINT64 value)
+;
+;   slot  -> ECX (0..3, anything else is ignored)
+;   value -> RDX
+;
+; WHY THIS IS ASM AND NOT C (9.588)
+;
+;   MSVC exposes no debug-register intrinsic: __writedr0..__writedr3 and
+;   __readdr7 do not exist in the WDK headers, measured with a bare translation
+;   unit compiled against 10.0.26100 - six C3861 errors. The only way to touch a
+;   physical DR from C is inline asm, which x64 MSVC does not support. So it is
+;   a leaf here.
+;
+; WHY IT IS NEEDED AT ALL
+;
+;   SVM keeps Dr7 and Dr6 in the VMCB StateSaveArea, but it keeps NO Dr0-Dr3
+;   there - check svm_simplevm206.hpp, the state save area has exactly one 64-bit
+;   Dr7 and one Dr6. VMRUN/VMLOAD/VMSAVE therefore neither save nor restore the
+;   breakpoint ADDRESSES. They have to be programmed into the real registers, and
+;   they survive the transition because nothing on the host side clears them.
+;
+;   This is called per core from SvDrApplyOnCore, pinned, in host context. That
+;   is the only context where writing them is meaningful: the guest sees them
+;   through the VMCB on the way back in.
+;
+; Leaf: clobbers nothing, uses no stack, cannot fault (DR4/DR5 aliasing is
+; avoided by only accepting 0..3).
+; ---------------------------------------------------------------------------
+Sv206WriteDr proc
+    cmp     ecx, 0
+    je      Sv206WriteDr0
+    cmp     ecx, 1
+    je      Sv206WriteDr1
+    cmp     ecx, 2
+    je      Sv206WriteDr2
+    cmp     ecx, 3
+    je      Sv206WriteDr3
+    ret
+Sv206WriteDr0:
+    mov     dr0, rdx
+    ret
+Sv206WriteDr1:
+    mov     dr1, rdx
+    ret
+Sv206WriteDr2:
+    mov     dr2, rdx
+    ret
+Sv206WriteDr3:
+    mov     dr3, rdx
+    ret
+Sv206WriteDr endp
+
 ;
 
         end
