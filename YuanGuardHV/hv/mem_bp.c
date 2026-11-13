@@ -974,19 +974,6 @@ int yghv_bp_on_npf(uint64_t gpa, uint64_t rip, uint32_t kind, uint32_t cpl,
 
     int n = (int)InterlockedCompareExchange(&g_bp_count, 0, 0);
 
-
-
-
-
-
-
-
-
-
-
-
-
-
     if (n <= 0)
         return 0;
 
@@ -1105,19 +1092,6 @@ int yghv_bp_on_int3(uint64_t va, uint32_t cpl, uint64_t cr3) {
 
     int n = (int)InterlockedCompareExchange(&g_bp_count, 0, 0);
 
-
-
-
-
-
-
-
-
-
-
-
-
-
     if (n <= 0)
         return 0;
 
@@ -1156,19 +1130,6 @@ int yghv_bp_on_dr(uint64_t dr6, uint64_t rip, uint32_t cpl, uint64_t cr3) {
      * decided per slot, as in the other three scans.
      */
     int live = (int)InterlockedCompareExchange(&g_bp_count, 0, 0);
-
-
-
-
-
-
-
-
-
-
-
-
-
 
     if (live <= 0)
         return -1;

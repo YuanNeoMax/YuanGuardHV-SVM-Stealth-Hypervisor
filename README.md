@@ -134,7 +134,7 @@ YuanGuardHV/
 │   ├── yghv_guard.c          隐藏表完整性（SHA-256）
 │   ├── yghv_sentry.c         攻击面清单与 escape 记录
 │   └── common/               头文件（33 个）
-├── tests/                    构建期检查器（17 个脚本 + 2 个运行器）
+├── tests/                    构建期检查器（18 个脚本 + 2 个运行器）
 ├── tools/
 │   ├── yghv_ctl.ps1          PowerShell 客户端（80 条命令）
 │   └── yghv_client/          Java 客户端（18 条命令）
@@ -256,7 +256,7 @@ build.bat
 
 流程（`build.bat`）：
 
-1. 先运行 `tests\run_source_checks.ps1`（**16 个脚本 / 41 条 PASS**，含 26 条自检），失败即中止；
+1. 先运行 `tests\run_source_checks.ps1`（**17 个脚本 / 49 条 PASS**，含 33 条自检），失败即中止；
 2. clang-cl 编译 `hv\*.c` / `hv\*.cpp` + `svm_trampoline.S`；
 3. MSVC link 链接为 `bin\yuanguard_hv.sys`，**同时产出 `bin\yuanguard_hv.map`**；
 4. 运行 `tests\run_map_checks.ps1`（页布局检查，必须链接后跑）；
@@ -376,6 +376,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File $ctl mem-read <pid> <hex_va>
 | **`docs_check.ps1`** | **文档门**：相对链接、索引行数、空记录、最新编号、归档份数、状态块自洽、镜像哈希、检查器数量、目录树份数 |
 | **`win32_error_names.ps1`** | **错误码名门**：文档里「数字 + `ERROR_*`」的配对必须与 OS 表一致（`[HIST]` 引用除外）|
 | **`eol_check.ps1`** | **行尾门**：同一文件不许混用 CRLF 与裸 LF，也不许有孤立 CR（混排会把 +37 行的真实改动撑成 1301 行 diff）|
+| **`source_citation_check.ps1`** | **引用门**：文档里 `文件.c:123` 形式的引用必须指向真实存在的、非空行（行号越界会报，**漂移到空行也会报** —— 9.587 手工审计 18 条里有 7 条已漂移，且全部仍在文件内）|
 | `page_layout_check.ps1` | 隐藏表不与 guard 状态共页、岛内读区域页对齐（链接后跑）|
 
 > **每个检查器都必须能失败。** 三个曾报假 PASS（正则够不到目标文本）。
@@ -415,7 +416,7 @@ csc /nologo /optimize+ /out:tools\bench_core.exe tools\bench_core.cs
 
 ## 文档索引
 
-**先读 [`docs/INDEX.md`](docs/INDEX.md)** —— 按问题索引，根目录 7 份，其余在 `archive/`。
+**先读 [`docs/INDEX.md`](docs/INDEX.md)** —— 按问题索引，根目录 8 份，其余在 `archive/`。
 
 | 文档 | 内容 |
 |---|---|
@@ -423,7 +424,7 @@ csc /nologo /optimize+ /out:tools\bench_core.exe tools\bench_core.cs
 | **`docs/QUICKSTART.md`** | **★★ 跨会话快速承接** —— 三分钟上手 / 当前状态 / 下一步 / 八个坑 |
 | `docs/RESUME_PROMPT.md` | 深一层：铁律 / 架构约束 / 观测手段 / 方法论 |
 | **`docs/TIER_LEDGER.md`** | **Tier 清单最终台账** —— 8 完成 / 9 不做（附理由）/ 1 需重启 |
-| `docs/YUANMOD_HANDOFF_CURRENT.md` | 逐条变更记录 9.500–9.577（开头有 63 条索引）|
+| `docs/YUANMOD_HANDOFF_CURRENT.md` | 逐条变更记录 9.500 起（开头有索引，标题 + 真实行数）|
 | `docs/WINDOWS_AS_GUEST_FINDINGS.md` | Windows-as-Guest 全部结论（唯一权威）|
 | **`docs/KERNEL_API_CHECKLIST.md`** | **★ 写内核代码前必读** —— 三次蓝屏换来的 API 契约核对清单 |
 | `docs/archive/` | 9.1–9.499 历史交接、2026-08 评审与研究、Tier 设计计划书 |
@@ -474,7 +475,8 @@ csc /nologo /optimize+ /out:tools\bench_core.exe tools\bench_core.cs
 
 | 版本 | 主题 | 关键数据 |
 |---|---|---|
-| **v0.4.1**（当前）| 配置不一致可见化 + 真 guest 下重测内存基准 | B 比 A 快 **1.8–2.4×**；真 guest 下 B 慢 13%（NPT 代价）|
+| **v0.4.2**（当前）| P1-3 全部结案 + 错误码门 + 文档侧 5 处过期值 | 目标自写 10/10 存活；外来写 1/1 回滚 |
+| v0.4.1 | 配置不一致可见化 + 真 guest 下重测内存基准 | B 比 A 快 **1.8–2.4×**；真 guest 下 B 慢 13%（NPT 代价）|
 | v0.4.0 | 全核真 guest 成为默认 | 12 线程 **1.05×**、G25 **17/17**、卸载 0.07 s |
 | v0.3.0 | 周期同步守卫（绕开 Zen3 NPT TLB 限制）| 延迟 92 s → **2.3 s**，64 页 @20 polls/s 0.38% 单核 |
 | v0.2.0 | OS-as-guest 206 里程碑 | 页写保护全链 PASS |

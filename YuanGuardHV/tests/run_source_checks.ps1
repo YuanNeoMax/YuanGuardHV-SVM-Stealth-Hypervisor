@@ -91,7 +91,18 @@ $scripts = @(
     # A file may be all-CRLF or all-LF; mixing the two inside one file may not happen.
     # Its self-test plants a mixed-EOL file AND a clean one, because a checker that
     # fails on everything also "catches" the defect.
-    'eol_check.ps1'
+    'eol_check.ps1',
+    # 9.587: the documents cite source as "file:NNN" -- "the early-out is at
+    # mem_bp.c:1139". 18 such citations were audited by hand and SEVEN pointed at
+    # the wrong line while every one of them was still INSIDE its file, so no bounds
+    # check could ever have seen it: svm_core.c:479 was a blank line two below the
+    # real state->dr7 = 0x400, and svm_simplevm206_x64.asm:406 was a blank comment
+    # line six above the real Sv206GuestStub. A citation past the end of a file is
+    # loud and rare; a citation that quietly means something else is silent and
+    # common, which is the worse of the two.
+    # The gate checks existence, range, and NON-BLANK -- it does NOT check that the
+    # line still says what the prose claims, and its header says so.
+    'source_citation_check.ps1'
 )
 
 # 9.583: COUNT THE PASSES INSTEAD OF LETTING PEOPLE WRITE THE NUMBER DOWN.

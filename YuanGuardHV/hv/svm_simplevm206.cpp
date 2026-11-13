@@ -1639,8 +1639,6 @@ extern "C" void yghv_s206_virtualize_counts(UINT64 *entries, UINT64 *early,
     *secondPass = marked;
 }
 
-
-
 /*
  * 9.525: HOW MANY CORES TO VIRTUALISE, read from the registry at prepare.
  *
@@ -6581,8 +6579,6 @@ extern "C" int yghv_s206_bp_int3_apply_all(VOID)
      */
     return 0;
 }
-
-
 
 static
 NTSTATUS

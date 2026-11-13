@@ -60,7 +60,7 @@ Get-Content C:\Windows\yghv_progress.log | Select-String "invmrun at unload"
 | 驱动 | `yghvpa` · **STOPPED** · 设备 `\\.\YuanGuardHV` |
 | 最新编号 | **9.585** |
 | 工作树 | 干净 |
-| 静态检查 | **16 个源级脚本 / 41 条 PASS**（含 **26** 条自检）+ 1 个 map 脚本，两个运行器全绿（9.586 实测）；客户端 **PowerShell 80 / Java 18** 条命令、IOCTL **56** 个 |
+| 静态检查 | **17 个源级脚本 / 49 条 PASS**（含 **33** 条自检）+ 1 个 map 脚本，两个运行器全绿（9.587 实测）；客户端 **PowerShell 80 / Java 18** 条命令、IOCTL **56** 个 |
 | 部署镜像 | `C:\yghv_pa.sys` = `BCC4FECDEA8DCEE5`，**与 `bin` 哈希一致**（9.585 复测）|
 | **最近一次卸载** | `invmrun at unload = 0x0`，无蓝屏（9.513）|
 | **性能（9.575-9.577 实测）** | 默认 **真 guest + 全部 12 个逻辑核**：12 线程 **1.05-1.08×**。旧默认（6 核桩模式）是 1.13-1.34× 且 G25 只有 15/17；现在 G25 **17/17**。可用 `CoreCount` / `RealGuestMode` 覆盖 |
@@ -161,12 +161,15 @@ mmf-hold 寿命       : 3600 秒
 
 | 想知道什么 | 读哪个 | 大小 |
 |---|---|---|
-| **新会话第一步** | `docs/INDEX.md`（按问题索引）| 3.5 KB |
-| 现在在哪、这一步做了什么 | `docs/YUANMOD_HANDOFF_CURRENT.md`（9.500–9.585，开头有 71 条索引）| 183 KB |
-| 哪些功能做了 / 哪些不做 / 为什么 | `docs/TIER_LEDGER.md` | 14.9 KB |
+| **新会话第一步** | `docs/INDEX.md`（按问题索引）| 5 KB |
+| 现在在哪、这一步做了什么 | `docs/YUANMOD_HANDOFF_CURRENT.md`（9.500 起，开头有索引：标题 + 真实行数）| 181 KB |
+| 哪些功能做了 / 哪些不做 / 为什么 | `docs/TIER_LEDGER.md` | 15 KB |
 | **写内核代码前** | `docs/KERNEL_API_CHECKLIST.md` | 36 KB |
-| 目录总览 | `docs/RESUME_PROMPT.md`（深一层：铁律/约束/观测）| 33.6 KB |
+| 目录总览 | `docs/RESUME_PROMPT.md`（深一层：铁律/约束/观测）| 35 KB |
 | 考古（9.1–9.299） | `docs/archive/_ARCHIVE_HANDOFF_9.1-9.299.md` | 1027 KB |
+
+> 大小取整到 KB，是「这文档多长」的规模提示，**不是断言**。真正的断言是行数与记录数，
+> 那两个数由 `docs_check.ps1` 核对。
 
 ---
 

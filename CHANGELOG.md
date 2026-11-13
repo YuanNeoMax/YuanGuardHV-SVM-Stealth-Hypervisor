@@ -1,6 +1,6 @@
 # Changelog
 
-本项目的版本级变更摘要。逐条工程记录（编号 `9.x`，当前 63 条）在
+本项目的版本级变更摘要。逐条工程记录（编号 `9.x`，条数以交接文档开头索引为准）在
 [`docs/YUANMOD_HANDOFF_CURRENT.md`](docs/YUANMOD_HANDOFF_CURRENT.md)；
 本文只回答「两个版本之间发生了什么」。
 
@@ -9,6 +9,71 @@
 
 > **注意本项目的版本号语义**：`0.x` 阶段，MINOR 版本可能包含**破坏性变更**
 > （运行时开关语义、默认配置）。每次有此类变更都会在下面明确标注 **Breaking**。
+
+---
+
+## v0.4.2 — P1-3 全部结案 + 错误码门 + 文档侧修复
+
+**日期**：2026-11-08
+**范围**：v0.4.1..v0.4.2（工程记录 9.579–9.584）
+
+> 这一节补写得晚：v0.4.2 打了 tag、发了 notes（`.release/notes-v0.4.2.md`），
+> 却**从未进入 CHANGELOG**，于是「完整摘要见 CHANGELOG.md」这句话在 v0.4.2 上不成立。
+> 版本级摘要是给人回答「两个版本之间发生了什么」的，它缺一节就等于该版本没发生过。
+
+### Added
+
+- **`sync-stats` 命令**（9.582）：同步守卫的 8 个计数器可读，含 `hits`（回滚次数）。
+  此前该守卫**不可观测** —— 没有计数器，「它在工作」和「它没被调用」是同一幅画面。
+- **`win32_error_names.ps1` + 5 条自检**（9.583）：文档里「数字 + `ERROR_*`」的配对
+  必须与 OS 现场提供的名字表一致；`[HIST]` 标记允许引用自己纠正过的错误；
+  `checked==0` 直接判 FAIL（跑起来什么都没比 == 没查）。
+- **`docs_check` 第 6–9 项**（9.583）：状态块自洽、镜像哈希、检查器数量、目录树份数。
+  反向变异自检 4 → 10 个，正向对照 1 → 2 条。
+- **`docs/archive/README.md`** 与 **`reference/README.md`**（9.583）。
+
+### Changed
+
+- `protect-page` 的错误信息：`0x490` 现在翻译成
+  "pid X is not a registered target. Run 'set-target X' first."
+- `docs/ISSUES.md` 的 P1-3 一节补齐 9.582→9.584 的三步进展。
+
+### Fixed
+
+- **P1-3b 根因**（9.584）：`protect-page` 对任何页返回 `0x490` 的真实原因是
+  **缺 `set-target <pid>`**，不是 mmf 页限制。补上后同页同 pid 立即 `OK`。
+- **P1-3c 的疑问被实测收窄**（9.584）：目标自写 10/10 存活（`hits` 不变），
+  外来写 1/1 被回滚（`hits` 0→1）。守卫实际能区分写入来源，
+  但**代码不检查写入者 CR3**，机制未完全解释（可能是 COW 或缓存一致性）。
+
+### Known limitations
+
+- **P1-3c 的机制不明** —— 「能区分」是实测，不是设计。对产品是好消息
+  （保护页免受外来写入，不破坏目标自身状态），但它仍是未解释现象。
+- P0-1 Tier 6.1 启动期验收：需重启，不进 0.4.x。
+- P1-1 `mem-bp dr`：功能不存在（`yghv_bp_add_ex` 对 DR 模式返回 `-12`）。
+  9.585 已查明三次失败打在**206-B 不走的 resident 路径**上。
+
+### Verification
+
+```
+ALL SOURCE CHECKS PASS      15 脚本 / 39 条 PASS（含 25 条自检）
+ALL MAP CHECKS PASS         1 条
+docs_check PASS             57 md / 32 链接 / 69 记录 / 9 项
+win32_error_names PASS      10 组配对与 OS 表一致
+G25                         17/17 ALL PASS（全核真 guest）
+性能                        12 线程 1.05-1.08×
+卸载                        0.06-0.23 s，invmrun at unload = 0x0
+```
+
+> 上面这组数字是 **v0.4.2 发版当时**的实测值，刻意保持原样而不是换成今天的最新值 ——
+> 版本级摘要记录的是那个版本。今天的数字在 `docs/YUANMOD_HANDOFF_CURRENT.md` 末尾状态块。
+
+### SHA256
+
+```
+acbe2dc6ffab08ab8db917607cc0e37d87567b86ffd4fa5b72d82578619c2963
+```
 
 ---
 
