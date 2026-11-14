@@ -12,6 +12,79 @@
 
 ---
 
+## v0.4.3 — 进程/线程控制面接入（P1-1 之外的第一次能力面扩张）
+
+**日期**：2026-11-14
+**范围**：v0.4.2..v0.4.3（工程记录 9.588–9.591）
+
+> v0.4.2 之后的一轮工作分两半：9.588 把 P1-1 的 `mem-bp dr` 真正接上硬件（代码完成，
+> 上机未验证），9.589–9.590 做了原生结构/偏移/特征码/字符串加密四块底层，
+> 9.591 把前两块接到 IOCTL 上——这是它们第一次能被外部问到。
+
+### Added
+
+- **`IOCTL_YGHV_PROC`（函数号 0x838）与 `hv/yghv_proc.c`**（9.591）：十个 op。
+  `SNAPSHOT` 进程快照（最多 120 条）、`QUERY` 单进程、`PROT` 写 PP/PPL protection 字节、
+  `SUSPEND`/`RESUME`、`TERM` 结束进程（含 `YGHV_PROC_TERM_CLEAR_PROT` 先清保护字节）、
+  `OFFSETS`/`SIG` 诊断、`THREADS` 线程枚举（含 freeze count）、`TOKEN` 主令牌偷取、`HIDE` 摘链隐藏。
+- **偏移表 v2**（9.591）：`YGHV_OFF_VERSION` 1→2，append-only 追加 `inherited_pid` / `exit_status` /
+  `thread_list_entry` / `token`，位 `YGHV_OFF_PPID 0x400` / `XSTAT 0x800` / `TLIST 0x1000` / `TOKEN 0x2000`，
+  新访问器 `yghv_proc_inherited_pid` / `yghv_proc_exit_status`。
+- **两个运行时探针**（9.591）：ETHREAD.`ThreadListEntry` 与 EPROCESS token（EX_FAST_REF）扫
+  `0x100..0x900` 步长 8，**命中数必须恰为 1**，否则字段保持 NOT DERIVED 并打日志拒绝。
+- **PowerShell `proc` 命令**（9.591）：`proc [<pid>|offsets|sig|threads <pid> [max]|prot <pid> <hex>|
+  suspend <pid>|resume <pid>|term <pid> [clearp] [code]|token <src> <dst>|hide <pid>|unhide <pid>]`。
+
+### Changed
+
+- `hv/common/yghv_nt.h` 补 `PROCESS_TERMINATE` / `PROCESS_VM_READ` /
+  `PROCESS_QUERY_LIMITED_INFORMATION` / `PROCESS_SUSPEND_RESUME` 四个 `#ifndef` 兜底——
+  **这四个常量在 WDK km 头里根本不存在**（只在用户态 `winnt.h`），
+  而 `YGHV_PROC_READ_RIGHTS` 从 9.590 之前就引用其中两个，只是从来没有调用点所以没炸。
+- `hv/common/yghv_sig.h` 的四个访问器形状宏包 `#ifndef`：它们与 `yghv_accessor.h` 重复定义，
+  同时 include 两者的 .c 会拿到 8 条 `-Wmacro-redefined`。
+- `tools/gen_strtab.py` 的 NAMES 11 → 13 条（append-only：`key_for(i)` 按索引算，插入会重编整个表）。
+- `hv/main.c` `DriverEntry` 在 sig 自检之后调 `yghv_proc_init()`；`DriverUnload` 在
+  `yghv_ut_snapshot_pre_unload(` 之前调 `yghv_proc_cleanup()`。
+
+### Fixed
+
+- **`hv/yghv_proc.c` 的 METHOD_BUFFERED 单缓冲别名**（9.591）：`in` 与 `out` 同一个地址，
+  第一版先 `RtlZeroMemory(out, out_len)` 再读请求 → `r.op` 读回 0，
+  **每一次调用都静默退化成 SNAPSHOT**，客户端收到进程列表而不是它要的结果。
+  正确顺序是先 `RtlCopyMemory(&r, in, sizeof(r))` 再清零 out。
+- **`YGHV_PROC_TERM_CLEAR_PROT` 的顺序**（9.591）：受保护进程的
+  `ZwOpenProcess(PROCESS_TERMINATE)` 一开始就失败，所以清保护字节必须发生在**第一次
+  ZwOpenProcess 之前**；失败回滚要用 `PsLookupProcessByProcessId` 重新拿引用，不能用可能已回收的旧引用。
+- **README / QUICKSTART 的三处过期计数**（9.591）：`hv/` 44、`common/` 39、
+  PowerShell 81 条命令、IOCTL 57 个。`docs_check.ps1` 会核对这些数字，但**它读的
+  `tests/check_stats.txt` 是上一轮的**——单独跑 `docs_check` 会被它误导，必须先跑 runner。
+
+### Known limitations
+
+- **`IOCTL_YGHV_PROC` 的十个 op 全部没有在真机上跑过**：`C:\yghv_pa.sys` 仍是 9.588 那一版，
+  v0.4.3 的镜像没有部署。`dumpbin /imports` 已确认
+  `PsSuspendProcess` / `PsResumeProcess` / `PsGetThreadFreezeCount` / `ZwOpenProcess` /
+  `ZwTerminateProcess` / `PsReferencePrimaryToken` 六条新符号确实进了 IAT（导入总数 99），
+  但「进了 IAT」与「行为正确」是两件事。
+- **三个看着能派生、实际会派生错的导出**不会被加进偏移表，理由记在代码注释里：
+  `PsGetProcessSignatureLevel` 会解出 0x879（真值 0x87A，差一个字节）、
+  `PsGetThreadFreezeCount` 是二级解引用、`PsIsProtectedProcess` 是 `test` 形状不是访问器。
+- **摘链隐藏没有拿 `EPROCESS.ProcessLock`**：实测代价大于它关掉的窗口，是记录在案的取舍。
+  对应地 `yghv_proc_cleanup()` 必须挂在卸载路径上——被摘出去的 EPROCESS 比驱动活得久。
+- P1-1 `mem-bp dr`（9.588）代码完成且编译通过，**未上机验证**。
+- P0-1 Tier 6.1 启动期验收：需重启，不进 0.4.x。
+
+### Verification
+
+```
+ALL SOURCE CHECKS PASS     17 脚本 / 49 条 PASS（含 33 条自检）
+ALL MAP CHECKS PASS
+Build SUCCESS              bin/yuanguard_hv.sys
+镜像 SHA256                f3b88948110f2ab9d6f8aba160e3af66ffe2f0a7e66ffd8dbe2615f626a4f3cd
+导入符号                   99（全部 ntoskrnl.exe），新增 6 条已验证在列
+```
+
 ## v0.4.2 — P1-3 全部结案 + 错误码门 + 文档侧修复
 
 **日期**：2026-11-08

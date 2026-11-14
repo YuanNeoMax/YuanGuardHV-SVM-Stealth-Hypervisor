@@ -28,7 +28,9 @@ enum {
     YGHV_SID_PSGETTHREADTEB = 8,
     YGHV_SID_PSINITIALSYSTEMPROCESS = 9,
     YGHV_SID_PSLOADEDMODULELIST = 10,
-    YGHV_SID_COUNT = 11
+    YGHV_SID_PSGETPROCESSINHERITEDFROMUNIQUEPROCESSID = 11,
+    YGHV_SID_PSGETPROCESSEXITSTATUS = 12,
+    YGHV_SID_COUNT = 13
 };
 
 /* PsGetCurrentProcessId : 3 word(s), key 0x5A17 */
@@ -106,6 +108,23 @@ static const unsigned long long YGHV_SID_PSLOADEDMODULELIST_w[3] = {
     0x3C6EF372FE9511CCULL
 };
 
+/* PsGetProcessInheritedFromUniqueProcessId : 6 word(s), key 0x6F88 */
+static const unsigned long long YGHV_SID_PSGETPROCESSINHERITEDFROMUNIQUEPROCESSID_w[6] = {
+    0x6F72507465471CD8ULL,
+    0xFB5F17F00C398EFEULL,
+    0x531CB5169BE10EC0ULL,
+    0x8AC3185D14B1B6AAULL,
+    0x1C949596984930AEULL,
+    0x1715609F7C74DBF1ULL
+};
+
+/* PsGetProcessExitStatus : 3 word(s), key 0x717B */
+static const unsigned long long YGHV_SID_PSGETPROCESSEXITSTATUS_w[3] = {
+    0x6F7250746547022BULL,
+    0xEA5E01FC0C3988F3ULL,
+    0x3C6E80078AF41DF6ULL
+};
+
 static const unsigned long long *const yghv_str_words[YGHV_SID_COUNT] = {
     YGHV_SID_PSGETCURRENTPROCESSID_w,
     YGHV_SID_PSGETPROCESSID_w,
@@ -118,6 +137,8 @@ static const unsigned long long *const yghv_str_words[YGHV_SID_COUNT] = {
     YGHV_SID_PSGETTHREADTEB_w,
     YGHV_SID_PSINITIALSYSTEMPROCESS_w,
     YGHV_SID_PSLOADEDMODULELIST_w,
+    YGHV_SID_PSGETPROCESSINHERITEDFROMUNIQUEPROCESSID_w,
+    YGHV_SID_PSGETPROCESSEXITSTATUS_w,
 };
 
 static const unsigned int yghv_str_nwords[YGHV_SID_COUNT] = {
@@ -131,6 +152,8 @@ static const unsigned int yghv_str_nwords[YGHV_SID_COUNT] = {
     3,
     2,
     3,
+    3,
+    6,
     3,
 };
 
@@ -146,6 +169,8 @@ static const unsigned long long yghv_str_keys[YGHV_SID_COUNT] = {
     0x69AFULL,
     0x6BA2ULL,
     0x6D95ULL,
+    0x6F88ULL,
+    0x717BULL,
 };
 
 /* Decode entry id into out (ASCII). Returns out, or 0 on a bad id. */

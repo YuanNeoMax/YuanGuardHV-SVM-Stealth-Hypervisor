@@ -44,7 +44,7 @@
 #include "yghv_accessor.h"
 
 #define YGHV_OFF_MAGIC   0x59474F46u   /* 'YGOF' */
-#define YGHV_OFF_VERSION 1
+#define YGHV_OFF_VERSION 2   /* 9.591: +ppid +exit_status +thread_list_entry +token */
 
 /*
  * Offsets, in bytes, from the base of the object. 0 means NOT DERIVED, which
@@ -72,6 +72,33 @@ typedef struct _YGHV_OFFSETS {
     uint16_t thread_teb;        /* PVOID; == PsGetThreadTeb() */
     uint16_t thread_cid;        /* CLIENT_ID */
 
+    /*
+     * 9.591: two more EPROCESS fields, appended rather than inserted so the
+     * prefix above keeps its offsets. Both are derived from single-instruction
+     * accessors (measured on 19045):
+     *
+     *   PsGetProcessInheritedFromUniqueProcessId  48 8B 81 40 05 00 00 C3
+     *   PsGetProcessExitStatus                    8B 81 D4 07 00 00 C3
+     */
+    uint16_t inherited_pid;     /* ULONG_PTR; parent pid */
+    uint16_t exit_status;       /* ULONG; NTSTATUS once the process exits */
+
+    /*
+     * 9.591: the two coupled thread-list unknowns, filled by a structural
+     * probe (yghv_proc.c) rather than by an export, because no export reads
+     * either. Both are 0 until the probe succeeds, and the probe demands the
+     * whole chain stay inside one process, so a wrong pair cannot pass.
+     *
+     *   thread_list_entry  ETHREAD:  LIST_ENTRY that is a node of that list
+     *
+     * Token is an EX_FAST_REF, found by matching PsReferencePrimaryToken()
+     * against every aligned offset -- see the probe's comment for why a
+     * self-comparison during init cannot validate it.
+     */
+    uint16_t thread_list_entry;
+    uint16_t token;
+    /* 16 more bytes than version 1 had; reserved keeps the tail aligned. */
+
     /* --- validation --- */
     uint32_t derived_mask;      /* YGHV_OFF_* bits that were actually derived */
     uint32_t validated_mask;    /* ... and then checked against an export */
@@ -90,6 +117,10 @@ typedef struct _YGHV_OFFSETS {
 #define YGHV_OFF_TID       0x00000080u
 #define YGHV_OFF_TPROC     0x00000100u
 #define YGHV_OFF_TEB       0x00000200u
+#define YGHV_OFF_PPID      0x00000400u
+#define YGHV_OFF_XSTAT     0x00000800u
+#define YGHV_OFF_TLIST     0x00001000u
+#define YGHV_OFF_TOKEN     0x00002000u
 
 extern yghv_offsets_t g_yghv_off;
 
@@ -138,6 +169,14 @@ static __inline ULONG_PTR yghv_thread_id(PETHREAD t) {
 static __inline PEPROCESS yghv_thread_process(PETHREAD t) {
     PEPROCESS *f = YGHV_FIELD_PTR(t, g_yghv_off.thread_process, PEPROCESS);
     return f ? *f : NULL;
+}
+static __inline ULONG_PTR yghv_proc_inherited_pid(PEPROCESS p) {
+    ULONG_PTR *f = YGHV_FIELD_PTR(p, g_yghv_off.inherited_pid, ULONG_PTR);
+    return f ? *f : 0;
+}
+static __inline ULONG yghv_proc_exit_status(PEPROCESS p) {
+    ULONG *f = YGHV_FIELD_PTR(p, g_yghv_off.exit_status, ULONG);
+    return f ? *f : 0;
 }
 
 /*
@@ -194,6 +233,28 @@ typedef union _YGHV_PS_PROTECTION {
  * at open time, so a downgrade rewrites the granted mask rather than the
  * requested one.
  */
+/*
+ * 9.591: the WDK kernel headers ship exactly two process access rights,
+ * PROCESS_ALL_ACCESS and PROCESS_DUP_HANDLE. Everything else is only in the
+ * user-mode winnt.h, which a driver never includes - so YGHV_PROC_READ_RIGHTS
+ * below spelled two identifiers that did not exist, and any file that actually
+ * used it failed to compile. Define the three this driver needs, at their
+ * documented values, and guard each so a future header that does export them
+ * wins.
+ */
+#ifndef PROCESS_TERMINATE
+#define PROCESS_TERMINATE                  0x0001
+#endif
+#ifndef PROCESS_VM_READ
+#define PROCESS_VM_READ                    0x0010
+#endif
+#ifndef PROCESS_QUERY_LIMITED_INFORMATION
+#define PROCESS_QUERY_LIMITED_INFORMATION  0x1000
+#endif
+#ifndef PROCESS_SUSPEND_RESUME
+#define PROCESS_SUSPEND_RESUME             0x0800
+#endif
+
 #define YGHV_PROC_READ_RIGHTS  (PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ)
 #define YGHV_PROC_FULL_RIGHTS  (PROCESS_ALL_ACCESS)
 

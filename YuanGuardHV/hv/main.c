@@ -10,6 +10,7 @@
 #include "yghv_unload_trace.h"   /* 9.390: unload progress record */
 #include "common/yghv_nt.h"     /* 9.589: native offsets + accessors */
 #include "common/yghv_sig.h"    /* 9.589: signature / accessor scan */
+#include "common/yghv_proc.h"   /* 9.591: process / thread control */
 
 #define YGHV_R1_SKIP_NPT_TEST 0
 #define YGHV_R1_NPT_UNIT_TEST 1
@@ -4932,7 +4933,16 @@ void DriverUnload(struct _DRIVER_OBJECT *d) {
 
         resident_threads_at_entry = svm_core_resident_threads_for_trace();
 
-        yghv_ut_snapshot_pre_unload(
+        /*
+     * 9.591: put back every process this driver unlinked from
+     * ActiveProcessLinks. FIRST, before anything else is torn down: an
+     * EPROCESS left out of the list outlives the driver, and the next
+     * enumeration that walks the list faults on the hole. There is no later
+     * point in this function where the offsets are still valid.
+     */
+    yghv_proc_cleanup();
+
+    yghv_ut_snapshot_pre_unload(
             (UINT64)resident_threads_at_entry,
             (UINT64)yghv_s206_power_cb_for_trace(),
             (UINT64)g_vcpu_count,
@@ -5502,6 +5512,16 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
         else
             LOG_ERROR("sig: self-test FAILED ok=%llu fail=%llu hits=%llu",
                       sigStats[5], sigStats[6], sigStats[2]);
+    }
+    /*
+     * 9.591: the two structures no export can describe -- the thread list pair
+     * and EPROCESS.Token. Runs after the offsets because the probes read through
+     * the accessors that pass fills in; reports how many it found, and the ops
+     * built on a missing one answer STATUS_NOT_IMPLEMENTED instead of guessing.
+     */
+    {
+        int procOk = yghv_proc_init();
+        LOG_INFO("proc: field probes %d of 3 ok (thread list, token, protection export)", procOk);
     }
     /* 9.304: hand the service's own registry path to the persistence layer
      * BEFORE protect_init, which loads the saved settings. */

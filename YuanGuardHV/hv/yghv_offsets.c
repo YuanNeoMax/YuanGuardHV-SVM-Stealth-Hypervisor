@@ -237,6 +237,7 @@ NTSTATUS yghv_offsets_init(void)
 {
     UINT16 pid = 0, links = 0, protect = 0, peb = 0, base = 0, name = 0;
     UINT16 tid = 0, tproc = 0, teb = 0;
+    UINT16 ppid = 0, xstat = 0;
     UINT32 count = 0;
     UNICODE_STRING sysName;
     WCHAR sysWide[YGHV_STR_MAX_CHARS];
@@ -279,6 +280,29 @@ NTSTATUS yghv_offsets_init(void)
         g_yghv_off.derived_mask |= YGHV_OFF_TEB;
 
     /*
+     * 9.591: parent pid and exit status. Both exports are single-instruction
+     * accessors on 19045 (see yghv_accessor.h), so the decode is trustworthy.
+     *
+     * Deliberately NOT derived here, even though the offsets are known:
+     *
+     *   PsGetProcessSignatureLevel   decodes to 0x879 -- the SIGNER byte.
+     *   PsGetProcessProtection       (0x87A) is the one already in the table.
+     *                                Two exports, two adjacent bytes, and the
+     *                                accessor decoder cannot tell which is
+     *                                which; taking the wrong one writes the
+     *                                protection level into the signer nibble.
+     *   PsGetThreadFreezeCount       is a two-level dereference, not a field
+     *                                read; the "offset" it yields is ETHREAD
+     *                                +0x220, which is a pointer, not a counter.
+     *   PsIsProtectedProcess         is "test [rcx+0x87A],7", which the
+     *                                decoder cannot see (no 8A/8B/8D).
+     */
+    if (yghv_off_by_id(YGHV_SID_PSGETPROCESSINHERITEDFROMUNIQUEPROCESSID, &ppid))
+        g_yghv_off.derived_mask |= YGHV_OFF_PPID;
+    if (yghv_off_by_id(YGHV_SID_PSGETPROCESSEXITSTATUS, &xstat))
+        g_yghv_off.derived_mask |= YGHV_OFF_XSTAT;
+
+    /*
      * PsGetProcessProtection exists from Windows 10 1607 onward. Before that
      * the byte exists but nothing exports its offset, so the field stays 0 and
      * the protection feature reports "not available on this build" instead of
@@ -298,6 +322,8 @@ NTSTATUS yghv_offsets_init(void)
     g_yghv_off.thread_unique_id  = tid;
     g_yghv_off.thread_process    = tproc;
     g_yghv_off.thread_teb        = teb;
+    g_yghv_off.inherited_pid     = ppid;
+    g_yghv_off.exit_status       = xstat;
     g_yghv_off.thread_cid        = 0;      /* not derived; see the header note */
     g_yghv_off.thread_list_head  = 0;      /* not derived, on purpose */
     g_yghv_off.process_lock      = 0;
@@ -356,8 +382,9 @@ NTSTATUS yghv_offsets_init(void)
     g_yghv_off.failures     = (UINT32)InterlockedCompareExchange64(&g_off_failures, 0, 0);
 
     LOG_INFO("offsets: build %u pid=0x%x peb=0x%x base=0x%x name=0x%x prot=0x%x "
-             "tid=0x%x tproc=0x%x teb=0x%x derived=0x%x validated=0x%x",
-             build, pid, peb, base, name, protect, tid, tproc, teb,
+             "tid=0x%x tproc=0x%x teb=0x%x ppid=0x%x xstat=0x%x "
+             "derived=0x%x validated=0x%x",
+             build, pid, peb, base, name, protect, tid, tproc, teb, ppid, xstat,
              g_yghv_off.derived_mask, g_yghv_off.validated_mask);
 
     return STATUS_SUCCESS;

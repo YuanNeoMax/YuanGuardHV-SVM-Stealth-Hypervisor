@@ -122,6 +122,11 @@ public class YghvCtl {
   /* 9.546: where the guest actually started (stage-C diagnostic).
      Declared so the four-way parity check stays a real check. */
   private static final int FN_GUEST_START = 0x837;
+  /* 9.591: process / thread control (snapshot, protection byte, suspend, terminate,
+     offsets/sig diagnostics, thread list, token, hide). Declared with no command
+     case so the ioctl parity check stays a real check; the PowerShell client is
+     where this one is exercised from. */
+  private static final int FN_PROC = 0x838;
 
     private static native long openHandle();
     private static native void closeHandle(long handle);

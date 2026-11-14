@@ -29,7 +29,7 @@
 
 ---
 
-## 记录索引（9.590 重新测量，76 条）
+## 记录索引（9.591 重新测量，77 条）
 
 > 这是本文档自己的目录。**按标题扫一眼，找到要的那条，再跳过去读。**
 > 行数是该记录占的篇幅，用来判断"值不值得读全文"。
@@ -112,6 +112,7 @@
 | 9.588 P1-1 `mem-bp dr` 真正接上硬件：地址进物理 DR0-3，控制位进每核 VMCB Dr7 | 99 |
 | 9.589 原生结构访问 + 偏移推导 + 特征码定位：四种访问器边界，sigtest 用户态验收 | 66 |
 | 9.590 加密落地 + 导出名从镜像里彻底消掉：最后一条明文来自 import table | 55 |
+| 9.591 进程/线程控制面接进门：偏移表追加、十 op 分发、三客户端同步 | 121 |
 
 ---
 
@@ -4231,6 +4232,127 @@ flink 是 canonical 内核指针、`blink == prev`、`pid = *(cand+pid_off) <= 0
 未做完的：yghv_offsets / yghv_sig 只在 DriverEntry 里跑一次并打日志，**还没有任何 IOCTL 能问到
 它们的结论**；能力清单里的其余项目（PP/PPL、防截图、注入、挂起……）都还没开始。
 
+#### 9.591 进程/线程控制面接进门：偏移表追加、十 op 分发、三客户端同步
+
+##### 一、这一轮要接的是什么
+
+9.589–9.590 做完了三块底层：原生结构访问器（`yghv_accessor.h`）、偏移推导（`yghv_offsets.c`）、
+特征码定位（`yghv_sig.c`），外加编译期字符串加密（`gen_strtab.py` → `yghv_strtab.h`）。
+**但没有任何 IOCTL 能问到它们的结论** —— 它们只在 `DriverEntry` 里跑一次、打一行日志，
+之后整个生命周期里无人可问。这与 9.454 的 loader-stealth、9.589 的字符串表是同一个形状：
+能力存在、没接线、没有测试问它。
+
+这一轮接的是能力面上的第 ⑦ 项，落成 `IOCTL_YGHV_PROC`（函数号 **0x838**，前面 0x800–0x837 已满）
+与 `hv/yghv_proc.c`。十个 op：进程快照、单进程查询、写 protection 字节、暂停/恢复、
+结束进程、offsets 诊断、sig 诊断、线程枚举、token 偷取、摘链隐藏。
+
+##### 二、WDK 头里没有的东西，比预想的多
+
+`PsSuspendProcess` / `PsResumeProcess` / `PsGetThreadFreezeCount` 在 ntoskrnl 里都导出，
+但在 WDK 10.0.19041.0 的 `km/` 下一处声明都没有 —— 三个都要自己写 `NTKERNELAPI`。
+
+真正卡住编译的是另一类：**`PROCESS_TERMINATE` / `PROCESS_VM_READ` /
+`PROCESS_QUERY_LIMITED_INFORMATION` / `PROCESS_SUSPEND_RESUME` 这四个常量在 km 头里根本不存在**
+（`wdm.h` 只给 `PROCESS_ALL_ACCESS` 与 `PROCESS_DUP_HANDLE`；它们真正的家在用户态 `winnt.h`，
+而 WDK 的 `um/` 目录只有 40 个文件、不含 `winnt.h`）。`hv/common/yghv_nt.h` 里那个
+`YGHV_PROC_READ_RIGHTS` 宏在 9.590 之前就写着两个不存在的标识符 —— **只是从没人用过它，所以从没炸过**。
+这是「写下来就算完成」的另一种形态：宏本身合法，引用它才报错，而没有引用点的地方不算代码。
+
+##### 三、偏移表追加四个字段，以及**明确不**派生的三个
+
+`YGHV_OFF_VERSION` 1 → 2，append-only 追加 `inherited_pid`（ppid）、`exit_status`、
+`thread_list_entry`、`token`，位定义接 `YGHV_OFF_PPID 0x400` / `XSTAT 0x800` /
+`TLIST 0x1000` / `TOKEN 0x2000`。
+
+同时记下三个**看着能派生、实际会派生错**的导出，并把理由写进代码注释：
+
+| 导出 | 字节 | 为什么不能进偏移表 |
+|---|---|---|
+| `PsGetProcessSignatureLevel` | `48 85 d2 74 08 8a 81 79 08 ... 8a 81 78 08` | 是多指令函数，访问器解码拿到 **0x879**；真实 protection 在 **0x87A**（`PsGetProcessProtection` 是 `8A 81 7A 08 00 00 C3`）。差一个字节，读出来永远是 0 |
+| `PsGetThreadFreezeCount` | `48 8b 91 20 02 00 00 8b 82 78 02 00 00 c1 e8 03 ...` | 二级解引用（`[rcx+0x220]` → `[+0x278]` bit3 + `[+0x378]`），不是字段偏移 |
+| `PsIsProtectedProcess` | `f6 81 7a 08 00 00 07 ...` | `test byte [rcx+0x87A],7`，不是 8A/8B/8D 形状，解码拿不到 |
+
+**这三条的价值不在「读到了」，而在「知道读不到」。** 一个解出 0x879 的派生字段会安静地返回 0，
+看上去像「这个进程没有保护」，而真值在下一个字节。
+
+##### 四、探针必须恰好一个候选，否则拒绝
+
+thread list 与 token 两个探针都扫 `0x100..0x900` 步长 8，命中数**必须恰为 1**，
+否则打一行 `probe found %u candidates, refusing` 并返回 0（字段保持 NOT DERIVED，所有访问器继续 fail-closed）。
+「多个候选里挑第一个」在这里等于猜 —— 猜错的下场是后续所有枚举走错链表。
+
+token 探针还有一层：init 时只能拿 System 进程自比，**自比证明不了任何事**
+（`PsReferencePrimaryToken(sys)` 的结果和 `*(sys+off)` 是同一次读）。
+所以 op 8 每次使用前都用目标进程自己做一次 `PsReferencePrimaryToken` 复核。
+
+##### 五、METHOD_BUFFERED 是单缓冲，in == out
+
+`yghv_ioctl_proc_req_t` 是 56 字节，out 是 4096 字节，两者在缓冲里同一个地址开头。
+第一版 `RtlZeroMemory(out, out_len)` 写在拷出请求之前 —— 于是 `r.op` 读回 0，
+**每一次调用都静默退化成 SNAPSHOT**。没有崩溃、没有报错，客户端收到一份进程列表而不是它要的结果。
+
+正确顺序：先 `RtlCopyMemory(&r, in, sizeof(r))`，再清零 out。这条对项目里所有 METHOD_BUFFERED
+的分发都成立，只是此前的 case 都恰好没有「先把 out 清掉」的动作，所以没暴露。
+
+##### 六、结束受保护进程：清字节必须在第一次 ZwOpenProcess 之前
+
+对一个 PP/PPL 进程，`ZwOpenProcess(PROCESS_TERMINATE)` **一开始就会失败** —— 拿不到句柄，
+后面写什么都没机会。所以 `YGHV_PROC_TERM_CLEAR_PROT` 的处理顺序是硬约束：
+
+1. 从偏移表取 protection 字节，存旧值；
+2. 写 0（此刻进程还活着，偏移有效）；
+3. `ZwOpenProcess` + `ZwTerminateProcess`；
+4. 失败时用**新引用**把旧值写回（`PsLookupProcessByProcessId` 重新拿一次 EPROCESS，
+   因为第 2 步之后原引用可能已经被回收）。
+
+op 2（写 protection）写完后用 **export 读回**校验而不是用访问器自读：
+两者共用同一个 offset，自读只能证明「内存里是我刚写进去的值」，抓不到 offset 本身就是错的。
+
+##### 七、摘链清理是必须的，不是洁癖
+
+op 9 把 EPROCESS 从 `ActiveProcessLinks` 摘掉，记在原链表头里备份两个指针（上限 8 个）。
+问题在于：**被摘出去的 EPROCESS 比驱动活得久** —— 驱动卸载后它还在内存里，
+下一次任何进程枚举走到那个洞就是一次解引用野指针。
+所以 `yghv_proc_cleanup()` 挂在 `DriverUnload` 的 `yghv_ut_snapshot_pre_unload(` 之前：
+此刻偏移表仍然有效，之后再也没有这个时点。
+
+代码注释里同时写明**已知竞态**：摘链没拿 `EPROCESS.ProcessLock`。
+实测代价大于它关掉的窗口 —— 这是一个记录在案的取舍，不是遗漏。
+
+##### 八、接线与门
+
+- `control_device.c` 的 `case IOCTL_YGHV_PROC:` 插在 `:3691 default:` 之前，
+  body 里出现 `out_len`（`ioctl_output_bounds.ps1` 的判据）。
+- 这个 case **自动进 attack-surface 清单** —— `:3687` 的 `yghv_sentry_surface_add_ioctl((code >> 2) & 0xFFF)`
+  对所有成功 case 生效，不需要手工登记。
+- 三客户端同步（`ioctl_parity.ps1` 比数字集合、`command_parity.ps1` 比命令数）：
+  `control_ioctl.h` 加 `IOCTL_YGHV_PROC`、`yghv_ctl.ps1` 加 `IoCtl(0x838)` 与 `proc` 命令、
+  `YghvCtl.java` 加 `FN_PROC = 0x838`（只加常量不加 case）、`tools/yghv_client/README.md` 加一行命令说明。
+- PowerShell 侧每个分支都用 `-OutputLength 4096`：`ioctl_buffer_size.ps1` 会拒
+  「读了 offset 0 却要得比 `YGHV_PROC_OUT_QWORDS` 少」的调用 —— 按需小缓冲在这里不是优化而是违约。
+
+##### 九、一次真的构建验证
+
+```
+YGHV_BAREMETAL_STEP=206 YGHV_206B_COEXIST=1 YGHV_206B_GNPT=1 build.bat
+→ Build SUCCESS，ALL MAP CHECKS PASS
+镜像 SHA256 f3b88948110f2ab9d6f8aba160e3af66ffe2f0a7e66ffd8dbe2615f626a4f3cd
+```
+
+`dumpbin /imports` 确认新符号确实进了 IAT（导入总数 99，全部 ntoskrnl.exe）：
+`PsSuspendProcess`、`PsResumeProcess`、`PsGetThreadFreezeCount`、`ZwOpenProcess`、
+`ZwTerminateProcess`、`PsReferencePrimaryToken`、`PsLookupProcessByProcessId` 七条齐全。
+**首次调用即自动进 IAT，不需要改 build 配置** —— 这一点是量出来的，不是推断的。
+（顺带：手写 PE 解析器读导入表连踩两坑 —— 导入名 RVA 指向 hint/name 结构、名字从 `p+2` 开始；
+RVA 要经 section 映射且 `rva < va + max(VirtualSize, SizeOfRawData)` 才算命中。
+**结论是不如直接 dumpbin**。）
+
+##### 十、还没做的
+
+op 0–9 全部只有代码，**没有一条在真机上跑过**（`C:\yghv_pa.sys` 仍是 9.588 那一版，
+本轮的镜像没部署）。能力面清单里的其余项目 —— PP/PPL 的窗口防截图、注入原语（APC / 消息 / shellcode /
+远程 DLL）、CR3 解密与页表分析、无痕通信扩展 —— 都还没开始。
+
 ## 本次会话结束时状态
 
 > 这一段曾被落在 9.564 而正文已经写到 9.582 —— 同一份文件里两个互相矛盾的状态，
@@ -4246,7 +4368,7 @@ flink 是 canonical 内核指针、`blink == prev`、`pid = *(cand+pid_off) <= 0
 台账          : 8 完成 / 9 不做 / 1 需重启（Tier 6.1）
 静态检查      : 17 脚本 / 49 条 PASS（含 33 条自检），另 1 条链接后检查（tests/ 共 19 个脚本）
 文档检查      : docs_check PASS —— 57 md / 32 链接 / 76 记录 / 9 项
-最新编号      : 9.590
+最新编号      : 9.591
 ```
 
 **P1-1 的结论变了，但没结案。** 9.585 证明三次失败有一个共同原因：

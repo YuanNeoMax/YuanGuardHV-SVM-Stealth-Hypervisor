@@ -5093,6 +5093,161 @@ try {
                 [YghvMem]::CloseHandle($h) | Out-Null
             }
         }
+        'proc' {
+            # 9.591: process and thread control (IOCTL 0x838).
+            #
+            # One request struct carries every op, so the driver side is a single
+            # switch:
+            #   ULONG op; ULONG pid; ULONG_PTR arg0; ULONG arg1; ULONG flags;
+            #   UCHAR name[32];
+            #
+            # Every call below asks for the FULL 4096-byte reply even when it only
+            # reads the header. The handler gates its write on out_len, and
+            # ioctl_buffer_size.ps1 refuses a call that reads past offset 0 while
+            # asking for less than YGHV_PROC_OUT_QWORDS - for good reason: a short
+            # ask that happens to work today is the defect that ships tomorrow.
+            #
+            # usage:
+            #   proc                            process list (snapshot)
+            #   proc <pid>                      one process by pid
+            #   proc offsets                    where the offset table landed
+            #   proc sig                        signature-scan counters
+            #   proc threads <pid> [max]        thread list of one process
+            #   proc prot <pid> <hex>           rewrite the protection byte
+            #   proc suspend <pid>              freeze every thread
+            #   proc resume <pid>               thaw
+            #   proc term <pid> [clearp] [code] terminate; clearp drops protection first
+            #   proc token <src_pid> <dst_pid>  read/copy the primary token
+            #   proc hide <pid> | proc unhide <pid>
+
+            function New-ProcReq([uint32]$op, [uint32]$pidVal, [uint64]$a0, [uint32]$a1, [uint32]$fl) {
+                $req = New-Object byte[] 56
+                [BitConverter]::GetBytes([uint32]$op).CopyTo($req, 0)
+                [BitConverter]::GetBytes([uint32]$pidVal).CopyTo($req, 4)
+                [BitConverter]::GetBytes([uint64]$a0).CopyTo($req, 8)
+                [BitConverter]::GetBytes([uint32]$a1).CopyTo($req, 16)
+                [BitConverter]::GetBytes([uint32]$fl).CopyTo($req, 20)
+                return ,$req
+            }
+
+            function Show-ProcEntry([byte[]]$buf, [int]$at) {
+                $e0 = [BitConverter]::ToUInt64($buf, $at)
+                $e1 = [BitConverter]::ToUInt64($buf, $at + 8)
+                $e2 = [BitConverter]::ToUInt64($buf, $at + 16)
+                $e3 = [BitConverter]::ToUInt64($buf, $at + 24)
+                Write-Host ("  pid={0,-6} ppid={1,-6} prot=0x{2:X2} type={3} signer={4} exit=0x{5:X8} base=0x{6:X} flags=0x{7:X}" -f ([uint32]($e0 -band 0xFFFFFFFF)),  ([uint32](($e0 -shr 32) -band 0xFFFFFFFF)),  ([uint32]($e1 -band 0xFF)),  ([uint32](($e1 -shr 16) -band 0x7)),  ([uint32](($e1 -shr 8) -band 0xF)),  ([uint32](($e1 -shr 32) -band 0xFFFFFFFF)),  $e2, $e3)
+            }
+
+            if ($null -eq $Arg1) {
+                $req = New-ProcReq 0 0 120 0 0
+                $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x838)) -InBytes $req -OutputLength 4096
+                $count = [BitConverter]::ToUInt64($out, 8)
+                Write-Host ("proc: {0} process(es), offset mask 0x{1:X}" -f  $count, [BitConverter]::ToUInt64($out, 16))
+                for ($i = 0; $i -lt [int]$count; $i++) { Show-ProcEntry $out (32 + $i * 32) }
+                return
+            }
+
+            $v = "$Arg1".ToLower()
+
+            if ($v -eq 'offsets') {
+                $req = New-ProcReq 5 0 0 0 0
+                $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x838)) -InBytes $req -OutputLength 4096
+                Write-Host ("proc offsets: derived=0x{0:X} validated=0x{1:X} failures={2} build={3}" -f  [BitConverter]::ToUInt64($out, 8), [BitConverter]::ToUInt64($out, 16),  [BitConverter]::ToUInt64($out, 24), [BitConverter]::ToUInt64($out, 32))
+                Write-Host ("proc offsets: thread_list_head=0x{0:X} token=0x{1:X} thread_list_entry=0x{2:X}" -f  [BitConverter]::ToUInt64($out, 40), [BitConverter]::ToUInt64($out, 48),  [BitConverter]::ToUInt64($out, 56))
+                return
+            }
+
+            if ($v -eq 'sig') {
+                $req = New-ProcReq 6 0 0 0 0
+                $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x838)) -InBytes $req -OutputLength 4096
+                Write-Host ("proc sig: scans={0} bytes={1} hits={2} faults={3} bad_module={4} selftest_ok={5} selftest_fail={6}" -f  [BitConverter]::ToUInt64($out, 8), [BitConverter]::ToUInt64($out, 16),  [BitConverter]::ToUInt64($out, 24), [BitConverter]::ToUInt64($out, 32),  [BitConverter]::ToUInt64($out, 40), [BitConverter]::ToUInt64($out, 48),  [BitConverter]::ToUInt64($out, 56))
+                return
+            }
+
+            if ($v -eq 'threads') {
+                if ($null -eq $Arg2) { throw 'proc threads: usage: proc threads <pid> [max]' }
+                $tp = [uint32]::Parse($Arg2)
+                $mx = [uint32]240
+                if ($null -ne $Arg3) { $mx = [uint32]::Parse($Arg3) }
+                $req = New-ProcReq 7 $tp $mx 0 0
+                $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x838)) -InBytes $req -OutputLength 4096
+                $count = [BitConverter]::ToUInt64($out, 8)
+                Write-Host ("proc threads: pid={0} {1} thread(s)" -f $tp, $count)
+                for ($i = 0; $i -lt [int]$count; $i++) {
+                    $t0 = [BitConverter]::ToUInt64($out, 32 + $i * 16)
+                    $t1 = [BitConverter]::ToUInt64($out, 32 + $i * 16 + 8)
+                    Write-Host ("  tid={0,-6} pid={1,-6} freeze={2} state={3}" -f  ([uint32]($t0 -band 0xFFFFFFFF)),  ([uint32](($t0 -shr 32) -band 0xFFFFFFFF)),  ([uint32]($t1 -band 0xFFFFFFFF)),  ([uint32](($t1 -shr 32) -band 0xFFFFFFFF)))
+                }
+                return
+            }
+
+            if ($v -eq 'prot') {
+                if ($null -eq $Arg2 -or $null -eq $Arg3) { throw 'proc prot: usage: proc prot <pid> <hex_level>' }
+                $pp = [uint32]::Parse($Arg2)
+                $lv = [Convert]::ToUInt64(($Arg3 -replace '^0[xX]', ''), 16)
+                $req = New-ProcReq 2 $pp $lv 0 0
+                $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x838)) -InBytes $req -OutputLength 4096
+                $okp = [BitConverter]::ToUInt64($out, 0)
+                Write-Host ("proc prot: pid={0} old=0x{1:X2} verify=0x{2:X2} want=0x{3:X2} {4}" -f  $pp, [BitConverter]::ToUInt64($out, 8), [BitConverter]::ToUInt64($out, 16),  [BitConverter]::ToUInt64($out, 24), $(if ($okp -ne 0) { 'OK' } else { 'MISMATCH' }))
+                return
+            }
+
+            if ($v -eq 'suspend' -or $v -eq 'resume') {
+                if ($null -eq $Arg2) { throw ('proc {0}: usage: proc {0} <pid>' -f $v) }
+                $sp = [uint32]::Parse($Arg2)
+                $want = [uint32]1
+                if ($v -eq 'resume') { $want = [uint32]0 }
+                $req = New-ProcReq 3 $sp $want 0 0
+                $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x838)) -InBytes $req -OutputLength 4096
+                Write-Host ("proc {0}: pid={1} status=0x{2:X8} {3}" -f  $v, $sp, [BitConverter]::ToUInt64($out, 8), $(if ([BitConverter]::ToUInt64($out, 0) -ne 0) { 'OK' } else { 'FAILED' }))
+                return
+            }
+
+            if ($v -eq 'term') {
+                if ($null -eq $Arg2) { throw 'proc term: usage: proc term <pid> [clearp] [exit_code]' }
+                $tp = [uint32]::Parse($Arg2)
+                $fl = [uint32]0
+                $ex = [uint32]0
+                if ($null -ne $Arg3) {
+                    if ("$Arg3".ToLower() -eq 'clearp') { $fl = [uint32]1 }
+                    else { $ex = [uint32]::Parse($Arg3) }
+                }
+                if ($null -ne $Arg4) { $ex = [uint32]::Parse($Arg4) }
+                $req = New-ProcReq 4 $tp 0 $ex $fl
+                $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x838)) -InBytes $req -OutputLength 4096
+                Write-Host ("proc term: pid={0} status=0x{1:X8} cleared={2} old_prot=0x{3:X2} {4}" -f  $tp, [BitConverter]::ToUInt64($out, 8), [BitConverter]::ToUInt64($out, 16),  [BitConverter]::ToUInt64($out, 24), $(if ([BitConverter]::ToUInt64($out, 0) -ne 0) { 'TERMINATED' } else { 'FAILED' }))
+                return
+            }
+
+            if ($v -eq 'token') {
+                if ($null -eq $Arg2 -or $null -eq $Arg3) { throw 'proc token: usage: proc token <src_pid> <dst_pid>' }
+                $src = [uint32]::Parse($Arg2)
+                $dst = [uint32]::Parse($Arg3)
+                $req = New-ProcReq 8 $src $dst 1 0
+                $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x838)) -InBytes $req -OutputLength 4096
+                Write-Host ("proc token: src={0} dst={1} raw=0x{2:X} copied={3}" -f  $src, $dst, [BitConverter]::ToUInt64($out, 8),  $(if ([BitConverter]::ToUInt64($out, 16) -ne 0) { 'yes' } else { 'no' }))
+                return
+            }
+
+            if ($v -eq 'hide' -or $v -eq 'unhide') {
+                if ($null -eq $Arg2) { throw ('proc {0}: usage: proc {0} <pid>' -f $v) }
+                $hp = [uint32]::Parse($Arg2)
+                $want = [uint64]1
+                if ($v -eq 'unhide') { $want = [uint64]0 }
+                $req = New-ProcReq 9 $hp $want 0 0
+                $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x838)) -InBytes $req -OutputLength 4096
+                Write-Host ("proc {0}: pid={1} state={2}" -f $v, $hp, $(if ([BitConverter]::ToUInt64($out, 8) -ne 0) { 'hidden' } else { 'visible' }))
+                return
+            }
+
+            # Anything left is a bare pid: single-process query.
+            $qp = [uint32]::Parse($v)
+            $req = New-ProcReq 1 $qp 0 0 0
+            $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x838)) -InBytes $req -OutputLength 4096
+            Show-ProcEntry $out 32
+            $nm = [Text.Encoding]::ASCII.GetString($out, 64, 16).TrimEnd([char]0)
+            Write-Host ("proc: pid={0} image='{1}'" -f $qp, $nm)
+        }
         default {
             throw ("unknown command: {0}" -f $Command)
         }

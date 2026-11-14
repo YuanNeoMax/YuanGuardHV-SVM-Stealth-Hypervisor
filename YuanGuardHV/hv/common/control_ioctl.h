@@ -821,4 +821,73 @@ typedef struct {
 
 #define YGHV_SCAN_OUT_HDR_QWORDS 5
 
+
+/*
+ * 9.591: process / thread control.
+ *
+ * WHY THIS IS ONE FUNCTION NUMBER AND NOT TWELVE
+ *   Every operation here is the same shape: "one target process, one verb,
+ *   one small answer". Twelve IOCTL codes would put twelve switch arms in the
+ *   dispatcher and twelve numbers in three clients; one code with an op field
+ *   keeps the parity table one line long. The op is validated in
+ *   yghv_proc.c, not here, so the policy stays in the module that owns it.
+ *
+ * WHAT ARG0/ARG1 MEAN PER OP (see yghv_proc.c for the authoritative table)
+ *   0 SNAPSHOT   pid ignored        arg0 = max entries     -> entry list
+ *   1 QUERY      pid = target       --                    -> one entry + name
+ *   2 PROT       pid = target       arg0 = new level byte -> old byte, new byte
+ *   3 SUSPEND    pid = target       arg0 = 1 suspend / 0 resume
+ *   4 TERM       pid = target       arg0 = exit status, flags bit0 = clear
+ *                                                        protection first
+ *   5 OFFSETS    --                 --                    -> 4 qwords
+ *   6 SIG        --                 --                    -> 7 qwords
+ *   7 THREADS    pid = target       arg0 = max entries    -> thread list
+ *   8 TOKEN      pid = source       --                    -> stolen token addr
+ *   9 HIDE       pid = target       arg0 = 1 hide / 0 unhide
+ *
+ * ENTRY LAYOUT (4 qwords each, at out[YGHV_PROC_HDR_QWORDS])
+ *   [0] pid | (ppid << 32)
+ *   [1] prot | (signer << 8) | (type << 16) | (audit << 24) | (exit << 32)
+ *   [2] image base
+ *   [3] flags: bit0 hidden bit1 suspended bit2 offsets-derived bit3 has-name
+ *
+ * THREAD ENTRY (2 qwords each)
+ *   [0] tid | (pid << 32)          [1] freeze count | (state << 32)
+ */
+#define IOCTL_YGHV_PROC \
+    YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x838, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
+
+/* 4096-byte buffer: 4 qwords of header, the rest is entries. */
+#define YGHV_PROC_HDR_QWORDS   4
+#define YGHV_PROC_OUT_QWORDS   512
+#define YGHV_PROC_ENTRY_QWORDS 4
+#define YGHV_PROC_TENTRY_QWORDS 2
+#define YGHV_PROC_MAX_ENTRIES  120
+#define YGHV_PROC_MAX_THREADS  240
+
+#define YGHV_PROC_OP_SNAPSHOT 0
+#define YGHV_PROC_OP_QUERY    1
+#define YGHV_PROC_OP_PROT     2
+#define YGHV_PROC_OP_SUSPEND  3
+#define YGHV_PROC_OP_TERM     4
+#define YGHV_PROC_OP_OFFSETS  5
+#define YGHV_PROC_OP_SIG      6
+#define YGHV_PROC_OP_THREADS  7
+#define YGHV_PROC_OP_TOKEN    8
+#define YGHV_PROC_OP_HIDE     9
+
+/* flags for op 4 */
+#define YGHV_PROC_TERM_CLEAR_PROT 0x1u
+/* flags field for any op */
+#define YGHV_PROC_F_ALLOW_SYSTEM  0x1u  /* pid 4 / pid 0 refused without it */
+
+typedef struct {
+    ULONG     op;
+    ULONG     pid;
+    ULONG_PTR arg0;
+    ULONG     arg1;
+    ULONG     flags;
+    UCHAR     name[32];
+} yghv_ioctl_proc_req_t;
+
 #endif

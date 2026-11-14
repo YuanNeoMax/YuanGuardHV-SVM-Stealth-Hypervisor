@@ -23,6 +23,7 @@
 #include "yghv_sentry.h"   /* Tier 7.4/7.5/7.6: timing/escape/surface */
 #include "yghv_auth.h"     /* 9.371 (Tier 9.2): authenticated commands */
 #include "common/yghv_nt.h" /* 9.590: pid via derived offset, not the import */
+#include "common/yghv_proc.h" /* 9.591: process / thread control policy */
 #include "debug.h"
 
 /*
@@ -3661,6 +3662,32 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
         status = STATUS_INVALID_PARAMETER;
         break;
     }
+    /*
+     * 9.591: process / thread control.
+     *
+     * Everything in here is one switch arm and one call: the policy -- what may
+     * be done to which process -- lives in yghv_proc.c so the rules can be read
+     * in one place. This arm only checks the buffer is big enough and turns the
+     * returned NTSTATUS into an IRP status.
+     *
+     * The output length reported to the client is whatever yghv_proc_dispatch
+     * decided it wrote: several ops answer with four qwords regardless of how
+     * much room they were given, and the snapshot ops answer with as many
+     * entries as fit. Reporting a fixed size would let a client read past the
+     * entries with stale METHOD_BUFFERED bytes.
+     */
+    case IOCTL_YGHV_PROC:
+        if (in_len < sizeof(yghv_ioctl_proc_req_t)) {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        {
+            ULONG procInfo = 0;
+            status = yghv_proc_dispatch(buf, in_len, buf, out_len, &procInfo);
+            if (NT_SUCCESS(status)) info = procInfo;
+        }
+        break;
+
     default:
         status = STATUS_INVALID_DEVICE_REQUEST;
         break;

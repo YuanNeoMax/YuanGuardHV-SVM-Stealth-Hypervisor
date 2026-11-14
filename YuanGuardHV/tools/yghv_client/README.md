@@ -112,6 +112,7 @@ yghv_ctl.ps1 exit-codes
 yghv_ctl.ps1 handler-cost [reset]
 yghv_ctl.ps1 virt-counts
 yghv_ctl.ps1 guest-start [reset]
+yghv_ctl.ps1 proc [<pid>|offsets|sig|threads <pid> [max]|prot <pid> <hex>|suspend <pid>|resume <pid>|term <pid> [clearp] [code]|token <src> <dst>|hide <pid>|unhide <pid>]
 ```
 
 `protect` sets the target, enumerates committed pages of the real Java process,

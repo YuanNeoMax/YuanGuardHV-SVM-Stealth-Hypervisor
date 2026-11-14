@@ -37,6 +37,10 @@ NAMES = [
     "PsGetThreadTeb",
     "PsInitialSystemProcess",
     "PsLoadedModuleList",
+    # 9.591: append-only. key_for(i) is indexed, so inserting above would
+    # re-key every later name and silently change the whole table.
+    "PsGetProcessInheritedFromUniqueProcessId",
+    "PsGetProcessExitStatus",
 ]
 
 

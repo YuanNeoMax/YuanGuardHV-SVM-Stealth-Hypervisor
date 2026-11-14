@@ -128,10 +128,25 @@ int yghv_sig_branch_target(uint64_t site, uint64_t *target);
  * chose. So the shape is explicit, and a caller that wants to locate a
  * specific accessor passes the shape it observed.
  */
+/*
+ * 9.591: these four are already defined by yghv_accessor.h, which yghv_nt.h
+ * pulls in. A translation unit that includes both (yghv_proc.c does, because it
+ * needs offsets and signatures) got eight -Wmacro-redefined warnings, which is
+ * exactly the kind of noise that hides a real diagnostic. Guarded rather than
+ * removed so a caller that includes only yghv_sig.h still compiles.
+ */
+#ifndef YGHV_ACC_MOV64
 #define YGHV_ACC_MOV64   1   /* 48 8B 81 dd dd dd dd C3  (8 bytes) */
+#endif
+#ifndef YGHV_ACC_LEA64
 #define YGHV_ACC_LEA64   2   /* 48 8D 81 dd dd dd dd C3  (8 bytes) */
+#endif
+#ifndef YGHV_ACC_MOV8
 #define YGHV_ACC_MOV8    3   /* 8A 81 dd dd dd dd C3     (7 bytes) */
+#endif
+#ifndef YGHV_ACC_MOV64_8
 #define YGHV_ACC_MOV64_8 4   /* 48 8B 41 dd C3           (5 bytes, disp < 0x80) */
+#endif
 
 /*
  * Build the machine code of one accessor shape from a derived offset.

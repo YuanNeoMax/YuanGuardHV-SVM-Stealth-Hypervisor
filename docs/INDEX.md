@@ -17,7 +17,7 @@
 | **了解 Windows-as-Guest** | **[`WINDOWS_AS_GUEST_FINDINGS.md`](WINDOWS_AS_GUEST_FINDINGS.md)** | 全部结论：能跑、快 38%、停不下来、根因、已排除解法 |
 | **写内核代码前** | [`KERNEL_API_CHECKLIST.md`](KERNEL_API_CHECKLIST.md) | 三次蓝屏换来的 API 契约 |
 | **改文档之后** | `YuanGuardHV/tests/README.md`（代码树内，用路径而非链接）| `docs_check.ps1` 会拦住过期数字（构建期自动跑）|
-| **查某条变更** | [`YUANMOD_HANDOFF_CURRENT.md`](YUANMOD_HANDOFF_CURRENT.md) | 9.500 起逐条记录，**开头有 74 条索引**（标题 + 真实行数）|
+| **查某条变更** | [`YUANMOD_HANDOFF_CURRENT.md`](YUANMOD_HANDOFF_CURRENT.md) | 9.500 起逐条记录，**开头有 77 条索引**（标题 + 真实行数）|
 | **查更早的变更** | [`archive/_ARCHIVE_HANDOFF_9.1-9.299.md`](archive/_ARCHIVE_HANDOFF_9.1-9.299.md) | 9.1–9.499 |
 
 ---
@@ -26,13 +26,13 @@
 
 ```
 驱动          : STOPPED
-镜像          : bin == 4C826DCE80B10033
+镜像          : bin == f3b88948110f2ab9
                 部署 C:\yghv_pa.sys 仍是 BCC4FECDEA8DCEE5（9.588 的构建还没部署）
 默认配置      : 真 guest + 全核（9.577 起），12 线程 1.05-1.08×
 卸载          : 0.07 s，invmrun at unload = 0x0
 台账          : 8 完成 / 9 不做 / 1 需重启（Tier 6.1 启动期验收）
 HEAD          : 不写死 —— 写进文档的那一刻就开始过期，看 `git log -1`
-最新编号      : 9.590
+最新编号      : 9.591
 ```
 
 > `镜像` 与 `最新编号` 两行由 `docs_check.ps1` 核对（前者比 `bin/yuanguard_hv.sys`
