@@ -100,7 +100,13 @@ int yghv_obguard_enable(PEPROCESS target)
     *(USHORT *)(opbuf + 0x08) = 0x0003;  /* HANDLE_CREATE | HANDLE_DUPLICATE */
     *(PVOID *)(opbuf + 0x10) = (PVOID)yghv_obguard_pre;
 
-    RtlInitUnicodeString(&altitude, L"321000");
+    /*
+     * 9.601: altitude 321000 is in the legitimate OB filter range (320000-329999)
+     * but it is still a signature.  321000 is the number several public rootkit
+     * samples use; picking 327681 puts us in the same range with a value no
+     * static list matches.
+     */
+    RtlInitUnicodeString(&altitude, L"327681");
 
     /* regbuf: Version, Count, Altitude, RegistrationContext, OperationRegistration */
     *(USHORT *)(regbuf + 0x00) = 0x0100;  /* OB_FLT_REGISTRATION_VERSION */

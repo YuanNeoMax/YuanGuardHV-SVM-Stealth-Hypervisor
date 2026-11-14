@@ -12,6 +12,14 @@
 
 ---
 
+## v0.4.13 — OB 回调 altitude 去签名化
+
+### Changed
+- ObRegisterCallbacks altitude 从 `321000`（多个公开 rootkit 样本用的值）改为 `327681`（同一合法范围，无已知样本）。
+
+### Verification
+- 单文件编译零诊断；全量构建 EXIT=0，镜像 SHA256 = 9226652daac909f1b26b21c3be74b5de201a0832b940fe56913c7932d7f943e3。
+
 ## v0.4.12 — 动态设备名（避免静态签名匹配）
 
 ### Changed
