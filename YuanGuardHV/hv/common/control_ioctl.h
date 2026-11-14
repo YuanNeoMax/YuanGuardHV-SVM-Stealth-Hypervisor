@@ -672,6 +672,15 @@ typedef struct {
     ULONG     _pad;
 } yghv_ioctl_npt_remap_t;
 
+/*
+ * 9.600: dynamic device name.  The static names below remain as the FALLBACK
+ * (used when YGHV_DYNNAME is 0 or when the random generation fails).
+ * When dynamic naming is active, the real name is written to the registry
+ * key  \Registry\Machine\System\CurrentControlSet\Services\YghvDevice
+ * value  DeviceName  (REG_SZ)  so the client can discover it.
+ */
+#define YGHV_DYNNAME_LEN 32
+
 #define YGHV_DEVICE_NAME_STRING     L"\\Device\\YuanGuardHV"
 #define YGHV_DOS_DEVICE_NAME_STRING L"\\DosDevices\\YuanGuardHV"
 

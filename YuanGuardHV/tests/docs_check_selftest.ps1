@@ -128,7 +128,7 @@ try {
     # silently stop mutating anything the moment a new record was added -- exactly
     # the "test that can no longer fail" shape this file exists to prevent.
     $t = ReadText $handoffPath
-    $m = [regex]::Match($t, '\|\s*(9\.5[6-9][0-9][^|]*)\|\s*([0-9]+)\s*\|')
+    $m = [regex]::Match($t, '\|\s*(9\.[56][0-9]{2}[^|]*)\|\s*([0-9]+)\s*\|')
     if (-not $m.Success) { throw 'selftest: cannot locate any 9.5xx index row to mutate' }
     $t2 = $t.Substring(0, $m.Index) + ($m.Value -replace '\|\s*[0-9]+\s*\|', '| 999 |') + $t.Substring($m.Index + $m.Length)
     WriteText $handoffPath $t2
@@ -163,8 +163,8 @@ try {
     # perfectly awake. Measured 9.586: the earlier version took the FIRST match
     # (9.583, a changelog line) and INDEX meanwhile carried 9.585 in two places, so
     # the mutation never touched the number under test.
-    $idxNums = @([regex]::Matches($t, '9\.5[0-9]{2}') | ForEach-Object { $_.Value })
-    if ($idxNums.Count -eq 0) { throw 'selftest: cannot locate a 9.5xx number in INDEX.md to mutate' }
+    $idxNums = @([regex]::Matches($t, '9\.[0-9]{3}') | ForEach-Object { $_.Value })
+    if ($idxNums.Count -eq 0) { throw 'selftest: cannot locate a 9.xxx number in INDEX.md to mutate' }
     $newest = ($idxNums | Sort-Object { [double]$_.Substring(2) })[-1]
     $idxStale = '9.' + ([double]$newest.Substring(2) - 1)
     # String.Replace (not -replace) replaces EVERY occurrence, which is the point.
@@ -259,7 +259,7 @@ try {
     # replacing the first occurrence left the real claim untouched and the check
     # was reported asleep (measured, second run).
     $n = $null
-    foreach ($m in [regex]::Matches($blockText, '9\.5[0-9]{2}')) {
+    foreach ($m in [regex]::Matches($blockText, '9\.[0-9]{3}')) {
         if (-not $n -or [double]$m.Value.Substring(2) -gt [double]$n.Value.Substring(2)) { $n = $m }
     }
     if (-not $n) { throw 'selftest: the final section carries no 9.xxx number' }

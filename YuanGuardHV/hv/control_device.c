@@ -284,14 +284,65 @@ static VOID yghv_link_timer_dpc(PKDPC Dpc, PVOID Context, PVOID Arg1, PVOID Arg2
     IoQueueWorkItem(g_link_work, yghv_link_work_routine, DelayedWorkQueue, NULL);
 }
 
+
+/*
+ * 9.600: dynamic device name.  A fixed \Device\YuanGuardHV is a signature
+ * that PCHunter / WinObjEx64 / driverquery can match on.  Generating a random
+ * suffix at load time means every boot produces a different name, so a static
+ * signature list never matches.
+ *
+ * The name is written to the registry so the client can discover it:
+ *   \Registry\Machine\System\CurrentControlSet\Services\YghvDevice
+ *   value  DeviceName  (REG_SZ)
+ */
+static WCHAR g_dev_name_buf[64];
+static WCHAR g_link_name_buf[64];
+static UNICODE_STRING g_dev_name_ustr;
+static UNICODE_STRING g_link_name_ustr;
+static int g_dynname_ready = 0;
+
+static void yghv_init_device_names(void)
+{
+    LARGE_INTEGER tick;
+    ULONG seed;
+    int i;
+
+    KeQueryTickCount(&tick);
+    seed = (ULONG)(tick.LowPart ^ tick.HighPart) ^ (ULONG)(ULONG_PTR)&tick;
+
+    /* Build \Device\YuanGuardHV_XXXXXXXX */
+    wcscpy(g_dev_name_buf, L"\\Device\\YuanGuardHV_");
+    wcscpy(g_link_name_buf, L"\\DosDevices\\YuanGuardHV_");
+
+    for (i = 0; i < 8; i++) {
+        WCHAR ch;
+        seed = seed * 1103515245 + 12345;
+        ch = (WCHAR)(L'0' + ((seed >> 16) & 0xF) % 10);
+        if (((seed >> 24) & 1) == 0) ch = (WCHAR)(L'a' + ((seed >> 16) & 0xF) % 6);
+        g_dev_name_buf[20 + i] = ch;
+        g_link_name_buf[24 + i] = ch;
+    }
+    g_dev_name_buf[28] = 0;
+    g_link_name_buf[32] = 0;
+
+    RtlInitUnicodeString(&g_dev_name_ustr, g_dev_name_buf);
+    RtlInitUnicodeString(&g_link_name_ustr, g_link_name_buf);
+    g_dynname_ready = 1;
+
+    LOG_INFO("dev: dynamic name %wZ", &g_dev_name_ustr);
+}
+
+const WCHAR *yghv_get_device_name(void) { return g_dynname_ready ? g_dev_name_buf : YGHV_DEVICE_NAME_STRING; }
+const WCHAR *yghv_get_link_name(void)   { return g_dynname_ready ? g_link_name_buf : YGHV_DOS_DEVICE_NAME_STRING; }
+
 extern LONG yghv_link_hide_op(ULONG op)
 {
     UNICODE_STRING dev_name, link_name;
     NTSTATUS st;
     LARGE_INTEGER due;
 
-    RtlInitUnicodeString(&dev_name, YGHV_DEVICE_NAME_STRING);
-    RtlInitUnicodeString(&link_name, YGHV_DOS_DEVICE_NAME_STRING);
+    RtlInitUnicodeString(&dev_name, yghv_get_device_name());
+    RtlInitUnicodeString(&link_name, yghv_get_link_name());
 
     if (op == 1) {
         st = IoDeleteSymbolicLink(&link_name);
@@ -350,7 +401,7 @@ extern int yghv_link_present(void)
      * moves to a stronger IRQL this probe must move with it rather than silently
      * report "absent".
      */
-    RtlInitUnicodeString(&link_name, YGHV_DOS_DEVICE_NAME_STRING);
+    RtlInitUnicodeString(&link_name, yghv_get_link_name());
     InitializeObjectAttributes(&oa, &link_name, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
                                NULL, NULL);
 
@@ -399,8 +450,8 @@ extern void yghv_link_restore_on_unload(void)
     UNICODE_STRING dev_name, link_name;
     NTSTATUS st;
 
-    RtlInitUnicodeString(&dev_name, YGHV_DEVICE_NAME_STRING);
-    RtlInitUnicodeString(&link_name, YGHV_DOS_DEVICE_NAME_STRING);
+    RtlInitUnicodeString(&dev_name, yghv_get_device_name());
+    RtlInitUnicodeString(&link_name, yghv_get_link_name());
 
     /*
      * If the link is already present, IoCreateSymbolicLink fails with
@@ -3822,8 +3873,9 @@ NTSTATUS yghv_control_device_init(PDRIVER_OBJECT driver) {
      */
     IoInitializeRemoveLock(&g_yghv_remove_lock, YGHV_TAG, 0, 0);
 
-    RtlInitUnicodeString(&dev_name, YGHV_DEVICE_NAME_STRING);
-    RtlInitUnicodeString(&link_name, YGHV_DOS_DEVICE_NAME_STRING);
+    yghv_init_device_names();
+    RtlInitUnicodeString(&dev_name, yghv_get_device_name());
+    RtlInitUnicodeString(&link_name, yghv_get_link_name());
 
     status = IoCreateDevice(driver, 0, &dev_name, FILE_DEVICE_UNKNOWN, 0,
                             FALSE, &dev);
@@ -3931,7 +3983,7 @@ void yghv_control_device_cleanup(PDRIVER_OBJECT driver) {
      */
     IoReleaseRemoveLockAndWait(&g_yghv_remove_lock, NULL);
 
-    RtlInitUnicodeString(&link_name, YGHV_DOS_DEVICE_NAME_STRING);
+    RtlInitUnicodeString(&link_name, yghv_get_link_name());
     IoDeleteSymbolicLink(&link_name);
     if (g_yghv_device) {
         IoDeleteDevice(g_yghv_device);

@@ -29,7 +29,7 @@
 
 ---
 
-## 记录索引（9.599 重新测量，85 条）
+## 记录索引（9.600 重新测量，86 条）
 
 > 这是本文档自己的目录。**按标题扫一眼，找到要的那条，再跳过去读。**
 > 行数是该记录占的篇幅，用来判断"值不值得读全文"。
@@ -121,6 +121,7 @@
 | 9.597 句柄降权接进门：ObRegisterCallbacks 拦截句柄创建 | 64 |
 | 9.598 伪装进程映像名：DISGUISE op，修 GUARD 不可达 bug | 21 |
 | 9.599 模块隐藏补全：三个链表都摘除 | 15 |
+| 9.600 动态设备名：随机后缀 + 注册表发现 | 18 |
 
 ---
 
@@ -4813,6 +4814,24 @@ op 10/11 没上机。guard_enable 需要传入目标 PEPROCESS，op 10 的参数
 
 **构建验证**：单文件编译零诊断；全量构建 EXIT=0，镜像 SHA256 = d3c0f207c1405d6dbc866502886aef7cc4d4d7256062a4d47f08b5c67da62950。
 
+#### 9.600 动态设备名：随机后缀 + 注册表发现
+
+**做什么**：设备名从固定的 `\\Device\\YuanGuardHV` 改为 `\\Device\\YuanGuardHV_{8位随机hex}`，每次驱动加载都不同。DOS 链接同步改。
+
+**为什么**：固定的设备名是 PCHunter / WinObjEx64 / driverquery 能匹配的签名。随机化之后静态签名列表永远匹配不上。
+
+**实现**：
+- `control_device.c` 加 `yghv_init_device_names()`：用 KeQueryTickCount 做种子生成 8 位随机 hex 后缀，构建 `g_dev_name_buf` / `g_link_name_buf`。
+- 两个 `yghv_get_device_name()` / `yghv_get_link_name()` 在动态名就绪时返回随机名，否则回退到静态宏。
+- 全部 8 处 `RtlInitUnicodeString(&dev_name, YGHV_DEVICE_NAME_STRING)` 替换为 `yghv_get_device_name()`。
+- `control_ioctl.h` 加 `YGHV_DYNNAME_LEN 32` 与注释。
+
+**已知限制**：
+- 客户端硬编码 `\\.\\YuanGuardHV`，随机名后客户端需要通过注册表发现。注册表写入尚未实现。
+- 没上机。与 P1-4/P1-5/P1-7/P1-8 同组。
+
+**构建验证**：单文件编译零诊断；全量构建 EXIT=0，镜像 SHA256 = bc2adb7b2c2629e744e61c6437d650d06a42023b7aefeb3b68bad65ff543262c。
+
 ## 本次会话结束时状态
 
 > 这一段曾被落在 9.564 而正文已经写到 9.582 —— 同一份文件里两个互相矛盾的状态，
@@ -4828,7 +4847,7 @@ op 10/11 没上机。guard_enable 需要传入目标 PEPROCESS，op 10 的参数
 台账          : 8 完成 / 9 不做 / 1 需重启（Tier 6.1）
 静态检查      : 17 脚本 / 49 条 PASS（含 33 条自检），另 1 条链接后检查（tests/ 共 19 个脚本）
 文档检查      : docs_check PASS —— 57 md / 32 链接 / 79 记录 / 9 项
-最新编号      : 9.599
+最新编号      : 9.600
 ```
 
 **P1-1 的结论变了，但没结案。** 9.585 证明三次失败有一个共同原因：

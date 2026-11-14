@@ -12,6 +12,20 @@
 
 ---
 
+## v0.4.12 — 动态设备名（避免静态签名匹配）
+
+### Changed
+- 设备名从固定的 `\\Device\\YuanGuardHV` 改为 `\\Device\\YuanGuardHV_{8位随机hex}`，每次加载都不同。
+- `control_device.c` 加 `yghv_init_device_names()` 随机名生成 + `yghv_get_device_name()` / `yghv_get_link_name()` 访问器。
+- 全部 8 处设备名宏替换为动态名访问器。
+
+### Known limitations
+- 客户端硬编码 `\\.\\YuanGuardHV`，随机名后需通过注册表发现（注册表写入尚未实现）。
+- 没上机。
+
+### Verification
+- 单文件编译零诊断；全量构建 EXIT=0，镜像 SHA256 = bc2adb7b2c2629e744e61c6437d650d06a42023b7aefeb3b68bad65ff543262c。
+
 ## v0.4.11 — 模块隐藏补全（三个链表都摘除）
 
 ### Changed
