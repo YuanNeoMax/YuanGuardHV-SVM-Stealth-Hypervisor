@@ -226,6 +226,78 @@ void yghv_channel_doorbell(uint64_t guest_cr3, uint64_t req_va,
         status = YGHV_CH_STATUS_OK;
         break;
 
+    case YGHV_CH_OP_MEM_READ: {
+        uint64_t src_va, phys;
+        if (!yghv_pa_read(req_pa + YGHV_CH_REQ_ARG0, &src_va, sizeof(src_va)) || !src_va) {
+            status = YGHV_CH_STATUS_FAULT;
+            InterlockedIncrement64(&g_ch.s.fault);
+            break;
+        }
+        phys = yghv_pte_va_to_pa(guest_cr3, src_va);
+        if (!phys || !yghv_pa_read_u64(phys, &value)) {
+            status = YGHV_CH_STATUS_FAULT;
+            InterlockedIncrement64(&g_ch.s.fault);
+            break;
+        }
+        status = YGHV_CH_STATUS_OK;
+        break;
+    }
+
+    case YGHV_CH_OP_MEM_WRITE: {
+        uint64_t dst_va, phys, wr_val;
+        if (!yghv_pa_read(req_pa + YGHV_CH_REQ_ARG0, &dst_va, sizeof(dst_va)) ||
+            !yghv_pa_read(req_pa + YGHV_CH_REQ_ARG1, &wr_val, sizeof(wr_val)) ||
+            !dst_va) {
+            status = YGHV_CH_STATUS_FAULT;
+            InterlockedIncrement64(&g_ch.s.fault);
+            break;
+        }
+        phys = yghv_pte_va_to_pa(guest_cr3, dst_va);
+        if (!phys || !yghv_pa_write_u64(phys, wr_val)) {
+            status = YGHV_CH_STATUS_FAULT;
+            InterlockedIncrement64(&g_ch.s.fault);
+            break;
+        }
+        value = wr_val;
+        status = YGHV_CH_STATUS_OK;
+        break;
+    }
+
+    case YGHV_CH_OP_PHYS_READ: {
+        uint64_t pa_src;
+        if (!yghv_pa_read(req_pa + YGHV_CH_REQ_ARG0, &pa_src, sizeof(pa_src)) || !pa_src) {
+            status = YGHV_CH_STATUS_FAULT;
+            InterlockedIncrement64(&g_ch.s.fault);
+            break;
+        }
+        if (!yghv_pa_read_u64(pa_src, &value)) {
+            status = YGHV_CH_STATUS_FAULT;
+            InterlockedIncrement64(&g_ch.s.fault);
+            break;
+        }
+        status = YGHV_CH_STATUS_OK;
+        break;
+    }
+
+    case YGHV_CH_OP_PHYS_WRITE: {
+        uint64_t pa_dst, pw_val;
+        if (!yghv_pa_read(req_pa + YGHV_CH_REQ_ARG0, &pa_dst, sizeof(pa_dst)) ||
+            !yghv_pa_read(req_pa + YGHV_CH_REQ_ARG1, &pw_val, sizeof(pw_val)) ||
+            !pa_dst) {
+            status = YGHV_CH_STATUS_FAULT;
+            InterlockedIncrement64(&g_ch.s.fault);
+            break;
+        }
+        if (!yghv_pa_write_u64(pa_dst, pw_val)) {
+            status = YGHV_CH_STATUS_FAULT;
+            InterlockedIncrement64(&g_ch.s.fault);
+            break;
+        }
+        value = pw_val;
+        status = YGHV_CH_STATUS_OK;
+        break;
+    }
+
     default:
         InterlockedIncrement64(&g_ch.s.bad_op);
         ch_ack(YGHV_CH_STATUS_BADOP, op, out_eax, out_ebx, out_ecx, out_edx);

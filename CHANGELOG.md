@@ -12,6 +12,24 @@
 
 ---
 
+## v0.4.7 — 无痕通信扩展（能力面第五块）
+
+### Added
+- CPUID 门铃新增四个内存原语：`MEM_READ`（4）/ `MEM_WRITE`（5）/ `PHYS_READ`（6）/ `PHYS_WRITE`（7）
+- 全部 island-safe（DISPATCH_LEVEL, GIF=0），走 `yghv_pa_read_u64` / `yghv_pa_write_u64`
+- VA 解析走 `yghv_pte_va_to_pa`（已验证 walker），不走 `MmGetVirtualForPhysical`
+- 调用者循环 MEM_WRITE 8 字节一次即可传输任意大小 payload
+
+### Known limitations
+- 通道 op 的客户端参数编码未接（PS 侧 `ch-ring` 命令已有基础）
+- 请求体是明文 + HMAC tag，可用 yghv_crypto 加密
+- 当前一次一 u64，可加帧头支持批量传输
+
+### Verification
+- 构建 EXIT=0，镜像 SHA256 = f375770d25e9765af67f8f53e641bb5c22a5ffb29a10f888c1980ac465cbd012
+- map 中 3 个 yghv_channel 符号
+- 源检查 EXIT=0
+
 ## v0.4.6 — 窗口防截图接入（能力面第四块扩张）
 
 ### Added

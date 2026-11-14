@@ -116,6 +116,24 @@ static unsigned int yghv_ch_sub(unsigned long long va) {
 #define YGHV_CH_OP_READ     2   /* read the caller's own memory back (sanity) */
 #define YGHV_CH_OP_STATS    3   /* hypervisor counters, no side effects */
 
+/*
+ * 9.595: four memory primitives over the same doorbell. All island-safe
+ * (DISPATCH_LEVEL, GIF=0) because they are pure physical reads/writes through
+ * yghv_pa_* — the same primitives the INT3 path already uses at this IRQL.
+ *
+ * MEM_* resolve the caller's VA through the guest page tables (yghv_pte_va_to_pa)
+ * then read/write the resulting frame. PHYS_* take a physical address directly.
+ * Both return one u64 per call through EDX:EBX (the same value channel READ uses).
+ *
+ * The write ops are the reason this channel can replace a device handle for
+ * payloads too large for one CPUID call: the caller loops MEM_WRITE 8 bytes at a
+ * time. No allocation, no shared page, no object in the manager.
+ */
+#define YGHV_CH_OP_MEM_READ   4   /* ARG0=guest VA → EDX:EBX = value */
+#define YGHV_CH_OP_MEM_WRITE  5   /* ARG0=guest VA, ARG1=value */
+#define YGHV_CH_OP_PHYS_READ  6   /* ARG0=physical addr → EDX:EBX = value */
+#define YGHV_CH_OP_PHYS_WRITE 7   /* ARG0=physical addr, ARG1=value */
+
 #define YGHV_CH_REQ_MAGIC   0
 #define YGHV_CH_REQ_OP      4
 #define YGHV_CH_REQ_SEQ     8

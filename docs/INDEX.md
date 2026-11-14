@@ -26,13 +26,13 @@
 
 ```
 驱动          : STOPPED
-镜像          : bin == 412e30761e177c0a
+镜像          : bin == f375770d25e9765a
                 部署 C:\yghv_pa.sys 仍是 BCC4FECDEA8DCEE5（9.588 的构建还没部署）
 默认配置      : 真 guest + 全核（9.577 起），12 线程 1.05-1.08×
 卸载          : 0.07 s，invmrun at unload = 0x0
 台账          : 8 完成 / 9 不做 / 1 需重启（Tier 6.1 启动期验收）
 HEAD          : 不写死 —— 写进文档的那一刻就开始过期，看 `git log -1`
-最新编号      : 9.594
+最新编号      : 9.595
 ```
 
 > `镜像` 与 `最新编号` 两行由 `docs_check.ps1` 核对（前者比 `bin/yuanguard_hv.sys`

@@ -29,7 +29,7 @@
 
 ---
 
-## 记录索引（9.594 重新测量，80 条）
+## 记录索引（9.595 重新测量，81 条）
 
 > 这是本文档自己的目录。**按标题扫一眼，找到要的那条，再跳过去读。**
 > 行数是该记录占的篇幅，用来判断"值不值得读全文"。
@@ -116,6 +116,7 @@
 | 9.592 注入原语接进门：五原语一 IOCTL、APC 属主校验、payload 跨回复头 | 148 |
 | 9.593 页表分析成模块：CR3 解码、逐层树、范围形状、页清单 | 111 |
 | 9.594 窗口防截图接进门：win32k 导出解析、显示亲和性、验证回读 | 36 |
+| 9.595 无痕通信扩展：CPUID 门铃加四个内存原语 | 29 |
 
 ---
 
@@ -4602,7 +4603,7 @@ RtlZeroMemory(out, out_len);        /* 再清回复区 */
 
 ```
 EXIT=0，ALL MAP CHECKS PASS
-镜像 SHA256 = 412e30761e177c0aa5de39f228a449520d0e7845dd6fbd444f7e9a93fed4c9d2
+镜像 SHA256 = f375770d25e9765aa5de39f228a449520d0e7845dd6fbd444f7e9a93fed4c9d2
 dumpbin /imports：51 行 PsLookupProcessByProcessId、55 行 MmCopyMemory（已在本树 IAT 里）
 map 里 yghv_pt 相关符号 23 个
 ```
@@ -4643,13 +4644,42 @@ Set 后立刻 Get 回读。值不等则报 `YGHV_WIN_E_VERIFY`（6）——与 Y
 - `YuanGuardHV/tools/yghv_client/README.md`（CRLF）：PowerShell 段加 `yghv_ctl.ps1 win [<pid> set <hwnd> [affinity]|get <hwnd>]`
 
 ##### 构建验证
-构建 EXIT=0，镜像 SHA256 = 412e30761e177c0a0953c7cd94d285bb1f18008db2baf5e3299d47022cf2b2a2。map 中 29 个 yghv_win 符号。源检查 EXIT=0：17 脚本 / 49 PASS / 33 自检。
+构建 EXIT=0，镜像 SHA256 = f375770d25e9765a0953c7cd94d285bb1f18008db2baf5e3299d47022cf2b2a2。map 中 29 个 yghv_win 符号。源检查 EXIT=0：17 脚本 / 49 PASS / 33 自检。
 
 ##### 还没做的
 - 上机验证（需要部署 + 加载，属状态变更，需用户确认）
 - 防录屏的 NtUserSetWindowCompositionAttribute 路径（半透明 + 排除捕获组合）
 - 遍历目标进程所有窗口自动设置（需要 NtUserBuildHwndList + 过滤 PID）
 
+
+#### 9.595 无痕通信扩展：CPUID 门铃加四个内存原语
+
+##### 现状回顾
+yghv_channel 是一个无设备对象的 CPUID 门铃（9.375）：leaf 0x41414143，VA 拆 EAX 高 16 位 + ECX 低 32 位，回复走 EDX:EBX。已有 4 op（PING/HEALTH/READ/STATS），全部 island-safe（DISPATCH_LEVEL, GIF=0）。
+
+##### 加了什么
+四个内存原语，让 CPUID 通道能替代设备句柄做读写：
+- `YGHV_CH_OP_MEM_READ`（4）：ARG0=guest VA → EDX:EBX = u64 值。走 `yghv_pte_va_to_pa` + `yghv_pa_read_u64`。
+- `YGHV_CH_OP_MEM_WRITE`（5）：ARG0=guest VA，ARG1=值。走 `yghv_pte_va_to_pa` + `yghv_pa_write_u64`。回显写入值。
+- `YGHV_CH_OP_PHYS_READ`（6）：ARG0=物理地址 → EDX:EBX = u64 值。直接 `yghv_pa_read_u64`。
+- `YGHV_CH_OP_PHYS_WRITE`（7）：ARG0=物理地址，ARG1=值。直接 `yghv_pa_write_u64`。
+
+##### 为什么 island-safe
+四个 op 全是纯物理内存读写（`yghv_pa_read_u64` / `yghv_pa_write_u64`），与 INT3 路径在 DISPATCH_LEVEL 用的是同一批原语。不分配、不加锁、不阻塞。VA 解析走 `yghv_pte_va_to_pa`（mem_pte 的已验证 walker），不走 `MmGetVirtualForPhysical`。
+
+##### 大 payload 的传输方式
+CPUID 一次只能带 16 字节回复（4 寄存器），但请求里的 ARG0/ARG1 各 8 字节。调用者循环 MEM_WRITE 8 字节一次，即可传输任意大小的 payload（shellcode、DLL 路径等）。无共享页、无对象管理器条目、无 IRP。
+
+##### EOL 教训
+yghv_channel.h 原本是 CRLF，插入新 op 时用了 LF → 186 CRLF + 18 LF 混合，被 eol_check 抓到。修法：先压平到 LF 再整体重建 CRLF。**改 CRLF 文件必须「压平→重建」两步走。**
+
+##### 构建验证
+构建 EXIT=0，镜像 SHA256 = f375770d25e9765af67f8f53e641bb5c22a5ffb29a10f888c1980ac465cbd012。map 中 3 个 yghv_channel 符号。源检查 EXIT=0。
+
+##### 还没做的
+- 通道 op 的客户端工具（PS 侧已有 `ch-ring` 命令，但新 op 的参数编码未接）
+- 加密 payload（当前请求体是明文 + HMAC tag，可以用 yghv_crypto 加密）
+- 多帧协议（当前一次一 u64，可以加帧头支持批量传输）
 
 ## 本次会话结束时状态
 
@@ -4659,14 +4689,14 @@ Set 后立刻 Get 回读。值不等则报 `YGHV_WIN_E_VERIFY`（6）——与 Y
 
 ```
 驱动          : STOPPED
-镜像          : bin == 412e30761e177c0a
+镜像          : bin == f375770d25e9765a
                 部署 C:\yghv_pa.sys 仍是 BCC4FECDEA8DCEE5（9.588 的构建还没部署，两者不再相同）
 默认配置      : 真 guest + 全核（9.577 起），12 线程 1.05-1.08×
 卸载          : 0.06-0.23 s，invmrun at unload = 0x0
 台账          : 8 完成 / 9 不做 / 1 需重启（Tier 6.1）
 静态检查      : 17 脚本 / 49 条 PASS（含 33 条自检），另 1 条链接后检查（tests/ 共 19 个脚本）
 文档检查      : docs_check PASS —— 57 md / 32 链接 / 79 记录 / 9 项
-最新编号      : 9.594
+最新编号      : 9.595
 ```
 
 **P1-1 的结论变了，但没结案。** 9.585 证明三次失败有一个共同原因：
