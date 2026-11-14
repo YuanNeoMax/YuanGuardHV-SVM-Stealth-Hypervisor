@@ -78,7 +78,7 @@ $scripts = @(
     # 1168 = ERROR_NOT_FOUND, whose only source on that path is protect.c:1099
     # ("pid not in the target table"), which points at a missing `set-target`.
     # The name is not a label -- it is the constant some `return` produced.
-    'win32_error_names.ps1',
+    'struct_layout_check.ps1', 'win32_error_names.ps1',
     'win32_error_names_selftest.ps1',
     'client_undefined_vars.ps1',
     # 9.586: a whitespace-only rewrite of an UNTOUCHED file makes the real change
