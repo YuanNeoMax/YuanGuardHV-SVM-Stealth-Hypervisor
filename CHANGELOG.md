@@ -12,6 +12,22 @@
 
 ---
 
+## v0.4.10 — 伪装进程映像名（进程管控的最后一块拼图）
+
+### Added
+- `IOCTL_YGHV_PROC` 新增 op 12（DISGUISE）：把 EPROCESS.image_file_name 改写为指定名字（最多 15 字节），让任务管理器等工具显示假名。
+- `yghv_proc.h` 新增五个错误码：YGHV_PROC_E_OK / _BAD_ARG / _NO_TARGET / _OFFSETS / _DENIED。
+
+### Fixed
+- `yghv_proc_dispatch` 的范围检查 `r.op > YGHV_PROC_OP_HIDE` 会拒绝 GUARD(10) 与 GUARD_STATS(11)，导致 9.597 加的两个 case 不可达。改为 `r.op > YGHV_PROC_OP_DISGUISE`。
+
+### Known limitations
+- 只改 image_file_name（15 字节），不改 PE 头的 OriginalFilename。工具读 PE 头仍能看到真名。
+- 没上机。与 P1-4/P1-5/P1-7 同组，一次上机全验。
+
+### Verification
+- 单文件编译零诊断；全量构建 EXIT=0，镜像 SHA256 = 82ebcb029c925d4a68b35b81621ed6d0e4207f95e2dc8e25d0f1caaeeecdbbe4。
+
 ## v0.4.9 — 句柄降权（进程管控的能力面扩张）
 
 ### Added

