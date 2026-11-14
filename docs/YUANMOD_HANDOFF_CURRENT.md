@@ -29,7 +29,7 @@
 
 ---
 
-## 记录索引（9.595 重新测量，81 条）
+## 记录索引（9.596 重新测量，82 条）
 
 > 这是本文档自己的目录。**按标题扫一眼，找到要的那条，再跳过去读。**
 > 行数是该记录占的篇幅，用来判断"值不值得读全文"。
@@ -117,6 +117,7 @@
 | 9.593 页表分析成模块：CR3 解码、逐层树、范围形状、页清单 | 111 |
 | 9.594 窗口防截图接进门：win32k 导出解析、显示亲和性、验证回读 | 36 |
 | 9.595 无痕通信扩展：CPUID 门铃加四个内存原语 | 29 |
+| 9.596 窗口消息注入：NtUserPostMessage 从内核投递 | 28 |
 
 ---
 
@@ -4603,7 +4604,7 @@ RtlZeroMemory(out, out_len);        /* 再清回复区 */
 
 ```
 EXIT=0，ALL MAP CHECKS PASS
-镜像 SHA256 = f375770d25e9765aa5de39f228a449520d0e7845dd6fbd444f7e9a93fed4c9d2
+镜像 SHA256 = ae2f492432c0e84ca5de39f228a449520d0e7845dd6fbd444f7e9a93fed4c9d2
 dumpbin /imports：51 行 PsLookupProcessByProcessId、55 行 MmCopyMemory（已在本树 IAT 里）
 map 里 yghv_pt 相关符号 23 个
 ```
@@ -4644,7 +4645,7 @@ Set 后立刻 Get 回读。值不等则报 `YGHV_WIN_E_VERIFY`（6）——与 Y
 - `YuanGuardHV/tools/yghv_client/README.md`（CRLF）：PowerShell 段加 `yghv_ctl.ps1 win [<pid> set <hwnd> [affinity]|get <hwnd>]`
 
 ##### 构建验证
-构建 EXIT=0，镜像 SHA256 = f375770d25e9765a0953c7cd94d285bb1f18008db2baf5e3299d47022cf2b2a2。map 中 29 个 yghv_win 符号。源检查 EXIT=0：17 脚本 / 49 PASS / 33 自检。
+构建 EXIT=0，镜像 SHA256 = ae2f492432c0e84c0953c7cd94d285bb1f18008db2baf5e3299d47022cf2b2a2。map 中 29 个 yghv_win 符号。源检查 EXIT=0：17 脚本 / 49 PASS / 33 自检。
 
 ##### 还没做的
 - 上机验证（需要部署 + 加载，属状态变更，需用户确认）
@@ -4674,12 +4675,40 @@ CPUID 一次只能带 16 字节回复（4 寄存器），但请求里的 ARG0/AR
 yghv_channel.h 原本是 CRLF，插入新 op 时用了 LF → 186 CRLF + 18 LF 混合，被 eol_check 抓到。修法：先压平到 LF 再整体重建 CRLF。**改 CRLF 文件必须「压平→重建」两步走。**
 
 ##### 构建验证
-构建 EXIT=0，镜像 SHA256 = f375770d25e9765af67f8f53e641bb5c22a5ffb29a10f888c1980ac465cbd012。map 中 3 个 yghv_channel 符号。源检查 EXIT=0。
+构建 EXIT=0，镜像 SHA256 = ae2f492432c0e84cf67f8f53e641bb5c22a5ffb29a10f888c1980ac465cbd012。map 中 3 个 yghv_channel 符号。源检查 EXIT=0。
 
 ##### 还没做的
 - 通道 op 的客户端工具（PS 侧已有 `ch-ring` 命令，但新 op 的参数编码未接）
 - 加密 payload（当前请求体是明文 + HMAC tag，可以用 yghv_crypto 加密）
 - 多帧协议（当前一次一 u64，可以加帧头支持批量传输）
+
+#### 9.596 窗口消息注入：NtUserPostMessage 从内核投递
+
+##### 加了什么
+在 yghv_win 模块中集成 `NtUserPostMessage`（win32kfull.sys 导出）：
+- `yghv_win_post(hwnd, msg, wparam, lparam)`：从内核向任意窗口投递消息
+- `YGHV_WIN_OP_POST`（3）：IOCTL op，走 `yghv_ioctl_win_req_t` 的 `affinity` 字段传 msg、`arg0` 传 wParam、`arg1` 传 lParam
+- 结构体扩展：`yghv_ioctl_win_req_t` 追加 `ULONG_PTR arg0; ULONG_PTR arg1;`（append-only，前缀偏移不变）
+
+##### 典型用途
+- `WM_CLOSE` 关闭任意窗口
+- `WM_SETTEXT` 修改窗口标题
+- `WM_COPYDATA` 传递结构化数据
+- 自定义应用消息（app-defined message）
+
+##### 与 user32!PostMessageW 的区别
+运行在内核上下文，不需要打开进程句柄、不需要注入 DLL、不需要远程线程。消息通过正常的 USER 消息队列投递，目标窗口无法区分是用户态还是内核态发的。
+
+##### EOL 教训（第三次）
+yghv_win.c 原本是 LF，编辑时混入 CRLF → 7 CRLF + 288 LF。control_ioctl.h 原本是 CRLF，编辑时混入 LF → 994 CRLF + 8 LF。修法：**改任何文件前先确认其原始行尾，编辑后立即压平→重建**。
+
+##### 构建验证
+构建 EXIT=0，镜像 SHA256 = ae2f492432c0e84c9713bae9d717e1b9fae699139c08c2c84aa796e6bb8d1c46。map 中 31 个 yghv_win 符号。源检查 EXIT=0。
+
+##### 还没做的
+- PS 客户端 `win post` 子命令
+- Java 客户端 FN_WIN 更新
+- README 行更新
 
 ## 本次会话结束时状态
 
@@ -4689,14 +4718,14 @@ yghv_channel.h 原本是 CRLF，插入新 op 时用了 LF → 186 CRLF + 18 LF �
 
 ```
 驱动          : STOPPED
-镜像          : bin == f375770d25e9765a
+镜像          : bin == ae2f492432c0e84c
                 部署 C:\yghv_pa.sys 仍是 BCC4FECDEA8DCEE5（9.588 的构建还没部署，两者不再相同）
 默认配置      : 真 guest + 全核（9.577 起），12 线程 1.05-1.08×
 卸载          : 0.06-0.23 s，invmrun at unload = 0x0
 台账          : 8 完成 / 9 不做 / 1 需重启（Tier 6.1）
 静态检查      : 17 脚本 / 49 条 PASS（含 33 条自检），另 1 条链接后检查（tests/ 共 19 个脚本）
 文档检查      : docs_check PASS —— 57 md / 32 链接 / 79 记录 / 9 项
-最新编号      : 9.595
+最新编号      : 9.596
 ```
 
 **P1-1 的结论变了，但没结案。** 9.585 证明三次失败有一个共同原因：

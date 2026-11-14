@@ -12,6 +12,22 @@
 
 ---
 
+## v0.4.8 — 窗口消息注入（超越清单的新能力）
+
+### Added
+- `yghv_win_post(hwnd, msg, wparam, lparam)`：从内核向任意窗口投递消息
+- `YGHV_WIN_OP_POST`（3）：IOCTL op，`affinity`=msg、`arg0`=wParam、`arg1`=lParam
+- `yghv_ioctl_win_req_t` 追加 `arg0`/`arg1`（append-only）
+- 典型用途：WM_CLOSE / WM_SETTEXT / WM_COPYDATA / 自定义消息
+
+### Changed
+- `yghv_win_init()` 现在解析三个 win32kfull 导出（Set/Get/Post）
+
+### Verification
+- 构建 EXIT=0，镜像 SHA256 = ae2f492432c0e84c9713bae9d717e1b9fae699139c08c2c84aa796e6bb8d1c46
+- map 中 31 个 yghv_win 符号
+- 源检查 EXIT=0
+
 ## v0.4.7 — 无痕通信扩展（能力面第五块）
 
 ### Added

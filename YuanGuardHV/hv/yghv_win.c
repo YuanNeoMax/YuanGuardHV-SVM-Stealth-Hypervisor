@@ -43,9 +43,14 @@ NTKERNELAPI PVOID PsGetThreadWin32Thread(PETHREAD Thread);
  * macro happens to be in scope. */
 typedef int (*yghv_set_display_fn)(uint32_t hwnd, uint32_t affinity);
 typedef int (*yghv_get_display_fn)(uint32_t hwnd, uint32_t *affinity);
+/* NtUserPostMessage(HWND, UINT Msg, WPARAM, LPARAM) -> BOOLEAN. Posts to the
+ * target window's message queue without blocking. Returns nonzero on success.
+ * Signature matches user32!PostMessageW but runs in kernel context. */
+typedef int (*yghv_post_msg_fn)(uint32_t hwnd, uint32_t msg, uint64_t wparam, uint64_t lparam);
 
 static yghv_set_display_fn g_win_set;
 static yghv_get_display_fn g_win_get;
+static yghv_post_msg_fn  g_win_post;
 static YGHV_SIG_MODULE     g_win_full;      /* win32kfull.sys */
 static YGHV_SIG_MODULE     g_win_base;      /* win32kbase.sys */
 static volatile LONG       g_win_init_done;
@@ -58,6 +63,7 @@ static volatile LONG64 g_win_no_gui;
 static volatile LONG64 g_win_init_ok;
 static volatile LONG64 g_win_last_affinity;
 static volatile LONG64 g_win_last_hwnd;
+static volatile LONG64 g_win_posts;
 
 /* --------------------------------------------------------------- resolve */
 
@@ -182,6 +188,31 @@ int yghv_win_get(uint64_t hwnd, uint32_t *out_affinity)
     return 0;
 }
 
+/* --------------------------------------------------------------- post */
+
+/*
+ * Post a window message from kernel mode. The target window receives the
+ * message through the normal USER message queue — indistinguishable from a
+ * user-mode PostMessage call.
+ *
+ * Typical uses: WM_CLOSE to close a window, WM_SETTEXT to change its title,
+ * WM_COPYDATA to deliver structured data, or a custom app-defined message.
+ */
+int yghv_win_post(uint64_t hwnd, uint32_t msg, uint64_t wparam, uint64_t lparam)
+{
+    if (!yghv_win_ready() && yghv_win_init() < 3) return YGHV_WIN_E_NO_MODULE;
+    if (hwnd == 0 || hwnd > 0xFFFFFFFFULL) return YGHV_WIN_E_BAD_ARG;
+    if (!yghv_win_have_gui()) return YGHV_WIN_E_NO_GUI;
+    if (!g_win_post) return YGHV_WIN_E_NO_EXPORT;
+
+    if (!g_win_post((uint32_t)hwnd, msg, wparam, lparam)) {
+        InterlockedIncrement64(&g_win_refused);
+        return YGHV_WIN_E_REFUSED;
+    }
+    InterlockedIncrement64(&g_win_posts);
+    return 0;
+}
+
 /* ------------------------------------------------------------- dispatch */
 
 /*
@@ -232,6 +263,16 @@ NTSTATUS yghv_win_dispatch(const void *in, void *out, ULONG out_len, ULONG *info
         yghv_win_stats(o);
         break;
 
+    case YGHV_WIN_OP_POST:
+        rc = yghv_win_post(req->hwnd, (uint32_t)req->affinity, req->arg0, req->arg1);
+        if (rc == 0) {
+            o[0] = 1;
+        } else {
+            o[1] = (UINT64)rc;
+        }
+        o[3] = req->hwnd;
+        break;
+
     default:
         return STATUS_INVALID_PARAMETER;
     }
@@ -248,6 +289,7 @@ void yghv_win_stats(uint64_t *out)
     out[3] = (uint64_t)InterlockedCompareExchange64(&g_win_verify_fail, 0, 0);
     out[4] = (uint64_t)InterlockedCompareExchange64(&g_win_no_gui, 0, 0);
     out[5] = (uint64_t)InterlockedCompareExchange64(&g_win_init_ok, 0, 0);
+    out[6] = (uint64_t)InterlockedCompareExchange64(&g_win_posts, 0, 0);
     out[6] = (uint64_t)InterlockedCompareExchange64(&g_win_last_affinity, 0, 0);
     out[7] = (uint64_t)InterlockedCompareExchange64(&g_win_last_hwnd, 0, 0);
 }

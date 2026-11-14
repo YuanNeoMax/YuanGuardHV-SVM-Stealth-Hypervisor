@@ -988,6 +988,7 @@ typedef struct {
 #define YGHV_WIN_OP_SET   0
 #define YGHV_WIN_OP_GET   1
 #define YGHV_WIN_OP_STATS 2
+#define YGHV_WIN_OP_POST  3   /* post a message to a window */
 
 typedef struct _YGHV_IOCTL_WIN_REQ {
     ULONG     op;
@@ -995,6 +996,7 @@ typedef struct _YGHV_IOCTL_WIN_REQ {
     ULONG_PTR hwnd;
     ULONG     flags;
     ULONG     _pad;
+    ULONG_PTR arg0;
+    ULONG_PTR arg1;
 } yghv_ioctl_win_req_t;
-
 #endif
