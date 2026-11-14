@@ -918,6 +918,38 @@ int yghv_bp_add_ex(uint64_t gpa, uint64_t va, uint64_t rip,
      *   (c) consistency across 12 cores is what the walk provides; a partial walk
      *       fails the arm rather than leaving half the cores armed.
      *
+     * 9.608 -- (a) IS NOT TRUE ON THIS MACHINE, AND NOW IT IS MEASURABLE.
+     *
+     * The walk runs, but every core fails to resolve its VPD, so NO VMCB ever
+     * receives Dr7. Measured with a live target writing the watched page ~200
+     * times:
+     *
+     *     mem-bp dr <va> w   -> OK
+     *     count=1 dr=1          the slot is claimed
+     *     hits=0                the target wrote it and nothing trapped
+     *     dr7 cores=0 unresolved=12
+     *     walk sawProcessors=12 indexFailures=0
+     *
+     * The last two lines together are decisive: the callbacks DID run on all
+     * twelve processors, and every one of them took the "CPUID handshake did
+     * not answer" branch. SvDrApplyOnCore asks for its VPD through
+     * CPUID_FAKE_VPD, which is answered in SvHandleVmExit -- i.e. only in GUEST
+     * context. SvExecuteOnEachProcessor runs the callback in HOST context, so
+     * the CPUID executes natively, ECX is not 'SSV1', and the caller correctly
+     * refuses. It cannot be retried into working; the callback is structurally
+     * in the wrong context to ask that question.
+     *
+     * SvTscApplyOnCore and SvFakeNcr3Resync read the same leaf the same way,
+     * so both have the same defect.
+     *
+     * THE FIX (not applied here) is a per-core VPD table filled at
+     * virtualization time and read by KeGetCurrentProcessorNumber() from the
+     * callback -- no CPUID, no race. That is a change to the vendored entry
+     * path and needs a machine that can take a bugcheck to validate.
+     *
+     * Until then: arming still reports OK because the REQUEST is accepted, but
+     * the diagnostics say cores=0, so "dr OK" can no longer be read as "armed".
+     *
      * ORDER, and why it is this order. The slot is claimed and re-read BEFORE the
      * hardware is touched (the 9.359 discipline from the NPF branch): if the claim
      * did not land, programming the registers would leave a live breakpoint with

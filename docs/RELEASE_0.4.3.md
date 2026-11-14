@@ -307,6 +307,40 @@ YuanGuardHV/tools/yghv_client/run.bat mem-read <pid> <va>
 仍未端到端验证的：`inject op3`（创建线程）与 `op4`（APC 排队）——两者都需要一个
 可控的靶程序来观察执行效果，本轮没有准备。它们在派发层是可达的（同一 switch），
 但没有"写入的代码确实被执行"这种证据。
+
+### P1-1 `mem-bp dr`：**机制上不工作**，且现在可测
+
+这是本轮最重要的发现。之前 P1-1 的记录是「代码完成、未上机」；实测结论是
+**代码完成，但机制在本机不可能工作**。
+
+观测链（每个数字现在都由驱动打印）：
+
+```
+mem-bp dr <va> w     -> OK          请求被接受
+count=1 dr=1                       槽位已占用
+hits=0                             靶进程写了那个页约 200 次，一次没命中
+dr7: cores=0 unresolved=12         没有任何核的 VMCB 收到 Dr7
+walk: sawProcessors=12 indexFailures=0
+```
+
+**最后两行同时成立，才说明问题**：走核机制跑遍了 12 个处理器且没中途退出，
+所以回调确实执行了 12 次；但每一次都走了「CPUID 握手没应答」分支。
+
+根因：`SvDrApplyOnCore` 用 `CPUID_FAKE_VPD` 取自己的 VPD 指针，而这个叶只在
+`SvHandleVmExit` 里应答，**也就是只在 guest 态**。`SvExecuteOnEachProcessor`
+的回调跑在 **host 态**，CPUID 直接由硬件执行，ECX 不是 `'SSV1'`，调用方正确拒绝。
+
+这不是重试能修的竞态 —— **回调所在的上下文结构上就无法问这个问题**。
+
+> 同一模式还有两处：`SvTscApplyOnCore`、`SvFakeNcr3Resync`，用同一个叶、同样写法。
+> VPD 探针（op 8）在加走核计数器之前返回 `hits=0 misses=0`（12 个处理器），
+> 这个组合在回调跑过的情况下不可能出现 —— 就是它把我引到这里的。
+
+**正确做法**（本轮未做）：每个核的 VPD 指针改由「虚拟化时填好的按核表」提供，
+回调里用 `KeGetCurrentProcessorNumber()` 索引，不走 CPUID。这是对 vendored 入口路径
+的真实改动，且需要一台能承受蓝屏的机器来验证 —— **不该在无法验证时猜着改**。
+
+在修好之前，`dr OK` 不再会被误读成「已武装」：诊断会明确显示 `cores=0`。
 ### op7 / op14（线程枚举与线程隐藏）：`TLIST` 探针已修
 
 **这是从 9.591 起就从未工作过的功能。** 探针有两个未知量互相依赖，而代码试图

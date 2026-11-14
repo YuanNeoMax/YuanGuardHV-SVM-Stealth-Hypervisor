@@ -2304,7 +2304,31 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
              * guest page keeps 0xCC for the breakpoint's whole life. */
             out[14] = bs.shadow_switches;
             out[15] = bs.fail_shadow;
-            info = 16 * sizeof(UINT64);
+            /*
+             * 9.608: the DR7-programming outcome, per core.
+             *
+             * "mem-bp dr" answering OK only means the request was accepted --
+             * it says nothing about whether any core's VMCB actually received
+             * the new Dr7. Measured with a live target writing the watched page
+             * ~200 times: count=1 dr=1 hits=0, and the three counters that
+             * would separate "never programmed" from "programmed but #DB never
+             * credited" had no reader at all.
+             *
+             *   [16] cores programmed,  [17] cores that could not resolve VPD,
+             *   [18] walks that failed outright
+             */
+            {
+                UINT64 drs[6];
+                extern VOID yghv_s206_dr7_apply_stats(UINT64 *out);
+                yghv_s206_dr7_apply_stats(drs);
+                out[16] = drs[0];   /* cores programmed      */
+                out[17] = drs[1];   /* cores that said no    */
+                out[18] = drs[2];   /* walk failed outright  */
+                out[19] = drs[3];   /* processors the walk saw */
+                out[20] = drs[4];   /* walk aborted at index */
+                out[21] = drs[5];   /* which index           */
+            }
+            info = 22 * sizeof(UINT64);
             status = STATUS_SUCCESS;
             break;
         }

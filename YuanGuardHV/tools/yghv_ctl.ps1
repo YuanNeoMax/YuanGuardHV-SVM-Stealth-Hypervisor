@@ -3910,7 +3910,7 @@ try {
             #   mem-bp drain [max]                     drain the hit ring
             # kinds: r (read), w (write), x (execute); default w for npf, x for int3/dr
             if ($null -eq $Arg1) {
-                $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x823)) -OutputLength 128
+                $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x823)) -OutputLength 160
                 Write-Host ("mem-bp: count={0}  hits={1} recorded={2} refusals={3} missed={4}" -f `
                     [BitConverter]::ToUInt64($out,16), [BitConverter]::ToUInt64($out,24),
                     [BitConverter]::ToUInt64($out,32), [BitConverter]::ToUInt64($out,40),
@@ -3929,6 +3929,9 @@ try {
                 # exists in the shadow copy.
                 if ($out.Length -ge 128) {
                     Write-Host ("  shadow leaf flips={0}" -f [BitConverter]::ToUInt64($out,112))
+                }
+                if ($out.Length -ge 152) {
+                    Write-Host ("  dr7 apply: cores={0} unresolved={1} walk-failed={2}" -f [BitConverter]::ToUInt64($out,128), [BitConverter]::ToUInt64($out,136), [BitConverter]::ToUInt64($out,144))
                 }
                 return
             }

@@ -922,6 +922,12 @@ static volatile LONG64 g_TscBudgetLeft = YGHV_TSC_EXIT_BUDGET;
 static volatile LONG64 g_TscBudgetHits = 0;          /* freezes cut short by the budget */
 static volatile LONG64 g_TscSelfDisarmed = 0;        /* RDTSC handlers that disarmed their own core */
 static volatile LONG64 g_TscApplyFailures = 0;       /* per-core walks that did not complete */
+/* 9.608: the walk aborted before running any callback -- see the note at the
+ * KeGetProcessorNumberFromIndex call. Distinguishes "no core answered" from
+ * "the callbacks never ran", which the per-core counters cannot. */
+static volatile LONG64 g_WalkIndexFailures = 0;
+static volatile LONG64 g_WalkLastIndex = 0;
+static volatile LONG64 g_WalkCoreCount = 0;
 static volatile LONG64 g_TscCoreHits = 0;            /* cores where a walk reached a VPD */
 static volatile LONG64 g_TscCoreMisses = 0;          /* cores where the handshake answered no */
 static volatile LONG64 g_TscIntercepts = 0;          /* RDTSC/RDTSCP exits handled */
@@ -6457,6 +6463,7 @@ SvExecuteOnEachProcessor (
     //
     numOfProcessors = yghv_s206_core_limit(
         KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS));   /* 9.525 */
+    InterlockedExchange64(&g_WalkCoreCount, (LONG64)numOfProcessors);
 
     for (i = 0; i < numOfProcessors; i++)
     {
@@ -6466,6 +6473,20 @@ SvExecuteOnEachProcessor (
         status = KeGetProcessorNumberFromIndex(i, &processorNumber);
         if (!NT_SUCCESS(status))
         {
+            /*
+             * 9.608: THIS EXIT IS SILENT AND IT SWALLOWS THE WHOLE WALK.
+             *
+             * If this fails on i == 0 the loop body never runs, so no callback
+             * executes, so the per-core counters stay at 0/0 -- which reads
+             * exactly like "every core answered no". Measured that way this
+             * round: dr7 apply cores=0 unresolved=12, and the VPD probe returned
+             * hits=0 misses=0 for all twelve cores, a combination that is
+             * impossible if the callbacks had run at all (12 cores must land in
+             * one counter or the other).
+             *
+             * Record it so the two cases can be told apart.
+             */
+            InterlockedIncrement64(&g_WalkIndexFailures);
             goto Exit;
         }
 
@@ -6841,6 +6862,36 @@ SvDrApplyOnCore (
  * must be reported as a failure rather than assumed: half the cores armed is
  * both wrong and visible to the guest.
  */
+/*
+ * 9.608 -- THE DR7 APPLY COUNTERS WERE static AND HAD NO READER.
+ *
+ * Three counters record what actually happened when a DR breakpoint is armed:
+ *   g_DrApplyHits      cores that got the new Dr7
+ *   g_DrApplyMisses    cores that could not resolve their VPD (CPUID failed)
+ *   g_DrApplyFailures  the per-processor walk failed entirely
+ *
+ * All three were file-static and nothing outside this file could read them, so
+ * "mem-bp dr says OK" was the ONLY observable -- and it is exactly the claim in
+ * question. Measured with a live target writing the watched page ~200 times:
+ * count=1, dr=1, hits=0. Either the VMCB never got Dr7 (misses > 0) or it did
+ * and the #DB never credited the hit. Without these numbers those two are
+ * indistinguishable, which is the same defect shape as every other finding in
+ * this session: the observation existed and went nowhere.
+ */
+extern "C" VOID yghv_s206_dr7_apply_stats(UINT64 *out)
+{
+    if (!out) return;
+    out[0] = (UINT64)InterlockedCompareExchange64(&g_DrApplyHits, 0, 0);
+    out[1] = (UINT64)InterlockedCompareExchange64(&g_DrApplyMisses, 0, 0);
+    out[2] = (UINT64)InterlockedCompareExchange64(&g_DrApplyFailures, 0, 0);
+    /* 9.608: what the WALK saw, so "no core answered" and "no callback ran" are
+     * distinguishable. A walk that reports 0 completed with 0 hits AND 0 misses
+     * never executed a callback at all. */
+    out[3] = (UINT64)InterlockedCompareExchange64(&g_WalkCoreCount, 0, 0);
+    out[4] = (UINT64)InterlockedCompareExchange64(&g_WalkIndexFailures, 0, 0);
+    out[5] = (UINT64)InterlockedCompareExchange64(&g_WalkLastIndex, 0, 0);
+}
+
 extern "C" int yghv_s206_dr7_apply_all(VOID)
 {
     S206_DR_APPLY_CONTEXT ctx;
