@@ -21,6 +21,9 @@ $ErrorActionPreference = 'Stop'
 #   8. stale image hash     a manufactured .sys + wrong claim -> check 7 (image hash)
 #   9. checker-count claim  README's "N / M PASS" vs the runner -> check 8 (checker counts)
 #  10. README tree count   hv/ file count +1               -> check 9 (tree counts)
+#  11. stale QUICKSTART number   its "latest record" claim -> check 10 (entry-doc number)
+#  12. wrong main-doc line count INDEX's "compressed to N" -> check 11 (narrative count)
+#  13. duplicate count, 2nd wrong  first correct, second 99 -> check 9 (Matches, not Match)
 #
 # 5-7 were added in 9.583, after five checks reported ALL GREEN on a tree that
 # still carried three wrong numbers. Each of the three new mutators was itself
@@ -414,7 +417,119 @@ try {
     Assert-Caught 'README tree count' 'hv/ file count' (Invoke-Check)
     Remove-Item -LiteralPath $binDir2 -Recurse -Force -ErrorAction SilentlyContinue
     Reset-Copy
-}
+    # 11. QUICKSTART announcing a stale latest number (9.607)
+    #
+    # Check 4 only ever looked at INDEX.md. QUICKSTART carries the same claim TWICE
+    # (the 30-second line and the status table) and both said 9.585/9.588 while the
+    # log had reached 9.605 -- in the file a new session reads first. Mutate the
+    # number on ONE announcement line and require the new check to catch it.
+    #
+    # The old value is DERIVED from the log, not written as a literal: a pinned number
+    # stops mutating the day the log advances, which is the defect shape this file
+    # exists to prevent.
+    $qsPath = Join-Path $copy 'QUICKSTART.md'
+    if (-not (Test-Path -LiteralPath $qsPath)) { throw 'selftest: cannot find QUICKSTART.md in the copy' }
+    $handoffNums = @([regex]::Matches((ReadText $handoffPath), '(?m)^####\s+(9\.[0-9]{3})') | ForEach-Object { $_.Groups[1].Value })
+    if ($handoffNums.Count -eq 0) { throw 'selftest: no record headings to derive the current number from' }
+    $cur = ($handoffNums | Sort-Object { [double]$_.Substring(2) })[-1]
+    $qsText = ReadText $qsPath
+    $kLatest = [string]([char]0x6700 + [char]0x65B0 + [char]0x7F16 + [char]0x53F7)
+    $qsMatch = [regex]::Match($qsText, [regex]::Escape($kLatest) + '[^0-9' + [char]10 + ']*?(9\.[0-9]{3})')
+    if (-not $qsMatch.Success) { throw 'selftest: QUICKSTART announces no latest number to mutate' }
+    $qsGroup = $qsMatch.Groups[1]
+    $qsStale = '9.' + ([double]$cur.Substring(2) - 7)
+    $qsText2 = $qsText.Substring(0, $qsGroup.Index) + $qsStale + $qsText.Substring($qsGroup.Index + $qsGroup.Length)
+    WriteText $qsPath $qsText2
+    Assert-Caught 'stale QUICKSTART number' 'announces latest number' (Invoke-Check)
+    Reset-Copy
+
+    # 12. INDEX stating a wrong line count for the main document (9.607)
+    #
+    # INDEX said the handoff was compressed to 235 lines; the file is 254. Nothing
+    # compared that number to the file, so a reader judging "is this readable" had one
+    # unchecked number to go on. Plant +9 on whatever the real line count is.
+    $mainDocPath = Join-Path $copy 'RELEASE_0.4.3.md'
+    if (-not (Test-Path -LiteralPath $mainDocPath)) { throw 'selftest: cannot find RELEASE_0.4.3.md in the copy' }
+    $realLines = @([IO.File]::ReadAllLines($mainDocPath)).Count
+    $kSqueeze = [string]([char]0x538B + [char]0x6210)
+    $kLines = [string]([char]0x884C)
+    $ixText = ReadText $indexPath
+    $lineClaim = [regex]::Match($ixText, [regex]::Escape($kSqueeze) + '\s*([0-9]+)\s*' + [regex]::Escape($kLines))
+    if (-not $lineClaim.Success) { throw 'selftest: INDEX states no compressed-to-N-lines claim to mutate' }
+    $lcGroup = $lineClaim.Groups[1]
+    $ixText2 = $ixText.Substring(0, $lcGroup.Index) + ('' + ($realLines + 9)) + $ixText.Substring($lcGroup.Index + $lcGroup.Length)
+    WriteText $indexPath $ixText2
+    Assert-Caught 'wrong main-doc line count' 'compressed to' (Invoke-Check)
+    Reset-Copy    # 13. the tree count stated TWICE, only the SECOND one wrong (9.607)
+    #
+    # Check 9 used [regex]::Match, which returns ONE match. README states the tests/
+    # count twice -- once in the repository tree, once in the testing section -- and
+    # one of them said 19 while disk had 20. The check passed for a whole release
+    # because it only ever looked at the first line.
+    #
+    # This mutation is aimed at exactly that: a purpose-built README where the FIRST
+    # tests/ count is CORRECT and only the SECOND is wrong. A Match-based checker
+    # reports PASS here; only a Matches-based one can catch it. Mutation 10 already
+    # covers "notices a wrong number", so this one covers the other axis.
+    $dupRoot = Join-Path $work 'YuanGuardHV'
+    New-Item -ItemType Directory -Path (Join-Path $dupRoot 'hv') -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $dupRoot 'tests') -Force | Out-Null
+    1..2 | ForEach-Object { WriteText (Join-Path $dupRoot "hv/d$_.c") "x`n" }
+    1..4 | ForEach-Object { WriteText (Join-Path $dupRoot "tests/d$_.ps1") "x`n" }
+    $dupReadme = Join-Path $work 'README.md'
+    # Built from scratch so the two counts are the ONLY thing under test: a real
+    # README here would also drag in check 8 by mentioning run_source_checks.
+    $dupBody = @(
+        '# fixture',
+        '',
+        '- hv/   ( 2 files )',
+        '- tests/   ( 4 scripts )',
+        '',
+        '## testing',
+        '',
+        'Build-time checkers (tests/, 4 scripts)',
+        '',
+        '- see tests/   ( 99 scripts ) for the full list',
+        ''
+    ) -join "`n"
+    WriteText $dupReadme $dupBody
+    Assert-Caught 'tree count wrong in the SECOND statement only' 'claims 99' (Invoke-Check)
+    Remove-Item -LiteralPath $dupRoot -Recurse -Force -ErrorAction SilentlyContinue
+    Reset-Copy    # 13b. THE CONTROL for the mutation above: both statements correct -> silent.
+    #
+    # Mutation 13 proves the check can see the SECOND statement. It does not prove
+    # the check is not simply failing on any README with two tests/ lines. Fix both
+    # to the true count (4 on disk) and require PASS. Without this, a checker that
+    # rejects every duplicate would "pass" mutation 13 while being unusable.
+    $dupRoot = Join-Path $work 'YuanGuardHV'
+    New-Item -ItemType Directory -Path (Join-Path $dupRoot 'hv') -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $dupRoot 'tests') -Force | Out-Null
+    1..2 | ForEach-Object { WriteText (Join-Path $dupRoot "hv/d$_.c") "x`n" }
+    1..4 | ForEach-Object { WriteText (Join-Path $dupRoot "tests/d$_.ps1") "x`n" }
+    $dupReadme2 = Join-Path $work 'README.md'
+    $dupOk = @(
+        '# fixture',
+        '',
+        '- hv/   ( 2 files )',
+        '- tests/   ( 4 scripts )',
+        '',
+        '## testing',
+        '',
+        'Build-time checkers (tests/, 4 scripts)',
+        '',
+        '- see tests/   ( 4 scripts ) for the full list',
+        ''
+    ) -join "`n"
+    WriteText $dupReadme2 $dupOk
+    $r13b = Invoke-Check
+    if ($r13b.Exit -ne 0) {
+        $selfTestFailures.Add("control: two CORRECT duplicate counts were reported as a problem (the check rejects duplicates instead of comparing them): $($r13b.Out.Trim())")
+    }
+    else {
+        Write-Host '[PASS] self-test: two correct duplicate counts stay silent'
+    }
+    Remove-Item -LiteralPath $dupRoot -Recurse -Force -ErrorAction SilentlyContinue
+    Reset-Copy}
 finally {
     if (Test-Path -LiteralPath $work) { Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue }
     $env:YGHV_DOCS_ROOT = $null
@@ -425,4 +540,4 @@ if ($selfTestFailures.Count -gt 0) {
     throw 'docs_check_selftest: self-test failed'
 }
 
-Write-Host '[PASS] docs_check self-test: all 10 planted defects were caught, and the 2 controls (code-span link, real image hash) stayed silent'
+Write-Host '[PASS] docs_check self-test: all 13 planted defects were caught, and the 3 controls (code-span link, real image hash, correct-first-duplicate-count) stayed silent'

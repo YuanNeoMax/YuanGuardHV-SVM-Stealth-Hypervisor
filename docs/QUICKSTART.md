@@ -2,7 +2,7 @@
 
 > **30 秒版**：AMD SVM 管理程序驱动，Windows 自己是 guest。代码在 `D:\yuanguard`，
 > 分支 `main`，构建一条命令，加载一条命令。
-> **当前最新编号 9.585**。默认真 guest + 全 12 核，12 线程 **1.05-1.08×**，卸载 **0.06-0.23 s**，`invmrun at unload = 0x0`。
+> **当前最新编号 9.605**。默认真 guest + 全 12 核，12 线程 **1.05-1.08×**，卸载 **0.06-0.23 s**，`invmrun at unload = 0x0`。
 
 ---
 
@@ -52,17 +52,17 @@ Get-Content C:\Windows\yghv_progress.log | Select-String "invmrun at unload"
 
 ---
 
-## 3. 当前状态（2026-11-08）
+## 3. 当前状态（2026-11-14）
 
 | 项 | 值 |
 |---|---|
 | 分支 / HEAD | `main`，**不写死 commit** —— 写下的那一刻就开始过期，看 `git log -1` |
 | 驱动 | `yghvpa` · **STOPPED** · 设备 `\\.\YuanGuardHV` |
-| 最新编号 | **9.588** |
+| 最新编号 | **9.605** |
 | 工作树 | 干净 |
-| 静态检查 | **18 个源级脚本 / 57 条 PASS**（含 **33** 条自检）+ 1 个 map 脚本，两个运行器全绿（9.588 实测）；客户端 **PowerShell 86 / Java 18** 条命令、IOCTL **59** 个 |
-| 构建产物 | `bin/yuanguard_hv.sys` = `A8452F9BAECA7AE8`（9.588 构建）|
-| 部署镜像 | `C:\yghv_pa.sys` = `BCC4FECDEA8DCEE5` —— **与当前 `bin` 不同**：9.588 的构建尚未部署，验收要的那一步（`mem-bp dr` 真正命中）还没做 |
+| 静态检查 | **18 个源级脚本 / 61 条 PASS**（含 **37** 条自检）+ 2 个 map 脚本（`page_layout_check` / `string_encryption_check`），两个运行器全绿；客户端 **PowerShell 86 / Java 18** 条命令、IOCTL **60** 个 |
+| 构建产物 | `bin/yuanguard_hv.sys` = `ABEAAD12E973A71A`（**当前 HEAD** 构建 = v0.4.16 代码）|
+| 部署镜像 | `C:\yghv_pa.sys` = `BCC4FECDEA8DCEE5` —— **与当前 `bin` 不同**：v0.4.3 的构建尚未部署，验收要的那一步（`mem-bp dr` 真正命中）还没做 |
 | **最近一次卸载** | `invmrun at unload = 0x0`，无蓝屏（9.513）|
 | **性能（9.575-9.577 实测）** | 默认 **真 guest + 全部 12 个逻辑核**：12 线程 **1.05-1.08×**。旧默认（6 核桩模式）是 1.13-1.34× 且 G25 只有 15/17；现在 G25 **17/17**。可用 `CoreCount` / `RealGuestMode` 覆盖 |
 | **G25** | **17/17 ALL PASS** —— 12 核真 guest 默认配置（9.577 实测）；15/17 是 9.533 的旧 6 核桩模式数字 |

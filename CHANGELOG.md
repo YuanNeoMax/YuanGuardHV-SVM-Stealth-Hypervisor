@@ -1,14 +1,27 @@
 # Changelog
 
 本项目的版本级变更摘要。逐条工程记录（编号 `9.x`，条数以交接文档开头索引为准）在
-[`docs/YUANMOD_HANDOFF_CURRENT.md`](docs/YUANMOD_HANDOFF_CURRENT.md)；
-本文只回答「两个版本之间发生了什么」。
+[`docs/archive/v0.4.2/YUANMOD_HANDOFF_CURRENT.md`](docs/archive/v0.4.2/YUANMOD_HANDOFF_CURRENT.md)；
+本文只回答「两个版本之间发生了什么」。当前交接入口是 [`docs/RELEASE_0.4.3.md`](docs/RELEASE_0.4.3.md)。
 
 格式参考 [Common Changelog](https://common-changelog.org)，版本号遵循
 [语义化版本](https://semver.org/lang/zh-CN/)。
 
 > **注意本项目的版本号语义**：`0.x` 阶段，MINOR 版本可能包含**破坏性变更**
 > （运行时开关语义、默认配置）。每次有此类变更都会在下面明确标注 **Breaking**。
+
+> **tag 与本文小节一一对应**（2026-11-14 补齐）：
+> `v0.4.3 → bc2b417`（9.588–9.591）、`v0.4.4 → fb1ef33`（9.592）、…
+> `v0.4.16 → 39da6e2`（9.604）。每个 tag 是 annotated tag，指向该小节记录的提交，
+> 提交关系严格线性（`git merge-base --is-ancestor` 逐对验证过）。
+>
+> **v0.4.3 的 tag 在 2026-11-14 被改指**：它此前指向 `f747091`（最后状态，含全部能力面），
+> 那与本文"v0.4.3 的范围是 9.588–9.591"矛盾。改指后 `v0.4.3` 只含 9.588–9.591 的代码，
+> 镜像哈希因此是 `f3b88948`（从 tag 重新构建，与本节 Verification 记录逐位一致），
+> **不是** `abeaad12`（那是 HEAD = v0.4.16 代码的构建）。
+>
+> 每个小节 Verification 块里的脚本数 / PASS 数是**当时的快照**，不随之后的版本更新——
+> 那是历史记录，不是当前值。
 
 ---
 

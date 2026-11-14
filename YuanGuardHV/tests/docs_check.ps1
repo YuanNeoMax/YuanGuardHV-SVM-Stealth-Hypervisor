@@ -485,8 +485,17 @@ else {
     )
     foreach ($tc in $treeChecks) {
         $dir = Join-Path $repoRoot $tc.Dir
-        $m = [regex]::Match($rd, $tc.Pattern)
-        if (-not $m.Success) {
+        # 9.607: EVERY occurrence, not just the first.
+        #
+        # This used [regex]::Match, which returns ONE match. README states the
+        # tests/ count TWICE -- once in the repository tree, once in the testing
+        # section -- and one of them said 19 while disk had 20. The check passed
+        # for a whole release because it only ever looked at the first line. A
+        # count stated twice in one file is the easiest inconsistency there is,
+        # and a checker that reads one of them reports "the document agrees"
+        # about a document that disagrees with itself.
+        $ms = @([regex]::Matches($rd, $tc.Pattern))
+        if ($ms.Count -eq 0) {
             $problems.Add("README.md carries no $($tc.What)")
             continue
         }
@@ -496,12 +505,67 @@ else {
         }
         $actual = @(Get-ChildItem -LiteralPath $dir -File -Filter $tc.Filter |
                 Where-Object { $_.Name -notmatch '^run_' }).Count
-        if ([int]$m.Groups[1].Value -ne $actual) {
-            $problems.Add("README.md claims $($m.Groups[1].Value) for $($tc.What), disk has $actual")
+        foreach ($m in $ms) {
+            if ([int]$m.Groups[1].Value -ne $actual) {
+                $line = ($rd.Substring(0, $m.Index) -split [char]10).Count
+                $problems.Add(("README.md:{0} claims {1} for {2}, disk has {3}" -f $line, $m.Groups[1].Value, $tc.What, $actual))
+            }
         }
     }
 }
 
+# --------------------------------- 10. the "latest record number" in every entry doc
+#
+# 9.607. Check 4 compares the INDEX highest 9.xxx against the log. It does not look
+# at QUICKSTART.md, and QUICKSTART carries that number TWICE -- in the 30-second
+# line and in the status table -- while the log had reached 9.605. Two stale
+# numbers, in the file a new session is told to read first, and the checker that
+# exists to catch exactly this was pointed at a different file.
+#
+# The Chinese anchor is built from [char] codes, not written out: this file is
+# ASCII-only on purpose (see the header) and powershell.exe decodes a BOM-less
+# UTF-8 script as ANSI, so a Chinese literal here is a parser error several lines
+# away from the real cause -- measured, 9.583, in this very file.
+if ($haveHandoff) {
+    $kLatest = [string]([char]0x6700 + [char]0x65B0 + [char]0x7F16 + [char]0x53F7)
+    foreach ($doc in @('docs/QUICKSTART.md')) {
+        $p = Join-Path (Split-Path -Parent $docsRoot) $doc
+        if (-not (Test-Path -LiteralPath $p)) { continue }
+        $txt = ReadUtf8 $p
+        # Only lines that ANNOUNCE the number, not every 9.xxx mention: QUICKSTART
+        # legitimately cites historical records as evidence (9.449, 9.556), and
+        # those are not claims about the ceiling. The anchor word separates them.
+        $rx = '(?m)^.*' + [regex]::Escape($kLatest) + '[^0-9' + [char]10 + ']*?(9\.[0-9]{3})'
+        foreach ($m in [regex]::Matches($txt, $rx)) {
+            if ($m.Groups[1].Value -ne $highest) {
+                $line = ($txt.Substring(0, $m.Index) -split [char]10).Count
+                $problems.Add(("QUICKSTART.md:{0} announces latest number {1}, the log highest is {2}" -f $line, $m.Groups[1].Value, $highest))
+            }
+        }
+    }
+}
+
+# ------------------------- 11. a narrative line count must equal the real file
+#
+# 9.607. INDEX.md said the handoff was "compressed to 235 lines"; the file is 254.
+# A reader judging "is this short enough to read" has exactly one number to go on,
+# and nothing compared it to the file it describes. Same shape as the index row
+# counts in check 2 -- a number in a document about a document -- but this one had
+# no gate at all.
+$mainDoc = Join-Path $docsRoot 'RELEASE_0.4.3.md'
+if (Test-Path -LiteralPath $mainDoc) {
+    $realLines = @([IO.File]::ReadAllLines($mainDoc)).Count
+    $ix = ReadUtf8 $index
+    $kSqueeze = [string]([char]0x538B + [char]0x6210)
+    $kLines = [string]([char]0x884C)
+    $rx2 = [regex]::Escape($kSqueeze) + '\s*([0-9]+)\s*' + [regex]::Escape($kLines)
+    foreach ($m in [regex]::Matches($ix, $rx2)) {
+        if ([int]$m.Groups[1].Value -ne $realLines) {
+            $line = ($ix.Substring(0, $m.Index) -split [char]10).Count
+            $problems.Add(("INDEX.md:{0} says the handoff was compressed to {1} lines, RELEASE_0.4.3.md is {2}" -f $line, $m.Groups[1].Value, $realLines))
+        }
+    }
+}
 # ------------------------------------------------------------ report
 if ($problems.Count -gt 0) {
     # Write-Output, not Write-Host: the self-test runs this checker as a child

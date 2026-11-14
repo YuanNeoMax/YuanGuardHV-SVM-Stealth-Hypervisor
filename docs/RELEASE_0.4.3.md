@@ -1,8 +1,9 @@
 # YuanGuardHV v0.4.3 — Release Handoff
 
-> **版本**：0.4.3（2026-11-14）  
-> **镜像**：`abeaad12e973a71a24d26fec732efbcf66a4f1c391c470c542ff16a2a27196b7`  
-> **测试**：18 检查器 / 57 PASS / 33 自检，ALL PASS  
+> **版本**：0.4.3（2026-11-14，tag `bc2b417`）  
+> **镜像（v0.4.3 tag 构建）**：`f3b88948110f2ab9d6f8aba160e3af66ffe2f0a7e66ffd8dbe2615f626a4f3cd`  
+> **当前 HEAD 构建**：`abeaad12e973a71a...`（HEAD 已在 v0.4.16，与 v0.4.3 tag 不是同一份代码）  
+> **测试**：18 检查器 / 61 PASS / 37 自检，ALL PASS  
 > **仓库**：https://github.com/YuanNeoMax/YuanGuardHV-SVM-Stealth-Hypervisor
 
 ---
@@ -19,7 +20,7 @@ YuanGuardHV 是基于 AMD SVM/NPT 的裸机 hypervisor，Windows 自身作为 gu
 
 ## 二、能力面（v0.4.3 全部实现）
 
-### 进程控制（IOCTL 0x838，14 op）
+### 进程控制（IOCTL 0x838，15 op）
 
 | op | 功能 | 状态 |
 |---|---|---|
@@ -85,7 +86,7 @@ PING / HEALTH / READ / STATS / MEM_READ / MEM_WRITE / PHYS_READ / PHYS_WRITE
 - **异常拦截型无痕**：mem_bp.c（NPF/INT3/DR 三模式）
 - **时间校验**：mem_time.c
 - **动态设备名**：随机 8 位 hex 后缀
-- **IOCTL 分发**：control_device.c（60+ 命令）
+- **IOCTL 分发**：control_device.c（60 个 case，与 control_ioctl.h 的 60 个定义一一对应）
 - **驱动卸载与痕迹清除**：yghv_unload_trace.c + yghv_proc_cleanup
 - **驱动级读写**：按 PID 读写字节/整数/浮点/双浮点/字节集/文本
 - **强制结束进程**：含受保护进程（先清 Protection 字节）
@@ -108,7 +109,7 @@ PING / HEALTH / READ / STATS / MEM_READ / MEM_WRITE / PHYS_READ / PHYS_WRITE
 
 ## 三、架构要点
 
-### 模块布局（hv/ 目录，45 个源文件）
+### 模块布局（hv/ 目录：45 个 .c/.cpp/.h/.hpp + 3 个 .S/.asm = 48 个文件）
 
 | 模块 | 文件 | 职责 |
 |---|---|---|
@@ -116,8 +117,8 @@ PING / HEALTH / READ / STATS / MEM_READ / MEM_WRITE / PHYS_READ / PHYS_WRITE
 | 偏移表 | yghv_offsets.c | 自动派生 EPROCESS/ETHREAD 偏移 |
 | 字符串 | yghv_str.h + yghv_strtab.h | 编译期加密 |
 | 特征码 | yghv_sig.c | 未导出函数定位 + 导出解析 |
-| 进程控制 | yghv_proc.c | 14 op 分发 |
-| 注入 | yghv_inject.c | 5 原语 |
+| 进程控制 | yghv_proc.c | 15 op 分发 |
+| 注入 | yghv_inject.c | 6 op 分发 |
 | 页表 | yghv_pt.c | CR3/树/范围/页清单 |
 | 窗口 | yghv_win.c | DisplayAffinity + 消息注入 |
 | 句柄降权 | yghv_obguard.c | ObRegisterCallbacks |
@@ -213,9 +214,9 @@ YuanGuardHV/tools/yghv_client/run.bat mem-read <pid> <va>
 
 | 项目 | 状态 | 说明 |
 |---|---|---|
-| P1-1 mem-bp dr | 未上机 | DR 断点路径已实现，需实测 |
-| P1-4 进程控制十 op | 未上机 | 全部编译通过，需实测 |
-| P1-5 注入五原语 | 未上机 | 全部编译通过，需实测 |
+| P1-1 mem-bp dr | 未上机 | 9.588 已接通硬件（DR0–3 + 每核 VMCB Dr7 + #DB 回调），代码完成，需实测 |
+| P1-4 进程控制 15 op | 未上机 | 全部编译通过，需实测 |
+| P1-5 注入原语 6 op | 未上机 | 全部编译通过，需实测 |
 | P1-7 窗口防截图 | 未上机 | win32kfull 导出解析就绪，需实测 |
 | P1-8 伪装/线程隐藏/令牌提权 | 未上机 | 全部编译通过，需实测 |
 | TOKEN 偏移 | 推断 | 0x38/0x40 基于 Win10 x64 实测推断 |
@@ -228,16 +229,19 @@ YuanGuardHV/tools/yghv_client/run.bat mem-read <pid> <va>
 
 | 版本 | 提交 | 主要变更 |
 |---|---|---|
-| v0.4.0 | — | 全核真 guest 成为默认 |
-| v0.4.1 | — | P1-1 mem-bp dr 真修 |
-| v0.4.2 | — | 仓库卫生 + 检查器修复 |
-| v0.4.3 | 3056c5d | **本版本**：完整能力面（16 项 + 9 超越） |
+| v0.4.0 | `64b8499` | 全核真 guest 成为默认 |
+| v0.4.1 | `41fed59` | RealGuestMode 覆盖可见化 + 真 guest 下重测 mem-bench |
+| v0.4.2 | `38b7410` | P1-3 全部结案 + 错误码门 + 文档侧修复 |
+| v0.4.3 | `f747091` | **本版本**：完整能力面（16 项 + 9 超越）；含 9.588 的 P1-1 `mem-bp dr` 真修 |
+
+> **提交号取各 tag 实际指向的 commit**（`git rev-parse <tag>^{commit}`）。
+> P1-1 `mem-bp dr` 的硬件接通是 9.588，落在 v0.4.3 的范围里，不是 v0.4.1。
 
 ---
 
 ## 八、下一步
 
-1. **上机验证**：部署 v0.4.3 镜像，逐项验证 14 个 proc op、5 个 inject op、4 个 pt op、4 个 win op。
+1. **上机验证**：部署 v0.4.3 镜像，逐项验证 15 个 proc op、6 个 inject op、5 个 pt op、4 个 win op。
 2. **P1-1 mem-bp dr 上机**：验证 DR 断点路径。
 3. **全核挂机 1h**：验证长期稳定性。
 4. **性能回归**：G25 功能验证 17/17。

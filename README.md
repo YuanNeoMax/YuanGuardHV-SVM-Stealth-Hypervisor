@@ -256,7 +256,7 @@ build.bat
 
 流程（`build.bat`）：
 
-1. 先运行 `tests\run_source_checks.ps1`（**18 个脚本 / 57 条 PASS**，含 33 条自检），失败即中止；
+1. 先运行 `tests\run_source_checks.ps1`（**18 个脚本 / 61 条 PASS**，含 37 条自检），失败即中止；
 2. clang-cl 编译 `hv\*.c` / `hv\*.cpp` + `svm_trampoline.S`；
 3. MSVC link 链接为 `bin\yuanguard_hv.sys`，**同时产出 `bin\yuanguard_hv.map`**；
 4. 运行 `tests\run_map_checks.ps1`（页布局检查，必须链接后跑）；
@@ -358,7 +358,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File $ctl mem-read <pid> <hex_va>
 
 ## 测试
 
-### 构建期检查器（`tests\`，19 个脚本 + 2 个运行器）
+### 构建期检查器（`tests\`，20 个脚本 + 2 个运行器）
 
 | 脚本 | 检查什么 |
 |---|---|
@@ -473,7 +473,7 @@ csc /nologo /optimize+ /out:tools\bench_core.exe tools\bench_core.cs
 
 | 版本 | 主题 | 关键数据 |
 |---|---|---|
-| **v0.4.3**（当前）| 完整能力面：进程控制 / 注入 / 页表 / 窗口 / 句柄降权 / 无痕通信 | 16 项清单 + 9 超越；镜像 `abeaad12e973a71a` |
+| **v0.4.3** | 进程/线程控制面接入（9.588–9.591，tag `bc2b417`）| 镜像 `f3b88948`；能力面由 v0.4.4–v0.4.16 逐条补齐 |
 | v0.4.2 | P1-3 全部结案 + 错误码门 + 文档侧 5 处过期值 | 目标自写 10/10 存活；外来写 1/1 回滚 |
 | v0.4.1 | 配置不一致可见化 + 真 guest 下重测内存基准 | B 比 A 快 **1.8–2.4×**；真 guest 下 B 慢 13%（NPT 代价）|
 | v0.4.0 | 全核真 guest 成为默认 | 12 线程 **1.05×**、G25 **17/17**、卸载 0.07 s |
