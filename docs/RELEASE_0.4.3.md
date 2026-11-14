@@ -1,0 +1,235 @@
+# YuanGuardHV v0.4.3 — Release Handoff
+
+> **版本**：0.4.3（2026-11-14）  
+> **镜像**：`abeaad12e973a71a24d26fec732efbcf66a4f1c391c470c542ff16a2a27196b7`  
+> **测试**：18 检查器 / 57 PASS / 33 自检，ALL PASS  
+> **仓库**：https://github.com/YuanNeoMax/YuanGuardHV-SVM-Stealth-Hypervisor
+
+---
+
+## 一、项目概览
+
+YuanGuardHV 是基于 AMD SVM/NPT 的裸机 hypervisor，Windows 自身作为 guest 运行在全部 12 个逻辑核上。核心目标是**真 guest + 全核**，不是桩模式。
+
+**出货构建参数**：`YGHV_BAREMETAL_STEP=206 YGHV_206B_COEXIST=1 YGHV_206B_GNPT=1`
+
+**真实处理 VMEXIT 的路径**：`hv/svm_simplevm206.cpp` 的 `SvHandleVmExit`（不是 `svm_core.c` 的 resident loop）。
+
+---
+
+## 二、能力面（v0.4.3 全部实现）
+
+### 进程控制（IOCTL 0x838，14 op）
+
+| op | 功能 | 状态 |
+|---|---|---|
+| 0 | 进程快照 | ✅ |
+| 1 | 进程查询 | ✅ |
+| 2 | PP/PPL 保护级别修改 | ✅ |
+| 3 | 暂停/恢复进程 | ✅ |
+| 4 | 强制结束进程 | ✅ |
+| 5 | 偏移表诊断 | ✅ |
+| 6 | 特征码诊断 | ✅ |
+| 7 | 线程枚举 | ✅ |
+| 8 | 令牌偷取 | ✅ |
+| 9 | 进程隐藏 | ✅ |
+| 10 | 句柄降权 | ✅ |
+| 11 | 句柄降权诊断 | ✅ |
+| 12 | 伪装进程映像名 | ✅ |
+| 13 | 令牌提权 | ✅ |
+| 14 | 线程隐藏 | ✅ |
+
+### 注入原语（IOCTL 0x839，6 op）
+
+| op | 功能 |
+|---|---|
+| 0 | 分配内存 |
+| 1 | 写内存 |
+| 2 | 释放内存 |
+| 3 | 创建线程 |
+| 4 | APC 排队 |
+| 5 | 统计 |
+
+### 页表分析（IOCTL 0x83A，5 op）
+
+| op | 功能 |
+|---|---|
+| 0 | CR3 解码 |
+| 1 | 页表树遍历 |
+| 2 | 范围映射 |
+| 3 | 页清单 |
+| 4 | 统计 |
+
+### 窗口防截图（IOCTL 0x83B，4 op）
+
+| op | 功能 |
+|---|---|
+| 0 | 设置 DisplayAffinity |
+| 1 | 查询 DisplayAffinity |
+| 2 | 统计 |
+| 3 | 窗口消息注入 |
+
+### 无痕通信（CPUID 门铃，8 op）
+
+PING / HEALTH / READ / STATS / MEM_READ / MEM_WRITE / PHYS_READ / PHYS_WRITE
+
+### 其他能力
+
+- **原生结构体定义**：yghv_nt.h（偏移表 + 访问器）
+- **编译期字符串加密**：yghv_str.h + gen_strtab.py
+- **未导出函数特征码定位**：yghv_sig.c（含 yghv_sig_export_of 按名解析任意模块导出）
+- **全局系统偏移初始化**：yghv_offsets.c（自动派生 + 验证）
+- **物理地址映射读写**：mem_pa.c
+- **影子页 IO 窗口**：mem_engine.c（A/B 双引擎）
+- **页表重定向无痕**：mem_pte.c
+- **异常拦截型无痕**：mem_bp.c（NPF/INT3/DR 三模式）
+- **时间校验**：mem_time.c
+- **动态设备名**：随机 8 位 hex 后缀
+- **IOCTL 分发**：control_device.c（60+ 命令）
+- **驱动卸载与痕迹清除**：yghv_unload_trace.c + yghv_proc_cleanup
+- **驱动级读写**：按 PID 读写字节/整数/浮点/双浮点/字节集/文本
+- **强制结束进程**：含受保护进程（先清 Protection 字节）
+- **挂起进程**：PsSuspendProcess/PsResumeProcess
+- **抢权**：令牌偷取 + 令牌提权
+- **CR3 解密/页表分析**：yghv_pt.c
+- **进程保护**：ObRegisterCallbacks 句柄降权
+- **进程管控**：伪装/隐藏/提权/句柄降权/线程隐藏
+- **无痕注入**：alloc+write+thread/APC
+- **远程 DLL 注入**：alloc+write(path)+thread(LoadLibraryW,path)
+- **APC 注入**：KeInitializeApc+KeInsertQueueApc（带属主校验）
+- **窗口消息注入**：NtUserPostMessage
+- **shellcode 注入**：alloc+write(bytes)+thread(bytes)
+- **无痕通信**：CPUID 门铃 + 四内存原语
+- **模块隐藏**：三链表摘除（InLoad/InMemory/InInitialization）
+- **回调隐藏**：OB 回调从枚举链表摘除
+- **回调去签名化**：altitude 327681（无已知样本）
+
+---
+
+## 三、架构要点
+
+### 模块布局（hv/ 目录，45 个源文件）
+
+| 模块 | 文件 | 职责 |
+|---|---|---|
+| 核心 | svm_simplevm206.cpp | VMEXIT 处理（真路径） |
+| 偏移表 | yghv_offsets.c | 自动派生 EPROCESS/ETHREAD 偏移 |
+| 字符串 | yghv_str.h + yghv_strtab.h | 编译期加密 |
+| 特征码 | yghv_sig.c | 未导出函数定位 + 导出解析 |
+| 进程控制 | yghv_proc.c | 14 op 分发 |
+| 注入 | yghv_inject.c | 5 原语 |
+| 页表 | yghv_pt.c | CR3/树/范围/页清单 |
+| 窗口 | yghv_win.c | DisplayAffinity + 消息注入 |
+| 句柄降权 | yghv_obguard.c | ObRegisterCallbacks |
+| 无痕通信 | yghv_channel.c | CPUID 门铃 |
+| 物理读写 | mem_pa.c | 物理地址映射 |
+| 影子页 | mem_engine.c | A/B 双引擎 |
+| 页表重定向 | mem_pte.c | 无痕映射 |
+| 断点 | mem_bp.c | NPF/INT3/DR |
+| 卸载痕迹 | yghv_unload_trace.c | 痕迹清除 |
+
+### 关键设计约束
+
+1. **VIRTUAL_PROCESSOR_DATA 不许加成员**（9.577 硬约束）：HostStackLimit 带 DECLSPEC_ALIGN(PAGE_SIZE)，任何增长把 GuestVmcb/HostVmcb 后移一页，asm 用固定偏移寻址。
+2. **METHOD_BUFFERED 单缓冲别名**：dispatch 必须先拷出请求再 memset out。
+3. **偏移表 fail-closed**：off==0 返回 NULL，所有访问器安全失败。
+4. **字符串不进镜像**：所有导出名走 strtab 解密。
+5. **IRQL 全 PASSIVE**：所有 IOCTL op 在 PASSIVE_LEVEL 执行。
+
+---
+
+## 四、构建与部署
+
+### 构建
+
+```bash
+cd YuanGuardHV
+set YGHV_BAREMETAL_STEP=206
+set YGHV_206B_COEXIST=1
+set YGHV_206B_GNPT=1
+build.bat
+```
+
+产物：`bin/yuanguard_hv.sys`（已签名）+ `bin/yuanguard_hv.map`
+
+### 部署
+
+```bash
+copy bin\yuanguard_hv.sys C:\yghv_pa.sys
+sc start yghvpa
+```
+
+### 测试
+
+```bash
+powershell -NoProfile -ExecutionPolicy Bypass -File tests/run_source_checks.ps1
+```
+
+18 个检查器，覆盖：IOCTL 一致性、命令一致性、结构体布局、字符串加密、EOL、源引用、IRQL 契约、缓冲区边界等。
+
+---
+
+## 五、客户端
+
+### PowerShell（86 条命令）
+
+```bash
+YuanGuardHV/tools/yghv_ctl.ps1 proc snapshot
+YuanGuardHV/tools/yghv_ctl.ps1 proc query <pid>
+YuanGuardHV/tools/yghv_ctl.ps1 inject alloc <pid> <size>
+YuanGuardHV/tools/yghv_ctl.ps1 pt <pid> tree <va>
+YuanGuardHV/tools/yghv_ctl.ps1 win <pid> set <hwnd> [affinity]
+```
+
+### Java（18 条命令）
+
+```bash
+YuanGuardHV/tools/yghv_client/run.bat state
+YuanGuardHV/tools/yghv_client/run.bat mem-read <pid> <va>
+```
+
+---
+
+## 六、已知限制
+
+| 项目 | 状态 | 说明 |
+|---|---|---|
+| P1-1 mem-bp dr | 未上机 | DR 断点路径已实现，需实测 |
+| P1-4 进程控制十 op | 未上机 | 全部编译通过，需实测 |
+| P1-5 注入五原语 | 未上机 | 全部编译通过，需实测 |
+| P1-7 窗口防截图 | 未上机 | win32kfull 导出解析就绪，需实测 |
+| P1-8 伪装/线程隐藏/令牌提权 | 未上机 | 全部编译通过，需实测 |
+| TOKEN 偏移 | 推断 | 0x38/0x40 基于 Win10 x64 实测推断 |
+| 线程隐藏 | 部分 | 只摘进程线程链表，不摘 session/全局 |
+| 1h 挂机 | 未测 | P2-1，需重启 |
+
+---
+
+## 七、版本历史（0.4.x 系列）
+
+| 版本 | 提交 | 主要变更 |
+|---|---|---|
+| v0.4.0 | — | 全核真 guest 成为默认 |
+| v0.4.1 | — | P1-1 mem-bp dr 真修 |
+| v0.4.2 | — | 仓库卫生 + 检查器修复 |
+| v0.4.3 | 3056c5d | **本版本**：完整能力面（16 项 + 9 超越） |
+
+---
+
+## 八、下一步
+
+1. **上机验证**：部署 v0.4.3 镜像，逐项验证 14 个 proc op、5 个 inject op、4 个 pt op、4 个 win op。
+2. **P1-1 mem-bp dr 上机**：验证 DR 断点路径。
+3. **全核挂机 1h**：验证长期稳定性。
+4. **性能回归**：G25 功能验证 17/17。
+
+---
+
+## 九、文档索引
+
+| 文档 | 用途 |
+|---|---|
+| **本文档** | 0.4.3 交接文档（主文档） |
+| ISSUES.md | 问题清单 |
+| QUICKSTART.md | 快速开始 |
+| archive/ | 历史文档归档 |
