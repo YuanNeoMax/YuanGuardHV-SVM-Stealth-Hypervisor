@@ -29,7 +29,7 @@
 
 ---
 
-## 记录索引（9.598 重新测量，84 条）
+## 记录索引（9.599 重新测量，85 条）
 
 > 这是本文档自己的目录。**按标题扫一眼，找到要的那条，再跳过去读。**
 > 行数是该记录占的篇幅，用来判断"值不值得读全文"。
@@ -120,6 +120,7 @@
 | 9.596 窗口消息注入：NtUserPostMessage 从内核投递 | 28 |
 | 9.597 句柄降权接进门：ObRegisterCallbacks 拦截句柄创建 | 64 |
 | 9.598 伪装进程映像名：DISGUISE op，修 GUARD 不可达 bug | 21 |
+| 9.599 模块隐藏补全：三个链表都摘除 | 15 |
 
 ---
 
@@ -4797,6 +4798,21 @@ op 10/11 没上机。guard_enable 需要传入目标 PEPROCESS，op 10 的参数
 
 **构建验证**：单文件编译零诊断；全量构建 EXIT=0，镜像 SHA256 = 82ebcb029c925d4a68b35b81621ed6d0e4207f95e2dc8e25d0f1caaeeecdbbe4。
 
+#### 9.599 模块隐藏补全：从三个链表都摘除
+
+**做什么**：改进 `loader_stealth.c` 的 `yghv_unlink_module`，从只摘 InLoadOrderLinks 改为同时摘 InMemoryOrderLinks（+0x10）和 InInitializationOrderLinks（+0x20）。
+
+**为什么**：只摘第一个链表时，`NtQuerySystemInformation(SystemModuleInformation)` 走的是 InInitializationOrderLinks，仍能看到模块。三个链表都摘才能让枚举工具全部看不到。
+
+**实现**：找到 entry 后，按偏移 0x10 / 0x20 取另外两个 LIST_ENTRY，各自做标准的双向链表摘除（prev->Flink = next, next->Blink = prev, 自指）。Windows 10 的 KLDR_DATA_TABLE_ENTRY 三个 LIST_ENTRY 在 0x00 / 0x10 / 0x20，19041 与 26100 一致。
+
+**已知限制**：
+- `YGHV_LOADER_STEALTH` 默认仍是 0（main.c 的门）。需要 kd `!driver` 验证后再开。
+- 只摘链表，不改 PE 头。内存扫描仍能看到驱动映像。
+- 没上机。与 P1-4/P1-5/P1-7/P1-8 同组。
+
+**构建验证**：单文件编译零诊断；全量构建 EXIT=0，镜像 SHA256 = d3c0f207c1405d6dbc866502886aef7cc4d4d7256062a4d47f08b5c67da62950。
+
 ## 本次会话结束时状态
 
 > 这一段曾被落在 9.564 而正文已经写到 9.582 —— 同一份文件里两个互相矛盾的状态，
@@ -4812,7 +4828,7 @@ op 10/11 没上机。guard_enable 需要传入目标 PEPROCESS，op 10 的参数
 台账          : 8 完成 / 9 不做 / 1 需重启（Tier 6.1）
 静态检查      : 17 脚本 / 49 条 PASS（含 33 条自检），另 1 条链接后检查（tests/ 共 19 个脚本）
 文档检查      : docs_check PASS —— 57 md / 32 链接 / 79 记录 / 9 项
-最新编号      : 9.598
+最新编号      : 9.599
 ```
 
 **P1-1 的结论变了，但没结案。** 9.585 证明三次失败有一个共同原因：
