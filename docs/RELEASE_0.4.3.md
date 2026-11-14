@@ -138,6 +138,25 @@ PING / HEALTH / READ / STATS / MEM_READ / MEM_WRITE / PHYS_READ / PHYS_WRITE
 
 ---
 
+## 三·五、关键代码位置
+
+文档里的每一处 `file.ext:NNN` 都由 `tests/source_citation_check.ps1` 机械校验：
+文件存在、行号在范围内、该行非空。改代码挪了行，这里会红。
+
+| 要找什么 | 位置 |
+|---|---|
+| 偏移表结构与 magic | `common/yghv_nt.h:53`（`YGHV_OFF_MAGIC` 在 `common/yghv_nt.h:46`）|
+| IOCTL 总派发 | `control_device.c:628` |
+| 偏移派生（按导出名反汇编取 disp）| `yghv_offsets.c:89` |
+| 线程链表探针（唯一性判据）| `yghv_proc.c:165` |
+| 令牌探针（EX_FAST_REF 低 4 位）| `yghv_proc.c:255` |
+| 注入：分配 | `yghv_inject.c:156` |
+| 页表：逐层树 + 交叉校验 | `yghv_pt.c:82` |
+| 窗口：初始化（解析 win32kfull 导出）| `yghv_win.c:70` |
+| 句柄降权：注册 | `yghv_obguard.c:79` |
+| 无痕通信：CPUID 门铃 | `yghv_channel.c:96` |
+
+---
 ## 四、构建与部署
 
 ### 构建

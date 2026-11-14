@@ -60,7 +60,7 @@ Get-Content C:\Windows\yghv_progress.log | Select-String "invmrun at unload"
 | 驱动 | `yghvpa` · **STOPPED** · 设备 `\\.\YuanGuardHV` |
 | 最新编号 | **9.588** |
 | 工作树 | 干净 |
-| 静态检查 | **18 个源级脚本 / 57 条 PASS**（含 **33** 条自检）+ 1 个 map 脚本，两个运行器全绿（9.588 实测）；客户端 **PowerShell 84 / Java 18** 条命令、IOCTL **59** 个 |
+| 静态检查 | **18 个源级脚本 / 57 条 PASS**（含 **33** 条自检）+ 1 个 map 脚本，两个运行器全绿（9.588 实测）；客户端 **PowerShell 86 / Java 18** 条命令、IOCTL **59** 个 |
 | 构建产物 | `bin/yuanguard_hv.sys` = `A8452F9BAECA7AE8`（9.588 构建）|
 | 部署镜像 | `C:\yghv_pa.sys` = `BCC4FECDEA8DCEE5` —— **与当前 `bin` 不同**：9.588 的构建尚未部署，验收要的那一步（`mem-bp dr` 真正命中）还没做 |
 | **最近一次卸载** | `invmrun at unload = 0x0`，无蓝屏（9.513）|
@@ -163,10 +163,10 @@ mmf-hold 寿命       : 3600 秒
 | 想知道什么 | 读哪个 | 大小 |
 |---|---|---|
 | **新会话第一步** | `docs/INDEX.md`（按问题索引）| 5 KB |
-| 现在在哪、这一步做了什么 | `docs/YUANMOD_HANDOFF_CURRENT.md`（9.500 起，开头有索引：标题 + 真实行数）| 181 KB |
-| 哪些功能做了 / 哪些不做 / 为什么 | `docs/TIER_LEDGER.md` | 15 KB |
-| **写内核代码前** | `docs/KERNEL_API_CHECKLIST.md` | 36 KB |
-| 目录总览 | `docs/RESUME_PROMPT.md`（深一层：铁律/约束/观测）| 35 KB |
+| 现在在哪、这一步做了什么 | `docs/archive/v0.4.2/YUANMOD_HANDOFF_CURRENT.md`（9.500 起，开头有索引：标题 + 真实行数）| 181 KB |
+| 哪些功能做了 / 哪些不做 / 为什么 | `docs/archive/v0.4.2/TIER_LEDGER.md` | 15 KB |
+| **写内核代码前** | `docs/archive/v0.4.2/KERNEL_API_CHECKLIST.md` | 36 KB |
+| 目录总览 | `docs/archive/v0.4.2/RESUME_PROMPT.md`（深一层：铁律/约束/观测）| 35 KB |
 | 考古（9.1–9.299） | `docs/archive/_ARCHIVE_HANDOFF_9.1-9.299.md` | 1027 KB |
 
 > 大小取整到 KB，是「这文档多长」的规模提示，**不是断言**。真正的断言是行数与记录数，

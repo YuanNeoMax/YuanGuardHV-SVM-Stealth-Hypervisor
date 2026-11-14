@@ -60,6 +60,11 @@ foreach ($rel in $checkFiles) {
         if (Test-Path -LiteralPath $candidate) { $file = $candidate; break }
         $archived = Join-Path $prefix ($rel -replace '^docs\\', 'docs\archive\')
         if (Test-Path -LiteralPath $archived) { $file = $archived; break }
+        # 9.606: v0.4.3 archived the v0.4.2 root documents into docs\archive\v0.4.2\,
+        # one level deeper than the 9.564 move handled. Same rule applies: resolve,
+        # never assume, and still FAIL when the file is nowhere.
+        $archived2 = Join-Path $prefix ($rel -replace '^docs\\', 'docs\archive\v0.4.2\')
+        if (Test-Path -LiteralPath $archived2) { $file = $archived2; break }
     }
     if (-not $file) {
         throw "Safety check FAIL: none of the documented paths exists for '$rel'"

@@ -31,7 +31,7 @@
 | 文档 | 是什么 | 注意 |
 |---|---|---|
 | [`YGHV_OS_AS_GUEST_RESEARCH_20260814.md`](YGHV_OS_AS_GUEST_RESEARCH_20260814.md) | 8 月的研究方案 | 结论已被 9.539 起的实测推翻适用范围 |
-| [`YGHV_OS_AS_GUEST_SUMMARY_20260815.md`](YGHV_OS_AS_GUEST_SUMMARY_20260815.md) | 114 个实验的总结，结论是"本机不可行" | **那个结论错了** —— 见 [`../WINDOWS_AS_GUEST_FINDINGS.md`](../WINDOWS_AS_GUEST_FINDINGS.md) 第六节的更正 |
+| [`YGHV_OS_AS_GUEST_SUMMARY_20260815.md`](YGHV_OS_AS_GUEST_SUMMARY_20260815.md) | 114 个实验的总结，结论是"本机不可行" | **那个结论错了** —— 见 [`../WINDOWS_AS_GUEST_FINDINGS.md`](v0.4.2/WINDOWS_AS_GUEST_FINDINGS.md) 第六节的更正 |
 | [`YGHV_SIMPLEVM_LEVERAGE_20260918.md`](YGHV_SIMPLEVM_LEVERAGE_20260918.md) | SimpleSvm / HelloAmdHv 构型复审 + C0/C1 实机验证方案 | 含本机 CPU 权威记录 |
 
 ## 2026-11-08 会话过程记录

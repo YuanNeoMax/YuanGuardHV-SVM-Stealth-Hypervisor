@@ -134,9 +134,9 @@ YuanGuardHV/
 │   ├── yghv_guard.c          隐藏表完整性（SHA-256）
 │   ├── yghv_sentry.c         攻击面清单与 escape 记录
 │   └── common/               头文件（43 个）
-├── tests/  测试脚本（20 个） 个脚本 + 2 个运行器）
+├── tests/  检查器（20 个脚本 + 2 个运行器）
 ├── tools/
-│   ├── yghv_ctl.ps1          PowerShell 客户端（84 条命令）
+│   ├── yghv_ctl.ps1          PowerShell 客户端（86 条命令）
 │   └── yghv_client/          Java 客户端（18 条命令）
 └── docs/                     见 docs/INDEX.md
 tools/                        独立工具
@@ -240,7 +240,7 @@ VM 内路线已判定不可用）。
 
 > - **CPU 型号是权威事实**：`INVLPGB`/`TLBSYNC` 是 Zen4+ 指令，**本机 Zen3 没有**（CPUID 实测确认）。
 > - **单机交互式内核调试不可行**（内核断点挂起整机 + 本机 NIC 不支持 KDNET），
->   唯一路径是第二台物理机。详见 `docs/YUANMOD_HANDOFF_CURRENT.md` 9.296。
+>   唯一路径是第二台物理机。详见 `docs/archive/v0.4.2/YUANMOD_HANDOFF_CURRENT.md` 9.296。
 
 ---
 
@@ -331,7 +331,7 @@ Get-Content C:\Windows\yghv_progress.log | Select-String "invmrun at unload"
 
 ### PowerShell 客户端
 
-`tools\yghv_ctl.ps1` —— **84 条命令**，覆盖控制面、内存引擎、保护、隐藏、进程控制、注入、页表分析、诊断。
+`tools\yghv_ctl.ps1` —— **86 条命令**，覆盖控制面、内存引擎、保护、隐藏、进程控制、注入、页表分析、诊断。
 
 ```powershell
 $ctl = 'D:\yuanguard\YuanGuardHV\tools\yghv_ctl.ps1'
@@ -363,7 +363,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File $ctl mem-read <pid> <hex_va>
 | 脚本 | 检查什么 |
 |---|---|
 | `ioctl_parity.ps1` | C ↔ PowerShell ↔ Java ↔ JNI 的 IOCTL 编号一致（当前 **60/60/60**）|
-| `command_parity.ps1` | README ↔ 两个客户端的命令一致（当前 **PS=84 / Java=18**）|
+| `command_parity.ps1` | README ↔ 两个客户端的命令一致（当前 **PS=86 / Java=18**）|
 | `safety_checks.ps1` | 安全红线（pause-under-lock 作用域、`STATUS_DEVICE_BUSY`、`0x5AA` 命名）|
 | `irql_contract_check.ps1` | IRQL 可达性、岛内读区域、不许有「说谎的 `*_bare`」|
 | `exit_rip_contract.ps1` | 38 个 `#VMEXIT` case 的 RIP 契约（ADVANCE / INJECT / HOLD 三类断言）|
@@ -417,18 +417,15 @@ csc /nologo /optimize+ /out:tools\bench_core.exe tools\bench_core.cs
 
 ## 文档索引
 
-**先读 [`docs/INDEX.md`](docs/INDEX.md)** —— 按问题索引，根目录 8 份，其余在 `archive/`。
+**先读 [`docs/INDEX.md`](docs/INDEX.md)** —— 按问题索引，根目录 4 份，其余在 `archive/`。
 
 | 文档 | 内容 |
 |---|---|
+| **[`docs/RELEASE_0.4.3.md`](docs/RELEASE_0.4.3.md)** | **★★ 主文档** —— 0.4.3 交接：能力面 / 架构约束 / 构建 / 限制 / 下一步 |
 | **`docs/INDEX.md`** | **★ 唯一入口** —— 按「你想知道什么」索引全部文档 |
-| **`docs/QUICKSTART.md`** | **★★ 跨会话快速承接** —— 三分钟上手 / 当前状态 / 下一步 / 八个坑 |
-| `docs/RESUME_PROMPT.md` | 深一层：铁律 / 架构约束 / 观测手段 / 方法论 |
-| **`docs/TIER_LEDGER.md`** | **Tier 清单最终台账** —— 8 完成 / 9 不做（附理由）/ 1 需重启 |
-| `docs/YUANMOD_HANDOFF_CURRENT.md` | 逐条变更记录 9.500 起（开头有索引，标题 + 真实行数）|
-| `docs/WINDOWS_AS_GUEST_FINDINGS.md` | Windows-as-Guest 全部结论（唯一权威）|
-| **`docs/KERNEL_API_CHECKLIST.md`** | **★ 写内核代码前必读** —— 三次蓝屏换来的 API 契约核对清单 |
-| `docs/archive/` | 9.1–9.499 历史交接、2026-08 评审与研究、Tier 设计计划书 |
+| **`docs/QUICKSTART.md`** | **跨会话快速承接** —— 三分钟上手 / 当前状态 / 八个坑 |
+| `docs/archive/v0.4.2/` | v0.4.2 的 5 份根文档（逐条记录 9.1–9.605 / 承接 / Tier 台账 / API 清单 / Guest 结论）|
+| `docs/archive/` | 更早的历史交接、评审、研究、Tier 设计计划书 |
 | **[`CHANGELOG.md`](CHANGELOG.md)** | **版本级变更摘要** —— 两个版本之间发生了什么（含 Breaking 标注）|
 | **[`docs/ISSUES.md`](docs/ISSUES.md)** | **★ 唯一的问题清单** —— P0–P3 分级 + 版本规划 + 判据纪律 |
 
@@ -476,15 +473,17 @@ csc /nologo /optimize+ /out:tools\bench_core.exe tools\bench_core.cs
 
 | 版本 | 主题 | 关键数据 |
 |---|---|---|
-| **v0.4.2**（当前）| P1-3 全部结案 + 错误码门 + 文档侧 5 处过期值 | 目标自写 10/10 存活；外来写 1/1 回滚 |
+| **v0.4.3**（当前）| 完整能力面：进程控制 / 注入 / 页表 / 窗口 / 句柄降权 / 无痕通信 | 16 项清单 + 9 超越；镜像 `abeaad12e973a71a` |
+| v0.4.2 | P1-3 全部结案 + 错误码门 + 文档侧 5 处过期值 | 目标自写 10/10 存活；外来写 1/1 回滚 |
 | v0.4.1 | 配置不一致可见化 + 真 guest 下重测内存基准 | B 比 A 快 **1.8–2.4×**；真 guest 下 B 慢 13%（NPT 代价）|
 | v0.4.0 | 全核真 guest 成为默认 | 12 线程 **1.05×**、G25 **17/17**、卸载 0.07 s |
 | v0.3.0 | 周期同步守卫（绕开 Zen3 NPT TLB 限制）| 延迟 92 s → **2.3 s**，64 页 @20 polls/s 0.38% 单核 |
 | v0.2.0 | OS-as-guest 206 里程碑 | 页写保护全链 PASS |
 | v0.1.0 | 首个可用版本 | SVM + 多核 + 三种保护 |
 
-**完整摘要见 [`CHANGELOG.md`](CHANGELOG.md)**；逐条工程记录（编号 9.x）见
-[`docs/YUANMOD_HANDOFF_CURRENT.md`](docs/YUANMOD_HANDOFF_CURRENT.md)。
+**完整摘要见 [`CHANGELOG.md`](CHANGELOG.md)**；当前状态见
+[`docs/RELEASE_0.4.3.md`](docs/RELEASE_0.4.3.md)，逐条工程记录（9.1–9.605）在
+[`docs/archive/v0.4.2/YUANMOD_HANDOFF_CURRENT.md`](docs/archive/v0.4.2/YUANMOD_HANDOFF_CURRENT.md)。
 
 > ⚠️ **v0.4.0 含破坏性变更**：`RealGuestMode` 的语义从"启用"反转为"禁用"。
 > 详见[构建](#构建)一节的运行时开关表。

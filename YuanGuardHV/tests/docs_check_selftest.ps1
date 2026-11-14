@@ -50,7 +50,15 @@ $copy = Join-Path $work 'docs'
 New-Item -ItemType Directory -Path $copy -Force | Out-Null
 Copy-Item -Path $realDocs -Destination $work -Recurse -Force
 
+# 9.606: the record log moved to archive/v0.4.2/ when v0.4.3 shipped (docs were
+# consolidated into RELEASE_0.4.3.md). The mutations below still target it --
+# the log's internal consistency is still checked by docs_check -- so resolve the
+# path the same way the checker does instead of assuming it sits at docs\ root.
 $handoffPath = Join-Path $copy 'YUANMOD_HANDOFF_CURRENT.md'
+if (-not (Test-Path -LiteralPath $handoffPath)) {
+    $handoffPath = Join-Path $copy 'archive/v0.4.2/YUANMOD_HANDOFF_CURRENT.md'
+}
+if (-not (Test-Path -LiteralPath $handoffPath)) { throw "selftest: cannot find the record log in the copy ($handoffPath)" }
 $indexPath = Join-Path $copy 'INDEX.md'
 
 function ReadText {
