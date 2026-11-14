@@ -5274,6 +5274,16 @@ try {
                 }
                 return
             }
+            'escalate' {
+                if ($null -eq $Arg1) { throw 'proc escalate: usage: proc escalate <pid>' }
+                $req = New-ProcReq 13 ([uint32]::Parse($Arg1)) 0 0 0
+                $out = Invoke-YghvIoctl -Code (IoCtl 0x838) -InBytes $req -OutputLength 4096
+                if ([BitConverter]::ToUInt64($out, 0) -eq 1) {
+                    Write-Output ("proc: pid={0} privileges enabled={1} total={2}" -f $Arg1, [BitConverter]::ToUInt64($out, 8), [BitConverter]::ToUInt64($out, 16))
+                } else {
+                    throw ("proc escalate failed: code={0}" -f [BitConverter]::ToUInt64($out, 8))
+                }
+            }
             # Anything left is a bare pid: single-process query.
             $qp = [uint32]::Parse($v)
             $req = New-ProcReq 1 $qp 0 0 0

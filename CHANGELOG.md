@@ -12,6 +12,18 @@
 
 ---
 
+## v0.4.15 — 令牌提权
+
+### Added
+- `IOCTL_YGHV_PROC` op 13（ESCALATE）：给目标进程的令牌启用全部特权（SE_PRIVILEGE_ENABLED）。
+
+### Known limitations
+- TOKEN.Privileges 偏移 0x38/0x40 基于 Windows 10 x64 实测推断。
+- 没上机。
+
+### Verification
+- 单文件编译零诊断；全量构建 EXIT=0，镜像 SHA256 = 3e51e9e1e1bea223a67a01f592a14c306736925aec5346b8f32ccd267c23d79f。
+
 ## v0.4.14 — 回调隐藏（从枚举链表摘除）
 
 ### Added
