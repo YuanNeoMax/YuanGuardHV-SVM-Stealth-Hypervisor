@@ -262,8 +262,8 @@ YuanGuardHV/tools/yghv_client/run.bat mem-read <pid> <va>
 | | 12 伪装映像名 | ✅ |
 | | 13 令牌提权 | ✅ 返回启用特权数 `0x39E846` |
 | | 14 线程隐藏 | ⛔ **默认拒绝**（见上节）|
-| **inject 0x839** | 0 分配 / 5 统计 | ✅ |
-| **pt 0x83A** | 0 CR3 / 2 范围映射 / 3 页清单 | ✅ |
+| **inject 0x839** | 0 分配 / 1 写 / 2 释放 / 5 统计 | ✅ 全链路：va=0x1BCC31E0000 → write → free |
+| **pt 0x83A** | 0 CR3 / 2 范围映射 / 3 页清单 / 4 统计 | ✅ 统计返回 6 次查询 |
 | **win 0x83B** | 0–3 全部 | ✅ 派发正确；`win32kfull` 无交互会话时按设计拒绝 |
 | **sys-health 0x825** | — | ✅ `degraded=0 total=0 fatal=0` |
 
@@ -291,6 +291,22 @@ YuanGuardHV/tools/yghv_client/run.bat mem-read <pid> <va>
 审计结果：16 处比较，**真正裸露的只有 `obguard` 一处**（本轮已修），
 其余有 `__try` 或走 `yghv_safe` 层。
 
+
+### 剩余 op 的补测结果（本轮完成）
+
+| op | 结果 | 说明 |
+|---|---|---|
+| `pt op4` 统计 | ✅ `q0=0x6 q1=0x1` | 6 次 CR3 查询。**之前报 `ok=False` 是测试脚本传参错误**，不是缺陷 |
+| `inject op0` 分配 | ✅ `va=0x1BCC31E0000` | 在 notepad 里真实分配 |
+| `inject op1` 写内存 | ✅ `err=0` | 写入 8 字节 |
+| `inject op2` 释放 | ✅ `err=0` | |
+| `inject op5` 统计 | ✅ `allocs=1 writes=1` | 计数器与实际操作一致 |
+
+**`inject` 的 alloc → write → free 全链路已验证**，这是 9.592 接入后第一次端到端跑通。
+
+仍未端到端验证的：`inject op3`（创建线程）与 `op4`（APC 排队）——两者都需要一个
+可控的靶程序来观察执行效果，本轮没有准备。它们在派发层是可达的（同一 switch），
+但没有"写入的代码确实被执行"这种证据。
 ### op7 / op14（线程枚举与线程隐藏）：`TLIST` 探针已修
 
 **这是从 9.591 起就从未工作过的功能。** 探针有两个未知量互相依赖，而代码试图
