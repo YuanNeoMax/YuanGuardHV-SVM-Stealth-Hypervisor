@@ -71,6 +71,26 @@ int yghv_obguard_init(void)
     RtlInitUnicodeString(&u2, name_unreg);
     g_ob_register = (yghv_ob_register_fn)MmGetSystemRoutineAddress(&u1);
     g_ob_unregister = (yghv_ob_unregister_fn)MmGetSystemRoutineAddress(&u2);
+
+    /*
+     * 9.608: report the resolution outcome instead of returning a boolean that
+     * nobody reads. Measured: op10 (GUARD) answered ERROR_INVALID_PARAMETER for
+     * every target while op11 (GUARD_STATS) reported g_ob_register as NULL --
+     * both routines are genuinely exported by this ntoskrnl (verified against
+     * the on-disk export table), so "not found" is a fact about the CALL, not
+     * about the system, and it needs to be on the record.
+     */
+    {
+        char d[64];
+        int k = 0;
+        d[k++] = 'o'; d[k++] = 'b'; d[k++] = 'g'; d[k++] = 'u'; d[k++] = 'a'; d[k++] = 'r'; d[k++] = 'd';
+        d[k++] = ':'; d[k++] = ' '; d[k++] = 'r'; d[k++] = 'e'; d[k++] = 'g'; d[k++] = '=';
+        d[k++] = g_ob_register ? '1' : '0';
+        d[k++] = ' '; d[k++] = 'u'; d[k++] = 'n'; d[k++] = 'r'; d[k++] = 'e'; d[k++] = 'g'; d[k++] = '=';
+        d[k++] = g_ob_unregister ? '1' : '0';
+        d[k++] = 0;
+        yghv_trace(d);
+    }
     return (g_ob_register && g_ob_unregister) ? 1 : 0;
 }
 
@@ -97,8 +117,24 @@ int yghv_obguard_enable(PEPROCESS target)
     RtlZeroMemory(regbuf, sizeof(regbuf));
     RtlZeroMemory(opbuf, sizeof(opbuf));
 
-    /* opbuf: ObjectType, Operations, PreOperation, PostOperation */
-    *(PVOID *)(opbuf + 0x00) = (PVOID)PsProcessType;
+    /*
+     * 9.608 -- THE OBJECT TYPE WAS THE ADDRESS OF THE VARIABLE, NOT THE TYPE.
+     *
+     * ntddk.h declares, for this build's configuration:
+     *
+     *     extern POBJECT_TYPE *PsProcessType;      <- a POINTER to POBJECT_TYPE
+     *
+     * so `(PVOID)PsProcessType` is the address of that pointer, not the object
+     * type the object manager validates. ObRegisterCallbacks rejected it with
+     * STATUS_INVALID_PARAMETER (Win32 0x57) on every target, and because the
+     * failure is reported as a generic parameter error it looked like a layout
+     * mistake in regbuf rather than the wrong KIND of pointer.
+     *
+     * Dereference the variable to get the POBJECT_TYPE the API expects. The
+     * cast chain keeps it readable: &PsProcessType is POBJECT_TYPE**, and one
+     * dereference yields the POBJECT_TYPE.
+     */
+    *(PVOID *)(opbuf + 0x00) = *(PVOID **)&PsProcessType;
     *(USHORT *)(opbuf + 0x08) = 0x0003;  /* HANDLE_CREATE | HANDLE_DUPLICATE */
     *(PVOID *)(opbuf + 0x10) = (PVOID)yghv_obguard_pre;
 

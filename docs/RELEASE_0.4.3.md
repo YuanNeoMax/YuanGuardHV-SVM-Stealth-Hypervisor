@@ -224,6 +224,25 @@ YuanGuardHV/tools/yghv_client/run.bat mem-read <pid> <va>
 | 持续运行 | 3 小时以上，零蓝屏 |
 | 卸载 | 6.94 s，**`invmrun at unload=0x0`**，卸载后 `HypervisorPresent=False` |
 
+**实测中被降级为「明确拒绝」的两个 op**
+
+`op9`（进程摘链隐藏）与 `op14`（线程摘链隐藏）**默认返回 `STATUS_NOT_IMPLEMENTED`**，
+实现保留在 `YGHV_ALLOW_PROC_HIDE` / `YGHV_ALLOW_THREAD_HIDE` 之后供实验使用。
+
+依据是 5 次蓝屏，每次都能定位到一个具体判据：
+
+| BugCheck | 栈上的证据 | 原因 |
+|---|---|---|
+| `0x139` subcode 3 ×3 | `nt!KeTerminateThread` / `PspExitProcess` | 摘链时 `node->Flink = node` **自链接**；被隐藏的进程/线程退出时，内核自己的 teardown 走过该节点，判定 `CORRUPT_LIST_ENTRY` |
+| `0x18` ×2 | `nt!ObfReferenceObjectWithTag` → `CcWriteBehindInternal` | 保存裸指针后**立即释放引用**，是 use-after-free；池内存被 `FILE_OBJECT` 复用后，几分钟后在缓存写回时才爆 |
+
+两者是**同一条路径上的两个独立缺陷**：先修引用计数只是让自链接成为第一个引爆的。
+**活着的 EPROCESS/ETHREAD 不能保持摘链状态** —— 退出路径要求它可达，这不是补丁能改的。
+
+> 项目在 ISSUES.md 里已为 EPROCESS 记过同一结论（「摘链的代价大于它关掉的窗口」）。
+> 9.507 对 `mem-bp dr` 用的也是这个模式：能报告「未实现」的功能是可见的，
+> 在例行线程退出时崩机的功能不是。
+
 **能力面实测（IOCTL，真实调用）**
 
 | 家族 | 结果 |

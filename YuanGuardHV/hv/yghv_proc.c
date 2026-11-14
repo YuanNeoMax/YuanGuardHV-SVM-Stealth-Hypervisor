@@ -911,6 +911,45 @@ static NTSTATUS yghv_proc_token(UINT64 *out, ULONG src_pid, ULONG dst_pid, ULONG
  * snapshot, so the window is documented instead of papered over. Unlinking the
  * CURRENT process instead of an arbitrary one is a caller-side decision.
  */
+/*
+ * 9.608 -- PROCESS UNLINKING IS REFUSED BY DEFAULT, FOR THE SAME REASON AS
+ * THREAD UNLINKING (see yghv_proc_hide_thread).
+ *
+ * MEASURED: 0x139 KERNEL_SECURITY_CHECK_FAILURE, subcode 3
+ * (CORRUPT_LIST_ENTRY), three times. A hidden process exited and its teardown
+ * walked a node left self-linked:
+ *
+ *     node->Flink = node;
+ *     node->Blink = node;
+ *
+ * That idiom belongs to a list HEAD that must stay a valid empty list. It is
+ * wrong for a removed MEMBER: PspExitProcess unlinks the process from
+ * ActiveProcessLinks on the way out and treats a self-referential node as
+ * corruption.
+ *
+ * The reference-lifetime fix (holding a reference while the pointer is stored)
+ * removed the 0x18 that used to appear minutes later. It does not address this:
+ * dangling pointer and self-link are two separate defects on one path, and
+ * fixing the first only made the second the first one to fire.
+ *
+ * A live EPROCESS cannot be kept unlinked: process teardown, PspCidTable and
+ * the enumeration paths all require it to be reachable. This tree recorded the
+ * conclusion once already (ISSUES.md: the unlink "costs more than the window it
+ * closes"). Refuse, and say so -- 9.507's pattern for mem-bp dr.
+ */
+#ifndef YGHV_ALLOW_PROC_HIDE
+static NTSTATUS yghv_proc_hide(UINT64 *out, ULONG pid, int hide)
+{
+    (void)pid;
+    (void)hide;
+    if (out) {
+        out[0] = 0;
+        out[1] = (UINT64)(ULONG)STATUS_NOT_IMPLEMENTED;
+        out[2] = 0;
+    }
+    return STATUS_SUCCESS;
+}
+#else
 static NTSTATUS yghv_proc_hide(UINT64 *out, ULONG pid, int hide)
 {
     int i, slot = -1;
@@ -939,10 +978,14 @@ static NTSTATUS yghv_proc_hide(UINT64 *out, ULONG pid, int hide)
             g_proc_hidden[slot].flink->Blink = node;
             g_proc_hidden[slot].blink->Flink = node;
         } __except (EXCEPTION_EXECUTE_HANDLER) {
+            /* 9.608: release the held reference even when the relink faults. */
+            g_proc_hidden[slot].used = 0;
+            ObDereferenceObject((PEPROCESS)(ULONG_PTR)g_proc_hidden[slot].self);
             return STATUS_INVALID_ADDRESS;
         }
 
         g_proc_hidden[slot].used = 0;
+        ObDereferenceObject((PEPROCESS)(ULONG_PTR)g_proc_hidden[slot].self);
         out[0] = 1;
         out[1] = 0;
         out[2] = pid;
@@ -988,13 +1031,25 @@ static NTSTATUS yghv_proc_hide(UINT64 *out, ULONG pid, int hide)
     }
 
     InterlockedIncrement64(&g_proc_hides);
-    ObDereferenceObject(proc);
+    /*
+     * 9.608 -- SAME USE-AFTER-FREE AS yghv_proc_hide_thread, SAME CONSEQUENCE.
+     *
+     * The slot stores proc's address; if the reference is dropped here, a
+     * process exit returns that EPROCESS to the pool, and the UNHIDE path (and
+     * yghv_proc_cleanup, which relinks unconditionally at unload) then writes
+     * four pointers through it. The measured symptom was 0x18
+     * REFERENCE_BY_POINTER inside nt!ObfReferenceObjectWithTag with no driver
+     * frame anywhere -- module corruption that surfaces in the cache writer.
+     *
+     * The reference is held until the slot is cleared (unhide or cleanup).
+     */
 
     out[0] = 1;
     out[1] = 1;
     out[2] = pid;
     return STATUS_SUCCESS;
 }
+#endif /* YGHV_ALLOW_PROC_HIDE */
 /* ------------------------------------------------------------------ */
 /* Entry points                                                        */
 /* ------------------------------------------------------------------ */
@@ -1049,11 +1104,14 @@ int yghv_proc_init(void)
     return ok;
 }
 
+static void yghv_proc_thread_cleanup(void);
+
 void yghv_proc_cleanup(void)
 {
-    yghv_obguard_disable();
     int i;
+    yghv_obguard_disable();
 
+#ifdef YGHV_ALLOW_PROC_HIDE
     /*
      * Put back anything still hidden. An unlinked EPROCESS outlives this
      * driver, and a later list walk would fault on the hole we left -- so the
@@ -1084,8 +1142,20 @@ void yghv_proc_cleanup(void)
             }
         }
 
+        /*
+         * 9.608: the slot holds a reference for as long as the pointer is
+         * stored (see yghv_proc_hide). Unload is the last place that can drop
+         * it -- if this line is missing the object leaks for the remaining
+         * lifetime of the machine, which is exactly what the previous
+         * "release immediately after hiding" bug looked like from the other
+         * side.
+         */
         g_proc_hidden[i].used = 0;
+        ObDereferenceObject((PEPROCESS)(ULONG_PTR)g_proc_hidden[i].self);
     }
+#endif /* YGHV_ALLOW_PROC_HIDE */
+    /* Same contract for the thread table. */
+    yghv_proc_thread_cleanup();
 
     RtlZeroMemory(g_proc_hidden, sizeof(g_proc_hidden));
     g_proc_get_prot = NULL;
@@ -1105,10 +1175,102 @@ void yghv_proc_stats(uint64_t *out)
 }
 
 
+/*
+ * 9.608: this table was a function-local static, which made the contract
+ * "a slot holds a reference" unenforceable -- yghv_proc_cleanup could not see
+ * it and therefore could not release what each slot holds at unload. It is
+ * file-scope now and paired with yghv_proc_thread_cleanup() below.
+ */
+#define YGHV_PROC_MAX_HIDDEN_THREADS 16
+static struct {
+    ULONG      tid;
+    uint64_t   self;
+    PLIST_ENTRY flink, blink;
+    int        used;
+} g_hidden_threads[YGHV_PROC_MAX_HIDDEN_THREADS];
+
+#ifndef YGHV_ALLOW_THREAD_HIDE
+static void yghv_proc_thread_cleanup(void)
+{
+    /* Nothing can be in the table when hiding is refused at the op level. */
+}
+#else
+static void yghv_proc_thread_cleanup(void)
+{
+    int i;
+    for (i = 0; i < YGHV_PROC_MAX_HIDDEN_THREADS; i++) {
+        if (!g_hidden_threads[i].used) continue;
+        if (g_yghv_off.thread_list_entry) {
+            PLIST_ENTRY node = (PLIST_ENTRY)((PUCHAR)(ULONG_PTR)g_hidden_threads[i].self +
+                                             g_yghv_off.thread_list_entry);
+            __try {
+                node->Flink = g_hidden_threads[i].flink;
+                node->Blink = g_hidden_threads[i].blink;
+                g_hidden_threads[i].flink->Blink = node;
+                g_hidden_threads[i].blink->Flink = node;
+            } __except (EXCEPTION_EXECUTE_HANDLER) { }
+        }
+        g_hidden_threads[i].used = 0;
+        ObDereferenceObject((PETHREAD)(ULONG_PTR)g_hidden_threads[i].self);
+    }
+    RtlZeroMemory(g_hidden_threads, sizeof(g_hidden_threads));
+}
+#endif /* YGHV_ALLOW_THREAD_HIDE */
+
+/*
+ * 9.608 -- THREAD UNLINKING IS REFUSED BY DEFAULT.
+ *
+ * MEASURED: 0x139 KERNEL_SECURITY_CHECK_FAILURE, subcode 3
+ * (CORRUPT_LIST_ENTRY), stack:
+ *
+ *     nt!KiRaiseSecurityCheckFailure
+ *     nt!KeTerminateThread+0x31f
+ *     nt!PspExitThread
+ *     nt!NtTerminateProcess
+ *
+ * A thread was hidden, the process exited, and the thread's own teardown found
+ * its ThreadListEntry self-linked (Flink == Blink == &node) and raised the
+ * list-integrity failure. That is deterministic, not a race: hiding a thread
+ * and letting it exit kills the machine every time.
+ *
+ * WHY A PATCH DOES NOT FIX IT. Two separate reasons, and the second is the one
+ * that matters:
+ *
+ *   1. Self-linking a REMOVED MEMBER is wrong. The "Flink = Blink = self"
+ *      idiom is for a list HEAD that must remain a valid empty list. A member
+ *      that has been taken out must not be left self-referential, because its
+ *      own removal path walks that pointer.
+ *
+ *   2. Even with the links left sane, a live ETHREAD cannot be kept unlinked.
+ *      KeTerminateThread, the scheduler, and PspCidTable all expect it to be
+ *      reachable. There is no supported way to hide a thread that may exit
+ *      while hidden -- and "may exit" is every thread.
+ *
+ * This tree already reached the same conclusion for the EPROCESS case
+ * (ISSUES.md: the unlink "costs more than the window it closes"). Repeating
+ * the mistake on ETHREAD cost five bugchecks to learn.
+ *
+ * SO: refuse, and say so. 9.507 did exactly this for mem-bp dr when it could
+ * not be made to work, and the reason it is the right pattern is that a
+ * feature which answers STATUS_NOT_IMPLEMENTED is VISIBLE, while one that
+ * bugchecks on a routine thread exit is not. The probe and relink code stays
+ * for lab use behind YGHV_ALLOW_THREAD_HIDE.
+ */
+#ifndef YGHV_ALLOW_THREAD_HIDE
 static NTSTATUS yghv_proc_hide_thread(UINT64 *out, ULONG tid, int hide)
 {
-    static struct { ULONG tid; uint64_t self; PLIST_ENTRY flink, blink; int used; }
-        g_hidden_threads[16];
+    (void)tid;
+    (void)hide;
+    if (out) {
+        out[0] = 0;
+        out[1] = (UINT64)(ULONG)STATUS_NOT_IMPLEMENTED;
+        out[2] = 0;
+    }
+    return STATUS_SUCCESS;
+}
+#else
+static NTSTATUS yghv_proc_hide_thread(UINT64 *out, ULONG tid, int hide)
+{
     int i, slot = -1;
     PETHREAD thread = NULL;
     NTSTATUS st;
@@ -1128,8 +1290,19 @@ static NTSTATUS yghv_proc_hide_thread(UINT64 *out, ULONG tid, int hide)
             node->Blink = g_hidden_threads[slot].blink;
             g_hidden_threads[slot].flink->Blink = node;
             g_hidden_threads[slot].blink->Flink = node;
-        } __except (EXCEPTION_EXECUTE_HANDLER) { return STATUS_INVALID_ADDRESS; }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            /*
+             * 9.608: the reference is held for the lifetime of the slot (see the
+             * hide path), so the slot must be cleared and the reference dropped
+             * even when the relink faults -- otherwise the object leaks for the
+             * life of the driver.
+             */
+            g_hidden_threads[slot].used = 0;
+            ObDereferenceObject((PETHREAD)(ULONG_PTR)g_hidden_threads[slot].self);
+            return STATUS_INVALID_ADDRESS;
+        }
         g_hidden_threads[slot].used = 0;
+        ObDereferenceObject((PETHREAD)(ULONG_PTR)g_hidden_threads[slot].self);
         out[0] = 1; out[1] = 0; out[2] = tid;
         return STATUS_SUCCESS;
     }
@@ -1163,10 +1336,43 @@ static NTSTATUS yghv_proc_hide_thread(UINT64 *out, ULONG tid, int hide)
     }
 
     InterlockedIncrement64(&g_proc_hides);
-    ObDereferenceObject(thread);
+    /*
+     * NOTE (9.608): the whole function above is compiled ONLY under
+     * YGHV_ALLOW_THREAD_HIDE. The reference lifetime is still held correct
+     * inside it, because a lab build that does enable it must not trade the
+     * 0x139 for the 0x18 this comment used to describe.
+     *
+     * DO NOT RELEASE HERE. Storing thread's address and then dropping the
+     * reference was a USE-AFTER-FREE that corrupted the object manager and
+     * bugchecked (0x18) minutes later.
+     *
+     * The slot now holds thread's address and, separately, the node's own
+     * flink/blink. The UNHIDE path does this with no lookup and no validation:
+     *
+     *     node = (PLIST_ENTRY)((PUCHAR)g_hidden_threads[slot].self + entry_off);
+     *     node->Flink = ...; node->Blink = ...;
+     *     g_hidden_threads[slot].flink->Blink = node;
+     *     g_hidden_threads[slot].blink->Flink = node;
+     *
+     * If the thread exited while hidden, that ETHREAD went back to the pool and
+     * those four stores land in whatever now owns the memory. Pool reuse for
+     * FILE_OBJECT / CONTROL_AREA is routine, and the damage is silent until the
+     * object is touched -- measured stack, with no yghv frame in it at all:
+     *
+     *     nt!ObfReferenceObjectWithTag      (refcount field is garbage)
+     *     nt!MiReferenceControlAreaFile
+     *     nt!MmFlushSection -> CcWriteBehindInternal (lazy writer, later)
+     *
+     * So the reference is NOT dropped while the pointer is stored. It is
+     * released exactly once, by whichever of these runs first:
+     *   - the UNHIDE request (search for g_hidden_threads[slot].used = 0),
+     *   - yghv_proc_cleanup at unload.
+     * That is what the per-slot state was already shaped for.
+     */
     out[0] = 1; out[1] = 1; out[2] = tid;
     return STATUS_SUCCESS;
 }
+#endif /* YGHV_ALLOW_THREAD_HIDE */
 
 NTSTATUS yghv_proc_dispatch(const void *in, ULONG in_len,
                             void *out, ULONG out_len, ULONG *info)
@@ -1321,6 +1527,18 @@ NTSTATUS yghv_proc_dispatch(const void *in, ULONG in_len,
         }
         break;
 
+    /*
+     * 9.608 -- THIS BLOCK WAS NEVER CLOSED.
+     *
+     * case YGHV_PROC_OP_GUARD_STATS: {   ... break;    <- no closing brace
+     *
+     * The "{" opened a scope that swallowed every case after it, so
+     * HIDE_THREAD / DISGUISE / ESCALATE were all inside GUARD_STATS's block.
+     * A missing brace at the end of a case is a syntax error in a normal
+     * function, but here the NEXT case's own "{" balanced it, so the file
+     * compiled: three features became unreachable and nothing said so.
+     * Measured: op 10 and op 11 answered Win32 error 1, op 14 was never reached.
+     */
     case YGHV_PROC_OP_GUARD_STATS: {
         uint64_t gs[4];
         yghv_obguard_stats(gs);
@@ -1332,17 +1550,18 @@ NTSTATUS yghv_proc_dispatch(const void *in, ULONG in_len,
         st = STATUS_SUCCESS;
         *info = 8 * 8;
         break;
+    }
 
-    case YGHV_PROC_OP_DISGUISE: {
-        PEPROCESS proc = NULL;
-        case YGHV_PROC_OP_HIDE_THREAD: {
+    case YGHV_PROC_OP_HIDE_THREAD: {
         int hide = (int)r.arg0;
         st = yghv_proc_hide_thread(o, r.pid, hide);
         if (NT_SUCCESS(st)) { o[3] = 0; *info = YGHV_PROC_HDR_QWORDS * 8; }
         break;
     }
 
-    NTSTATUS pst;
+    case YGHV_PROC_OP_DISGUISE: {
+        PEPROCESS proc = NULL;
+        NTSTATUS pst;
         char *iname;
 
         if (!r.name[0]) {
@@ -1380,7 +1599,6 @@ NTSTATUS yghv_proc_dispatch(const void *in, ULONG in_len,
         }
         ObDereferenceObject(proc);
         break;
-    }
     }
 
     case YGHV_PROC_OP_ESCALATE: {
