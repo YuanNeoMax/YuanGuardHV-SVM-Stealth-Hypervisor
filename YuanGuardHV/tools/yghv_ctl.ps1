@@ -5240,6 +5240,20 @@ try {
                 return
             }
 
+            if ($v -eq 'guard') {
+                if ($null -eq $Arg2) { throw 'proc guard: usage: proc guard <pid>' }
+                $gp = [uint32]::Parse($Arg2)
+                $req = New-ProcReq 10 $gp 1 0 0
+                $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x838)) -InBytes $req -OutputLength 4096
+                Write-Host ("proc guard: pid={0} enabled={1}" -f $gp, $(if ([BitConverter]::ToUInt64($out, 8) -ne 0) { 'yes' } else { 'no' }))
+                return
+            }
+            if ($v -eq 'guard-stats') {
+                $req = New-ProcReq 11 0 0 0 0
+                $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x838)) -InBytes $req -OutputLength 4096
+                Write-Host ("proc guard-stats: strips={0} active={1} target=0x{2:X} resolved={3}" -f [BitConverter]::ToUInt64($out, 8), [BitConverter]::ToUInt64($out, 16), [BitConverter]::ToUInt64($out, 24), [BitConverter]::ToUInt64($out, 32))
+                return
+            }
             # Anything left is a bare pid: single-process query.
             $qp = [uint32]::Parse($v)
             $req = New-ProcReq 1 $qp 0 0 0

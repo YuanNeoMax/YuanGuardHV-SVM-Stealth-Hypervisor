@@ -12,6 +12,28 @@
 
 ---
 
+## v0.4.9 — 句柄降权（进程管控的能力面扩张）
+
+### Added
+- `yghv_obguard.c` + `yghv_obguard.h`：ObRegisterCallbacks 句柄降权独立模块。当目标进程被 guard 后，任何进程对它发起的句柄创建/复制请求都会在创建前被剥掉 PROCESS_TERMINATE|VM_READ|VM_WRITE|SUSPEND_RESUME|DUP_HANDLE|SET_INFORMATION。
+- `IOCTL_YGHV_PROC` 新增 op 10（GUARD）与 op 11（GUARD_STATS）。
+
+### Changed
+- `build.bat` 从 LF 转 CRLF（`^` 续行在 LF 下失效，导致链接器只看到 obj 列表前几行）。
+- `build.bat` 的 `ntoskrnl.lib` 从裸名改为全路径（双保险）。
+
+### Fixed
+- 全量构建 147 个 LNK 未解析符号（`__imp_PsSuspendProcess`、`memcpy`、`__C_specific_handler` 等）的根因是 build.bat 行尾格式：`^` 续行需要 CRLF 才能正确拼接下一行。
+
+### Known limitations
+- op 10/11 没上机。guard_enable 的参数格式（pid vs PEPROCESS）待定。
+- ObRegisterCallbacks 只能拦截句柄创建/复制，不能拦截已有的句柄。
+
+### Verification
+- 单文件编译 yghv_proc.c / yghv_obguard.c 零诊断。
+- 全量构建 EXIT=0，0 LNK 错误，镜像 SHA256 = 2bb33e4adc5d8102c926d21e2ced35c77f4afc3ca9ed71d485305a9627354978。
+- 源检查 17 脚本 / 48 PASS / 33 自检（docs_check 因哈希不一致报 1 FAIL，已在本轮修正）。
+
 ## v0.4.8 — 窗口消息注入（超越清单的新能力）
 
 ### Added

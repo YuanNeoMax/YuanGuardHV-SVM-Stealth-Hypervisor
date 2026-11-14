@@ -34,6 +34,8 @@
 #include "common/yghv_nt.h"
 #include "common/control_ioctl.h"
 #include "common/yghv_sig.h"
+#include "common/yghv_obguard.h" /* 9.597: handle guard */
+#include "common/yghv_obguard.h" /* 9.597: handle guard */
 #include "common/yghv_str.h"
 #include "common/yghv_strtab.h"
 #include "debug.h"
@@ -803,6 +805,8 @@ static NTSTATUS yghv_proc_hide(UINT64 *out, ULONG pid, int hide)
 int yghv_proc_init(void)
 {
     PEPROCESS sys;
+    /* Resolve Ob callback functions for handle guard */
+    yghv_obguard_init();
     UINT16 head = 0, entry = 0, tok = 0;
     int ok = 0;
 
@@ -850,6 +854,7 @@ int yghv_proc_init(void)
 
 void yghv_proc_cleanup(void)
 {
+    yghv_obguard_disable();
     int i;
 
     /*
@@ -1003,6 +1008,33 @@ NTSTATUS yghv_proc_dispatch(const void *in, ULONG in_len,
     case YGHV_PROC_OP_HIDE:
         st = yghv_proc_hide(o, r.pid, r.arg0 != 0);
         break;
+
+    case YGHV_PROC_OP_GUARD:
+        st = r.arg0 ? STATUS_SUCCESS : STATUS_INVALID_PARAMETER;
+        if (NT_SUCCESS(st)) {
+            PEPROCESS gproc = NULL;
+            st = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)r.pid, &gproc);
+            if (NT_SUCCESS(st)) {
+                int ok = yghv_obguard_enable(gproc);
+                o[0] = ok ? 1 : 0;
+                ObDereferenceObject(gproc);
+                *info = 8 * 8;
+            }
+        }
+        break;
+
+    case YGHV_PROC_OP_GUARD_STATS: {
+        uint64_t gs[4];
+        yghv_obguard_stats(gs);
+        o[0] = 1;
+        o[1] = gs[0];
+        o[2] = gs[1];
+        o[3] = gs[2];
+        o[4] = gs[3];
+        st = STATUS_SUCCESS;
+        *info = 8 * 8;
+        break;
+    }
 
     default:
         return STATUS_INVALID_PARAMETER;

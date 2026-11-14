@@ -29,7 +29,7 @@
 
 ---
 
-## 记录索引（9.596 重新测量，82 条）
+## 记录索引（9.597 重新测量，83 条）
 
 > 这是本文档自己的目录。**按标题扫一眼，找到要的那条，再跳过去读。**
 > 行数是该记录占的篇幅，用来判断"值不值得读全文"。
@@ -118,6 +118,7 @@
 | 9.594 窗口防截图接进门：win32k 导出解析、显示亲和性、验证回读 | 36 |
 | 9.595 无痕通信扩展：CPUID 门铃加四个内存原语 | 29 |
 | 9.596 窗口消息注入：NtUserPostMessage 从内核投递 | 28 |
+| 9.597 句柄降权接进门：ObRegisterCallbacks 拦截句柄创建 | 64 |
 
 ---
 
@@ -4710,6 +4711,70 @@ yghv_win.c 原本是 LF，编辑时混入 CRLF → 7 CRLF + 288 LF。control_ioc
 - Java 客户端 FN_WIN 更新
 - README 行更新
 
+#### 9.597 句柄降权接进门：ObRegisterCallbacks 拦截句柄创建
+
+目标里"进程管控（伪装/ 隐藏 / 提权 / 句柄降权）"的句柄降权。当目标进程被 guard 后，
+任何进程对它发起的句柄创建/复制请求，都会在句柄真正创建之前被剥掉
+PROCESS_TERMINATE | PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_SUSPEND_RESUME |
+PROCESS_DUP_HANDLE | PROCESS_SET_INFORMATION 六项危险权限。
+
+**1. 为什么用 ObRegisterCallbacks 而不是直接改句柄表。**
+句柄表是按进程私有的，改句柄表需要先拿到句柄表地址、再逐条比对——每一步都是
+build 相关的猜测。ObRegisterCallbacks 是 Windows 自己的句柄过滤机制，它在句柄创建
+之前回调，我们只需要说"把这六位清掉"，剩下的创建/复制/权限检查全由系统完成。
+
+**2. 为什么不自己声明 OB_CALLBACK_REGISTRATION。**
+WDK 10.0.19041.0 的 km 头里 grep 不到 ObRegisterCallbacks / OB_CALLBACK_REGISTRATION /
+OB_PRE_OPERATION_INFORMATION 任何声明，但编译器报 conflicting types for 'ObRegisterCallbacks'
+——include 链有间接声明。自己声明同名类型会撞车。改为运行时解析：
+yghv_ob_register_fn / yghv_ob_unregister_fn 函数指针，MmGetSystemRoutineAddress 拿地址。
+OB 结构用字节缓冲 + 偏移写入，不碰类型声明。
+
+**3. 字节缓冲构造 OB_CALLBACK_REGISTRATION（x64 布局）。**
++0x00 Version(USHORT)=0x0100、+0x02 OperationRegistrationCount(USHORT)=1、
++0x08 Altitude(UNICODE_STRING)、+0x18 RegistrationContext(PVOID)、
++0x20 OperationRegistration(PVOID)。
+OB_OPERATION_REGISTRATION：+0x00 ObjectType=PsProcessType、
++0x08 Operations=0x0003(HANDLE_CREATE|HANDLE_DUPLICATE)、
++0x10 PreOperation=yghv_obguard_pre。
+
+**4. yghv_obguard_pre 按 x64 偏移读 OB_PRE_OPERATION_INFORMATION。**
+Object 在 +0x08、Parameters 在 +0x20。Parameters 指向 OB_PRE_OPERATION_PARAMETERS 联合体，
+CreateHandleInformation.DesiredAccess / DuplicateHandleInformation.DesiredAccess 都在 +0x00
+(ACCESS_MASK)。判据：Object == g_ob_target 才动，否则直接返回。命中后
+*access &= ~(ACCESS_MASK)YGHV_PROC_GUARD_STRIP，InterlockedIncrement64(&g_ob_strips)。
+
+**5. 独立模块，不塞进 yghv_proc.c。**
+hv/yghv_obguard.c（139 行）+ hv/common/yghv_obguard.h（31 行）。yghv_proc.c 只 include
+头文件、在 init 里调 yghv_obguard_init()、在 cleanup 里调 yghv_obguard_disable()、
+dispatch 加 op 10/11。原因：第一次尝试把 guard 代码插进 yghv_proc.c 函数体内部，导致
+"function definition is not allowed here" 一串错误 + 重复定义；独立文件避免插入位置出错。
+
+**6. 根因：build.bat 的 ^ 续行在 LF 下失效。**
+第一次全量构建报 147 个 LNK 未解析符号（__imp_PsSuspendProcess、__imp_ZwAllocateVirtualMemory、
+memcpy、__C_specific_handler 全部找不到），单文件编译零诊断。排查发现 build.bat 是纯 LF
+（0 CR / 224 LF），而 ^ 续行需要 CRLF 才能正确拼接下一行——LF 下 ^ 后面的 
+ 被吃掉但
+后续行没有被拼接进同一条命令，链接器只看到 obj 列表的前几行。修法：build.bat 整体转 CRLF
+（223 CRLF / 0 裸 LF），并把 ntoskrnl.lib 从裸名改成全路径 %WDK_ROOT%\Lib\%WDK_VER%\km\x64\ntoskrnl.lib
+（双保险）。修复后 EXIT=0，0 LNK 错误。
+教训：**eol_check.ps1 只查"同文件不许混 CRLF 与裸 LF"，不查"某个文件该不该是 CRLF"；
+batch 文件的 ^ 续行是唯一会因 LF 而静默失效的语法，编译器不报错、链接器报一堆莫名其妙的
+未解析符号。**
+
+**7. 接线。**
+yghv_proc.c dispatch 加 YGHV_PROC_OP_GUARD(10) / YGHV_PROC_OP_GUARD_STATS(11)；
+control_ioctl.h 加两个 op 定义；build.bat 编译列表加 yghv_obguard、obj 列表加 yghv_obguard.obj；
+PS 客户端加 guard/guard-stats 子命令；Java 加 FN_PROC = 0x838 常量已存在，不加 case。
+
+**8. 构建验证。**
+EXIT=0。镜像 SHA256 = 2bb33e4adc5d8102c926d21e2ced35c77f4afc3ca9ed71d485305a9627354978
+（前 16 位 2bb33e4adc5d8102）。map 中 yghv_obguard 符号正常。
+
+**9. 还没做的。**
+op 10/11 没上机。guard_enable 需要传入目标 PEPROCESS，op 10 的参数格式待定
+（是传 pid 还是直接传 PEPROCESS 地址？）。
+
 ## 本次会话结束时状态
 
 > 这一段曾被落在 9.564 而正文已经写到 9.582 —— 同一份文件里两个互相矛盾的状态，
@@ -4725,7 +4790,7 @@ yghv_win.c 原本是 LF，编辑时混入 CRLF → 7 CRLF + 288 LF。control_ioc
 台账          : 8 完成 / 9 不做 / 1 需重启（Tier 6.1）
 静态检查      : 17 脚本 / 49 条 PASS（含 33 条自检），另 1 条链接后检查（tests/ 共 19 个脚本）
 文档检查      : docs_check PASS —— 57 md / 32 链接 / 79 记录 / 9 项
-最新编号      : 9.596
+最新编号      : 9.597
 ```
 
 **P1-1 的结论变了，但没结案。** 9.585 证明三次失败有一个共同原因：
