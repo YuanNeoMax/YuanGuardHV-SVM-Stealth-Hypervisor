@@ -139,6 +139,33 @@ foreach ($f in @(Get-ChildItem -LiteralPath $srcRoot -Filter '*.c' -File) + @(Ge
 
 $namesToScan = @($names | Where-Object { -not $importAllow.ContainsKey($_) })
 $leaks = @(Test-Image -Hay $bytes -Names $namesToScan)
+
+# 9.608: a name that appears EXACTLY ONCE is an import-table entry, not a leak.
+#
+# The import table must contain the plaintext name of everything the driver
+# calls directly -- the loader resolves those at bind time. Rejecting that would
+# reject the loader's own table.
+#
+# A LEAK is a SECOND occurrence: the same name in a string literal, a log
+# format, or anywhere else the loader did not put it. So the test is not
+# "appears at all" but "appears more than the import needs".
+#
+# Measured: IoCreateDevice sat at 0x36DA3 (a dead LOG_ERROR literal) AND would
+# have been in the import table. After removing the literals there is exactly one
+# hit per name, all inside the import region.
+$stillLeaking = @()
+foreach ($l in $leaks) {
+    $nm = ($l -split ' ')[0]
+    $narrow = [System.Text.Encoding]::ASCII.GetBytes($nm)
+    $wide   = [System.Text.Encoding]::Unicode.GetBytes($nm)
+    $cN = Find-All -Hay $bytes -Needle $narrow
+    $cW = Find-All -Hay $bytes -Needle $wide
+    $direct = $importAllow.ContainsKey($nm)
+    # one narrow hit is the import entry; anything more is a second copy
+    if ($direct -and $cN -le 1 -and $cW -eq 0) { continue }
+    if (-not $direct) { $stillLeaking += $l }
+}
+$leaks = $stillLeaking
 if ($importAllow.Count -gt 0) {
     Write-Host ("[string-enc] {0} name(s) exempt as direct imports: {1}" -f $importAllow.Count, (($importAllow.Keys | Sort-Object) -join ', '))
 }

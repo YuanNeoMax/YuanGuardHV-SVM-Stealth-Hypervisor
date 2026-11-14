@@ -762,7 +762,7 @@ static NTSTATUS yghv_hook_test(void) {
 
     yghv_trace("hook test start");
     term = yghv_protect_find_func_pattern(L"ZwTerminateProcess", NULL, 0);
-    LOG_ERROR("protect hook test: ZwTerminateProcess=0x%llx", term);
+    LOG_ERROR("protect hook test: [api]=0x%llx", term);
     open = yghv_protect_find_func_pattern(L"NtOpenProcess", NULL, 0);
     LOG_ERROR("protect hook test: NtOpenProcess=0x%llx", open);
     dummy = (uint64_t)yghv_hook_test_dummy;
@@ -1010,7 +1010,7 @@ static NTSTATUS yghv_real_hook_test(void) {
     yghv_trace("real hook start");
     term = yghv_protect_find_func_pattern(L"ZwTerminateProcess", NULL, 0);
     open = yghv_protect_find_func_pattern(L"ZwOpenProcess", NULL, 0);
-    LOG_ERROR("real hook test: ZwTerminateProcess=0x%llx ZwOpenProcess=0x%llx",
+    LOG_ERROR("real hook test: [api]=0x%llx [api]=0x%llx",
         term, open);
     if (!term || !open) {
         LOG_ERROR("real hook test: exported functions not found");
@@ -1026,19 +1026,19 @@ static NTSTATUS yghv_real_hook_test(void) {
 
     /* install/remove validation on the handle-open function first. */
     if (yghv_protect_install_hook(1, open)) {
-        LOG_ERROR("real hook test: install ZwOpenProcess FAILED");
+        LOG_ERROR("real hook test: install [api] FAILED");
         ok = 0;
     } else {
         st = yghv_protect_remove_hook(1);
         yghv_trace("real hook open ok");
         if (!NT_SUCCESS(st)) {
-            LOG_ERROR("real hook test: remove ZwOpenProcess FAILED 0x%x", st);
+            LOG_ERROR("real hook test: remove [api] FAILED 0x%x", st);
             ok = 0;
         }
     }
 
     if (yghv_protect_install_hook(0, term)) {
-        LOG_ERROR("real hook test: install ZwTerminateProcess FAILED");
+        LOG_ERROR("real hook test: install [api] FAILED");
         ok = 0;
     } else {
         NTSTATUS (*fn)(HANDLE) = (NTSTATUS (*)(HANDLE))term;
@@ -1061,7 +1061,7 @@ static NTSTATUS yghv_real_hook_test(void) {
 
         st = yghv_protect_remove_hook(0);
         if (!NT_SUCCESS(st)) {
-            LOG_ERROR("real hook test: remove ZwTerminateProcess FAILED 0x%x",
+            LOG_ERROR("real hook test: remove [api] FAILED 0x%x",
                 st);
             ok = 0;
         }
@@ -4654,7 +4654,7 @@ static void yghv_hook_rendezvous_join(void) {
         KeWaitForSingleObject(thread_obj, Executive, KernelMode, FALSE, NULL);
         ObDereferenceObject(thread_obj);
     } else {
-        LOG_ERROR("hook rendezvous: ObReferenceObjectByHandle failed 0x%x",
+        LOG_ERROR("hook rendezvous: [api] failed 0x%x",
             status);
     }
     ZwClose(g_hook_rendezvous_thread);
@@ -4885,7 +4885,7 @@ static void yghv_join_system_thread(HANDLE h) {
         KeWaitForSingleObject(thread_obj, Executive, KernelMode, FALSE, NULL);
         ObDereferenceObject(thread_obj);
     } else {
-        LOG_ERROR("join thread: ObReferenceObjectByHandle failed 0x%x", jst);
+        LOG_ERROR("join thread: [api] failed 0x%x", jst);
     }
     ZwClose(h);
 }
@@ -5375,7 +5375,7 @@ after_vmrun_guard:;
                                   NULL);
             ObDereferenceObject(thread_obj);
         } else {
-            LOG_ERROR("watchdog join: ObReferenceObjectByHandle failed 0x%x",
+            LOG_ERROR("watchdog join: [api] failed 0x%x",
                       jst);
         }
         ZwClose(g_watchdog_thread);

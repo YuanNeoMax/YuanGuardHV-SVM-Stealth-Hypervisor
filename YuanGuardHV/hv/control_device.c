@@ -276,7 +276,7 @@ static VOID yghv_link_timer_dpc(PKDPC Dpc, PVOID Context, PVOID Arg1, PVOID Arg2
     if (g_link_work == NULL) {
         g_link_work = IoAllocateWorkItem(g_yghv_device);
         if (!g_link_work) {
-            LOG_ERROR("link restore: IoAllocateWorkItem failed - name stays "
+            LOG_ERROR("link restore: [api] failed - name stays "
                       "removed until unload");
             return;
         }
@@ -617,7 +617,7 @@ static BOOLEAN yghv_control_ioctl_authorized(PIRP irp) {
            become dead code); KernelMode returns FALSE instead.  The check
            still uses the current thread's token either way. */
         if (!SeSinglePrivilegeCheck(dbg_luid, KernelMode)) {
-            LOG_ERROR("control device: caller lacks SeDebugPrivilege");
+            LOG_ERROR("control device: caller lacks [api]");
             return FALSE;
         }
     }
@@ -3917,12 +3917,12 @@ NTSTATUS yghv_control_device_init(PDRIVER_OBJECT driver) {
     status = IoCreateDevice(driver, 0, &dev_name, FILE_DEVICE_UNKNOWN, 0,
                             FALSE, &dev);
     if (!NT_SUCCESS(status)) {
-        LOG_ERROR("control device: IoCreateDevice failed 0x%x", status);
+        LOG_ERROR("control device: [api] failed 0x%x", status);
         return status;
     }
     status = IoCreateSymbolicLink(&link_name, &dev_name);
     if (!NT_SUCCESS(status)) {
-        LOG_ERROR("control device: IoCreateSymbolicLink failed 0x%x", status);
+        LOG_ERROR("control device: [api] failed 0x%x", status);
         IoDeleteDevice(dev);
         return status;
     }
@@ -3987,7 +3987,7 @@ NTSTATUS yghv_control_device_init(PDRIVER_OBJECT driver) {
             LOG_INFO("control device: symbol link REMOVED (YGHV_HIDE_LINK) - "
                      "device still at \\Device\\YuanGuardHV");
         } else {
-            LOG_ERROR("control device: IoDeleteSymbolicLink failed 0x%x - link REMAINS",
+            LOG_ERROR("control device: [api] failed 0x%x - link REMAINS",
                       del);
         }
     }

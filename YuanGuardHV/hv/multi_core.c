@@ -122,7 +122,7 @@ void svm_core_wait_all_stopped(ULONG online) {
             KeWaitForSingleObject(thread_obj, Executive, KernelMode, FALSE, NULL);
             ObDereferenceObject(thread_obj);
         } else {
-            LOG_ERROR("ObReferenceObjectByHandle core %u failed 0x%x", i, status);
+            LOG_ERROR("[api] core %u failed 0x%x", i, status);
         }
 
         if (g_resident_ctx[i] && !NT_SUCCESS(g_resident_ctx[i]->status))

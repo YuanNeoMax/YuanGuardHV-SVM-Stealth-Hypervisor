@@ -115,7 +115,14 @@ $scripts = @(
     # raw dereference and none of the sanctioned guards. Verified to fail: a
     # planted function in yghv_obguard.c was caught (exit 1) and the clean tree
     # passes (exit 0).
-    'canonical_deref_check.ps1'
+    'canonical_deref_check.ps1',
+    # 9.608: LOG_* compiles to ((void)0) without YGHV_DEBUG_LOG, but its STRING
+    # LITERAL still lands in .rdata. Measured: seven API names were readable in
+    # the built image through dead log format strings alone, in a tree whose
+    # whole point is that no capability name survives. Source-level, so it names
+    # the file and line. Verified to fail in both directions: a planted literal
+    # is caught, a clean one stays silent.
+    'log_api_name_check.ps1'
 )
 
 # 9.583: COUNT THE PASSES INSTEAD OF LETTING PEOPLE WRITE THE NUMBER DOWN.

@@ -61,10 +61,22 @@ static void yghv_unlink_module(PDRIVER_OBJECT DriverObject) {
             PLIST_ENTRY prev = le->Blink;
             PLIST_ENTRY next = le->Flink;
 
+            /*
+             * 9.608 -- DO NOT SELF-LINK A REMOVED MEMBER.
+             *
+             * The idiom "Flink = Blink = self" belongs to a list HEAD that must
+             * stay a valid empty list. Applied to a member that has just been
+             * taken out it makes the entry self-referential, and any list
+             * primitive that later walks it raises CORRUPT_LIST_ENTRY -- the
+             * exact pattern that cost three 0x139 bugchecks on the process and
+             * thread unlink ops earlier today.
+             *
+             * Here the entry is left pointing at its former neighbours. It is
+             * out of the list either way; the difference is that a stale-but-
+             * sane pair cannot be mistaken for corruption.
+             */
             prev->Flink = next;
             next->Blink = prev;
-            le->Flink = le;
-            le->Blink = le;
 
             /*
              * 9.599: also unlink from InMemoryOrderLinks (+0x10) and
@@ -80,16 +92,14 @@ static void yghv_unlink_module(PDRIVER_OBJECT DriverObject) {
                 next = memL->Flink;
                 prev->Flink = next;
                 next->Blink = prev;
-                memL->Flink = memL;
-                memL->Blink = memL;
+                /* 9.608: no self-link -- see the note above the first unlink. */
 
                 PLIST_ENTRY initL = (PLIST_ENTRY)((PUCHAR)entry + 0x20);
                 prev = initL->Blink;
                 next = initL->Flink;
                 prev->Flink = next;
                 next->Blink = prev;
-                initL->Flink = initL;
-                initL->Blink = initL;
+                /* 9.608: no self-link -- see the note above the first unlink. */
             }
 
             RtlZeroMemory(&entry->BaseDllName, sizeof(entry->BaseDllName));
