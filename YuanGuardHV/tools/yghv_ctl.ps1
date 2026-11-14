@@ -5533,6 +5533,65 @@ try {
 
             throw 'pt: usage: pt [<pid> [cr3|tree <va>|map <start> <end>|pages <start> <end> [max]]]'
         }
+        'win' {
+            # 9.594: window capture suppression (IOCTL 0x83B).
+            #
+            # The driver calls NtUserSetWindowDisplayAffinity in win32kfull.sys.
+            # That call reads the GUI state of the CALLING THREAD, so this
+            # command has to be issued from the UI thread of the process that
+            # owns the window -- a worker thread has no Win32Thread and the
+            # driver reports code 3 instead of guessing.
+            function New-WinReq([uint32]$op, [uint64]$hwnd, [uint32]$affinity, [uint32]$flags) {
+                # 24 bytes: op | affinity | hwnd (8) | flags | pad
+                $req = New-Object byte[] 24
+                [BitConverter]::GetBytes([uint32]$op).CopyTo($req, 0)
+                [BitConverter]::GetBytes([uint32]$affinity).CopyTo($req, 4)
+                [BitConverter]::GetBytes([uint64]$hwnd).CopyTo($req, 8)
+                [BitConverter]::GetBytes([uint32]$flags).CopyTo($req, 16)
+                return ,$req
+            }
+            function Get-WinErr([uint64]$c) {
+                if ($c -eq 1) { return 'win32kfull.sys not loaded (no interactive session?)' }
+                if ($c -eq 2) { return 'display-affinity export not found in win32kfull' }
+                if ($c -eq 3) { return 'calling thread has no GUI state - issue this from the UI thread' }
+                if ($c -eq 4) { return 'bad argument (hwnd out of range)' }
+                if ($c -eq 5) { return 'the win32k call refused this window' }
+                if ($c -eq 6) { return 'written value did not read back' }
+                return ('unknown code ' + $c)
+            }
+            if ($null -eq $Arg1) {
+                $r = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x83B)) -InBytes (New-WinReq 2 0 0 0) -OutputLength 4096
+                Write-Host ('win: sets={0} gets={1} refused={2} verify_fail={3} no_gui={4} init_ok={5}' -f `
+                    [BitConverter]::ToUInt64($r,8), [BitConverter]::ToUInt64($r,16), [BitConverter]::ToUInt64($r,24), `
+                    [BitConverter]::ToUInt64($r,32), [BitConverter]::ToUInt64($r,40), [BitConverter]::ToUInt64($r,48))
+                Write-Host ('win: last affinity=0x{0:X} hwnd=0x{1:X}' -f [BitConverter]::ToUInt64($r,56), [BitConverter]::ToUInt64($r,64))
+                return
+            }
+            $v = "$Arg1".ToLower()
+            if ($v -eq 'set') {
+                if ($null -eq $Arg2) { throw 'win set: usage: win set <hwnd-hex> [affinity-hex]' }
+                $h = ConvertTo-U64 "$Arg2"
+                $a = 0x11
+                if ($null -ne $Arg3) { $a = ConvertTo-U64 "$Arg3" }
+                $r = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x83B)) -InBytes (New-WinReq 0 $h $a 0) -OutputLength 4096
+                if ([BitConverter]::ToUInt64($r,8) -ne 0) {
+                    throw ('win set failed: ' + (Get-WinErr ([BitConverter]::ToUInt64($r,16))))
+                }
+                Write-Host ('win: hwnd=0x{0:X} affinity=0x{1:X} applied and verified' -f $h, [BitConverter]::ToUInt64($r,24))
+                return
+            }
+            if ($v -eq 'get') {
+                if ($null -eq $Arg2) { throw 'win get: usage: win get <hwnd-hex>' }
+                $h = ConvertTo-U64 "$Arg2"
+                $r = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x83B)) -InBytes (New-WinReq 1 $h 0 0) -OutputLength 4096
+                if ([BitConverter]::ToUInt64($r,8) -ne 0) {
+                    throw ('win get failed: ' + (Get-WinErr ([BitConverter]::ToUInt64($r,16))))
+                }
+                Write-Host ('win: hwnd=0x{0:X} affinity=0x{1:X}' -f $h, [BitConverter]::ToUInt64($r,24))
+                return
+            }
+            throw 'win: usage: win | win set <hwnd> [affinity] | win get <hwnd>'
+        }
         default {
             throw ("unknown command: {0}" -f $Command)
         }

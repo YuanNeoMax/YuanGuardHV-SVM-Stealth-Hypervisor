@@ -977,7 +977,7 @@ NTSTATUS yghv_proc_dispatch(const void *in, ULONG in_len,
     }
 
     case YGHV_PROC_OP_SIG: {
-        uint64_t stats[8];
+        uint64_t stats[10];
         yghv_sig_stats(stats);
         o[0] = 1;
         o[1] = stats[0];

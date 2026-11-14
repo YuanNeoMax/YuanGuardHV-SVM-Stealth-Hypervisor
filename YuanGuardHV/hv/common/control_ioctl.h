@@ -971,4 +971,30 @@ typedef struct {
     ULONG     flags;
 } yghv_ioctl_pt_req_t;
 
+/* ------------------------------------------------------------------ 9.594 */
+/*
+ * IOCTL_YGHV_WIN -- window capture suppression.
+ *
+ * The reason this is a separate function number rather than an op on PROC: it
+ * needs the CALLING THREAD to own GUI state (see yghv_win.h), and a client that
+ * batches process operations must not have its whole batch fail because one of
+ * them happened to run on a non-UI thread.
+ */
+#define IOCTL_YGHV_WIN \
+    YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x83B, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
+
+#define YGHV_WIN_HDR_QWORDS 8
+
+#define YGHV_WIN_OP_SET   0
+#define YGHV_WIN_OP_GET   1
+#define YGHV_WIN_OP_STATS 2
+
+typedef struct _YGHV_IOCTL_WIN_REQ {
+    ULONG     op;
+    ULONG     affinity;
+    ULONG_PTR hwnd;
+    ULONG     flags;
+    ULONG     _pad;
+} yghv_ioctl_win_req_t;
+
 #endif

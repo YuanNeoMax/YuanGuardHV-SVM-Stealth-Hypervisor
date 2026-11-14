@@ -25,7 +25,8 @@
 #include "common/yghv_nt.h" /* 9.590: pid via derived offset, not the import */
 #include "common/yghv_proc.h" /* 9.591: process / thread control policy */
 #include "common/yghv_inject.h" /* 9.592: injection primitives */
-#include "common/yghv_pt.h"     /* 9.593: CR3 decode + page-table analysis */
+#include "common/yghv_pt.h"
+#include "common/yghv_win.h" /* 9.594: window capture suppression */     /* 9.593: CR3 decode + page-table analysis */
 #include "debug.h"
 
 /*
@@ -1373,7 +1374,18 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
                 status = STATUS_SUCCESS;
                 break;
             }
-            default: ok = 0; break;
+            case IOCTL_YGHV_WIN: {
+        ULONG winInfo = 0;
+        if (in_len < sizeof(yghv_ioctl_win_req_t)) {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        status = yghv_win_dispatch(buf, buf, out_len, &winInfo);
+        if (NT_SUCCESS(status)) info = winInfo;
+        break;
+    }
+
+    default: ok = 0; break;
             }
             if (op != 3) {
                 out[0] = (UINT64)(ok ? 1 : 0);

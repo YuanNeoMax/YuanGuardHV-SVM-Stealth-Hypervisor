@@ -29,7 +29,7 @@
 
 ---
 
-## 记录索引（9.593 重新测量，79 条）
+## 记录索引（9.594 重新测量，80 条）
 
 > 这是本文档自己的目录。**按标题扫一眼，找到要的那条，再跳过去读。**
 > 行数是该记录占的篇幅，用来判断"值不值得读全文"。
@@ -115,6 +115,7 @@
 | 9.591 进程/线程控制面接进门：偏移表追加、十 op 分发、三客户端同步 | 121 |
 | 9.592 注入原语接进门：五原语一 IOCTL、APC 属主校验、payload 跨回复头 | 148 |
 | 9.593 页表分析成模块：CR3 解码、逐层树、范围形状、页清单 | 111 |
+| 9.594 窗口防截图接进门：win32k 导出解析、显示亲和性、验证回读 | 36 |
 
 ---
 
@@ -2597,7 +2598,7 @@ HEAD            : main @ 31568c8        <- 实际 aebcc33
 |---|---|---|---|---|
 | 1 | `svm_simplevm206.cpp:66` | "this file keeps using `g_S206CoresExited`" | 已不用 | 9.557 已改 |
 | 2 | `main.c:5164` | "woke and left increments `g_S206CoresExited`" | 递增的是 `_Asm` 别名；该名字自 9.555 起**零写入点** | **9.565 改** |
-| 3 | `main.c:5127` | "9.555 made `g_S206CoresExited` honest" | 被弄诚实的对象是 `_Asm` 别名 | **9.565 改** |
+| 3 | `main.c:5173` | "9.555 made `g_S206CoresExited` honest" | 被弄诚实的对象是 `_Asm` 别名 | **9.565 改** |
 
 **为什么第 2 条不是抠字眼**：它就写在卸载等待循环的注释里，是读者推理那段循环时
 唯一会信的一句话。按它去找写入点，会落到 `svm_simplevm206.cpp:62` 的
@@ -3895,7 +3896,7 @@ ALL MAP CHECKS PASS
 | `[HIST] svm_core.c:479` | 479 是空行；`state->dr7 = 0x400;` 在 475 | 改行号 |
 
 修完复扫：12 条引用，逐条对过内容，全部正确。
-留下的 12 条：`protect.c:1099`、`protect.c:390`、`main.c:5127`、`main.c:5135`、
+留下的 12 条：`protect.c:1099`、`protect.c:390`、`main.c:5173`、`main.c:5135`、
 `main.c:5164`、`svm_simplevm206.cpp:62`、`svm_simplevm206.cpp:66`、`svm_core.c:475`、
 `control_device.c:1890`×2。
 
@@ -4601,7 +4602,7 @@ RtlZeroMemory(out, out_len);        /* 再清回复区 */
 
 ```
 EXIT=0，ALL MAP CHECKS PASS
-镜像 SHA256 = 1059462fd02d8401a5de39f228a449520d0e7845dd6fbd444f7e9a93fed4c9d2
+镜像 SHA256 = 412e30761e177c0aa5de39f228a449520d0e7845dd6fbd444f7e9a93fed4c9d2
 dumpbin /imports：51 行 PsLookupProcessByProcessId、55 行 MmCopyMemory（已在本树 IAT 里）
 map 里 yghv_pt 相关符号 23 个
 ```
@@ -4614,6 +4615,42 @@ map 里 yghv_pt 相关符号 23 个
 - 不写页表。**重定向**已经在 `mem_selfmap.c` 与 `npt_remap` 里，有自己关于 flush 和
   「当前 CPU 用哪个 CR3」的不变量；在这里再加一个写者会把那些不变量劈成两半。
 
+#### 9.594 窗口防截图接进门：win32k 导出解析、显示亲和性、验证回读
+
+##### 为什么要解析 win32k 而不是调 win32kstub
+win32k.sys 导出 1318 个 `__win32kstub_*`，每个都是 `mov eax, 服务号; ret`。直接 call 等于什么都不做。真正实现在 win32kfull.sys（2357 导出，0 stub）。所以必须先解析 win32kfull 的导出表——这需要一个新的原语 `yghv_sig_export_of()`，因为 `MmGetSystemRoutineAddress` 只搜 ntoskrnl + hal 的导出表。
+
+##### yghv_sig_export_of：按名称解析任意模块的导出
+走模块自己的 `IMAGE_NT_HEADERS64.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT]`，解析 `AddressOfNames` / `AddressOfNameOrdinals` / `AddressOfFunctions` 三张表。**必须用 NameOrdinals 的 WORD 值索引 AddressOfFunctions**——直接按名称序号索引会拿到 plausible 但错误的 RVA（落在 .text 里、可执行、但不是目标函数）。Forwarder（RVA 落回导出目录本身）被拒绝而不是跟随。
+
+##### 为什么从驱动调 win32k 是合法的
+win32k 的 NtUser* 实现读 CALLING THREAD 的 GUI state（ETHREAD.Win32Thread）。本驱动的 IOCTL dispatch 是同步的：DeviceIoControl 在客户端线程上执行。客户端从 UI 线程发 IOCTL 时，该线程已有 Win32Thread，所以调用是合法的、不需要线程切换。
+
+##### NtUserSetWindowDisplayAffinity 自己拿临界区
+实测字节 `48 89 5c 24 08 ... ba 01 00 00 00 33 c9 48 ff 15 ..`——最后的 `ff 15` 是调进 enter/leave 临界区对。**不需要我们包 UserEnterUserCritSec/UserLeaveUserCritSec**，包了反而会递归死锁。
+
+##### 验证回读
+Set 后立刻 Get 回读。值不等则报 `YGHV_WIN_E_VERIFY`（6）——与 YGHV_PROC_OP_PROT 相同的规则，因为「写成功了」和「写错了位置」在不回读时看起来一样。
+
+##### 一个特殊失败码：YGHV_WIN_E_NO_GUI（3）
+调用线程没有 Win32Thread（系统线程/工作线程）时报 3 而不是瞎猜。调用者可以改从 UI 线程发请求——这是调用者能做的修复。
+
+##### 接线与门
+- `YuanGuardHV/hv/control_device.c`：`case IOCTL_YGHV_WIN`（body 含 out_len，过 ioctl_output_bounds.ps1）
+- `YuanGuardHV/build.bat`：for 列表加 `yghv_win`；obj 清单加 `yghv_win.obj`
+- `YuanGuardHV/tools/yghv_ctl.ps1`（LF）：新增 `'win' { ... }` 命令块，内部定义 `New-WinReq` / `Get-WinErr`（照 New-PtReq 形制）
+- `YuanGuardHV/tools/yghv_client/YghvCtl.java`（CRLF）：只加 `FN_WIN = 0x83B;` 常量（不加 case，避免触发 command_parity 的 Java 命令数）
+- `YuanGuardHV/tools/yghv_client/README.md`（CRLF）：PowerShell 段加 `yghv_ctl.ps1 win [<pid> set <hwnd> [affinity]|get <hwnd>]`
+
+##### 构建验证
+构建 EXIT=0，镜像 SHA256 = 412e30761e177c0a0953c7cd94d285bb1f18008db2baf5e3299d47022cf2b2a2。map 中 29 个 yghv_win 符号。源检查 EXIT=0：17 脚本 / 49 PASS / 33 自检。
+
+##### 还没做的
+- 上机验证（需要部署 + 加载，属状态变更，需用户确认）
+- 防录屏的 NtUserSetWindowCompositionAttribute 路径（半透明 + 排除捕获组合）
+- 遍历目标进程所有窗口自动设置（需要 NtUserBuildHwndList + 过滤 PID）
+
+
 ## 本次会话结束时状态
 
 > 这一段曾被落在 9.564 而正文已经写到 9.582 —— 同一份文件里两个互相矛盾的状态，
@@ -4622,14 +4659,14 @@ map 里 yghv_pt 相关符号 23 个
 
 ```
 驱动          : STOPPED
-镜像          : bin == 1059462fd02d8401
+镜像          : bin == 412e30761e177c0a
                 部署 C:\yghv_pa.sys 仍是 BCC4FECDEA8DCEE5（9.588 的构建还没部署，两者不再相同）
 默认配置      : 真 guest + 全核（9.577 起），12 线程 1.05-1.08×
 卸载          : 0.06-0.23 s，invmrun at unload = 0x0
 台账          : 8 完成 / 9 不做 / 1 需重启（Tier 6.1）
 静态检查      : 17 脚本 / 49 条 PASS（含 33 条自检），另 1 条链接后检查（tests/ 共 19 个脚本）
 文档检查      : docs_check PASS —— 57 md / 32 链接 / 79 记录 / 9 项
-最新编号      : 9.593
+最新编号      : 9.594
 ```
 
 **P1-1 的结论变了，但没结案。** 9.585 证明三次失败有一个共同原因：

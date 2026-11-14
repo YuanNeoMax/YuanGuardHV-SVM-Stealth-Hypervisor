@@ -12,6 +12,30 @@
 
 ---
 
+## v0.4.6 — 窗口防截图接入（能力面第四块扩张）
+
+### Added
+- `yghv_sig_export_of()`：按名称解析任意模块的导出表（三表解析：AddressOfNames / AddressOfNameOrdinals / AddressOfFunctions；NameOrdinals WORD 值索引；Forwarder 拒绝）
+- `yghv_win.h` / `yghv_win.c`：窗口显示亲和性模块（`IOCTL_YGHV_WIN` = 0x83B，op 0 SET / 1 GET / 2 STATS）
+- 验证回读：Set 后立刻 Get，值不等报 `YGHV_WIN_E_VERIFY`（6）
+- NO_GUI 检测：调用线程无 Win32Thread 时报 `YGHV_WIN_E_NO_GUI`（3）而非瞎猜
+- PS 客户端 `win` 命令（set / get / 计数器）
+- Java 客户端 `FN_WIN = 0x83B` 常量
+
+### Changed
+- `yghv_sig_stats()` 从 8 qword 扩到 10（新增 exports / forwarders 计数）
+- `yghv_sig.h` 的调用者数组从 8 扩到 10
+
+### Known limitations
+- 防录屏的 `NtUserSetWindowCompositionAttribute` 路径未实现
+- 遍历目标进程所有窗口自动设置未实现（需要 `NtUserBuildHwndList` + PID 过滤）
+- `IOCTL_YGHV_WIN` 的三个 op 全部没上机
+
+### Verification
+- 源检查 EXIT=0：17 脚本 / 49 PASS / 33 自检
+- 构建 EXIT=0，镜像 SHA256 = 412e30761e177c0a0953c7cd94d285bb1f18008db2baf5e3299d47022cf2b2a2
+- `yghv_win` 符号在 map 中已确认
+
 ## v0.4.5 — 页表分析成模块（第 0.4.x 条能力面的第三块）
 
 **日期**：2026-11-14

@@ -104,6 +104,27 @@ uint64_t yghv_sig_find_in_module_of(PCWSTR export_name,
                                     uint32_t len, uint32_t *out_hits);
 
 /*
+ * Resolve an export by NAME inside an arbitrary module (9.594).
+ *
+ * MmGetSystemRoutineAddress only searches the kernel's own export table, which
+ * covers ntoskrnl and hal and nothing else. win32kfull.sys / win32kbase.sys
+ * keep their exports in their own tables, and the window-control work needs
+ * those -- so the module is resolved first, then its export directory is
+ * walked here.
+ *
+ * The mapping is AddressOfNames[i] -> AddressOfNameOrdinals[i] ->
+ * AddressOfFunctions[ordinal]; a name index used directly as a function index
+ * produces a plausible but wrong RVA. A forwarder (RVA inside the export
+ * directory) is refused, not followed.
+ *
+ * Returns 1 and writes out_addr/out_rva (both optional) on success. Returns 0
+ * for "no such export", "forwarder", and "unreadable image" alike; the shape
+ * of the failure is in yghv_sig_stats().
+ */
+int yghv_sig_export_of(const YGHV_SIG_MODULE *module, const char *name,
+                       uint64_t *out_addr, uint32_t *out_rva);
+
+/*
  * Decode a relative branch at 'site'.
  *
  * Almost nothing interesting is found by its own bytes; it is found by the
@@ -160,6 +181,8 @@ uint32_t yghv_sig_build_accessor(uint32_t shape, uint32_t disp, uint8_t *out8);
  * the self-test reads better as "a load of this offset" than as "shape 1". */
 uint32_t yghv_sig_build_rcx_load(uint32_t disp, uint8_t *out8);
 
+/* [0] scans [1] bytes [2] hits [3] faults [4] bad_module
+ * [5] selftest_ok [6] selftest_fail [7] exports_found [8] forwarders_refused */
 void yghv_sig_stats(uint64_t *out);
 int  yghv_sig_selftest(void);
 

@@ -82,6 +82,8 @@ static volatile LONG64 g_sig_faults;
 static volatile LONG64 g_sig_bad_module;
 static volatile LONG64 g_sig_selftest_ok;
 static volatile LONG64 g_sig_selftest_fail;
+static volatile LONG64 g_sig_exports;      /* successful name lookups (9.594) */
+static volatile LONG64 g_sig_forwarders;   /* forwarder exports we refused (9.594) */
 
 /* ---------------------------------------------------------------- helpers */
 
@@ -242,7 +244,112 @@ int yghv_sig_module_self(YGHV_SIG_MODULE *out)
     return 1;
 }
 
-/* ------------------------------------------------------------------- scan */
+/* ---------------------------------------------------------------- exports */
+
+/*
+ * Resolve an export by NAME inside an arbitrary module.
+ *
+ * Why this cannot be MmGetSystemRoutineAddress: that call only searches the
+ * kernel's own export table (ntoskrnl + hal). win32kfull.sys, win32kbase.sys
+ * and every other driver keep their exports in THEIR OWN table, and the whole
+ * window-control work (9.594) needs exactly those. So the module is resolved
+ * first (by_reference / by_name) and this walks that module's export
+ * directory directly.
+ *
+ * The trap that has bitten this tree before: AddressOfFunctions is indexed by
+ * ORDINAL, not by name index. Walking AddressOfNames and using that counter to
+ * index AddressOfFunctions yields plausible-looking but wrong RVAs -- they land
+ * in .text, they are executable, and they are not the function. The mapping is
+ * AddressOfNames[i] -> AddressOfNameOrdinals[i] -> AddressOfFunctions[ordinal].
+ *
+ * A forwarded export (a function whose RVA points back inside the export
+ * directory) is refused rather than followed: a forwarder is a name of a name,
+ * and resolving it means parsing yet another module's table. Reporting zero is
+ * honest; returning the forwarder's own RVA as if it were code is not.
+ */
+int yghv_sig_export_of(const YGHV_SIG_MODULE *module, const char *name,
+                       uint64_t *out_addr, uint32_t *out_rva)
+{
+    IMAGE_DOS_HEADER *dos;
+    IMAGE_NT_HEADERS64 *nt;
+    IMAGE_EXPORT_DIRECTORY *ed;
+    uint32_t exp_rva = 0;
+    uint32_t exp_size = 0;
+    int found = 0;
+
+    if (out_addr) *out_addr = 0;
+    if (out_rva) *out_rva = 0;
+    if (!module || !name || !name[0]) return 0;
+    if (!yghv_sig_canonical(module->base) || module->size < 0x1000) return 0;
+
+    __try {
+        dos = (IMAGE_DOS_HEADER *)module->base;
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
+        if (dos->e_lfanew <= 0 || dos->e_lfanew > 0x1000) return 0;
+        nt = (IMAGE_NT_HEADERS64 *)(module->base + (uint32_t)dos->e_lfanew);
+        if (nt->Signature != IMAGE_NT_SIGNATURE) return 0;
+
+        exp_rva  = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+        exp_size = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
+        if (exp_rva == 0 || exp_size < sizeof(IMAGE_EXPORT_DIRECTORY)) return 0;
+        if (exp_rva >= module->size) return 0;
+
+        ed = (IMAGE_EXPORT_DIRECTORY *)(module->base + exp_rva);
+        /* NumberOfNames is a 32-bit field read from an image; bound it before
+         * it becomes a loop count. A real module never has 64K exports. */
+        if (ed->NumberOfNames == 0 || ed->NumberOfNames > 0x10000) return 0;
+        if (ed->AddressOfNames == 0 || ed->AddressOfNameOrdinals == 0 ||
+            ed->AddressOfFunctions == 0) return 0;
+
+        {
+            const uint32_t *names = (const uint32_t *)(module->base + ed->AddressOfNames);
+            const uint16_t *ords  = (const uint16_t *)(module->base + ed->AddressOfNameOrdinals);
+            const uint32_t *funcs = (const uint32_t *)(module->base + ed->AddressOfFunctions);
+            uint32_t i;
+
+            for (i = 0; i < ed->NumberOfNames; i++) {
+                const char *cand = (const char *)(module->base + names[i]);
+                uint32_t j = 0;
+
+                /* Bounded compare, not strcmp: the name comes from an image we
+                 * do not own and may not be terminated inside that image. */
+                while (j < 96 && cand[j] && cand[j] == name[j]) j++;
+                if (j == 0 || cand[j] != name[j]) continue;
+                if (cand[j] != 0) continue;
+
+                {
+                    uint16_t ord = ords[i];
+                    uint32_t rva;
+
+                    if (ord >= ed->NumberOfFunctions) break;
+                    rva = funcs[ord];
+                    if (rva == 0) break;
+
+                    /* Forwarder: the RVA points back into the export directory
+                     * itself. Refuse instead of handing back a data address. */
+                    if (rva >= exp_rva && rva < exp_rva + exp_size) {
+                        InterlockedIncrement64(&g_sig_forwarders);
+                        break;
+                    }
+                    if (rva >= module->size) break;
+
+                    if (out_rva)  *out_rva = rva;
+                    if (out_addr) *out_addr = module->base + rva;
+                    found = 1;
+                }
+                break;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        InterlockedIncrement64(&g_sig_faults);
+        return 0;
+    }
+
+    if (found) InterlockedIncrement64(&g_sig_exports);
+    return found;
+}
+
+/* ---------------------------------------------------------------- scan */
 
 uint32_t yghv_sig_scan(const YGHV_SIG_MODULE *module,
                        const uint8_t *pattern, const uint8_t *mask,
@@ -490,4 +597,6 @@ void yghv_sig_stats(uint64_t *out)
     out[4] = (uint64_t)InterlockedCompareExchange64(&g_sig_bad_module, 0, 0);
     out[5] = (uint64_t)InterlockedCompareExchange64(&g_sig_selftest_ok, 0, 0);
     out[6] = (uint64_t)InterlockedCompareExchange64(&g_sig_selftest_fail, 0, 0);
+    out[7] = (uint64_t)InterlockedCompareExchange64(&g_sig_exports, 0, 0);
+    out[8] = (uint64_t)InterlockedCompareExchange64(&g_sig_forwarders, 0, 0);
 }

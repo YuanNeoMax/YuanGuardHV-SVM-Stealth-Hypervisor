@@ -11,7 +11,8 @@
 #include "common/yghv_nt.h"     /* 9.589: native offsets + accessors */
 #include "common/yghv_sig.h"    /* 9.589: signature / accessor scan */
 #include "common/yghv_proc.h"   /* 9.591: process / thread control */
-#include "common/yghv_inject.h" /* 9.592: injection primitives */
+#include "common/yghv_inject.h"
+#include "common/yghv_win.h"   /* 9.594: window capture suppression */ /* 9.592: injection primitives */
 
 #define YGHV_R1_SKIP_NPT_TEST 0
 #define YGHV_R1_NPT_UNIT_TEST 1
@@ -5514,7 +5515,7 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
      */
     {
         int sigOk = yghv_sig_selftest();
-        uint64_t sigStats[8];
+        uint64_t sigStats[10];
 
         yghv_sig_stats(sigStats);
         if (sigOk)
@@ -5535,6 +5536,11 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
     }
     /* 9.304: hand the service's own registry path to the persistence layer
      * BEFORE protect_init, which loads the saved settings. */
+    {
+        int winOk = yghv_win_init();
+        LOG_INFO("win: %d piece(s) resolved (win32kfull exports)", winOk);
+    }
+
     yghv_protect_set_registry_path(r);
     sv = yghv_protect_init();
     if (sv) {
