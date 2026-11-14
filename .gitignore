@@ -63,3 +63,7 @@ YuanGuardHV/tests/check_stats.txt
 
 # 9.584: build artifact of tools/selfwrite_hold.cs (compile it, do not ship a binary)
 tools/selfwrite_hold.exe
+# 9.589/9.590: build artifacts of the two user-mode acceptance tools (compile them,
+# do not ship a binary -- the source is the artifact, the exe is the result of running it)
+YuanGuardHV/tools/sigtest/sigtest.exe
+YuanGuardHV/tools/strtabtest/strtabtest.exe

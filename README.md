@@ -125,7 +125,7 @@ CPU 占用：自旋版 100% → **阻塞版 21–29%**（tick 循环用 `KeDelay
 ```
 YuanGuardHV/
 ├── build.bat                 构建（源级检查 → clang-cl → link → 签名）
-├── hv/                       内核源码（41 个文件）
+├── hv/                       内核源码（43 个文件）
 │   ├── svm_simplevm206.cpp   206 主线（vendored SimpleSvm + 4 处缝合）
 │   ├── svm_simplevm206_x64.asm  VMRUN 循环 / 桩 / 退出 thunk
 │   ├── npt_core.c            NPT 映射与权限
@@ -134,7 +134,7 @@ YuanGuardHV/
 │   ├── yghv_guard.c          隐藏表完整性（SHA-256）
 │   ├── yghv_sentry.c         攻击面清单与 escape 记录
 │   └── common/               头文件（33 个）
-├── tests/                    构建期检查器（18 个脚本 + 2 个运行器）
+├── tests/                    构建期检查器（19 个脚本 + 2 个运行器）
 ├── tools/
 │   ├── yghv_ctl.ps1          PowerShell 客户端（80 条命令）
 │   └── yghv_client/          Java 客户端（18 条命令）
@@ -358,7 +358,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File $ctl mem-read <pid> <hex_va>
 
 ## 测试
 
-### 构建期检查器（`tests\`，17 个脚本 + 2 个运行器）
+### 构建期检查器（`tests\`，19 个脚本 + 2 个运行器）
 
 | 脚本 | 检查什么 |
 |---|---|
@@ -378,6 +378,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File $ctl mem-read <pid> <hex_va>
 | **`eol_check.ps1`** | **行尾门**：同一文件不许混用 CRLF 与裸 LF，也不许有孤立 CR（混排会把 +37 行的真实改动撑成 1301 行 diff）|
 | **`source_citation_check.ps1`** | **引用门**：文档里 `文件.c:123` 形式的引用必须指向真实存在的、非空行（行号越界会报，**漂移到空行也会报** —— 9.587 手工审计 18 条里有 7 条已漂移，且全部仍在文件内）|
 | `page_layout_check.ps1` | 隐藏表不与 guard 状态共页、岛内读区域页对齐（链接后跑）|
+| `string_encryption_check.ps1` | 生成表与 `tools/gen_strtab.py` 逐字节一致；镜像里没有任何导出名以 ASCII 或 UTF-16 形式残留（链接后跑，覆盖 import table 这种源码 grep 看不见的来源）|
 
 > **每个检查器都必须能失败。** 三个曾报假 PASS（正则够不到目标文本）。
 > 现在 **9 个变异 + 2 条反向对照**在每次构建时跑：往副本注入真缺陷要求抓到，

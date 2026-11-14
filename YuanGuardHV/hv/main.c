@@ -8,6 +8,8 @@
 #include "protect.h"
 #include "debug.h"
 #include "yghv_unload_trace.h"   /* 9.390: unload progress record */
+#include "common/yghv_nt.h"     /* 9.589: native offsets + accessors */
+#include "common/yghv_sig.h"    /* 9.589: signature / accessor scan */
 
 #define YGHV_R1_SKIP_NPT_TEST 0
 #define YGHV_R1_NPT_UNIT_TEST 1
@@ -5455,6 +5457,52 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
     KeSetSystemAffinityThread((KAFFINITY)1);
     yghv_init_auth_cookie();
     yghv_trace_init();
+    /*
+     * 9.589: derive the EPROCESS/ETHREAD offsets before anything could want them.
+     *
+     * These come from ntoskrnl own exported accessors, not from a hardcoded table:
+     * each PsGetXxx is "load one field of RCX and return", so disassembling its
+     * body yields the offset for the build that is actually running. A table would
+     * be a delayed fuse - right on the build it was typed for, silently reading the
+     * neighbouring field afterwards, with correct width and plausible value.
+     *
+     * Failure here is NOT fatal to load: a driver that cannot derive an offset also
+     * cannot use it, so the features that need one fail and the rest carry on. What
+     * is rejected is the alternative - writing a guess and letting it read memory
+     * that looks like a process.
+     */
+    {
+        NTSTATUS offSt = yghv_offsets_init();
+        uint64_t offStats[4];
+
+        yghv_offsets_stats(offStats);
+        if (!NT_SUCCESS(offSt) || !yghv_offsets_ready()) {
+            LOG_ERROR("offsets: derivation FAILED 0x%x derived=0x%llx failures=%llu",
+                      offSt, offStats[0], offStats[2]);
+        } else {
+            LOG_INFO("offsets: derived=0x%llx validated=0x%llx build=%llu",
+                     offStats[0], offStats[1], offStats[3]);
+        }
+    }
+    /*
+     * 9.589: the signature engine proving itself against the image it is running in.
+     *
+     * It rebuilds each accessor pattern from the derived offset and demands exactly
+     * one hit sitting on the address MmGetSystemRoutineAddress reports. Two facts at
+     * once: the derivation and the search agree, and the pattern really is unique.
+     * Non-fatal for the same reason as above.
+     */
+    {
+        int sigOk = yghv_sig_selftest();
+        uint64_t sigStats[8];
+
+        yghv_sig_stats(sigStats);
+        if (sigOk)
+            LOG_INFO("sig: self-test ok, %llu case(s)", sigStats[5]);
+        else
+            LOG_ERROR("sig: self-test FAILED ok=%llu fail=%llu hits=%llu",
+                      sigStats[5], sigStats[6], sigStats[2]);
+    }
     /* 9.304: hand the service's own registry path to the persistence layer
      * BEFORE protect_init, which loads the saved settings. */
     yghv_protect_set_registry_path(r);

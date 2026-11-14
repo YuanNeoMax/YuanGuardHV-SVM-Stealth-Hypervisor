@@ -22,6 +22,7 @@
 #include "yghv_guard.h"    /* Tier 7.1/7.3: self-hiding + integrity */
 #include "yghv_sentry.h"   /* Tier 7.4/7.5/7.6: timing/escape/surface */
 #include "yghv_auth.h"     /* 9.371 (Tier 9.2): authenticated commands */
+#include "common/yghv_nt.h" /* 9.590: pid via derived offset, not the import */
 #include "debug.h"
 
 /*
@@ -63,7 +64,6 @@ extern UINT32   yghv_ut_last_step(void);
 extern UINT64   yghv_ut_last_value(void);
 
 NTKERNELAPI PEPROCESS IoGetRequestorProcess(PIRP Irp);
-NTKERNELAPI HANDLE PsGetProcessId(PEPROCESS Process);
 /* Phase 1: the WDK km headers here do not declare this, so declare it
  * explicitly (the project does the same for the others above). */
 NTKERNELAPI NTSTATUS PsLookupProcessByProcessId(HANDLE ProcessId,
@@ -760,7 +760,7 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
         }
         if (!yghv_protect_is_target_cr3(caller_cr3)) {
             status = yghv_protect_set_target(
-                (uint32_t)(ULONG_PTR)PsGetProcessId(req_proc));
+                (uint32_t)(ULONG_PTR)yghv_proc_id(req_proc));
             if (!NT_SUCCESS(status))
                 break;
         }

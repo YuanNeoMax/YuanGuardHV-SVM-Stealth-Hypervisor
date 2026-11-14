@@ -15,7 +15,10 @@ if (-not (Test-Path $map)) {
 }
 
 $scripts = @(
-    'page_layout_check.ps1'
+    'page_layout_check.ps1',
+    # 9.590: judges the LINKED image (plaintext export names), so it can
+    # only run after link.exe -- same reason page_layout_check lives here.
+    'string_encryption_check.ps1'
 )
 
 foreach ($script in $scripts) {

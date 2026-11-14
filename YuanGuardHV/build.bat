@@ -100,6 +100,15 @@ if "%YGHV_V101_4VEC%"=="1" set "CFLAGS=%CFLAGS% /DYGHV_V101_4VEC=1"
 
 set "LINKS=/nologo /SUBSYSTEM:NATIVE /DRIVER:WDM /ENTRY:DriverEntry /MACHINE:X64"
 set "LINKS=%LINKS% /OPT:NOREF,NOICF"
+rem 9.590: /Brepro makes the image byte-identical across rebuilds.
+rem Measured cause of the churn: the PE header carries a link timestamp,
+rem so the same sources produced a different SHA256 every time. That made
+rem docs_check owner of a number nobody could reproduce - the documented
+rem hash was right only for the one build that wrote it, and every rebuild
+rem had to edit two documents before the static checks would pass again.
+rem A reproducible hash turns that field into a real assertion: it now
+rem says the sources produce this image, which is checkable by anyone.
+set "LINKS=%LINKS% /Brepro"
 rem 9.304: emit a MAP file. Three BSODs this session had to be triaged by hand
 rem (disassembling raw bytes and reading .pdata) because no symbol map existed;
 rem with /MAP, "yghv+0x12e13" resolves to a named function in one lookup.
@@ -110,7 +119,7 @@ echo   WDK Version: %WDK_VER%
 echo   Compiling...
 
 rem 2026-10-11 Phase 1: mem_pte added (page-table walk, Engine B foundation).
-for %%f in (main svm_core npt_core vmexit vmmcall multi_core protect control_device loader_stealth svm_simplevm_port mem_pte mem_pa mem_engine mem_scan mem_bench mem_share yghv_sections mem_selfmap mem_coop mem_island mem_view mem_watch mem_time mem_cache mem_bp mem_frame yghv_fail yghv_guard yghv_crypto yghv_auth yghv_channel yghv_unload_trace yghv_sentry) do call :compile %%f || goto :error
+for %%f in (main svm_core npt_core vmexit vmmcall multi_core protect control_device loader_stealth svm_simplevm_port mem_pte mem_pa mem_engine mem_scan mem_bench mem_share yghv_sections mem_selfmap mem_coop mem_island mem_view mem_watch mem_time mem_cache mem_bp mem_frame yghv_fail yghv_guard yghv_crypto yghv_auth yghv_channel yghv_unload_trace yghv_sentry yghv_offsets yghv_sig) do call :compile %%f || goto :error
 
 echo   svm_trampoline.S
 "%CLANG_CL%" %CFLAGS% %INCLUDES% /c /Fo"%BIN_DIR%\svm_trampoline.obj" "%HV_DIR%\svm_trampoline.S"
@@ -175,6 +184,8 @@ set "LIB=%SS_LIB%"
     "%BIN_DIR%\yghv_channel.obj" ^
     "%BIN_DIR%\yghv_unload_trace.obj" ^
     "%BIN_DIR%\yghv_sentry.obj" ^
+    "%BIN_DIR%\yghv_offsets.obj" ^
+    "%BIN_DIR%\yghv_sig.obj" ^
     "%BIN_DIR%\svm_simplevm_port.obj" ^
     "%BIN_DIR%\svm_simplevm_port_asm.obj" ^
     "%BIN_DIR%\svm_trampoline.obj" ^
