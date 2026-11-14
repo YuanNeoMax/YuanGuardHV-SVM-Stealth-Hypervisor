@@ -12,6 +12,18 @@
 
 ---
 
+## v0.4.14 — 回调隐藏（从枚举链表摘除）
+
+### Added
+- `yghv_obguard_hide_callback()`：ObRegisterCallbacks 注册后从内核枚举链表中摘除回调注册结构，使 PCHunter / WinObjEx64 等工具看不到。
+
+### Known limitations
+- handle 内部结构未公开，list entry offset 0x00 基于 Windows 10 实测推断。
+- 没上机。
+
+### Verification
+- 单文件编译零诊断；全量构建 EXIT=0，镜像 SHA256 = ad81fc5b833129d42cfeefafbd1e5f016ac866d256ed8e647d2f27c4703cf7ae。
+
 ## v0.4.13 — OB 回调 altitude 去签名化
 
 ### Changed
