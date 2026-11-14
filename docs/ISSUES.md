@@ -43,6 +43,7 @@
 |---|---|---|---|
 | **P1-1** | `mem-bp dr` 是拒绝态 | 9.507 改成 `REFUSED`，**功能不存在** | 真修需要写 VMCB `Dr7` + 在 VM-exit 帧调 `on_dr`；9.413/9.414/9.416 三次证明那里加 call 会 `0x139`/`0x7F`。**独立一轮，不进 0.4.1** |
 | **P1-4** | `IOCTL_YGHV_PROC`的十个 op **全部没上机** | 9.591 接入的能力面。编译通过、`dumpbin /imports` 确认六条新符号在 IAT 里，但**「进了 IAT」与「行为正确」是两件事** | 部署 v0.4.3 镜像后逐 op 实测（需 operator 确认）；至少要跑一遍 `proc` / `proc <pid>` / `proc offsets` 三个读 op |
+| **P1-5** | `IOCTL_YGHV_INJECT` 的五个原语 **全部没上机** | 9.592 接入。编译通过、`dumpbin /imports` 确认 `ZwAllocateVirtualMemory` / `RtlCreateUserThread` / `KeInitializeApc` / `KeInsertQueueApc` 等八条符号在 IAT 里，但**「进了 IAT」与「行为正确」是两件事**。风险最高的是 `write`：请求头 40 字节、回复头 64 字节，payload 跨过回复头，一旦拷贝顺序错了就是「写成功、目标里一段零」 | 部署后先跑只读的 `inject`（计数器）；再 `alloc` + `write` 一个 16 字节串到记事本进程并`mem-read` 回读比对；`thread` / `apc` 各需一次可控的目标程序。**需 operator 确认** |
 | **P1-2** | `DENY` 的 AV 报告地址为 VA 0 | `MmGetVirtualForPhysical` 选择性失效 | 语义无损（确定性递 AV、零风暴）。**接受为限制**，不修 |
 | **P1-3a** | ~~同步守卫的计数器不可读~~ | ✅ **9.582 已做**：`sync-stats` 读出 8 个计数器（含 `hits`=回滚次数）；真 guest 下开 sync 稳定 | — |
 | **P1-3b** | ~~`protect-page` 对 mmf 页返回 `0x490`~~ | ✅ **9.584 实测确认**：缺 `set-target <pid>` 时报 `0x490 ERROR_NOT_FOUND`，补上后同页同 pid 立即 `OK`。根因确认，非 mmf 限制 | — |

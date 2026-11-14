@@ -24,6 +24,7 @@
 #include "yghv_auth.h"     /* 9.371 (Tier 9.2): authenticated commands */
 #include "common/yghv_nt.h" /* 9.590: pid via derived offset, not the import */
 #include "common/yghv_proc.h" /* 9.591: process / thread control policy */
+#include "common/yghv_inject.h" /* 9.592: injection primitives */
 #include "debug.h"
 
 /*
@@ -3685,6 +3686,30 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
             ULONG procInfo = 0;
             status = yghv_proc_dispatch(buf, in_len, buf, out_len, &procInfo);
             if (NT_SUCCESS(status)) info = procInfo;
+        }
+        break;
+
+    /*
+     * 9.592: injection primitives.
+     *
+     * The WRITE op carries a payload AFTER the request header, inside the same
+     * METHOD_BUFFERED buffer. It is passed as an explicit pointer rather than
+     * letting the callee recompute it, so the one place that knows where the
+     * payload starts is the one place that knows how long the input is.
+     */
+    case IOCTL_YGHV_INJECT:
+        if (in_len < sizeof(yghv_ioctl_inject_req_t)) {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        {
+            ULONG injInfo = 0;
+            const UCHAR *injPayload = (const UCHAR *)buf + sizeof(yghv_ioctl_inject_req_t);
+            ULONG injPayloadLen = in_len - (ULONG)sizeof(yghv_ioctl_inject_req_t);
+
+            status = yghv_inject_dispatch(buf, injPayload, injPayloadLen,
+                                          buf, out_len, &injInfo);
+            if (NT_SUCCESS(status)) info = injInfo;
         }
         break;
 

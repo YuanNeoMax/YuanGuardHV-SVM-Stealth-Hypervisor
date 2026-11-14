@@ -890,4 +890,45 @@ typedef struct {
     UCHAR     name[32];
 } yghv_ioctl_proc_req_t;
 
+/*
+ * 9.592: injection primitives. A SEPARATE function number from PROC because the
+ * request carries a payload that follows the header, and folding that into the
+ * 56-byte PROC struct would mean either a 32-byte payload ceiling or a variable
+ * struct that the PROC ops would then have to bounds-check against.
+ *
+ *   op 0 ALLOC   pid, va (in: preferred / out: granted), arg0 = size, flags = protect
+ *   op 1 WRITE   pid, va, arg0 = length; payload follows this header
+ *   op 2 FREE    pid, va, arg0 = size
+ *   op 3 THREAD  pid, arg0 = start VA, arg1 = argument, flags bit0 = suspended
+ *   op 4 APC     pid, arg0 = routine VA, arg1 = argument, flags = thread id
+ *   op 5 STATS   --                          -> 8 qwords
+ *
+ * Every op replies with the same 8-qword header:
+ *   [0] ok (1/0)  [1] status or count  [2] va / tid  [3] bytes  [4..7] reserved
+ */
+#define IOCTL_YGHV_INJECT     YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x839, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
+
+#define YGHV_INJECT_HDR_QWORDS 8
+#define YGHV_INJECT_OUT_QWORDS 512
+#define YGHV_INJECT_MAX_PAYLOAD 4000
+
+#define YGHV_INJECT_OP_ALLOC  0
+#define YGHV_INJECT_OP_WRITE  1
+#define YGHV_INJECT_OP_FREE   2
+#define YGHV_INJECT_OP_THREAD 3
+#define YGHV_INJECT_OP_APC    4
+#define YGHV_INJECT_OP_STATS  5
+
+#define YGHV_INJECT_F_SUSPEND 0x1u
+
+typedef struct {
+    ULONG     op;
+    ULONG     pid;
+    ULONG_PTR va;
+    ULONG_PTR arg0;
+    ULONG_PTR arg1;
+    ULONG     flags;
+    ULONG     _pad;
+} yghv_ioctl_inject_req_t;
+
 #endif

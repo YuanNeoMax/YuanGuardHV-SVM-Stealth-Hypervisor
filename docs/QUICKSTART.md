@@ -60,7 +60,7 @@ Get-Content C:\Windows\yghv_progress.log | Select-String "invmrun at unload"
 | 驱动 | `yghvpa` · **STOPPED** · 设备 `\\.\YuanGuardHV` |
 | 最新编号 | **9.588** |
 | 工作树 | 干净 |
-| 静态检查 | **17 个源级脚本 / 49 条 PASS**（含 **33** 条自检）+ 1 个 map 脚本，两个运行器全绿（9.588 实测）；客户端 **PowerShell 81 / Java 18** 条命令、IOCTL **57** 个 |
+| 静态检查 | **17 个源级脚本 / 49 条 PASS**（含 **33** 条自检）+ 1 个 map 脚本，两个运行器全绿（9.588 实测）；客户端 **PowerShell 82 / Java 18** 条命令、IOCTL **58** 个 |
 | 构建产物 | `bin/yuanguard_hv.sys` = `A8452F9BAECA7AE8`（9.588 构建）|
 | 部署镜像 | `C:\yghv_pa.sys` = `BCC4FECDEA8DCEE5` —— **与当前 `bin` 不同**：9.588 的构建尚未部署，验收要的那一步（`mem-bp dr` 真正命中）还没做 |
 | **最近一次卸载** | `invmrun at unload = 0x0`，无蓝屏（9.513）|

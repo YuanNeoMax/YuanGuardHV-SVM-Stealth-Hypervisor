@@ -5248,6 +5248,162 @@ try {
             $nm = [Text.Encoding]::ASCII.GetString($out, 64, 16).TrimEnd([char]0)
             Write-Host ("proc: pid={0} image='{1}'" -f $qp, $nm)
         }
+        'inject' {
+            # 9.592: the five injection primitives (IOCTL 0x839).
+            #
+            # There is deliberately no "inject-dll" command here. A DLL
+            # injection is three calls to this command in a row, and hiding that
+            # composition behind one verb would mean the kernel has to resolve
+            # kernel32!LoadLibraryW itself - which needs three more structure
+            # offsets, each of which fails silently when it is wrong. The client
+            # already has GetProcAddress, so it passes the address.
+            #
+            #   inject                          driver counters
+            #   inject alloc <pid> <size> [hex_protect]
+            #   inject write <pid> <hex_va> <hex_bytes>
+            #   inject free  <pid> <hex_va>
+            #   inject thread <pid> <hex_start> [hex_arg] [suspended]
+            #   inject apc   <pid> <tid> <hex_routine> [hex_arg]
+            #
+            # Request header is 40 bytes; for WRITE the payload follows it, which
+            # is why the driver takes a separate payload pointer instead of
+            # recomputing the offset on its side.
+            function New-InjReq([uint32]$op, [uint32]$pidVal, [uint64]$va, [uint64]$a0, [uint64]$a1, [uint32]$fl) {
+                $req = New-Object byte[] 40
+                [BitConverter]::GetBytes([uint32]$op).CopyTo($req, 0)
+                [BitConverter]::GetBytes([uint32]$pidVal).CopyTo($req, 4)
+                [BitConverter]::GetBytes([uint64]$va).CopyTo($req, 8)
+                [BitConverter]::GetBytes([uint64]$a0).CopyTo($req, 16)
+                [BitConverter]::GetBytes([uint64]$a1).CopyTo($req, 24)
+                [BitConverter]::GetBytes([uint32]$fl).CopyTo($req, 32)
+                return ,$req
+            }
+            function Get-InjErr([uint64]$c) {
+                switch ($c) {
+                    0  { 'OK' }
+                    1  { 'no such process' }
+                    2  { 'open refused (protected?)' }
+                    3  { 'bad size' }
+                    4  { 'allocate failed' }
+                    5  { 'write failed' }
+                    6  { 'create thread failed' }
+                    7  { 'thread not in that process' }
+                    8  { 'APC refused' }
+                    9  { 'free failed' }
+                    default { ('code {0}' -f $c) }
+                }
+            }
+
+            if ($null -eq $Arg1) {
+                $req = New-InjReq 5 0 0 0 0 0
+                $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x839)) -InBytes $req -OutputLength 4096
+                Write-Host ("inject: allocs={0} writes={1} threads={2} apcs={3}" -f  [BitConverter]::ToUInt64($out, 0), [BitConverter]::ToUInt64($out, 8),  [BitConverter]::ToUInt64($out, 16), [BitConverter]::ToUInt64($out, 24))
+                Write-Host ("inject: frees={0} fails={1} bytes={2} apc_live={3}" -f  [BitConverter]::ToUInt64($out, 32), [BitConverter]::ToUInt64($out, 40),  [BitConverter]::ToUInt64($out, 48), [BitConverter]::ToUInt64($out, 56))
+                return
+            }
+
+            $v = "$Arg1".ToLower()
+
+            if ($v -eq 'alloc') {
+                if ($null -eq $Arg2 -or $null -eq $Arg3) { throw 'inject alloc: usage: inject alloc <pid> <size> [hex_protect]' }
+                $p = [uint32]::Parse($Arg2)
+                $sz = [uint64]::Parse($Arg3)
+                $pr = [uint32]0
+                if ($null -ne $Arg4) { $pr = [uint32]::Parse($Arg4) }
+                $req = New-InjReq 0 $p 0 $sz 0 $pr
+                $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x839)) -InBytes $req -OutputLength 4096
+                $ok = [BitConverter]::ToUInt64($out, 0)
+                $rc = [BitConverter]::ToUInt64($out, 8)
+                $va = [BitConverter]::ToUInt64($out, 16)
+                if ($ok -ne 0) {
+                    Write-Host ("inject alloc: pid={0} va=0x{1:X} size=0x{2:X}" -f $p, $va, $sz)
+                } else {
+                    Write-Host ("inject alloc: pid={0} FAILED: {1}" -f $p, (Get-InjErr $rc))
+                }
+                return
+            }
+
+            if ($v -eq 'write') {
+                if ($null -eq $Arg2 -or $null -eq $Arg3 -or $null -eq $Arg4) {
+                    throw 'inject write: usage: inject write <pid> <hex_va> <hex_bytes>'
+                }
+                $p = [uint32]::Parse($Arg2)
+                $va = [Convert]::ToUInt64(($Arg3 -replace '^0[xX]', ''), 16)
+                $hex = ($Arg4 -replace '^0[xX]', '')
+                if ($hex.Length % 2 -ne 0) { throw 'inject write: hex payload needs an even number of digits' }
+                $n = $hex.Length / 2
+                if ($n -gt 4000) { throw 'inject write: payload above 4000 bytes; chunk it' }
+                $payload = New-Object byte[] $n
+                for ($i = 0; $i -lt $n; $i++) { $payload[$i] = [Convert]::ToByte($hex.Substring($i * 2, 2), 16) }
+
+                $req = New-Object byte[] (40 + $n)
+                [BitConverter]::GetBytes([uint32]1).CopyTo($req, 0)
+                [BitConverter]::GetBytes($p).CopyTo($req, 4)
+                [BitConverter]::GetBytes([uint64]$va).CopyTo($req, 8)
+                [BitConverter]::GetBytes([uint64]$n).CopyTo($req, 16)
+                $payload.CopyTo($req, 40)
+
+                $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x839)) -InBytes $req -OutputLength 4096
+                $ok = [BitConverter]::ToUInt64($out, 0)
+                $rc = [BitConverter]::ToUInt64($out, 8)
+                $done = [BitConverter]::ToUInt64($out, 16)
+                if ($ok -ne 0) {
+                    Write-Host ("inject write: pid={0} va=0x{1:X} {2} byte(s)" -f $p, $va, $done)
+                } else {
+                    Write-Host ("inject write: pid={0} va=0x{1:X} FAILED after {2} byte(s): {3}" -f  $p, $va, $done, (Get-InjErr $rc))
+                }
+                return
+            }
+
+            if ($v -eq 'free') {
+                if ($null -eq $Arg2 -or $null -eq $Arg3) { throw 'inject free: usage: inject free <pid> <hex_va>' }
+                $p = [uint32]::Parse($Arg2)
+                $va = [Convert]::ToUInt64(($Arg3 -replace '^0[xX]', ''), 16)
+                $req = New-InjReq 2 $p $va 0 0 0
+                $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x839)) -InBytes $req -OutputLength 4096
+                $ok = [BitConverter]::ToUInt64($out, 0)
+                Write-Host ("inject free: pid={0} va=0x{1:X} {2}" -f $p, $va, $(if ($ok -ne 0) { 'OK' } else { (Get-InjErr ([BitConverter]::ToUInt64($out, 8))) }))
+                return
+            }
+
+            if ($v -eq 'thread') {
+                if ($null -eq $Arg2 -or $null -eq $Arg3) { throw 'inject thread: usage: inject thread <pid> <hex_start> [hex_arg] [suspended]' }
+                $p = [uint32]::Parse($Arg2)
+                $start = [Convert]::ToUInt64(($Arg3 -replace '^0[xX]', ''), 16)
+                $arg = [uint64]0
+                if ($null -ne $Arg4) { $arg = [Convert]::ToUInt64(($Arg4 -replace '^0[xX]', ''), 16) }
+                $fl = [uint32]0
+                if ($null -ne $Arg5 -and "$Arg5".ToLower() -eq 'suspended') { $fl = [uint32]1 }
+                $req = New-InjReq 3 $p 0 $start $arg $fl
+                $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x839)) -InBytes $req -OutputLength 4096
+                $ok = [BitConverter]::ToUInt64($out, 0)
+                $tid = [BitConverter]::ToUInt64($out, 16)
+                if ($ok -ne 0) {
+                    Write-Host ("inject thread: pid={0} tid={1} start=0x{2:X} {3}" -f $p, $tid, $start, $(if ($fl -ne 0) { '(created suspended)' } else { '(running)' }))
+                } else {
+                    Write-Host ("inject thread: pid={0} FAILED: {1}" -f $p, (Get-InjErr ([BitConverter]::ToUInt64($out, 8))))
+                }
+                return
+            }
+
+            if ($v -eq 'apc') {
+                if ($null -eq $Arg2 -or $null -eq $Arg3 -or $null -eq $Arg4) {
+                    throw 'inject apc: usage: inject apc <pid> <tid> <hex_routine> [hex_arg]'
+                }
+                $p = [uint32]::Parse($Arg2)
+                $tid = [uint32]::Parse($Arg3)
+                $rt = [Convert]::ToUInt64(($Arg4 -replace '^0[xX]', ''), 16)
+                $arg = [uint64]0
+                if ($null -ne $Arg5) { $arg = [Convert]::ToUInt64(($Arg5 -replace '^0[xX]', ''), 16) }
+                $req = New-InjReq 4 $p 0 $rt $arg $tid
+                $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x839)) -InBytes $req -OutputLength 4096
+                $ok = [BitConverter]::ToUInt64($out, 0)
+                Write-Host ("inject apc: pid={0} tid={1} routine=0x{2:X} {3}" -f $p, $tid, $rt, $(if ($ok -ne 0) { 'QUEUED (fires at the next alertable wait)' } else { (Get-InjErr ([BitConverter]::ToUInt64($out, 8))) }))
+                return
+            }
+
+            throw 'inject: usage: inject [alloc <pid> <size> [prot]|write <pid> <va> <hex>|free <pid> <va>|thread <pid> <start> [arg] [suspended]|apc <pid> <tid> <routine> [arg]]'
+        }
         default {
             throw ("unknown command: {0}" -f $Command)
         }

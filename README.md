@@ -125,7 +125,7 @@ CPU 占用：自旋版 100% → **阻塞版 21–29%**（tick 循环用 `KeDelay
 ```
 YuanGuardHV/
 ├── build.bat                 构建（源级检查 → clang-cl → link → 签名）
-├── hv/                       内核源码（44 个文件）
+├── hv/                       内核源码（45 个文件）
 │   ├── svm_simplevm206.cpp   206 主线（vendored SimpleSvm + 4 处缝合）
 │   ├── svm_simplevm206_x64.asm  VMRUN 循环 / 桩 / 退出 thunk
 │   ├── npt_core.c            NPT 映射与权限
@@ -133,10 +133,10 @@ YuanGuardHV/
 │   ├── mem_*.c               内存引擎（read/write/pte/bp/cache/frame/watch/...）
 │   ├── yghv_guard.c          隐藏表完整性（SHA-256）
 │   ├── yghv_sentry.c         攻击面清单与 escape 记录
-│   └── common/               头文件（39 个）
+│   └── common/               头文件（40 个）
 ├── tests/                    构建期检查器（19 个脚本 + 2 个运行器）
 ├── tools/
-│   ├── yghv_ctl.ps1          PowerShell 客户端（81 条命令）
+│   ├── yghv_ctl.ps1          PowerShell 客户端（82 条命令）
 │   └── yghv_client/          Java 客户端（18 条命令）
 └── docs/                     见 docs/INDEX.md
 tools/                        独立工具
@@ -331,7 +331,7 @@ Get-Content C:\Windows\yghv_progress.log | Select-String "invmrun at unload"
 
 ### PowerShell 客户端
 
-`tools\yghv_ctl.ps1` —— **81 条命令**，覆盖控制面、内存引擎、保护、隐藏、诊断。
+`tools\yghv_ctl.ps1` —— **82 条命令**，覆盖控制面、内存引擎、保护、隐藏、进程控制、注入、诊断。
 
 ```powershell
 $ctl = 'D:\yuanguard\YuanGuardHV\tools\yghv_ctl.ps1'
@@ -362,7 +362,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File $ctl mem-read <pid> <hex_va>
 
 | 脚本 | 检查什么 |
 |---|---|
-| `ioctl_parity.ps1` | C ↔ PowerShell ↔ Java ↔ JNI 的 IOCTL 编号一致（当前 **56/56/56**）|
+| `ioctl_parity.ps1` | C ↔ PowerShell ↔ Java ↔ JNI 的 IOCTL 编号一致（当前 **58/58/58**）|
 | `command_parity.ps1` | README ↔ 两个客户端的命令一致（当前 **PS=79 / Java=18**）|
 | `safety_checks.ps1` | 安全红线（pause-under-lock 作用域、`STATUS_DEVICE_BUSY`、`0x5AA` 命名）|
 | `irql_contract_check.ps1` | IRQL 可达性、岛内读区域、不许有「说谎的 `*_bare`」|

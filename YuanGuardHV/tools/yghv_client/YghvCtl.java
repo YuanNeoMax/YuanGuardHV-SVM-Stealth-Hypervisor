@@ -127,6 +127,7 @@ public class YghvCtl {
      case so the ioctl parity check stays a real check; the PowerShell client is
      where this one is exercised from. */
   private static final int FN_PROC = 0x838;
+  private static final int FN_INJECT = 0x839;
 
     private static native long openHandle();
     private static native void closeHandle(long handle);

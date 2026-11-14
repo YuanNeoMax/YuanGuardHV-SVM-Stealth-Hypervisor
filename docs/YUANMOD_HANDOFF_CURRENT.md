@@ -29,7 +29,7 @@
 
 ---
 
-## 记录索引（9.591 重新测量，77 条）
+## 记录索引（9.592 重新测量，78 条）
 
 > 这是本文档自己的目录。**按标题扫一眼，找到要的那条，再跳过去读。**
 > 行数是该记录占的篇幅，用来判断"值不值得读全文"。
@@ -113,6 +113,7 @@
 | 9.589 原生结构访问 + 偏移推导 + 特征码定位：四种访问器边界，sigtest 用户态验收 | 66 |
 | 9.590 加密落地 + 导出名从镜像里彻底消掉：最后一条明文来自 import table | 55 |
 | 9.591 进程/线程控制面接进门：偏移表追加、十 op 分发、三客户端同步 | 121 |
+| 9.592 注入原语接进门：五原语一 IOCTL、APC 属主校验、payload 跨回复头 | 148 |
 
 ---
 
@@ -4353,6 +4354,154 @@ op 0–9 全部只有代码，**没有一条在真机上跑过**（`C:\yghv_pa.s
 本轮的镜像没部署）。能力面清单里的其余项目 —— PP/PPL 的窗口防截图、注入原语（APC / 消息 / shellcode /
 远程 DLL）、CR3 解密与页表分析、无痕通信扩展 —— 都还没开始。
 
+#### 9.592 注入原语接进门：五个原语、一个 IOCTL、三客户端同步
+
+##### 一、这一轮接的是什么
+
+9.591 把进程控制面接进门（IOCTL **0x838**，十个 op），但能力面清单里「注入」整块还空着：
+无痕注入、远程 DLL 注入、APC、窗口消息注入、shellcode。这一轮落的是其中能内核化的那一半，
+写成 `hv/yghv_inject.c` 与 `IOCTL_YGHV_INJECT`（函数号 **0x839**）。
+
+**五个原语，不是十五个。** `alloc` / `write` / `free` / `thread` / `apc`。
+DLL 注入是 `alloc + write(path) + thread(LoadLibraryW, path)`，
+shellcode 注入是 `alloc + write(bytes) + thread(bytes)`。
+把这两条组合路径各写成一个独立的内核函数，等于把同一份分配逻辑复制两遍、
+让两个 bug 有机会独立演化 —— 而组合本身在客户端是一行事。
+
+##### 二、函数地址由客户端传，不由内核解析
+
+最自然的做法是内核自己走 `PEB.Ldr` 找到 `kernel32!LoadLibraryW`。这条路需要三个额外结构偏移：
+`PEB.Ldr`、`LDR_DATA_TABLE_ENTRY.DllBase`、`IMAGE_EXPORT_DIRECTORY` 的三个字段。
+**每一个都是 build 相关的、错了会静默返回一个看起来合理的地址。**
+9.591 已经踩过一次同形状的坑（`PsGetProcessSignatureLevel` 解出 0x879，真值在 0x87A，差一个字节）。
+
+客户端本来就在用户态，有精确的 `GetProcAddress`。所以规格是：
+**`thread` 与 `apc` 的 `start_va` / `routine_va` 由调用者给。**
+内核只负责「在别人地址空间里分配、写、起线程、投 APC」，不负责猜地址。
+这条决定的代价是客户端必须先自己解析 `LoadLibraryW`；换来的是内核里少三个会安静出错的偏移。
+
+##### 三、每个原语只开它需要的权限
+
+`yghv_inj_open(pid, access, &handle, &proc)`：`PsLookupProcessByProcessId` 拿 EPROCESS，
+再 `ObOpenObjectByPointer(proc, OBJ_KERNEL_HANDLE, NULL, access, *PsProcessType, KernelMode, &h)`。
+
+三个细节：
+
+- **`PsProcessType` 是 `POBJECT_TYPE *`，要解一次**（`*PsProcessType`）。全树没有定义 `_NTHALLIB_`，
+  所以 `ntddk.h:111` 那一份（指针版）是生效的。
+- **权限按原语分开**：`alloc` 要 `PROCESS_VM_OPERATION`，`write` 走 `yghv_mem_write` 不需要句柄权限，
+  `thread` 要 `PROCESS_CREATE_THREAD`，`apc` 一个都不要。`PROCESS_ALL_ACCESS` 一次都不用 ——
+  它在受保护进程上必然失败，而且失败的形状和「注入被拦」一模一样，会把人引到错的方向。
+- **`STATUS_ACCESS_DENIED` 与「没这个进程」分开映射**（`_E_NO_HANDLE` / `_E_NO_TARGET`）。
+  这两种失败该给的人话完全不同。
+
+`PROCESS_VM_OPERATION`（0x0008）与 `PROCESS_CREATE_THREAD`（0x0002）在 WDK 10.0.19041.0 的
+`km/` 下不存在（`um/` 目录 40 个文件、不含 `winnt.h`），照样要 `#ifndef` 兜底 ——
+与 9.591 里 `PROCESS_TERMINATE` 那一批是同一个洞。
+
+##### 四、APC 必须校验线程属于目标进程
+
+`PsLookupThreadByThreadId` 只按 tid 找线程，而 **tid 是系统级唯一的**：传一个属于别的进程的 tid，
+依然能拿到一个合法的 `PETHREAD`，依然能 `KeInsertQueueApc` 成功。
+后果是：那个用户态例程地址落在**别的进程**的地址空间里，APC 触发一次就死在那个进程里，
+而发起方看到的是「投递成功」。这是最坏的一类错误 —— 成功返回值掩盖了错误的对象。
+
+所以队列之前有一步硬校验：`yghv_thread_process(thread) == proc`，不等就拒绝（`_E_TID`）。
+
+另外两点：`KeInitializeApc` 的环境参数用 `ORIGINAL` 而不是 `CURRENT`
+（`CURRENT` 绑定的是调用者此刻的进程，投递的线程在别的进程里）；`KeInsertQueueApc` 返回
+`FALSE` 时自己 `ExFreePoolWithTag` —— 未插入意味着内核例程永远不会跑，pool 归我们。
+
+##### 五、卸载顺序：APC 在 EPROCESS 摘链之前
+
+`yghv_inj_cleanup()` 挂在 `DriverUnload` 里、`yghv_proc_cleanup()` **之前**。
+理由是 APC 的 `KAPC` 结构在 non-paged pool 里，而 `NormalRoutine` 指向用户态、
+`KernelRoutine` 指向**本镜像**。先卸载驱动，那个内核例程就成了跳进已释放内存的地址。
+
+清理逻辑是边界等待而不是无限等待：
+
+```c
+while (apc_live > 0 && waited < YGHV_INJ_APC_WAIT_MS) {
+    KeDelayExecutionThread(KernelMode, FALSE, &interval_1ms);
+    waited++;
+}
+```
+
+超时就 `LOG_ERROR` 并继续卸载。**挂死卸载是另一种错**，而且更难查 —— 卡在卸载里的驱动
+看起来像「系统变慢」，不会有人往 APC 上想。事实留在 stats 里（`apc_live` 是第 8 个 qword）。
+
+##### 六、METHOD_BUFFERED 的第二个坑：请求头比回复头短
+
+9.591 记过一个：in == out 是同一块缓冲，`RtlZeroMemory(out)` 写在拷出请求之前会把 `op` 清零。
+这一轮的注入请求撞上它的变体：**请求头 40 字节、回复头 8 qword = 64 字节，而 payload 跟在请求头后面。**
+
+于是 `write` 的 payload 在缓冲里的位置是 `buf + 40`，而回复头的前 64 字节会把它整个盖掉。
+直接在原地读 payload 再去写目标进程，写进去的是回复头的内容 —— 而回复头此刻还是零。
+**写成功、返回成功、目标进程里是一段零。**
+
+修法不是调整顺序（顺序救不了，payload 跨过了回复头），而是
+**先 `ExAllocatePoolWithTag` 拷到池里再写**，写完 `ExFreePoolWithTag`。
+代价是一次 4 KB 以内的分配；换掉的是一类只在 `write` 上出现、跨进程才看得见的静默损坏。
+
+分发签名因此改成 `yghv_inject_dispatch(in, payload, payload_len, out, out_len, info)` ——
+payload 是一个单独的指针，由 `control_device.c` 按 `in_len - sizeof(req)` 算出来传进去，
+而不是让驱动自己再算一遍偏移（两处算同一个东西，迟早只改一处）。
+
+##### 七、接线与门
+
+- `control_device.c` 的 `case IOCTL_YGHV_INJECT:` 插在 `default:` 之前，body 含 `out_len`
+  （`ioctl_output_bounds.ps1` 判据）。这个 case 同样自动进 attack-surface 清单：
+  `:3687` 那条 `yghv_sentry_surface_add_ioctl` 对所有成功 case 生效。
+- 三客户端同步：`control_ioctl.h` 加 `IOCTL_YGHV_INJECT`（0x839）、`yghv_ctl.ps1` 加
+  `IoCtl(0x839)` 与 `inject` 命令（六个子命令）、`YghvCtl.java` 加 `FN_INJECT = 0x839`
+  （只加常量不加 `case`，满足 `ioctl_parity.ps1` 的数字集合又不进 `command_parity.ps1` 的 Java 计数）、
+  `tools/yghv_client/README.md` 加一行。
+- PowerShell 侧每个分支 `-OutputLength 4096`：`ioctl_buffer_size.ps1` 会拒「读了 offset 0
+  却要得比 `YGHV_INJECT_OUT_QWORDS` 少」的调用。
+
+##### 八、一次文档数字的翻车，和它暴露的方法错误
+
+为了改 README 里的树计数，用 `ls hv/ | grep -v / | wc -l` 量了一次，得到 **46**。
+写进 README，然后 `docs_check.ps1` 报 `claims 46, disk has 45`。
+
+错在 `ls`：**输出到管道时它不给目录加尾斜杠**，所以 `grep -v /` 一个目录也过滤不掉 ——
+数出来的是「45 个文件 + `common` 这个目录名」。`docs_check` 用的是
+`Get-ChildItem -File`，它天生只数文件，所以它是对的。
+
+这条值得单独记：**量数字的工具本身也要能被检查器推翻。** 我当时用的两个命令给了两个不同的答案
+（46 vs 45），而唯一的裁决权在门脚本手里 —— 这正是不写死数字、让 `docs_check` 每次重新量的价值。
+
+（顺带量出的另外两个数：`hv/common/*.h` = **40**；PowerShell 命令 **82** 条，Java 仍 **18** 条。）
+
+##### 九、构建验证
+
+```
+YGHV_BAREMETAL_STEP=206 YGHV_206B_COEXIST=1 YGHV_206B_GNPT=1 build.bat
+→ ALL MAP CHECKS PASS / Build SUCCESS
+镜像 SHA256 e31defa5214af6c9dd9c2987cea876c8f6cba6fc8da62e04ee541e3dced0cc7e
+```
+
+`dumpbin /imports` 确认八个新符号进了 IAT（导入总数 99 → 全部 ntoskrnl.exe）：
+
+```
+A6C ZwAllocateVirtualMemory     ABB ZwFreeVirtualMemory
+7EA RtlCreateUserThread         751 PsLookupThreadByThreadId
+47C KeInitializeApc             495 KeInsertQueueApc
+787 PsSuspendProcess            B55 ZwTerminateProcess
+```
+
+又一次「首次调用即自动进 IAT」—— 不需要改 build 配置。
+
+`run_source_checks.ps1`：`scripts=17 passes=49 selftests=33`，`ALL SOURCE CHECKS PASS`。
+
+##### 十、还没做的
+
+- **五个原语一次都没在真机上跑过**（`C:\yghv_pa.sys` 仍是 9.588 那一版，本轮镜像未部署）。
+- **窗口消息注入没接**：它是 `NtUserPostMessage` 那一侧的事（win32k），不是同一套机制。
+- **进程内的线程级挂起**：`KeSuspendThread` / `ZwSuspendThread` 在 ntoskrnl 里**不存在**，
+  只有进程级的 `PsSuspendProcess`（9.591 已用）。要单挂一个线程只能走 APC 冻结。
+- 能力面清单里剩下的：CR3 解密 / 页表分析、PP/PPL 与窗口防截图、无痕通信扩展。
+
 ## 本次会话结束时状态
 
 > 这一段曾被落在 9.564 而正文已经写到 9.582 —— 同一份文件里两个互相矛盾的状态，
@@ -4361,14 +4510,14 @@ op 0–9 全部只有代码，**没有一条在真机上跑过**（`C:\yghv_pa.s
 
 ```
 驱动          : STOPPED
-镜像          : bin == 4C826DCE80B10033
+镜像          : bin == e31defa5214af6c9
                 部署 C:\yghv_pa.sys 仍是 BCC4FECDEA8DCEE5（9.588 的构建还没部署，两者不再相同）
 默认配置      : 真 guest + 全核（9.577 起），12 线程 1.05-1.08×
 卸载          : 0.06-0.23 s，invmrun at unload = 0x0
 台账          : 8 完成 / 9 不做 / 1 需重启（Tier 6.1）
 静态检查      : 17 脚本 / 49 条 PASS（含 33 条自检），另 1 条链接后检查（tests/ 共 19 个脚本）
-文档检查      : docs_check PASS —— 57 md / 32 链接 / 76 记录 / 9 项
-最新编号      : 9.591
+文档检查      : docs_check PASS —— 57 md / 32 链接 / 78 记录 / 9 项
+最新编号      : 9.592
 ```
 
 **P1-1 的结论变了，但没结案。** 9.585 证明三次失败有一个共同原因：

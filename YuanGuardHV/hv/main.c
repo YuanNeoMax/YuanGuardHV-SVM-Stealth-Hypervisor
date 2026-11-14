@@ -11,6 +11,7 @@
 #include "common/yghv_nt.h"     /* 9.589: native offsets + accessors */
 #include "common/yghv_sig.h"    /* 9.589: signature / accessor scan */
 #include "common/yghv_proc.h"   /* 9.591: process / thread control */
+#include "common/yghv_inject.h" /* 9.592: injection primitives */
 
 #define YGHV_R1_SKIP_NPT_TEST 0
 #define YGHV_R1_NPT_UNIT_TEST 1
@@ -4940,6 +4941,15 @@ void DriverUnload(struct _DRIVER_OBJECT *d) {
      * enumeration that walks the list faults on the hole. There is no later
      * point in this function where the offsets are still valid.
      */
+    /*
+     * 9.592: drain queued user APCs before the image goes away. A KAPC holds
+     * non-paged pool and its kernel routine lives in THIS image; unloading
+     * first turns a pending injection into a jump into freed memory. The wait
+     * is bounded, so a stuck APC delays the unload instead of hanging it, and
+     * the count is left readable in yghv_inj_stats().
+     */
+    yghv_inj_cleanup();
+
     yghv_proc_cleanup();
 
     yghv_ut_snapshot_pre_unload(

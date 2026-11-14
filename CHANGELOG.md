@@ -12,6 +12,85 @@
 
 ---
 
+## v0.4.4 — 注入原语接入（能力面第二块扩张）
+
+**日期**：2026-11-14
+**范围**：v0.4.3..v0.4.4（工程记录 9.592）
+
+> v0.4.3 把「进程控制」接上了 IOCTL，这一轮把「注入」接上。
+> 落的是五个原语而不是十五条命令 —— DLL 注入与 shellcode 注入都是它们的组合，
+> 组合在客户端是一行事，在内核是两个独立演化的分配 bug。
+
+### Added
+
+- **`IOCTL_YGHV_INJECT`（函数号 0x839）与 `hv/yghv_inject.c`**（9.592）：五个原语。
+  `ALLOC`（`ZwAllocateVirtualMemory` 提交留驻，上限 1 MB）、`WRITE`（走 `yghv_mem_write`
+  的 A/B 双引擎，单块上限 64 KB）、`FREE`、`THREAD`（`RtlCreateUserThread`，可选择挂起创建）、
+  `APC`（`KeInitializeApc` + `KeInsertQueueApc`）、`STATS`。
+- **`hv/common/yghv_inject.h`**（新）：`yghv_inj_alloc` / `_write` / `_free` / `_thread` /
+  `_apc` / `_stats` / `_cleanup` 与十个错误码（`YGHV_INJ_E_NO_TARGET` …
+  `YGHV_INJ_E_OFFSETS`）。
+- **PowerShell `inject` 命令**（9.592）：`inject [alloc <pid> <size> [prot]|write <pid> <va> <hex>|
+  free <pid> <va>|thread <pid> <start> [arg] [suspended]|apc <pid> <tid> <routine> [arg]]`，
+  无参数时读八个计数器。
+
+### Changed
+
+- **函数地址由客户端传入，内核不解析**（9.592）：`thread` 的 `start_va` 与 `apc` 的
+  `routine_va` 都是调用者给的。走 `PEB.Ldr` 找 `kernel32!LoadLibraryW` 需要三个额外结构偏移
+  （`PEB.Ldr` / `LDR_DATA_TABLE_ENTRY.DllBase` / `IMAGE_EXPORT_DIRECTORY`），
+  每一个错了都会静默返回一个看起来合理的地址 —— 9.591 的 `PsGetProcessSignatureLevel`
+  解出 0x879（真值 0x87A）就是同形状的坑。客户端本来就有精确的 `GetProcAddress`。
+- **每个原语只开它需要的权限**（9.592）：`PROCESS_VM_OPERATION` / `PROCESS_CREATE_THREAD` 分开申请，
+  `PROCESS_ALL_ACCESS` 一次都不用（它在受保护进程上必然失败，失败形状与「注入被拦」一样，
+  会把人引到错方向）。`STATUS_ACCESS_DENIED` 与「没这个进程」分开映射成两个错误码。
+- `hv/common/control_ioctl.h` 追加 INJECT 块：`YGHV_INJECT_HDR_QWORDS 8`、
+  `YGHV_INJECT_OUT_QWORDS 512`、`YGHV_INJECT_MAX_PAYLOAD 4000`、
+  `yghv_ioctl_inject_req_t`（40 字节，payload 紧随其后）。
+- `hv/main.c` `DriverUnload` 的清理顺序：`yghv_inj_cleanup()` → `yghv_proc_cleanup()` →
+  `yghv_ut_snapshot_pre_unload(`。APC 的 `KernelRoutine` 指向**本镜像**，先卸载就是跳进已释放内存。
+- `YghvCtl.java` 加 `FN_INJECT = 0x839`（只加常量不加 `case`）。
+
+### Fixed
+
+- **`WRITE` 的 payload 跨过回复头**（9.592）：METHOD_BUFFERED 单缓冲里请求头 40 字节、
+  回复头 64 字节，payload 从 `buf + 40` 开始，**整个落在回复头覆盖范围内**。
+  原地读 payload 再写目标进程，写进去的是回复头此刻的内容（零）——
+  写成功、返回成功、目标里一段零。修法不是调整顺序（顺序救不了），
+  而是先 `ExAllocatePoolWithTag` 拷到池里再写。分发签名因此改成
+  `yghv_inject_dispatch(in, payload, payload_len, out, out_len, info)`，
+  payload 偏移由 `control_device.c` 算一次传进来，不在驱动里重算。
+- **APC 必须校验线程属于目标进程**（9.592）：`PsLookupThreadByThreadId` 只按 tid 找，
+  而 **tid 是系统级唯一的** —— 传别的进程的 tid 依然能成功入队，用户态例程地址落进
+  那个进程执行不了的地址空间，APC 触发一次就死，发起方看到的是「投递成功」。
+  现在队列前强制 `yghv_thread_process(thread) == proc`。
+- **README 树计数量错了一次，而且是量法错**（9.592）：`ls hv/ | grep -v / | wc -l` 得到 46，
+  写进 README 后被 `docs_check.ps1` 报 `claims 46, disk has 45`。
+  `ls` 输出到管道时不给目录加尾斜杠，`grep -v /` 一个目录也过滤不掉 ——
+  数出来的是「45 个文件 + `common` 这个目录名」。`docs_check` 用的是 `Get-ChildItem -File`，它是对的。
+
+### Known limitations
+
+- **五个原语一次都没有在真机上跑过**：`C:\yghv_pa.sys` 仍是 9.588 那一版，本轮镜像未部署。
+  `dumpbin /imports` 已确认 `ZwAllocateVirtualMemory` / `ZwFreeVirtualMemory` /
+  `RtlCreateUserThread` / `PsLookupThreadByThreadId` / `KeInitializeApc` /
+  `KeInsertQueueApc` 六条新符号进了 IAT，但「进了 IAT」与「行为正确」是两件事。
+- **窗口消息注入仍未接**：它走 win32k 的 `NtUserPostMessage` 那一侧，与这套原语不是同一机制。
+- **线程级挂起不存在**：ntoskrnl 没有 `KeSuspendThread` / `ZwSuspendThread`，
+  只有进程级 `PsSuspendProcess`（9.591 已用）。单挂一个线程只能走 APC 冻结。
+- 能力面清单里剩下的：CR3 解密 / 页表分析、PP/PPL 与窗口防截图、无痕通信扩展。
+- P1-4（`IOCTL_YGHV_PROC` 十个 op 未上机）与 P1-5（本轮五个原语未上机）见 `docs/ISSUES.md`。
+
+### Verification
+
+```
+YGHV_BAREMETAL_STEP=206 YGHV_206B_COEXIST=1 YGHV_206B_GNPT=1 build.bat
+-> ALL MAP CHECKS PASS / Build SUCCESS
+镜像 SHA256 e31defa5214af6c9dd9c2987cea876c8f6cba6fc8da62e04ee541e3dced0cc7e
+run_source_checks.ps1 -> scripts=17 passes=49 selftests=33 / ALL SOURCE CHECKS PASS
+docs_check -> 57 md / 32 links / 78 records / 9 项
+```
+
 ## v0.4.3 — 进程/线程控制面接入（P1-1 之外的第一次能力面扩张）
 
 **日期**：2026-11-14
