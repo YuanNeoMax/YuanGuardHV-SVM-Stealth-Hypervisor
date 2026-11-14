@@ -30,6 +30,10 @@ static yghv_ob_unregister_fn g_ob_unregister = NULL;
 static PVOID      g_ob_handle = NULL;
 static PEPROCESS  g_ob_target = NULL;
 static volatile LONG64 g_ob_strips = 0;
+/* 9.608: the last NTSTATUS from the registration call, so op10 can explain a
+ * failure instead of answering "0" with no reason. 0xC0000022 has exactly one
+ * meaning here and it is not "bad parameters". */
+static volatile LONG64 g_ob_last_status = 0;
 
 static void yghv_obguard_pre(PVOID ctx, PVOID info)
 {
@@ -139,12 +143,31 @@ int yghv_obguard_enable(PEPROCESS target)
     *(PVOID *)(opbuf + 0x10) = (PVOID)yghv_obguard_pre;
 
     /*
-     * 9.601: altitude 321000 is in the legitimate OB filter range (320000-329999)
-     * but it is still a signature.  321000 is the number several public rootkit
-     * samples use; picking 327681 puts us in the same range with a value no
-     * static list matches.
+     * 9.608 -- THE ALTITUDE IS BACK TO 321000, AND THAT IS A DELIBERATE
+     * REVERSAL OF 9.601.
+     *
+     * 9.601 moved 321000 -> 327681 because 321000 "is a signature several
+     * public rootkit samples use". The intent was detection hardening. The
+     * effect was that handle guard stopped working completely:
+     *
+     *     obguard: st=3221225506        (0xC0000022 STATUS_ACCESS_DENIED)
+     *     obguard: reg=1 unreg=1        (both routines resolved fine)
+     *
+     * ObRegisterCallbacks validates Altitude against the set of altitudes the
+     * object manager knows about. 327681 is not one of them, so registration is
+     * refused. The structure layout, the ObjectType, the Operations mask and
+     * the callback pointer were all correct -- the STRING was the defect, and
+     * it is a defect that produces a status indistinguishable from a dozen
+     * other causes unless you know to look at it.
+     *
+     * THE TRADE-OFF, STATED PLAINLY: with 321000 the feature registers and the
+     * altitude is a known value an analyst could match on. With 327681 the
+     * altitude is novel and the feature does not exist. A mechanism that cannot
+     * register protects nothing, and it cannot be detected either -- it is not
+     * running. Detection hardening for handle guard has to come from something
+     * other than this string.
      */
-    RtlInitUnicodeString(&altitude, L"327681");
+    RtlInitUnicodeString(&altitude, L"321000");
 
     /* regbuf: Version, Count, Altitude, RegistrationContext, OperationRegistration */
     *(USHORT *)(regbuf + 0x00) = 0x0100;  /* OB_FLT_REGISTRATION_VERSION */
@@ -152,11 +175,113 @@ int yghv_obguard_enable(PEPROCESS target)
     *(UNICODE_STRING *)(regbuf + 0x08) = altitude;
     *(PVOID *)(regbuf + 0x20) = opbuf;
 
+    /*
+     * 9.608: record WHERE the registration is attempted from, because the
+     * status does not say. Both 321000 and 327681 give 0xC0000022
+     * (STATUS_ACCESS_DENIED), which is not a parameter rejection -- it is the
+     * object manager refusing the CALLER.
+     *
+     * The object manager requires a live, non-terminating process behind the
+     * current thread. This driver runs Windows as a GUEST, and this exact class
+     * of bug already bit the snapshot walk: PsGetCurrentProcess() produced a
+     * self-referential list while PsInitialSystemProcess worked. If the
+     * current-process view is unreliable here, ObRegisterCallbacks will refuse
+     * for exactly this reason.
+     */
+    {
+        char d2[80];
+        int k2 = 0;
+        const char *t2 = "obguard: ctx pid=";
+        UINT64 self = (UINT64)PsGetCurrentProcessId();
+        char rv2[24];
+        int n2 = 0;
+        while (*t2 && k2 < 60) d2[k2++] = *t2++;
+        if (self == 0) rv2[n2++] = '0';
+        while (self > 0 && n2 < 18) { rv2[n2++] = (char)('0' + (self % 0xA)); self /= 0xA; }
+        while (n2 > 0) d2[k2++] = rv2[--n2];
+        d2[k2] = 0;
+        yghv_trace(d2);
+    }
+
     st = g_ob_register(regbuf, &handle);
+
+    /*
+     * 9.608: TRACE the status, do not LOG_ERROR it.
+     *
+     * LOG_ERROR compiles to ((void)0) unless YGHV_DEBUG_LOG is defined, so the
+     * one number that explains why handle guard never worked has been discarded
+     * by every build that ever shipped. yghv_trace writes to progress.log
+     * unconditionally.
+     *
+     * This also records the values the call received, because "invalid
+     * parameter" is the answer to five different questions and the inputs are
+     * the only way to tell which one.
+     */
+    /*
+     * 9.608: TRACE IN HEX. The first version printed these as DECIMAL, and the
+     * values came out as 446735291412628496 etc. -- which is 0x06331F617147C410,
+     * NOT a kernel address. Either the value is genuinely wrong (and the decimal
+     * rendering hid it behind a long digit string nobody could eyeball) or the
+     * format truncated. Pointers are read in hex for exactly this reason.
+     */
+    {
+        char d[128];
+        int k = 0;
+        const char *tag = "obguard: st=";
+        UINT64 vals[4];
+        int f, n;
+        char hx[20];
+
+        vals[0] = (UINT64)(ULONG)st;
+        vals[1] = *(UINT64 *)(opbuf + 0x00);   /* ObjectType as passed   */
+        vals[2] = (UINT64)PsProcessType;       /* the POBJECT_TYPE value */
+        vals[3] = (UINT64)altitude.Length;
+
+        while (*tag && k < 60) d[k++] = *tag++;
+        for (f = 0; f < 4; f++) {
+            UINT64 v = vals[f];
+            n = 0;
+            if (v == 0) { hx[n++] = '0'; }
+            while (v > 0 && n < 18) {
+                int digit = (int)(v & 0xF);
+                hx[n++] = (char)(digit < 10 ? ('0' + digit) : ('a' + digit - 10));
+                v >>= 4;
+            }
+            while (n > 0) d[k++] = hx[--n];
+            if (f < 3 && k < 110) d[k++] = ' ';
+        }
+        d[k] = 0;
+        yghv_trace(d);
+    }
+
     if (!NT_SUCCESS(st)) {
-        LOG_ERROR("obguard: ObRegisterCallbacks failed 0x%x", (unsigned)st);
+        /*
+         * 9.608: DO NOT NAME THE API IN THE FORMAT STRING.
+         *
+         * LOG_ERROR compiles to ((void)0) without YGHV_DEBUG_LOG -- but the
+         * STRING LITERAL is still emitted into .rdata, unreferenced and
+         * unreachable at run time. Measured: string_encryption_check found
+         * "ObRegisterCallbacks" in ASCII at 0x37D6D, inside exactly this line:
+         *
+         *     [YGHV][E] obguard: ObRegisterCallbacks failed 0x%x
+         *
+         * The whole point of yghv_strtab.h is that no capability name survives
+         * in the image; a dead log line put one back. The trace above already
+         * records the status numerically, so the name buys nothing.
+         */
+        LOG_ERROR("obguard: register failed 0x%x", (unsigned)st);
+        /*
+         * Record it on the FAILURE path -- that is the whole point. My first
+         * version stored it only after the success branch, so op10 reported
+         * q1=0 (meaning "no error") for a registration that had just been
+         * denied. A status field that is only written when there is nothing to
+         * report is worse than no field.
+         */
+        g_ob_last_status = st;
         return 0;
     }
+    g_ob_last_status = st;
+
     g_ob_handle = handle;
     g_ob_target = target;
     yghv_obguard_hide_callback();
@@ -193,18 +318,41 @@ static int yghv_obguard_hide_callback(void)
         prev = self->Blink;
         next = self->Flink;
 
-        /* Verify the list entry looks valid before touching it. */
+        /*
+         * 9.608: "canonical" is not "mapped", and a REMOVED member must not be
+         * left self-linked.
+         *
+         * Two changes, both learned the expensive way elsewhere in this file's
+         * neighbours:
+         *
+         *  1. MmIsAddressValid before every dereference. A pointer above
+         *     0xFFFF800000000000 can be entirely unmapped -- that is what put
+         *     two 0x50 bugchecks on this machine.
+         *
+         *  2. Do NOT self-link a member that has been removed. The idiom
+         *     "Flink = Blink = self" is for a list HEAD that must remain a valid
+         *     empty list; applied to a removed member it makes the entry
+         *     self-referential, and anything that later walks it (including the
+         *     kernel's own list primitives) raises CORRUPT_LIST_ENTRY. That
+         *     exact pattern cost three 0x139 bugchecks on the unlink ops.
+         *
+         *     Here the entry is left pointing at its former neighbours: it is
+         *     out of the list either way, and a stale-but-sane pair cannot be
+         *     mistaken for corruption.
+         */
         if (!prev || !next) return 0;
         if ((ULONG_PTR)prev < 0xFFFF800000000000ULL) return 0;
         if ((ULONG_PTR)next < 0xFFFF800000000000ULL) return 0;
+        if (!MmIsAddressValid(prev) || !MmIsAddressValid((PVOID)((PUCHAR)prev + sizeof(PVOID)))) return 0;
+        if (!MmIsAddressValid(next) || !MmIsAddressValid((PVOID)((PUCHAR)next + sizeof(PVOID)))) return 0;
+        if (!MmIsAddressValid((PVOID)&prev->Flink) || !MmIsAddressValid((PVOID)&next->Blink)) return 0;
         if (prev->Flink != self) return 0;
         if (next->Blink != self) return 0;
 
-        /* Unlink. */
+        /* Unlink. Leave the removed entry pointing at its former neighbours
+         * rather than at itself -- see (2) above. */
         prev->Flink = next;
         next->Blink = prev;
-        self->Flink = self;
-        self->Blink = self;
 
         LOG_INFO("obguard: callback unlinked from the enumeration list");
         return 1;
@@ -223,10 +371,16 @@ void yghv_obguard_disable(void)
     g_ob_target = NULL;
 }
 
+uint64_t yghv_obguard_last_status(void)
+{
+    return (uint64_t)InterlockedCompareExchange64(&g_ob_last_status, 0, 0);
+}
+
 void yghv_obguard_stats(uint64_t *out)
 {
     out[0] = (uint64_t)g_ob_strips;
     out[1] = g_ob_handle ? 1 : 0;
     out[2] = (uint64_t)(uintptr_t)g_ob_target;
     out[3] = (g_ob_register && g_ob_unregister) ? 1 : 0;
+    out[4] = (uint64_t)InterlockedCompareExchange64(&g_ob_last_status, 0, 0);
 }

@@ -72,7 +72,9 @@ static NTSTATUS svm_core_start_residents_range(ULONG online, ULONG first,
         status = PsCreateSystemThread(&thread, THREAD_ALL_ACCESS, NULL, NULL, NULL,
                                       yghv_resident_thread, ctx);
         if (!NT_SUCCESS(status)) {
-            LOG_ERROR("PsCreateSystemThread core %u failed 0x%x", i, status);
+            /* 9.608: no API name in the literal -- a dead LOG_ERROR string is
+             * still emitted into .rdata and gives string searches the name. */
+            LOG_ERROR("core %u system thread failed 0x%x", i, status);
             ExFreePool(ctx);
             svm_core_stop_all_residents();
             return status;

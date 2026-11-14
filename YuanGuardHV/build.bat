@@ -209,7 +209,21 @@ if errorlevel 1 (
 
 echo [YuanGuardHV] Build SUCCESS: %BIN_DIR%\yuanguard_hv.sys
 echo   signing...
+rem 9.608: THE SIGNING RESULT MUST GATE THE BUILD.
+rem
+rem This script used to run signtool, ignore its exit code, print the hash
+rem and exit 0. Measured: one build produced an UNSIGNED driver and said
+rem "Build SUCCESS"; sc start then failed with 577 "cannot verify the
+rem digital signature", which reads as a certificate or test-signing
+rem problem rather than "the signer did not run".
+rem
+rem An artifact that reports success and cannot be loaded is the exact
+rem shape this tree keeps paying for: the check did not observe the event.
 "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\signtool.exe" sign /fd SHA256 /a /f "%PROJECT_DIR%yuanguard_test.cer" "%BIN_DIR%\yuanguard_hv.sys"
+if errorlevel 1 (
+    echo [ERROR] signtool FAILED - the driver would not load
+    goto :error
+)
 certutil -hashfile "%BIN_DIR%\yuanguard_hv.sys" SHA256
 exit /b 0
 

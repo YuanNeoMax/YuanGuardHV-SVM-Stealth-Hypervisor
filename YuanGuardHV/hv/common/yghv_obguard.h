@@ -27,4 +27,10 @@ void yghv_obguard_disable(void);
 /* Fill 4 qwords: [0] strips [1] enabled [2] target [3] resolved */
 void yghv_obguard_stats(uint64_t *out);
 
+/* 9.608: the NTSTATUS from the last registration attempt, so op10 can say WHY
+ * it is not protecting instead of answering a bare 0. 0xC0000022 means the
+ * object manager refused the registration itself -- every input was verified
+ * correct before that conclusion was reached. */
+uint64_t yghv_obguard_last_status(void);
+
 #endif /* YGHV_OB_GUARD_H_ */

@@ -134,7 +134,7 @@ YuanGuardHV/
 │   ├── yghv_guard.c          隐藏表完整性（SHA-256）
 │   ├── yghv_sentry.c         攻击面清单与 escape 记录
 │   └── common/               头文件（43 个）
-├── tests/  检查器（20 个脚本 + 2 个运行器）
+├── tests/  检查器（21 个脚本 + 2 个运行器）
 ├── tools/
 │   ├── yghv_ctl.ps1          PowerShell 客户端（86 条命令）
 │   └── yghv_client/          Java 客户端（18 条命令）
@@ -256,7 +256,7 @@ build.bat
 
 流程（`build.bat`）：
 
-1. 先运行 `tests\run_source_checks.ps1`（**18 个脚本 / 42 条 PASS**，含 19 条自检；两个 docs 检查器只判门、不计入条数），失败即中止；
+1. 先运行 `tests\run_source_checks.ps1`（**19 个脚本 / 43 条 PASS**，含 19 条自检；两个 docs 检查器只判门、不计入条数），失败即中止；
 2. clang-cl 编译 `hv\*.c` / `hv\*.cpp` + `svm_trampoline.S`；
 3. MSVC link 链接为 `bin\yuanguard_hv.sys`，**同时产出 `bin\yuanguard_hv.map`**；
 4. 运行 `tests\run_map_checks.ps1`（页布局检查，必须链接后跑）；
@@ -358,7 +358,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File $ctl mem-read <pid> <hex_va>
 
 ## 测试
 
-### 构建期检查器（`tests\`，20 个脚本 + 2 个运行器）
+### 构建期检查器（`tests\`，21 个脚本 + 2 个运行器）
 
 | 脚本 | 检查什么 |
 |---|---|

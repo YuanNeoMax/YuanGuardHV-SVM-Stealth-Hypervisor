@@ -102,7 +102,20 @@ $scripts = @(
     # common, which is the worse of the two.
     # The gate checks existence, range, and NON-BLANK -- it does NOT check that the
     # line still says what the prose claims, and its header says so.
-    'source_citation_check.ps1'
+    'source_citation_check.ps1',
+    # 9.608: "canonical" IS NOT "mapped".
+    #
+    # Two 0x50 PAGE_FAULT_IN_NONPAGED_AREA bugchecks in one session came from
+    # comparing a pointer to 0xFFFF800000000000 and then reading through it --
+    # the value passed the test and the page was not there. The third instance
+    # (yghv_obguard.c, unlinking the OB callback) was found by reading source by
+    # hand, which is the "no check observed it" shape this tree keeps paying for.
+    #
+    # This checker flags a canonical comparison whose neighbourhood contains a
+    # raw dereference and none of the sanctioned guards. Verified to fail: a
+    # planted function in yghv_obguard.c was caught (exit 1) and the clean tree
+    # passes (exit 0).
+    'canonical_deref_check.ps1'
 )
 
 # 9.583: COUNT THE PASSES INSTEAD OF LETTING PEOPLE WRITE THE NUMBER DOWN.

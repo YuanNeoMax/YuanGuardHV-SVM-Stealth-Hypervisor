@@ -257,7 +257,7 @@ YuanGuardHV/tools/yghv_client/run.bat mem-read <pid> <va>
 | | 7 线程枚举 | ⛔ `NOT_IMPLEMENTED`（`TLIST` 未派生，如实返回）|
 | | 8 令牌偷取 | ✅ 返回两个内核指针 |
 | | 9 进程隐藏 | ⛔ **默认拒绝**（见上节）|
-| | 10 句柄降权 | ✅ 派发正确 |
+| | 10 句柄降权 | XX 派发正确，但注册被系统拒绝 0xC0000022（见下）|
 | | 11 句柄降权诊断 | ✅ |
 | | 12 伪装映像名 | ✅ |
 | | 13 令牌提权 | ✅ 返回启用特权数 `0x39E846` |
@@ -266,6 +266,52 @@ YuanGuardHV/tools/yghv_client/run.bat mem-read <pid> <va>
 | **pt 0x83A** | 0 CR3 / 2 范围映射 / 3 页清单 | ✅ |
 | **win 0x83B** | 0–3 全部 | ✅ 派发正确；`win32kfull` 无交互会话时按设计拒绝 |
 | **sys-health 0x825** | — | ✅ `degraded=0 total=0 fatal=0` |
+
+
+### 新增检查器：`canonical_deref_check.ps1`
+
+**"canonical" 不是 "mapped"。** 同一类缺陷在本轮造成两次 `0x50`，第三次
+（`yghv_obguard.c` 摘除 OB 回调）是靠**人读源码**发现的 —— 这正是本项目反复
+吃亏的"没有任何检查观察到它"的形状。现在它是检查器。
+
+判据：一次 `0xFFFF800000000000` 比较，其后 6 行内有**裸解引用**，且窗口内没有
+`__try` / `MmIsAddressValid` / `yghv_safe_*` / `yghv_p_read64` / `yghv_p_write64`。
+
+豁免三类，都是真的不该报：
+- 只用来**选路径**不解引用（`mem_engine.c` 选引擎）
+- 比较本身在 `__try` 内
+- 比较守的是受保护的读取
+
+单个位置可写 `/* canonical-ok: <理由> */` 就地豁免，理由写在发生处，
+而不是为所有人放宽规则。
+
+**已验证它能失败**：往 `yghv_obguard.c` 注入一个"比较后裸解引用"的函数，
+检查器返回 exit 1；恢复后回到 exit 0。
+
+审计结果：16 处比较，**真正裸露的只有 `obguard` 一处**（本轮已修），
+其余有 `__try` 或走 `yghv_safe` 层。
+### op10 句柄降权：`ObRegisterCallbacks` 被系统拒绝（已穷尽排查）
+
+`op10` 派发正确，`ObRegisterCallbacks` 返回 **`0xC0000022 STATUS_ACCESS_DENIED`**。
+现在该 op 会把这个状态码回给客户端（`o[1]`），不再只是一个无法解读的 0。
+
+逐项排除，每项都有实测数据：
+
+| 项 | 实测值 | 结论 |
+|---|---|---|
+| ObjectType | `fffff803364fc410` | 与 `PsProcessType` 的值**逐位相同** → 解引用正确 |
+| altitude | 试过 `321000` 与 `327681` | 状态**完全相同** → 不是字符串问题 |
+| 调用上下文 | `pid=4`（DriverEntry）与 `pid=8500`（IOCTL 调用者）| **完全相同** → 不是调用者问题 |
+| 结构尺寸 | `regbuf 0x28`、`opbuf 0x20` | 与结构定义精确匹配 |
+| Version / Operations / PreOperation | `0x0100` / `0x0003` / 非空 | 全部正确 |
+
+剩余解释只有镜像完整性：签名者 `CN=YuanGuardHV Test` **不在本机受信任根存储中**
+（本机只有 `CN=YuanGuardTest`），`AuthenticodeStatus = UnknownError`。
+Windows 对签名链不通过的驱动拒绝对象管理器注册路径。
+
+> **这是环境限制，不是代码缺陷** —— 但必须如实报告。
+> 与 9.507（`mem-bp dr` 返回 REFUSED）、两个摘链 op 同一条纪律：
+> **做不到的能力必须说出来，不能返回一个看不出原因的成功。**
 
 **实测中修掉的五个真缺陷**（每个都有 dump 或计数证据，见 CHANGELOG 9.608）：
 

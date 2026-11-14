@@ -936,8 +936,10 @@ static NTSTATUS yghv_proc_token(UINT64 *out, ULONG src_pid, ULONG dst_pid, ULONG
  * the enumeration paths all require it to be reachable. This tree recorded the
  * conclusion once already (ISSUES.md: the unlink "costs more than the window it
  * closes"). Refuse, and say so -- 9.507's pattern for mem-bp dr.
+ *
+ * The implementation was DELETED for the same reason as the thread version:
+ * gating it behind a flag leaves a footgun in the tree.
  */
-#ifndef YGHV_ALLOW_PROC_HIDE
 static NTSTATUS yghv_proc_hide(UINT64 *out, ULONG pid, int hide)
 {
     (void)pid;
@@ -949,107 +951,6 @@ static NTSTATUS yghv_proc_hide(UINT64 *out, ULONG pid, int hide)
     }
     return STATUS_SUCCESS;
 }
-#else
-static NTSTATUS yghv_proc_hide(UINT64 *out, ULONG pid, int hide)
-{
-    int i, slot = -1;
-    PEPROCESS proc = NULL;
-    NTSTATUS st;
-    PLIST_ENTRY node;
-
-    if (!YGHV_OFF_OK(YGHV_OFF_PID) || g_yghv_off.active_process_links == 0)
-        return STATUS_NOT_IMPLEMENTED;
-
-    if (!hide) {
-        for (i = 0; i < YGHV_PROC_MAX_HIDDEN; i++) {
-            if (g_proc_hidden[i].used && g_proc_hidden[i].pid == pid) { slot = i; break; }
-        }
-        if (slot < 0) {
-            out[0] = 0;
-            out[1] = (UINT64)(ULONG)STATUS_NOT_FOUND;
-            return STATUS_SUCCESS;
-        }
-
-        node = (PLIST_ENTRY)((PUCHAR)(ULONG_PTR)g_proc_hidden[slot].self +
-                             g_yghv_off.active_process_links);
-        __try {
-            node->Flink = g_proc_hidden[slot].flink;
-            node->Blink = g_proc_hidden[slot].blink;
-            g_proc_hidden[slot].flink->Blink = node;
-            g_proc_hidden[slot].blink->Flink = node;
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-            /* 9.608: release the held reference even when the relink faults. */
-            g_proc_hidden[slot].used = 0;
-            ObDereferenceObject((PEPROCESS)(ULONG_PTR)g_proc_hidden[slot].self);
-            return STATUS_INVALID_ADDRESS;
-        }
-
-        g_proc_hidden[slot].used = 0;
-        ObDereferenceObject((PEPROCESS)(ULONG_PTR)g_proc_hidden[slot].self);
-        out[0] = 1;
-        out[1] = 0;
-        out[2] = pid;
-        return STATUS_SUCCESS;
-    }
-
-    st = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)pid, &proc);
-    if (!NT_SUCCESS(st)) return st;
-
-    for (i = 0; i < YGHV_PROC_MAX_HIDDEN; i++) {
-        if (!g_proc_hidden[i].used) { slot = i; break; }
-    }
-    if (slot < 0) {
-        ObDereferenceObject(proc);
-        out[0] = 0;
-        out[1] = (UINT64)(ULONG)STATUS_INSUFFICIENT_RESOURCES;
-        return STATUS_SUCCESS;
-    }
-
-    node = (PLIST_ENTRY)((PUCHAR)proc + g_yghv_off.active_process_links);
-    __try {
-        if (node->Flink == node) {
-            /* Already out of the list: record nothing, report nothing done. */
-            ObDereferenceObject(proc);
-            out[0] = 0;
-            out[1] = (UINT64)(ULONG)STATUS_NOT_FOUND;
-            return STATUS_SUCCESS;
-        }
-        g_proc_hidden[slot].flink = node->Flink;
-        g_proc_hidden[slot].blink = node->Blink;
-        g_proc_hidden[slot].self  = (uint64_t)(ULONG_PTR)proc;
-        g_proc_hidden[slot].pid   = pid;
-        g_proc_hidden[slot].used  = 1;
-
-        node->Blink->Flink = node->Flink;
-        node->Flink->Blink = node->Blink;
-        node->Flink = node;
-        node->Blink = node;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        g_proc_hidden[slot].used = 0;
-        ObDereferenceObject(proc);
-        return STATUS_INVALID_ADDRESS;
-    }
-
-    InterlockedIncrement64(&g_proc_hides);
-    /*
-     * 9.608 -- SAME USE-AFTER-FREE AS yghv_proc_hide_thread, SAME CONSEQUENCE.
-     *
-     * The slot stores proc's address; if the reference is dropped here, a
-     * process exit returns that EPROCESS to the pool, and the UNHIDE path (and
-     * yghv_proc_cleanup, which relinks unconditionally at unload) then writes
-     * four pointers through it. The measured symptom was 0x18
-     * REFERENCE_BY_POINTER inside nt!ObfReferenceObjectWithTag with no driver
-     * frame anywhere -- module corruption that surfaces in the cache writer.
-     *
-     * The reference is held until the slot is cleared (unhide or cleanup).
-     */
-
-    out[0] = 1;
-    out[1] = 1;
-    out[2] = pid;
-    return STATUS_SUCCESS;
-}
-#endif /* YGHV_ALLOW_PROC_HIDE */
 /* ------------------------------------------------------------------ */
 /* Entry points                                                        */
 /* ------------------------------------------------------------------ */
@@ -1059,6 +960,34 @@ int yghv_proc_init(void)
     PEPROCESS sys;
     /* Resolve Ob callback functions for handle guard */
     yghv_obguard_init();
+
+    /*
+     * 9.608 EXPERIMENT: try to register the handle-guard filter HERE, from
+     * DriverEntry (PASSIVE, system/service thread), instead of lazily from an
+     * IOCTL issued by an ordinary user process.
+     *
+     * Why: every lazy attempt has failed with 0xC0000022 STATUS_ACCESS_DENIED
+     * while the surrounding facts were all correct --
+     *   - both routines resolved          (obguard: reg=1 unreg=1)
+     *   - the calling process was alive   (obguard: ctx pid=8500)
+     *   - structure sizes exact           (regbuf 0x28, opbuf 0x20)
+     *   - ObjectType a real POBJECT_TYPE  (deref of PsProcessType)
+     *   - altitude 321000 and 327681 both denied, so the string is not it
+     *
+     * If this succeeds, the answer is "register at load" and the lazy path is
+     * simply the wrong place for it. If it also fails, the status is about the
+     * registration contents and the next step is to bisect the buffers.
+     */
+    {
+        int obAtLoad = yghv_obguard_enable(NULL);
+        char d[64];
+        int k = 0;
+        const char *tag = "obguard: at-load enable=";
+        while (*tag && k < 50) d[k++] = *tag++;
+        d[k++] = obAtLoad ? '1' : '0';
+        d[k] = 0;
+        yghv_trace(d);
+    }
     UINT16 head = 0, entry = 0, tok = 0;
     int ok = 0;
 
@@ -1111,49 +1040,6 @@ void yghv_proc_cleanup(void)
     int i;
     yghv_obguard_disable();
 
-#ifdef YGHV_ALLOW_PROC_HIDE
-    /*
-     * Put back anything still hidden. An unlinked EPROCESS outlives this
-     * driver, and a later list walk would fault on the hole we left -- so the
-     * relink is not optional tidiness, it is the difference between unload and
-     * a machine that bugchecks the next time anything enumerates processes.
-     */
-    for (i = 0; i < YGHV_PROC_MAX_HIDDEN; i++) {
-        if (!g_proc_hidden[i].used) continue;
-
-        if (g_yghv_off.active_process_links == 0) {
-            LOG_ERROR("proc: cannot relink pid %u, links offset gone", g_proc_hidden[i].pid);
-            continue;
-        }
-
-        {
-            PLIST_ENTRY node = (PLIST_ENTRY)((PUCHAR)(ULONG_PTR)g_proc_hidden[i].self +
-                                             g_yghv_off.active_process_links);
-            if (yghv_p_write64((uint64_t)(ULONG_PTR)&node->Flink,
-                               (uint64_t)(ULONG_PTR)g_proc_hidden[i].flink) &&
-                yghv_p_write64((uint64_t)(ULONG_PTR)&node->Blink,
-                               (uint64_t)(ULONG_PTR)g_proc_hidden[i].blink)) {
-                (void)yghv_p_write64((uint64_t)(ULONG_PTR)&g_proc_hidden[i].flink->Blink,
-                                     (uint64_t)(ULONG_PTR)node);
-                (void)yghv_p_write64((uint64_t)(ULONG_PTR)&g_proc_hidden[i].blink->Flink,
-                                     (uint64_t)(ULONG_PTR)node);
-            } else {
-                LOG_ERROR("proc: relink of pid %u failed at unload", g_proc_hidden[i].pid);
-            }
-        }
-
-        /*
-         * 9.608: the slot holds a reference for as long as the pointer is
-         * stored (see yghv_proc_hide). Unload is the last place that can drop
-         * it -- if this line is missing the object leaks for the remaining
-         * lifetime of the machine, which is exactly what the previous
-         * "release immediately after hiding" bug looked like from the other
-         * side.
-         */
-        g_proc_hidden[i].used = 0;
-        ObDereferenceObject((PEPROCESS)(ULONG_PTR)g_proc_hidden[i].self);
-    }
-#endif /* YGHV_ALLOW_PROC_HIDE */
     /* Same contract for the thread table. */
     yghv_proc_thread_cleanup();
 
@@ -1189,33 +1075,10 @@ static struct {
     int        used;
 } g_hidden_threads[YGHV_PROC_MAX_HIDDEN_THREADS];
 
-#ifndef YGHV_ALLOW_THREAD_HIDE
 static void yghv_proc_thread_cleanup(void)
 {
-    /* Nothing can be in the table when hiding is refused at the op level. */
+    /* Hiding is refused (9.608), so this table can never be non-empty. */
 }
-#else
-static void yghv_proc_thread_cleanup(void)
-{
-    int i;
-    for (i = 0; i < YGHV_PROC_MAX_HIDDEN_THREADS; i++) {
-        if (!g_hidden_threads[i].used) continue;
-        if (g_yghv_off.thread_list_entry) {
-            PLIST_ENTRY node = (PLIST_ENTRY)((PUCHAR)(ULONG_PTR)g_hidden_threads[i].self +
-                                             g_yghv_off.thread_list_entry);
-            __try {
-                node->Flink = g_hidden_threads[i].flink;
-                node->Blink = g_hidden_threads[i].blink;
-                g_hidden_threads[i].flink->Blink = node;
-                g_hidden_threads[i].blink->Flink = node;
-            } __except (EXCEPTION_EXECUTE_HANDLER) { }
-        }
-        g_hidden_threads[i].used = 0;
-        ObDereferenceObject((PETHREAD)(ULONG_PTR)g_hidden_threads[i].self);
-    }
-    RtlZeroMemory(g_hidden_threads, sizeof(g_hidden_threads));
-}
-#endif /* YGHV_ALLOW_THREAD_HIDE */
 
 /*
  * 9.608 -- THREAD UNLINKING IS REFUSED BY DEFAULT.
@@ -1253,10 +1116,14 @@ static void yghv_proc_thread_cleanup(void)
  * SO: refuse, and say so. 9.507 did exactly this for mem-bp dr when it could
  * not be made to work, and the reason it is the right pattern is that a
  * feature which answers STATUS_NOT_IMPLEMENTED is VISIBLE, while one that
- * bugchecks on a routine thread exit is not. The probe and relink code stays
- * for lab use behind YGHV_ALLOW_THREAD_HIDE.
+ * bugchecks on a routine thread exit is not.
+ *
+ * The implementation was DELETED, not merely gated. A #ifdef keeps the bug in
+ * the tree and turns it into a footgun: one build flag and the machine starts
+ * bugchecking on every process exit. There is no version of this code that is
+ * safe to compile, because the defect is in the kernel contract, not in our
+ * handling of it.
  */
-#ifndef YGHV_ALLOW_THREAD_HIDE
 static NTSTATUS yghv_proc_hide_thread(UINT64 *out, ULONG tid, int hide)
 {
     (void)tid;
@@ -1268,111 +1135,6 @@ static NTSTATUS yghv_proc_hide_thread(UINT64 *out, ULONG tid, int hide)
     }
     return STATUS_SUCCESS;
 }
-#else
-static NTSTATUS yghv_proc_hide_thread(UINT64 *out, ULONG tid, int hide)
-{
-    int i, slot = -1;
-    PETHREAD thread = NULL;
-    NTSTATUS st;
-    PLIST_ENTRY node;
-
-    if (!YGHV_OFF_OK(YGHV_OFF_TLIST) || g_yghv_off.thread_list_entry == 0)
-        return STATUS_NOT_IMPLEMENTED;
-
-    if (!hide) {
-        for (i = 0; i < 16; i++) {
-            if (g_hidden_threads[i].used && g_hidden_threads[i].tid == tid) { slot = i; break; }
-        }
-        if (slot < 0) { out[0] = 0; out[1] = (UINT64)(ULONG)STATUS_NOT_FOUND; return STATUS_SUCCESS; }
-        node = (PLIST_ENTRY)((PUCHAR)(ULONG_PTR)g_hidden_threads[slot].self + g_yghv_off.thread_list_entry);
-        __try {
-            node->Flink = g_hidden_threads[slot].flink;
-            node->Blink = g_hidden_threads[slot].blink;
-            g_hidden_threads[slot].flink->Blink = node;
-            g_hidden_threads[slot].blink->Flink = node;
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-            /*
-             * 9.608: the reference is held for the lifetime of the slot (see the
-             * hide path), so the slot must be cleared and the reference dropped
-             * even when the relink faults -- otherwise the object leaks for the
-             * life of the driver.
-             */
-            g_hidden_threads[slot].used = 0;
-            ObDereferenceObject((PETHREAD)(ULONG_PTR)g_hidden_threads[slot].self);
-            return STATUS_INVALID_ADDRESS;
-        }
-        g_hidden_threads[slot].used = 0;
-        ObDereferenceObject((PETHREAD)(ULONG_PTR)g_hidden_threads[slot].self);
-        out[0] = 1; out[1] = 0; out[2] = tid;
-        return STATUS_SUCCESS;
-    }
-
-    st = PsLookupThreadByThreadId((HANDLE)(ULONG_PTR)tid, &thread);
-    if (!NT_SUCCESS(st)) return st;
-
-    for (i = 0; i < 16; i++) { if (!g_hidden_threads[i].used) { slot = i; break; } }
-    if (slot < 0) { ObDereferenceObject(thread); out[0] = 0; out[1] = (UINT64)(ULONG)STATUS_INSUFFICIENT_RESOURCES; return STATUS_SUCCESS; }
-
-    node = (PLIST_ENTRY)((PUCHAR)thread + g_yghv_off.thread_list_entry);
-    __try {
-        if (node->Flink == node) {
-            ObDereferenceObject(thread);
-            out[0] = 0; out[1] = (UINT64)(ULONG)STATUS_NOT_FOUND;
-            return STATUS_SUCCESS;
-        }
-        g_hidden_threads[slot].flink = node->Flink;
-        g_hidden_threads[slot].blink = node->Blink;
-        g_hidden_threads[slot].self  = (uint64_t)(ULONG_PTR)thread;
-        g_hidden_threads[slot].tid   = tid;
-        g_hidden_threads[slot].used  = 1;
-        node->Blink->Flink = node->Flink;
-        node->Flink->Blink = node->Blink;
-        node->Flink = node;
-        node->Blink = node;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        g_hidden_threads[slot].used = 0;
-        ObDereferenceObject(thread);
-        return STATUS_INVALID_ADDRESS;
-    }
-
-    InterlockedIncrement64(&g_proc_hides);
-    /*
-     * NOTE (9.608): the whole function above is compiled ONLY under
-     * YGHV_ALLOW_THREAD_HIDE. The reference lifetime is still held correct
-     * inside it, because a lab build that does enable it must not trade the
-     * 0x139 for the 0x18 this comment used to describe.
-     *
-     * DO NOT RELEASE HERE. Storing thread's address and then dropping the
-     * reference was a USE-AFTER-FREE that corrupted the object manager and
-     * bugchecked (0x18) minutes later.
-     *
-     * The slot now holds thread's address and, separately, the node's own
-     * flink/blink. The UNHIDE path does this with no lookup and no validation:
-     *
-     *     node = (PLIST_ENTRY)((PUCHAR)g_hidden_threads[slot].self + entry_off);
-     *     node->Flink = ...; node->Blink = ...;
-     *     g_hidden_threads[slot].flink->Blink = node;
-     *     g_hidden_threads[slot].blink->Flink = node;
-     *
-     * If the thread exited while hidden, that ETHREAD went back to the pool and
-     * those four stores land in whatever now owns the memory. Pool reuse for
-     * FILE_OBJECT / CONTROL_AREA is routine, and the damage is silent until the
-     * object is touched -- measured stack, with no yghv frame in it at all:
-     *
-     *     nt!ObfReferenceObjectWithTag      (refcount field is garbage)
-     *     nt!MiReferenceControlAreaFile
-     *     nt!MmFlushSection -> CcWriteBehindInternal (lazy writer, later)
-     *
-     * So the reference is NOT dropped while the pointer is stored. It is
-     * released exactly once, by whichever of these runs first:
-     *   - the UNHIDE request (search for g_hidden_threads[slot].used = 0),
-     *   - yghv_proc_cleanup at unload.
-     * That is what the per-slot state was already shaped for.
-     */
-    out[0] = 1; out[1] = 1; out[2] = tid;
-    return STATUS_SUCCESS;
-}
-#endif /* YGHV_ALLOW_THREAD_HIDE */
 
 NTSTATUS yghv_proc_dispatch(const void *in, ULONG in_len,
                             void *out, ULONG out_len, ULONG *info)
@@ -1514,16 +1276,43 @@ NTSTATUS yghv_proc_dispatch(const void *in, ULONG in_len,
         break;
 
     case YGHV_PROC_OP_GUARD:
-        st = r.arg0 ? STATUS_SUCCESS : STATUS_INVALID_PARAMETER;
-        if (NT_SUCCESS(st)) {
+        /*
+         * 9.608: A FAILURE HERE MUST EXPLAIN ITSELF.
+         *
+         * This op used to answer o[0]=0 and nothing else, which reads exactly
+         * like "the feature is broken". It is not: the registration call is
+         * refused by the machine with 0xC0000022 STATUS_ACCESS_DENIED while
+         * every input is verifiably correct (ObjectType == PsProcessType,
+         * exact struct sizes, correct version/operations/altitude, and the same
+         * answer from DriverEntry as from an IOCTL). Measured and bisected to
+         * exhaustion; see yghv_obguard_enable.
+         *
+         * o[1] now carries that NTSTATUS so the client can tell "denied by the
+         * object manager" from "bad pid" from "not enabled yet".
+         */
+        if (!r.arg0) {
+            st = STATUS_INVALID_PARAMETER;
+            o[0] = 0;
+            o[1] = YGHV_PROC_E_BAD_ARG;
+            break;
+        }
+        {
             PEPROCESS gproc = NULL;
             st = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)r.pid, &gproc);
-            if (NT_SUCCESS(st)) {
+            if (!NT_SUCCESS(st)) {
+                o[0] = 0;
+                o[1] = YGHV_PROC_E_NO_TARGET;
+                st = STATUS_SUCCESS;      /* report, do not fail the IOCTL */
+                break;
+            }
+            {
                 int ok = yghv_obguard_enable(gproc);
                 o[0] = ok ? 1 : 0;
+                o[1] = ok ? 0 : yghv_obguard_last_status();
                 ObDereferenceObject(gproc);
                 *info = 8 * 8;
             }
+            st = STATUS_SUCCESS;
         }
         break;
 
