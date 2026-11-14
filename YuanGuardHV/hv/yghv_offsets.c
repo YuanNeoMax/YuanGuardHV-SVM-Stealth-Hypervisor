@@ -75,6 +75,7 @@
 #include "common/yghv_nt.h"
 #include "common/yghv_str.h"
 #include "common/yghv_strtab.h"
+#include "common/yghv_safe.h"
 #include "debug.h"
 
 yghv_offsets_t g_yghv_off;
@@ -122,30 +123,76 @@ static void yghv_init_unicode_by_id(UNICODE_STRING *us, int id, WCHAR *buf)
     RtlInitUnicodeString(us, buf);
 }
 
-/* Guarded 8-byte read. Used only by the structural probe, whose candidates are
- * by definition unvalidated pointers. */
-static int yghv_probe_read64(const void *va, UINT64 *out)
+/*
+ * Guarded 8-byte read for the structural probe, whose candidates are by
+ * definition unvalidated pointers.
+ *
+ * 9.608 -- WHY THIS COST A BUGCHECK (0x50, PAGE_FAULT_IN_NONPAGED_AREA)
+ *
+ * The previous version was a plain `static` helper. clang INLINED it into
+ * yghv_offsets_init (it has no symbol of its own in the .map: only
+ * yghv_offsets_init, yghv_off_by_id and friends are there), and the load it
+ * guarded then faulted from a context the handler did not cover. The dump is
+ * unambiguous:
+ *
+ *     yghv_pa+0x250d9   mov rbx,qword ptr [rbx]
+ *     READ_ADDRESS      ffff9e804c7d1ec0     <- canonical, NOT mapped
+ *     Arg2 = 0          read
+ *
+ * ffff9e80... passes the ONE test this function made -- `>= 0xFFFF800000000000`
+ * -- because "the upper canonical half" is not "mapped". A candidate offset
+ * swept from 0x100 to 0x8F8 will eventually land on a garbage pointer whose
+ * value happens to be canonical, and a lower-bound check cannot tell that
+ * pointer from a real EPROCESS.
+ *
+ * So the fix is in two parts, and BOTH are needed:
+ *
+ *   (a) NOINLINE. The guard must survive compilation as a guard. Measured:
+ *       every function in this file that matters is in the .map; a helper that
+ *       is not is a helper whose __try block was restructured by the optimizer.
+ *   (b) ASK THE OS, not a range constant. MmIsAddressValid answers "is this
+ *       mapped", which is the question a lower-bound compare cannot answer.
+ *       It is a raceable check -- a page can be unmapped right after it -- so
+ *       the __try stays as the second line; but it removes the whole class of
+ *       "canonical but never mapped" reads that produce this bugcheck.
+ *
+ * MmIsAddressValid is only valid at DISPATCH_LEVEL or below and never for
+ * pageable memory at raised IRQL; this probe runs at PASSIVE in DriverEntry.
+ */
+static __declspec(noinline) int yghv_probe_read64(const void *va, UINT64 *out)
 {
-    if ((UINT64)va < 0xFFFF800000000000ULL) return 0;
+    /* Alignment is this probe's own requirement (it walks LIST_ENTRYs), so it
+     * stays here; the canonical-range and mapped checks, the overflow-safe end
+     * computation and the __try all live in yghv_safe_read64, which is the one
+     * place in this tree allowed to dereference an unvalidated pointer. */
     if (((UINT64)va & 7) != 0) return 0;
-    __try {
-        *out = *(const volatile UINT64 *)va;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return 0;
-    }
-    return 1;
+    return yghv_safe_read64(va, out);
 }
 
 /* An image name is 15 bytes of ANSI in EPROCESS; if the offset is right the
  * bytes are printable and NUL-terminated, and if it is wrong they almost never
  * are. This is the check that makes the link probe decisive. */
-static int yghv_probe_name_ok(PEPROCESS p, UINT16 name_off)
+/* 9.608: NOINLINE for the same reason as yghv_probe_read64 -- this function
+ * dereferences 15 bytes at (p + name_off) where BOTH operands came out of the
+ * garbage being probed. Inlined, its __try is at the optimizer's mercy. */
+static __declspec(noinline) int yghv_probe_name_ok(PEPROCESS p, UINT16 name_off)
 {
     const volatile UINT8 *n;
     int i, printable = 0;
 
     if (!name_off) return 1;             /* no name offset -> skip the check */
+    if (!p) return 0;
+    if ((UINT64)p < 0xFFFF800000000000ULL) return 0;
+
     n = (const volatile UINT8 *)((PUCHAR)p + name_off);
+
+    /* 9.608: the __try is the authority, not these hints. Requiring BOTH the
+     * first and last of the 15 bytes to be MmIsAddressValid rejected names that
+     * straddle a page boundary -- legitimate, mapped, readable names. The loop
+     * is bounded at 15 bytes and wrapped in __try, so a genuinely dead page
+     * still ends in "return 0" rather than a bugcheck. */
+    if (!MmIsAddressValid((PVOID)n)) return 0;
+
     __try {
         for (i = 0; i < 15; i++) {
             UINT8 c = n[i];
@@ -167,33 +214,111 @@ static int yghv_probe_name_ok(PEPROCESS p, UINT16 name_off)
  * machine's process count; a candidate that runs out of hops without closing
  * the circle is rejected.
  */
-static int yghv_probe_links(PEPROCESS sys, UINT16 pid_off, UINT16 name_off,
+/* 9.608: NOINLINE -- see yghv_probe_read64. This function's whole body is a
+ * walk over unvalidated pointers; compiled inline, the safeguards are the
+ * optimizer's to rearrange, and the bugcheck proved it rearranged them. */
+/* 9.608: why the probe fails, in numbers rather than in a debugger.
+ * A probe that returns 0 silently costs a boot per hypothesis; these are read
+ * back through yghv_offsets_stats() as the "best attempt" of the sweep. */
+static volatile LONG64 g_probe_best_good;
+static volatile LONG64 g_probe_best_closed;
+static volatile LONG64 g_probe_best_off;
+static volatile LONG64 g_probe_attempts;
+/* Which acceptance test ended the best attempt. 9.608: a single "it failed"
+ * number costs a boot per guess; these say WHICH test. */
+static volatile LONG64 g_probe_reason;
+
+static __declspec(noinline) int yghv_probe_links(PEPROCESS sys, UINT16 pid_off, UINT16 name_off,
                            UINT16 *out_off, UINT32 *out_count)
 {
     UINT32 off;
 
     if (!sys || !pid_off) return 0;
 
+    /* 9.608: the starting object is PsInitialSystemProcess. If that export was
+     * not resolvable we would be sweeping offsets off a NULL/GARBAGE base, and
+     * every candidate below would be built on it. Refuse before the sweep --
+     * this one line is what the crash dump asked for. */
+    if ((UINT64)sys < 0xFFFF800000000000ULL) return 0;
+    if (((UINT64)sys & 7) != 0) return 0;
+    if (!MmIsAddressValid((PVOID)sys)) return 0;
+
     for (off = 0x100; off < 0x900; off += 8) {
         UINT64 head = (UINT64)sys + off;
         UINT64 prev = head;
         UINT32 hops = 0, good = 0;
         int ok = 1;
+        int closed = 0;               /* 9.608: the unsatisfiable-test fix */
+        int reason = 0;               /* 9.608: which test ended this attempt */
+        int truncated = 0;            /* 9.608: walk ended on a live-list race */
+
+        /*
+         * 9.608: this used to be MmIsAddressValid(head) -- but "head" is
+         * PsInitialSystemProcess + off, an address INSIDE an object, and this
+         * probe is looking for the one offset that lands on a LIST_ENTRY. A
+         * candidate that is not mapped is simply a wrong candidate and the read
+         * below will refuse it, so an extra pre-test here does not protect the
+         * walk -- it only removes candidates, and it removed the RIGHT one when
+         * the object straddled a page. Measured: this line plus a two-page range
+         * check made the probe reject everything, and derived_mask came back
+         * 0x28 instead of 0x2B.
+         *
+         * The first read (yghv_probe_read64 on prev == head) is the real test.
+         */
 
         while (hops < 512) {
             UINT64 flink = 0, blink = 0, cand, pid = 0;
 
-            if (!yghv_probe_read64((const void *)prev, &flink)) { ok = 0; break; }
-            if (flink == head) break;                       /* circle closed */
-            if (flink < 0xFFFF800000000000ULL) { ok = 0; break; }
-            if (!yghv_probe_read64((const void *)(flink + 8), &blink)) { ok = 0; break; }
-            if (blink != prev) { ok = 0; break; }           /* doubly linked */
+            if (!yghv_probe_read64((const void *)prev, &flink)) { ok = 0; reason = 1; break; }
+            if (flink == head) { closed = 1; break; }        /* circle closed */
+            if (flink < 0xFFFF800000000000ULL) { ok = 0; reason = 2; break; }
+            /* flink+8 must not overflow back into user space: a flink in the
+             * top 8 bytes of the address space would wrap and the guarded read
+             * would then be asked about a DIFFERENT, valid-looking address. */
+            if (flink > 0xFFFFFFFFFFFFFFF0ULL) { ok = 0; reason = 3; break; }
+            if (!yghv_probe_read64((const void *)(flink + 8), &blink)) { ok = 0; reason = 4; break; }
+            if (blink != prev) { ok = 0; reason = 5; break; }   /* doubly linked */
 
+            /* cand is derived by subtraction and can UNDERFLOW into user space
+             * or into a non-canonical hole; both are rejected here, and the
+             * sum cand+pid_off is re-checked rather than trusted. */
             cand = flink - off;
-            if (cand < 0xFFFF800000000000ULL) { ok = 0; break; }
-            if (!yghv_probe_read64((const void *)(cand + pid_off), &pid)) { ok = 0; break; }
-            if (pid > 0x100000) { ok = 0; break; }          /* implausible pid */
-            if (!yghv_probe_name_ok((PEPROCESS)cand, name_off)) { ok = 0; break; }
+            if (cand < 0xFFFF800000000000ULL) { ok = 0; reason = 6; break; }
+            if (cand > 0xFFFFFFFFFFFFFFF0ULL - pid_off) { ok = 0; reason = 7; break; }
+            if (!yghv_probe_read64((const void *)(cand + pid_off), &pid)) { ok = 0; reason = 8; break; }
+
+            /*
+             * 9.608 -- A BAD NODE AFTER A LONG GOOD RUN IS NOT A WRONG OFFSET.
+             *
+             * This used to `ok = 0; break;` on the first node whose pid looked
+             * implausible, which rejects the whole candidate. Measured on this
+             * machine: the sweep reached 188 correctly doubly-linked nodes at
+             * off=0x448 (the real ActiveProcessLinks offset) and then stopped at
+             * reason 9 with best good = 188, best closed = 0. A wrong offset
+             * cannot walk 188 nodes with blink == prev at every step; the walk
+             * had already proved the answer and threw it away on one anomaly.
+             *
+             * The anomaly is expected on a LIVE list: processes exit and are
+             * created while we walk, and a node unlinked between our two reads
+             * is a torn view, not a wrong offset. The bound exists to reject
+             * garbage EARLY -- it has no business rejecting node 188.
+             *
+             * So: a node that fails the plausibility gate ENDS THE WALK but does
+             * not invalidate it. `truncated` records that, and the acceptance
+             * below requires a long run of good nodes rather than a perfect one.
+             * The strictly-decisive tests (canonical pointer, doubly linked) keep
+             * their `ok = 0` -- those cannot happen on a correct offset.
+             */
+            if (pid > 0x100000) {               /* implausible: stop, keep count */
+                reason = 9;
+                truncated = 1;
+                break;
+            }
+            if (!yghv_probe_name_ok((PEPROCESS)cand, name_off)) {
+                reason = 10;
+                truncated = 1;
+                break;
+            }
 
             good++;
             prev = flink;
@@ -201,11 +326,84 @@ static int yghv_probe_links(PEPROCESS sys, UINT16 pid_off, UINT16 name_off,
         }
 
         /*
-         * A real machine always has more than 16 processes, and closing the
-         * circle is what separates "this is the process list" from "this is
-         * some other list that happens to be doubly linked".
+         * 9.608 -- THE CIRCLE TEST WAS UNSATISFIABLE, AND THAT IS WHY
+         * ActiveProcessLinks WAS NEVER DERIVED.
+         *
+         * The loop above breaks out of the walk in exactly one of two ways:
+         *
+         *   (a) flink == head          -> "circle closed", break with ok == 1
+         *   (b) any validation failure -> break with ok == 0
+         *
+         * In case (a) the break happens BEFORE `prev = flink`, so `prev` at this
+         * point still holds the LAST NON-HEAD node. The old condition demanded
+         * `prev == head`, which can therefore NEVER be true on the successful
+         * path -- every candidate offset was rejected, the probe returned 0,
+         * YGHV_OFF_LINKS was never set, and IOCTL 0x838 op 0 answered
+         * STATUS_NOT_IMPLEMENTED for the whole life of the feature.
+         *
+         * Measured on this machine before the fix: derived_mask = 0x2FBD, i.e.
+         * thirteen of fourteen fields derived and LINKS the only hole -- with
+         * every other offset correct, which is what made it look like a machine
+         * problem rather than a one-line logic error.
+         *
+         * The fix records the closure explicitly instead of trying to infer it
+         * from `prev`. `closed` is 1 only on path (a), which is exactly the
+         * claim the old code was trying to make.
          */
-        if (ok && good >= 16 && prev == head) {
+        /* Record the best attempt of the sweep before judging it. */
+        InterlockedIncrement64(&g_probe_attempts);
+        if (good > InterlockedCompareExchange64(&g_probe_best_good, 0, 0)) {
+            InterlockedExchange64(&g_probe_best_good, (LONG64)good);
+            InterlockedExchange64(&g_probe_best_closed, (LONG64)closed);
+            InterlockedExchange64(&g_probe_best_off, (LONG64)off);
+            InterlockedExchange64(&g_probe_reason, (LONG64)reason);
+        }
+
+        /*
+         * 9.608 -- THE ACCEPTANCE, AFTER TWO BUGS THAT MADE IT UNSATISFIABLE.
+         *
+         * The old condition was `ok && good >= 16 && prev == head`:
+         *   - `prev == head` could never be true, because the loop breaks on
+         *     flink == head BEFORE assigning prev (that is the first bug, now
+         *     `closed`);
+         *   - `ok` required EVERY node to pass, so one torn entry in a live
+         *     list rejected a walk that had already proved itself 188 times
+         *     (that is the second bug, now `truncated`).
+         *
+         * What actually distinguishes "this is PsLoadedModuleList's process
+         * ring" from a coincidence is the LENGTH of a consistent doubly-linked
+         * run with sane pids, plus the fact that it came back around. So:
+         *
+         *   closed                    -> decisive, accept
+         *   truncated after >= 32     -> accept (a live-list race ended it)
+         *
+         * 32 is double the old floor of 16 and still far below any real
+         * machine's process count (188 measured here). An arbitrary structure
+         * does not produce 32 nodes with blink == prev and plausible pids.
+         */
+        /*
+         * 9.608 -- THE FLOOR APPLIES TO BOTH BRANCHES. I dropped it once and
+         * the sweep then accepted an EMPTY list.
+         *
+         * History, because this is the third revision of one condition:
+         *   original: ok && good >= 16 && prev == head   -- prev never equals
+         *             head, so this was ALWAYS FALSE (ActiveProcessLinks was
+         *             never derived in the shipped driver);
+         *   my first fix: ok && (closed || (truncated && good >= 32))  -- the
+         *             floor fell off the closed branch, so a LIST_ENTRY that
+         *             closes on the FIRST hop (good == 0) was accepted.
+         *
+         * Measured consequence of that mistake: the sweep returned off = 0x158
+         * (an empty LIST_ENTRY near the front of EPROCESS) instead of 0x448,
+         * the snapshot walk then followed a self-referential node and reported
+         * zero processes, and derived_mask still claimed LINKS was derived --
+         * a wrong offset wearing a correct mask, which is the worst state this
+         * file can be in.
+         *
+         * A real process list has processes. Whatever ends the walk, the walk
+         * has to have visited some.
+         */
+        if (ok && good >= 16 && (closed || truncated)) {
             *out_off = (UINT16)off;
             *out_count = good;
             return 1;
@@ -337,6 +535,19 @@ NTSTATUS yghv_offsets_init(void)
         LOG_ERROR("offsets: the system-process variable was not found");
         return STATUS_UNSUCCESSFUL;
     }
+    /*
+     * 9.608: MmGetSystemRoutineAddress resolves BOTH routines and data
+     * exports, and for a data export it returns the VARIABLE's address -- which
+     * must then be dereferenced. That dereference was unguarded: a resolver
+     * that handed back something non-mapped (or a build where this export is
+     * not a variable at all) faulted right here instead of failing closed.
+     */
+    if ((UINT64)sysVar < 0xFFFF800000000000ULL || ((UINT64)sysVar & 7) != 0 ||
+        !MmIsAddressValid(sysVar)) {
+        InterlockedIncrement64(&g_off_failures);
+        LOG_ERROR("offsets: the system-process export is not a readable pointer");
+        return STATUS_UNSUCCESSFUL;
+    }
     g_off_system = *(PEPROCESS *)sysVar;
     if (!g_off_system) {
         InterlockedIncrement64(&g_off_failures);
@@ -408,4 +619,9 @@ void yghv_offsets_stats(uint64_t *out)
     out[1] = g_yghv_off.validated_mask;
     out[2] = (uint64_t)InterlockedCompareExchange64(&g_off_failures, 0, 0);
     out[3] = g_yghv_off.build_number;
+    /* 9.608 diagnostics: best good/closed/off the links sweep ever reached. */
+    out[4] = (uint64_t)InterlockedCompareExchange64(&g_probe_best_good, 0, 0);
+    out[5] = (uint64_t)InterlockedCompareExchange64(&g_probe_best_closed, 0, 0);
+    out[6] = (uint64_t)InterlockedCompareExchange64(&g_probe_best_off, 0, 0);
+    out[7] = (uint64_t)InterlockedCompareExchange64(&g_probe_reason, 0, 0);
 }

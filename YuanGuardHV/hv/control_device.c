@@ -1425,18 +1425,7 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
                 status = STATUS_SUCCESS;
                 break;
             }
-            case IOCTL_YGHV_WIN: {
-        ULONG winInfo = 0;
-        if (in_len < sizeof(yghv_ioctl_win_req_t)) {
-            status = STATUS_BUFFER_TOO_SMALL;
-            break;
-        }
-        status = yghv_win_dispatch(buf, buf, out_len, &winInfo);
-        if (NT_SUCCESS(status)) info = winInfo;
-        break;
-    }
-
-    default: ok = 0; break;
+            default: ok = 0; break;
             }
             if (op != 3) {
                 out[0] = (UINT64)(ok ? 1 : 0);
@@ -1448,6 +1437,30 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
         status = STATUS_INVALID_PARAMETER;
         break;
     }
+    /*
+     * 9.608 -- THIS CASE WAS UNREACHABLE.
+     *
+     * It was written OUTSIDE its own switch and lands INSIDE the
+     * IOCTL_YGHV_CACHE handler, whose inner switch dispatches on the op field
+     * (0..3), not on an IOCTL code. So "case IOCTL_YGHV_WIN:" was compared
+     * against 0x594721EC and could never match: every window request fell to
+     * "default: ok = 0" and came back as Win32 error 1 (INVALID_FUNCTION).
+     * Measured: all four window ops (SET/GET/STATS/POST) returned 0x1.
+     *
+     * A case label inside the wrong switch is legal C -- it does not compile-fail
+     * and it does not warn -- which is why it survived from 9.594 to here.
+     */
+    case IOCTL_YGHV_WIN: {
+        ULONG winInfo = 0;
+        if (in_len < sizeof(yghv_ioctl_win_req_t)) {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        status = yghv_win_dispatch(buf, buf, out_len, &winInfo);
+        if (NT_SUCCESS(status)) info = winInfo;
+        break;
+    }
+
     case IOCTL_YGHV_SENTRY: {
         /* Tier 7.4/7.5/7.6: what is being attempted against us, how slow our
          * exits are, and what we currently expose. */
@@ -3888,6 +3901,33 @@ NTSTATUS yghv_control_device_init(PDRIVER_OBJECT driver) {
         LOG_ERROR("control device: IoCreateSymbolicLink failed 0x%x", status);
         IoDeleteDevice(dev);
         return status;
+    }
+
+    /*
+     * 9.608: PUT THE NAME IN THE TRACE, not only in DbgPrint.
+     *
+     * 9.600 gave the device a random suffix, and yghv_init_device_names()
+     * announced it with LOG_INFO -- which compiles to NOTHING unless
+     * YGHV_DEBUG_LOG is set, so the name never reached yghv_progress.log. The
+     * net effect: the device exists, the client asks for a name that no longer
+     * exists, and every command fails with Win32 error 2, which reads as "the
+     * driver is not loaded". That is the "configured but not observable" shape
+     * this tree keeps paying for.
+     *
+     * yghv_trace writes to progress.log unconditionally, so the name is now
+     * recoverable from the one artifact that always exists after a load.
+     */
+    {
+        /* ASCII-only: yghv_trace takes a char*, and a device name is ASCII. */
+        char nm[64];
+        int k = 0;
+        const WCHAR *p = yghv_get_link_name();
+        /* Skip the "\DosDevices\" prefix -- the client wants what follows. */
+        while (p && *p && (unsigned short)*p != (unsigned short)'Y' && k < 60) p++;
+        while (p && *p && k < 60) { nm[k++] = (char)(*p++); }
+        nm[k] = 0;
+        yghv_trace("dev: link name (user-visible part) =");
+        yghv_trace(nm);
     }
 
     /*

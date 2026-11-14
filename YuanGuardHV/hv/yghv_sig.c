@@ -53,6 +53,7 @@ NTKERNELAPI PVOID NTAPI RtlPcToFileHeader(PVOID PcValue, PVOID *BaseOfImage);
 #include "common/yghv_nt.h"
 #include "common/yghv_sig.h"
 #include "common/yghv_strtab.h"
+#include "common/yghv_safe.h"
 
 /* Same KLDR_DATA_TABLE_ENTRY prefix loader_stealth.c uses. Duplicated rather
  * than shared because that file needs only the links and this one needs the
@@ -95,30 +96,57 @@ static int yghv_sig_canonical(uint64_t p)
     return p >= 0xFFFF800000000000ULL;
 }
 
-static int yghv_sig_readable_image(uint64_t base, uint32_t size, uint32_t *out_size)
+/*
+ * 9.608 -- THIS FUNCTION CAUSED THE SECOND BUGCHECK.
+ *
+ *   yghv_sig_readable_image+0x21   read of ffff84a988200000
+ *
+ * The address is canonical AND page-aligned, so it passed both tests this
+ * function used to make, and the e_magic read then faulted. Worse, every
+ * individual read here is a plain dereference whose __try was the only
+ * protection -- and this function was INLINED (it has no definition of its own
+ * in the .map), so the handler was the optimizer's to place.
+ *
+ * Now: one NOINLINE entry point, and every field read goes through
+ * yghv_safe_read*. A "canonical + page-aligned" pair of tests cannot tell a
+ * mapped image from an empty region of address space; MmIsAddressValid inside
+ * yghv_safe_read* can, and the __try there is a real stack frame.
+ *
+ * The header layout is still validated field by field, in the same order, with
+ * the same rejections -- the difference is only HOW the bytes are fetched.
+ */
+static __declspec(noinline) int yghv_sig_readable_image(uint64_t base, uint32_t size, uint32_t *out_size)
 {
-    IMAGE_NT_HEADERS64 *nt;
-    IMAGE_DOS_HEADER *dos;
+    IMAGE_DOS_HEADER dos;
+    IMAGE_NT_HEADERS64 nt;
+    uint64_t ntAddr;
 
+    if (!out_size) return 0;
     if (!yghv_sig_canonical(base)) return 0;
     if ((base & 0xFFF) != 0) return 0;
 
-    __try {
-        dos = (IMAGE_DOS_HEADER *)base;
-        if (dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
-        if (dos->e_lfanew <= 0 || dos->e_lfanew > 0x1000) return 0;
-        nt = (IMAGE_NT_HEADERS64 *)(base + (uint32_t)dos->e_lfanew);
-        if (nt->Signature != IMAGE_NT_SIGNATURE) return 0;
-        if (nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) return 0;
-        if (nt->OptionalHeader.SizeOfImage < 0x1000) return 0;
-        if (nt->OptionalHeader.SizeOfImage > YGHV_SIG_MAX_IMAGE) return 0;
-        if (nt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64) return 0;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    /* --- DOS header --- */
+    if (!yghv_safe_read((const void *)base, &dos, sizeof(dos))) {
         InterlockedIncrement64(&g_sig_faults);
         return 0;
     }
+    if (dos.e_magic != IMAGE_DOS_SIGNATURE) return 0;
+    if (dos.e_lfanew <= 0 || dos.e_lfanew > 0x1000) return 0;
 
-    *out_size = nt->OptionalHeader.SizeOfImage;
+    /* --- NT headers, at a file-supplied offset that was bounded above --- */
+    ntAddr = base + (uint32_t)dos.e_lfanew;
+    if (ntAddr < base) return 0;             /* the sum wrapped */
+    if (!yghv_safe_read((const void *)ntAddr, &nt, sizeof(nt))) {
+        InterlockedIncrement64(&g_sig_faults);
+        return 0;
+    }
+    if (nt.Signature != IMAGE_NT_SIGNATURE) return 0;
+    if (nt.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) return 0;
+    if (nt.OptionalHeader.SizeOfImage < 0x1000) return 0;
+    if (nt.OptionalHeader.SizeOfImage > YGHV_SIG_MAX_IMAGE) return 0;
+    if (nt.FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64) return 0;
+
+    *out_size = nt.OptionalHeader.SizeOfImage;
     (void)size;
     return 1;
 }
@@ -156,6 +184,10 @@ int yghv_sig_module_by_reference(PCWSTR export_name, YGHV_SIG_MODULE *out)
     return 1;
 }
 
+/* 9.608: NOINLINE -- the walk over PsLoadedModuleList must not be inlined into
+ * a caller whose own __try would then be the only guard, and must not lose its
+ * own frames. See common/yghv_safe.h. */
+__declspec(noinline)
 int yghv_sig_module_by_name(PCWSTR module_name, YGHV_SIG_MODULE *out)
 {
     UNICODE_STRING funcName;
@@ -181,43 +213,84 @@ int yghv_sig_module_by_name(PCWSTR module_name, YGHV_SIG_MODULE *out)
     RtlInitUnicodeString(&want, module_name);
     if (!want.Buffer || want.Length == 0) return 0;
 
-    __try {
-        if (!yghv_sig_canonical((uint64_t)head)) return 0;
+    /*
+     * 9.608 -- EVERY DEREFERENCE BELOW GOES THROUGH yghv_safe_read.
+     *
+     * This loop used to read head->Flink, le->Flink, e->BaseDllName and
+     * e->DllBase directly, relying on one __try around the whole body plus
+     * yghv_sig_canonical() on two of the pointers. Both are the failure this
+     * build has already bugchecked on twice: "canonical" is not "mapped", and
+     * the __try was at the mercy of inlining (this function is NOINLINE only
+     * because 9.608 made it so).
+     *
+     * The loop now reads the entry STRUCT into a local and validates the local.
+     * That is more than defensive style: it means the walk never dereferences a
+     * pointer it has not just proved readable, and a corrupted list ends the
+     * walk instead of faulting.
+     */
+    if (!yghv_sig_canonical((uint64_t)head)) return 0;
+    if (!yghv_safe_range_ok((const void *)&head->Flink, sizeof(head->Flink))) return 0;
 
-        for (le = head->Flink; le != head; le = le->Flink) {
-            PYGHV_LDR_ENTRY e;
+    {
+        PLIST_ENTRY first = NULL;
 
-            /* A corrupted or circular list must end the walk, not hang the
-             * driver. 4096 modules is far past any real system. */
-            if (++guard > 4096) break;
-            if (!yghv_sig_canonical((uint64_t)le)) break;
+        if (!yghv_safe_read64((const void *)&head->Flink, (uint64_t *)&first)) {
+            InterlockedIncrement64(&g_sig_faults);
+            return 0;
+        }
+        le = first;
+    }
 
-            e = CONTAINING_RECORD(le, YGHV_LDR_ENTRY, InLoadOrderLinks);
+    while (le != head) {
+        YGHV_LDR_ENTRY e;
+        UNICODE_STRING baseName;
+        PVOID dllBase;
+        PLIST_ENTRY next = NULL;
 
-            /* Validate before trusting: these offsets are ours, not the
-             * header's, so a wrong one lands on garbage and must be caught
-             * here rather than by a fault three instructions later. */
-            if (!e->BaseDllName.Buffer || e->BaseDllName.Length == 0) continue;
-            if ((e->BaseDllName.Length & 1) != 0) continue;
-            if (e->BaseDllName.Length > 256) continue;
-            if (!yghv_sig_canonical((uint64_t)e->BaseDllName.Buffer)) continue;
-            if (e->BaseDllName.Length != want.Length) continue;
-            if (RtlCompareMemory(e->BaseDllName.Buffer, want.Buffer,
-                                 want.Length) != want.Length) continue;
+        /* A corrupted or circular list must end the walk, not hang the driver.
+         * 4096 modules is far past any real system. */
+        if (++guard > 4096) break;
+        if (!le) break;
+        if (!yghv_sig_canonical((uint64_t)le)) break;
 
-            if (!yghv_sig_readable_image((uint64_t)e->DllBase, 0, &out->size)) {
-                continue;
-            }
-            out->base = (uint64_t)e->DllBase;
+        /* Read the entry, then read its next pointer -- both guarded. */
+        if (!yghv_safe_read((const void *)le, &e, sizeof(e))) {
+            InterlockedIncrement64(&g_sig_faults);
+            break;
+        }
+        if (!yghv_safe_read64((const void *)&e.InLoadOrderLinks.Flink,
+                              (uint64_t *)&next)) {
+            InterlockedIncrement64(&g_sig_faults);
+            break;
+        }
+
+        baseName = e.BaseDllName;
+        dllBase = e.DllBase;
+
+        /* Validate the LOCAL copy: these offsets are ours, not the header's,
+         * so a wrong one lands on garbage -- and that is caught here rather
+         * than by a fault three instructions later. */
+        if (!baseName.Buffer || baseName.Length == 0) { le = next; continue; }
+        if ((baseName.Length & 1) != 0) { le = next; continue; }
+        if (baseName.Length > 256) { le = next; continue; }
+        if (!yghv_sig_canonical((uint64_t)baseName.Buffer)) { le = next; continue; }
+        if (baseName.Length != want.Length) { le = next; continue; }
+
+        /* The name compare reads want.Length bytes out of a pointer that has
+         * only been proved canonical, so the range is checked before use. */
+        if (!yghv_safe_range_ok(baseName.Buffer, baseName.Length)) { le = next; continue; }
+        if (RtlCompareMemory(baseName.Buffer, want.Buffer,
+                             want.Length) != want.Length) { le = next; continue; }
+
+        if (dllBase && yghv_sig_readable_image((uint64_t)dllBase, 0, &out->size)) {
+            out->base = (uint64_t)dllBase;
             out->flags = YGHV_SIG_MOD_BY_NAME;
             (void)RtlStringCchCopyW(out->name, YGHV_SIG_NAME_CHARS,
-                                    e->BaseDllName.Buffer);
+                                    baseName.Buffer);
             out->name[YGHV_SIG_NAME_CHARS - 1] = 0;
             return 1;
         }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        InterlockedIncrement64(&g_sig_faults);
-        return 0;
+        le = next;
     }
     return 0;
 }

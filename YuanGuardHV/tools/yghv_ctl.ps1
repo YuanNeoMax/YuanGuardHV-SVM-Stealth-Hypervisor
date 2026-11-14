@@ -1019,7 +1019,12 @@ if ($sysCommands -contains $Command.ToLower()) {
     }
 }
 
-$devicePath = '\\.\YuanGuardHV'
+# 9.608: 9.600 gave the device a RANDOM 8-character suffix at load time, and
+# this constant never followed. Every command then failed with Win32 error 2
+# (ERROR_FILE_NOT_FOUND) -- the client was looking for a name that no longer
+# exists, and the failure looks exactly like 'the driver is not loaded'.
+# Override with:  $env:YGHV_DEVICE_PATH = '\\.\YuanGuardHV_ab12cd34'
+$devicePath = if ($env:YGHV_DEVICE_PATH) { $env:YGHV_DEVICE_PATH } else { '\\.\YuanGuardHV' }
 $handle = [YghvCtlNative]::CreateFile(
     $devicePath,
     [YghvCtlNative]::GENERIC_READ -bor [YghvCtlNative]::GENERIC_WRITE,
@@ -5131,12 +5136,31 @@ try {
                 return ,$req
             }
 
+            # 9.608: 64-bit fields must be split with MODULO, not -band.
+            #
+            # The old formatter did  $e0 -band 0xFFFFFFFF , which promotes to a
+            # SIGNED 64-bit value: a legitimate pid|ppid pair like 0x400000094
+            # came out negative, and the [uint32] cast then threw "value too
+            # large or too small for UInt32". The driver was returning correct
+            # data; the formatter refused to print it -- and because the
+            # exception is raised while building the -f arguments, the whole
+            # proc command died on its FIRST entry: 120 processes reported,
+            # zero shown.
+            #
+            # Arithmetic modulo 2^32 stays unsigned at every step.
+            function Split-ProcQword([uint64]$v) {
+                $lo = [uint32]($v % 4294967296)
+                $hi = [uint32](($v / 4294967296) % 4294967296)
+                return @($lo, $hi)
+            }
             function Show-ProcEntry([byte[]]$buf, [int]$at) {
                 $e0 = [BitConverter]::ToUInt64($buf, $at)
                 $e1 = [BitConverter]::ToUInt64($buf, $at + 8)
                 $e2 = [BitConverter]::ToUInt64($buf, $at + 16)
                 $e3 = [BitConverter]::ToUInt64($buf, $at + 24)
-                Write-Host ("  pid={0,-6} ppid={1,-6} prot=0x{2:X2} type={3} signer={4} exit=0x{5:X8} base=0x{6:X} flags=0x{7:X}" -f ([uint32]($e0 -band 0xFFFFFFFF)),  ([uint32](($e0 -shr 32) -band 0xFFFFFFFF)),  ([uint32]($e1 -band 0xFF)),  ([uint32](($e1 -shr 16) -band 0x7)),  ([uint32](($e1 -shr 8) -band 0xF)),  ([uint32](($e1 -shr 32) -band 0xFFFFFFFF)),  $e2, $e3)
+                $a = Split-ProcQword $e0
+                $b = Split-ProcQword $e1
+                Write-Host ("  pid={0,-6} ppid={1,-6} prot=0x{2:X2} type={3} signer={4} exit=0x{5:X8} base=0x{6:X} flags=0x{7:X}" -f $a[0], $a[1], [uint32]($b[0] % 256), [uint32](($b[0] / 65536) % 8), [uint32](($b[0] / 256) % 16), $b[1], $e2, $e3)
             }
 
             if ($null -eq $Arg1) {
@@ -5274,28 +5298,6 @@ try {
                 }
                 return
             }
-            'escalate' {
-                if ($null -eq $Arg1) { throw 'proc escalate: usage: proc escalate <pid>' }
-                $req = New-ProcReq 13 ([uint32]::Parse($Arg1)) 0 0 0
-                $out = Invoke-YghvIoctl -Code (IoCtl 0x838) -InBytes $req -OutputLength 4096
-                if ([BitConverter]::ToUInt64($out, 0) -eq 1) {
-                    Write-Output ("proc: pid={0} privileges enabled={1} total={2}" -f $Arg1, [BitConverter]::ToUInt64($out, 8), [BitConverter]::ToUInt64($out, 16))
-                } else {
-                    throw ("proc escalate failed: code={0}" -f [BitConverter]::ToUInt64($out, 8))
-                }
-            }
-            'hide-thread' {
-                if ($null -eq $Arg1) { throw 'proc hide-thread: usage: proc hide-thread <tid> [unhide]' }
-                $hide = 1
-                if ($Arg2 -eq 'unhide') { $hide = 0 }
-                $req = New-ProcReq 14 ([uint32]::Parse($Arg1)) $hide 0 0
-                $out = Invoke-YghvIoctl -Code (IoCtl 0x838) -InBytes $req -OutputLength 4096
-                if ([BitConverter]::ToUInt64($out, 0) -eq 1) {
-                    Write-Output ("proc: tid={0} thread {1}" -f $Arg1, $(if ($hide) {'hidden'} else {'restored'}))
-                } else {
-                    throw ("proc hide-thread failed: code={0}" -f [BitConverter]::ToUInt64($out, 8))
-                }
-            }
             # Anything left is a bare pid: single-process query.
             $qp = [uint32]::Parse($v)
             $req = New-ProcReq 1 $qp 0 0 0
@@ -5303,6 +5305,35 @@ try {
             Show-ProcEntry $out 32
             $nm = [Text.Encoding]::ASCII.GetString($out, 64, 16).TrimEnd([char]0)
             Write-Host ("proc: pid={0} image='{1}'" -f $qp, $nm)
+        }
+        # 9.608: escalate / hide-thread are TOP-LEVEL commands.
+        #
+        # 9.603/9.604 wrote their bodies with switch-case syntax ('escalate' { ... })
+        # inside the `proc` case, which is a chain of ifs -- so the file did not
+        # even PARSE ("unexpected token {"). Both commands were unreachable, and
+        # the PowerShell client could not run ANY command, including sys-health.
+        # The client README declares them at top level; the client now matches.
+        'escalate' {
+            if ($null -eq $Arg1) { throw 'escalate: usage: escalate <pid>' }
+            $req = New-ProcReq 13 ([uint32]::Parse($Arg1)) 0 0 0
+            $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x838)) -InBytes $req -OutputLength 4096
+            if ([BitConverter]::ToUInt64($out, 0) -eq 1) {
+                Write-Output ('escalate: pid={0} privileges enabled={1} total={2}' -f $Arg1, [BitConverter]::ToUInt64($out, 8), [BitConverter]::ToUInt64($out, 16))
+            } else {
+                throw ('escalate failed: code={0}' -f [BitConverter]::ToUInt64($out, 8))
+            }
+        }
+        'hide-thread' {
+            if ($null -eq $Arg1) { throw 'hide-thread: usage: hide-thread <tid> [unhide]' }
+            $hide = 1
+            if ($Arg2 -eq 'unhide') { $hide = 0 }
+            $req = New-ProcReq 14 ([uint32]::Parse($Arg1)) $hide 0 0
+            $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x838)) -InBytes $req -OutputLength 4096
+            if ([BitConverter]::ToUInt64($out, 0) -eq 1) {
+                Write-Output ('hide-thread: tid={0} {1}' -f $Arg1, $(if ($hide) {'hidden'} else {'restored'}))
+            } else {
+                throw ('hide-thread failed: code={0}' -f [BitConverter]::ToUInt64($out, 8))
+            }
         }
         'inject' {
             # 9.592: the five injection primitives (IOCTL 0x839).

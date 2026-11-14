@@ -85,6 +85,14 @@ function Invoke-Check {
     $saved = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     $env:YGHV_DOCS_ROOT = $copy
+    # 9.608: the runner sets YGHV_BUILD_IN_PROGRESS while it is measuring, which
+    # DEFERS the image-hash comparison. The self-test is not a build: it has to
+    # observe that comparison, so the flag is cleared here. Without this the
+    # 'stale image hash' mutation passes (the check never ran) and the self-test
+    # correctly reports the check as asleep -- measured, right after the
+    # deferral was introduced.
+    $savedBuildFlag = $env:YGHV_BUILD_IN_PROGRESS
+    $env:YGHV_BUILD_IN_PROGRESS = $null
     $out = ''
     $code = 0
     try {
@@ -98,6 +106,7 @@ function Invoke-Check {
     finally {
         $ErrorActionPreference = $saved
         $env:YGHV_DOCS_ROOT = $null
+        $env:YGHV_BUILD_IN_PROGRESS = $savedBuildFlag
     }
     return @{ Exit = $code; Out = $out }
 }

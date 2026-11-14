@@ -5494,7 +5494,11 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
      */
     {
         NTSTATUS offSt = yghv_offsets_init();
-        uint64_t offStats[4];
+        /* 9.608: yghv_offsets_stats writes EIGHT entries (the links-probe
+         * diagnostics were added), so a [4] here would be a 32-byte stack
+         * overflow the first time it ran. Sized to the contract, not to the
+         * fields this particular caller reads. */
+        uint64_t offStats[8];
 
         yghv_offsets_stats(offStats);
         if (!NT_SUCCESS(offSt) || !yghv_offsets_ready()) {

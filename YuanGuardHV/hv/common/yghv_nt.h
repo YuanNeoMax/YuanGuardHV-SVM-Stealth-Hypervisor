@@ -259,7 +259,10 @@ typedef union _YGHV_PS_PROTECTION {
 #define YGHV_PROC_FULL_RIGHTS  (PROCESS_ALL_ACCESS)
 
 NTSTATUS yghv_offsets_init(void);
-void     yghv_offsets_stats(uint64_t *out);   /* [0] derived [1] validated [2] failures [3] build */
+/* 9.608: writes EIGHT entries; callers must pass a uint64_t[8].
+ * [0] derived [1] validated [2] failures [3] build
+ * [4] links-probe best good [5] best closed [6] best off [7] attempts */
+void     yghv_offsets_stats(uint64_t *out);
 PEPROCESS yghv_offsets_system_process(void);
 int      yghv_offsets_ready(void);
 

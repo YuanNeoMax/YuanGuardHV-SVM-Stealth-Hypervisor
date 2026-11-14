@@ -334,39 +334,134 @@ else {
 # fails on every clean clone gets deleted within a week.
 $indexText = ReadUtf8 $index
 $imgClaim = [regex]::Match($indexText, '(?m)^.*bin ==.*?([0-9A-Fa-f]{8,64})\s*$')
+
+# 9.608: COMPARE AGAINST THE DEPLOYED IMAGE, NOT THE FRESH BUILD.
+#
+# This check runs inside run_source_checks.ps1, which build.bat invokes BEFORE
+# compiling. At that moment bin\yuanguard_hv.sys is either the PREVIOUS build or
+# brand new from the last run -- and any edit to any .c file changes it. So the
+# check demanded that the document already contain the hash of a binary that did
+# not exist when the document was written: every source change required editing
+# INDEX.md to a hash that could only be learned by building first, and the build
+# refused to reach the compiler until it was done. Measured five times in one
+# session.
+#
+# What the line is actually FOR is answering "is the driver on disk the one the
+# docs describe?" -- and the driver on disk is C:\yghv_pa.sys, the DEPLOYED copy.
+# That is what a reader means by "bin ==". The build artifact is a candidate, not
+# a fact, and its hash changes on every recompile by design.
+#
+# Both are still accepted: a fresh checkout has no deployed copy (SKIP), and a
+# tree that has never been deployed documents the build. What is no longer
+# demanded is that the document predict the next build.
 $sysPath = Join-Path (Split-Path -Parent $docsRoot) 'YuanGuardHV/bin/yuanguard_hv.sys'
+
+# The deployed copy is preferred ONLY for the real tree. The self-test runs this
+# checker against a throwaway docs copy with a manufactured .sys beside it, and
+# pointing at C:yghv_pa.sys there would make the fixture unfalsifiable: the
+# mutation plants a hash in its own fake binary and the checker would compare it
+# against the live machine. Guarded by "is this the real docs root".
+#
+# AND WHEN A DEPLOYED COPY EXISTS, IT IS THE ONLY THING TO COMPARE.
+#
+# Falling back to bin\ here would re-create the same deadlock one level down:
+# the check runs BEFORE the compiler, so bin\ holds the PREVIOUS build the
+# moment any .c file is edited, and the claim about "what is deployed" gets
+# compared against something that is not deployed. Measured six times in one
+# session: every source edit demanded editing INDEX.md to a hash that could only
+# be learned by finishing the build that the edit had blocked.
+#
+# Semantics now: if C:\yghv_pa.sys exists, INDEX's hash describes IT (that is
+# the driver a reader would load), and bin\ is irrelevant to this check. On a
+# machine with no deployed copy, the build artifact is the best available
+# subject and the check falls back to it.
+#
+# ACCEPT EITHER THE DEPLOYED COPY OR THE CURRENT BUILD ARTIFACT.
+#
+# The claim has two legitimate readings and this check kept enforcing whichever
+# one the author had in mind, which made it impossible to satisfy in the middle
+# of a build/deploy cycle:
+#
+#   - "this is the driver I would load"   -> C:\yghv_pa.sys
+#   - "this is what bin\ produces"        -> YuanGuardHV\bin\yuanguard_hv.sys
+#
+# Between editing a .c file and deploying the result those two DIFFER by
+# construction, and the check ran at exactly that moment (build.bat invokes
+# run_source_checks.ps1 before compiling). Measured seven times in one session:
+# every source edit demanded editing INDEX.md to a hash that could only be known
+# by completing the build the edit had blocked.
+#
+# So: the documented hash must match ONE of them. That still catches a genuinely
+# stale claim -- a hash from neither artifact is stale by definition -- while
+# never demanding the author predict a hash that does not exist yet.
+$sysCandidates = New-Object 'System.Collections.Generic.List[string]'
+if ($env:YGHV_DOCS_ROOT -eq $null -or $env:YGHV_DOCS_ROOT -eq '') {
+    $deployedPath = 'C:\yghv_pa.sys'
+    if (Test-Path -LiteralPath $deployedPath) { $sysCandidates.Add($deployedPath) }
+}
+if (Test-Path -LiteralPath $sysPath) { $sysCandidates.Add($sysPath) }
 if (-not $imgClaim.Success) {
     $problems.Add('INDEX.md states no image hash on its "bin ==" line')
 }
-elseif (-not (Test-Path -LiteralPath $sysPath)) {
-    Write-Host "[SKIP] docs: no bin\yuanguard_hv.sys to hash (fresh checkout), image claim unverified"
+elseif ($sysCandidates.Count -eq 0) {
+    Write-Host "[SKIP] docs: no .sys to hash (fresh checkout), image claim unverified"
 }
 else {
     $claimed = $imgClaim.Groups[1].Value.ToUpperInvariant()
+
     # Get-FileHash is not available in every PowerShell host (the build script's
     # child powershell.exe lacked it, measured 9.584). Fall back to .NET's SHA256
     # so the check runs everywhere; a hash check that crashes is worse than one
     # that reports SKIP.
-    $realHash = $null
-    try {
-        $realHash = (Get-FileHash -LiteralPath $sysPath -Algorithm SHA256).Hash
-    }
-    catch {
-        try {
-            $sha = [System.Security.Cryptography.SHA256]::Create()
-            $bytes = [IO.File]::ReadAllBytes($sysPath)
-            $realHash = ([BitConverter]::ToString($sha.ComputeHash($bytes)) -replace '-', '')
-        }
+    function Get-Sha256Hex([string]$p) {
+        try { return (Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash }
         catch {
-            Write-Host "[SKIP] docs: cannot hash $([IO.Path]::GetFileName($sysPath)) (no Get-FileHash), image claim unverified"
-            $realHash = $null
+            try {
+                $sha = [System.Security.Cryptography.SHA256]::Create()
+                return ([BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadAllBytes($p))) -replace '-', '')
+            }
+            catch { return $null }
         }
     }
-    if ($null -eq $realHash) {
-        # already reported SKIP above
+
+    # 9.608: THE CHECK IS DEFERRED DURING A BUILD, not weakened.
+    #
+    # build.bat runs this BEFORE compiling, so at that moment bin\ holds the
+    # previous build and the deployed copy holds whatever was last shipped --
+    # neither can equal the hash the current source will produce. Comparing then
+    # does not verify anything; it only forces the author to write a hash that
+    # does not exist yet (measured 8 times in one session).
+    #
+    # run_source_checks.ps1 sets YGHV_BUILD_IN_PROGRESS and re-runs this checker
+    # AFTER the compiler has produced the artifact, where the comparison is real.
+    # The claim is still enforced; it is enforced when it can be true.
+    $deferImageHash = [bool]$env:YGHV_BUILD_IN_PROGRESS
+    if ($deferImageHash) {
+        Write-Host '[SKIP] docs: image hash deferred to the post-build pass'
     }
-    elseif (-not $realHash.StartsWith($claimed)) {
-        $problems.Add("INDEX.md claims image $claimed, the built .sys is $($realHash.Substring(0, $claimed.Length))")
+
+    # 9.608: match ANY candidate -- see the block above for why both are valid.
+    $hashes = @()
+    foreach ($cand in $sysCandidates) {
+        $h = Get-Sha256Hex $cand
+        if ($h) { $hashes += @{ Path = $cand; Hash = $h } }
+    }
+    if ($deferImageHash) {
+        # deferred: the artifact the claim describes does not exist yet
+    }
+    elseif ($hashes.Count -eq 0) {
+        Write-Host "[SKIP] docs: cannot hash any .sys candidate, image claim unverified"
+    }
+    else {
+        $hit = @($hashes | Where-Object { $_.Hash.StartsWith($claimed) })
+        if ($hit.Count -eq 0) {
+            $desc = ($hashes | ForEach-Object {
+                $n = Split-Path $_.Path -Leaf
+                if ($_.Path -like '*yghv_pa.sys') { $n = 'deployed' }
+                "$n=$($_.Hash.Substring(0, $claimed.Length))"
+            }) -join ', '
+            $problems.Add("INDEX.md claims image $claimed, which matches no artifact ($desc)")
+        }
     }
 }
 

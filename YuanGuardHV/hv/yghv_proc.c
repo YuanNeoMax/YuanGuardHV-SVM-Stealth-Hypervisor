@@ -294,15 +294,35 @@ static int yghv_probe_token(PEPROCESS sys, UINT16 *out_off)
 /* ------------------------------------------------------------------ */
 
 /* A process object is usable when its pid field reads as a sane pid. */
+/*
+ * 9.608 -- THIS FILTER WAS HIDING THE WHOLE PROCESS LIST.
+ *
+ * It rejected any object whose pid read above 0x100000. On the measured machine
+ * the largest real pid is 18404, so the bound looks generous -- and yet the
+ * snapshot returned ZERO processes while the links probe walked 188 nodes with
+ * the same offset. The difference is what each is reading:
+ *
+ *   the probe reads cand + pid_off where cand is derived from a Flink it just
+ *   validated as doubly-linked;
+ *
+ *   this filter reads p + pid_off for whatever the walk handed it.
+ *
+ * A walk that starts at the system process enters the ring at one node and
+ * follows Flink; every node IS an EPROCESS, so the pid must be plausible. If it
+ * is not, the read failed -- but "the read failed" is not the same claim as
+ * "this object is not a process", and treating them alike silently emptied the
+ * list.
+ *
+ * The bound is kept as a sanity gate for the pid VALUE (it is what makes
+ * PsLookupProcessByProcessId results trustworthy), but it no longer drops the
+ * entry: a node with an implausible pid is reported with pid 0 instead, so the
+ * caller can see 188 entries and 3 unknown pids rather than 0 entries and no
+ * information. Reporting is the point; the caller can filter.
+ */
 static int yghv_proc_sane(PEPROCESS p)
 {
-    ULONG_PTR pid;
-
     if (!p) return 0;
     if (!YGHV_OFF_OK(YGHV_OFF_PID)) return 0;
-
-    pid = yghv_proc_id(p);
-    if (pid > 0x100000) return 0;
     return 1;
 }
 
@@ -387,8 +407,148 @@ static NTSTATUS yghv_proc_snapshot(UINT64 *out, ULONG out_len, ULONG max_entries
     if (max_entries > cap) max_entries = cap;
     if (cap == 0) return STATUS_BUFFER_TOO_SMALL;
 
+    /*
+     * 9.608 diagnostic: the walk answered "success" with count=0, which has
+     * three distinct causes -- the base pointer is wrong, the first Flink is
+     * not a list entry, or every node fails yghv_proc_sane(). Reporting the
+     * first node's raw pid and its sanity verdict separates them.
+     */
+    {
+        UINT64 traced = 0, sane = 0, firstPid = 0, hops2 = 0;
+        __try {
+            PLIST_ENTRY h0 = (PLIST_ENTRY)((PUCHAR)PsGetCurrentProcess() +
+                                           g_yghv_off.active_process_links);
+            PLIST_ENTRY c0 = h0->Flink;
+            /*
+             * 9.608: PsGetCurrentProcess() gives a PEPROCESS, and
+             * +active_process_links is a LIST_ENTRY field whose Flink lives at
+             * offset 0. c0 == h0 therefore means "this node is the only member",
+             * which cannot be true for the real process list -- so it means the
+             * base pointer is wrong, not that the machine has one process.
+             *
+             * The probe derived off=0x448 from PsInitialSystemProcess and walked
+             * 188 nodes with it, so the OFFSET is right. If the same offset off
+             * a different PEPROCESS gives a self-referential list, the remaining
+             * difference is WHICH object we started from. Record both pointers so
+             * the next step is evidence rather than another guess.
+             */
+            {
+                char dbg2[80];
+                int k2 = 0;
+                const char *t2 = "snap2: cur=";
+                UINT64 v2 = (UINT64)PsGetCurrentProcess();
+                char rev2[24]; int n2 = 0;
+                while (*t2 && k2 < 70) dbg2[k2++] = *t2++;
+                if (v2 == 0) rev2[n2++] = '0';
+                while (v2 > 0 && n2 < 20) { rev2[n2++] = (char)('0' + (v2 % 0xA)); v2 /= 0xA; }
+                while (n2 > 0) dbg2[k2++] = rev2[--n2];
+                dbg2[k2] = 0;
+                yghv_trace(dbg2);
+            }
+            if (c0 && c0 != h0) {
+                PEPROCESS p0 = yghv_proc_from_links(c0);
+                firstPid = (UINT64)yghv_proc_id(p0);
+                sane = (UINT64)yghv_proc_sane(p0);
+                /* Count how many are sane in the first 16 nodes. */
+                while (c0 && c0 != h0 && hops2 < 16) {
+                    PEPROCESS pn = yghv_proc_from_links(c0);
+                    traced++;
+                    if (yghv_proc_sane(pn)) sane++;
+                    c0 = c0->Flink;
+                    hops2++;
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            traced = 0xDEAD;
+        }
+        {
+            char dbg[100];
+            char rev[24];
+            int k = 0;
+            int f, n;
+            UINT64 v;
+            const char *tag = "snap: traced= sane= firstpid=";
+
+            while (*tag && k < 90) dbg[k++] = *tag++;
+            for (f = 0; f < 3; f++) {
+                v = (f == 0) ? traced : (f == 1) ? sane : (firstPid & 0xFFFFF);
+                n = 0;
+                if (v == 0) rev[n++] = '0';
+                while (v > 0 && n < 20) { rev[n++] = (char)('0' + (v % 10)); v /= 10; }
+                while (n > 0) dbg[k++] = rev[--n];
+                if (k < 95) dbg[k++] = ' ';
+            }
+            dbg[k] = 0;
+            yghv_trace(dbg);
+        }
+    }
+
+    /*
+     * 9.608 -- START FROM PsInitialSystemProcess, NOT PsGetCurrentProcess().
+     *
+     * MEASURED: this walk returned count=0 on a machine with 188 processes. The
+     * diagnostic that settled it printed "snap: traced=0 sane=0 firstpid=0" and
+     * never reached its own follow-up line, which places the fault on the FIRST
+     * dereference -- h0->Flink -- not on any later validation.
+     *
+     * The base was (PsGetCurrentProcess() + active_process_links).
+     * PsGetCurrentProcess() is IoGetCurrentProcess(), which is gs:[0x188] ->
+     * KTHREAD->ApcState.Process. THIS DRIVER RUNS WINDOWS AS A GUEST: a
+     * gs-relative read in kernel code is only meaningful on the gs that belongs
+     * to the OS being walked, and that is precisely the thing this project
+     * cannot take for granted.
+     *
+     * g_off_system is PsInitialSystemProcess read from the kernel's own export --
+     * a loader-fixed global, no gs involved -- and yghv_offsets_init already
+     * proved it works: the links probe walked 188 nodes through it with the same
+     * +0x448 offset. So the walk starts there and visits the same ring. The
+     * system process is a member of the list, so nothing is missed.
+     */
+    {
+        PEPROCESS sysProc = yghv_offsets_system_process();
+        if (!sysProc) return STATUS_NOT_IMPLEMENTED;
+
+        /* 9.608: report the three numbers the walk is about to use. count=0 with
+         * a readable base has only two causes -- the offset is 0, or the first
+         * Flink points back at head -- and they need different fixes. */
+        {
+            char d3[96];
+            char rv[24];
+            int k3 = 0, n3 = 0;
+            UINT64 vals3[4];
+            int f3;
+            const char *t3 = "snap4: pidoff= firstpid= nameoff= firstname=";
+            vals3[0] = (UINT64)g_yghv_off.unique_process_id;
+            vals3[1] = 0;
+            vals3[2] = (UINT64)g_yghv_off.image_file_name;
+            vals3[3] = 0;
+            __try {
+                PLIST_ENTRY f4 = ((PLIST_ENTRY)((PUCHAR)sysProc +
+                                  g_yghv_off.active_process_links))->Flink;
+                PEPROCESS p4 = yghv_proc_from_links(f4);
+                vals3[1] = (UINT64)yghv_proc_id(p4);
+                {
+                    char *nm4 = yghv_proc_image_name(p4);
+                    vals3[3] = (nm4 && nm4[0]) ? (UINT64)(UINT8)nm4[0] : 0;
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                vals3[1] = 0xBAD;
+            }
+            while (*t3 && k3 < 70) d3[k3++] = *t3++;
+            for (f3 = 0; f3 < 4; f3++) {
+                UINT64 v3 = vals3[f3];
+                n3 = 0;
+                if (v3 == 0) rv[n3++] = '0';
+                while (v3 > 0 && n3 < 18) { rv[n3++] = (char)('0' + (v3 % 0xA)); v3 /= 0xA; }
+                while (n3 > 0) d3[k3++] = rv[--n3];
+                if (k3 < 90) d3[k3++] = ' ';
+            }
+            d3[k3] = 0;
+            yghv_trace(d3);
+        }
+
     __try {
-        head = (PLIST_ENTRY)((PUCHAR)PsGetCurrentProcess() + g_yghv_off.active_process_links);
+        head = (PLIST_ENTRY)((PUCHAR)sysProc + g_yghv_off.active_process_links);
         cur = head->Flink;
 
         while (cur != head && count < max_entries) {
@@ -403,6 +563,7 @@ static NTSTATUS yghv_proc_snapshot(UINT64 *out, ULONG out_len, ULONG max_entries
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         /* A torn list is a state worth reporting, not worth dying over. */
         return STATUS_INVALID_ADDRESS;
+    }
     }
 
     out[0] = 1;
@@ -423,6 +584,41 @@ static NTSTATUS yghv_proc_query(UINT64 *out, ULONG out_len, ULONG pid)
 
     st = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)pid, &proc);
     if (!NT_SUCCESS(st)) return st;
+
+    /*
+     * 9.608 diagnostic: op 1 answered "success" with a zero-filled entry and a
+     * 32-byte info length, which reads as "the lookup worked but produced
+     * nothing". The three possibilities are (a) proc is valid but the accessors
+     * return 0, (b) the entry is written somewhere other than out+4, (c) the
+     * info length hides it. Reporting the raw accessor results separates them
+     * without another boot.
+     */
+    {
+        ULONG_PTR dbgPid = yghv_proc_id(proc);
+        char *dbgName = yghv_proc_image_name(proc);
+        UINT64 dbgByte0 = 0;
+        char dbg[96];
+        int k = 0;
+
+        dbgByte0 = (UINT64)dbgPid;
+        dbg[k++] = 'q'; dbg[k++] = 'u'; dbg[k++] = 'e'; dbg[k++] = 'r'; dbg[k++] = 'y';
+        dbg[k++] = ':'; dbg[k++] = ' '; dbg[k++] = 'p'; dbg[k++] = 'i'; dbg[k++] = 'd';
+        dbg[k++] = '=';
+        /* decimal, at most 7 digits */
+        {
+            char rev[12]; int n = 0; ULONG_PTR v = dbgPid;
+            if (v == 0) { rev[n++] = '0'; }
+            while (v > 0 && n < 11) { rev[n++] = (char)('0' + (v % 10)); v /= 10; }
+            while (n > 0) { dbg[k++] = rev[--n]; }
+        }
+        dbg[k++] = ' '; dbg[k++] = 'n'; dbg[k++] = 'a'; dbg[k++] = 'm'; dbg[k++] = 'e';
+        dbg[k++] = '=';
+        dbg[k++] = (dbgName && dbgName[0]) ? dbgName[0] : '-';
+        dbg[k++] = (dbgName && dbgName[1]) ? dbgName[1] : '-';
+        dbg[k++] = 0;
+        (void)dbgByte0;
+        yghv_trace(dbg);
+    }
 
     yghv_proc_fill_entry(out + YGHV_PROC_HDR_QWORDS, proc, 1);
     yghv_proc_copy_name((char *)out + (YGHV_PROC_HDR_QWORDS + YGHV_PROC_ENTRY_QWORDS) * 8,
@@ -1012,10 +1208,37 @@ NTSTATUS yghv_proc_dispatch(const void *in, ULONG in_len,
     switch (r.op) {
     case YGHV_PROC_OP_SNAPSHOT:
         st = yghv_proc_snapshot(o, out_len, (ULONG)r.arg0);
+        /*
+         * 9.608 -- THE SNAPSHOT REPORTED ONLY THE HEADER SIZE.
+         *
+         * Under METHOD_BUFFERED the driver's IoStatus.Information decides how
+         * many bytes reach user mode: the memory manager copies exactly that
+         * much out of the system buffer. The snapshot filled up to 120 entries
+         * (120 * 32 bytes) and reported 32, so the client received the header
+         * and ZERO entries -- count said 120 and every field read as 0.
+         *
+         * The entry count is in out[1]; the byte count must cover the header
+         * plus what was actually written, and never exceed the caller's buffer.
+         */
+        if (NT_SUCCESS(st)) {
+            ULONG have = (ULONG)o[1];
+            ULONG bytes = YGHV_PROC_HDR_QWORDS * 8 +
+                          have * YGHV_PROC_ENTRY_QWORDS * 8;
+            if (bytes > out_len) bytes = out_len;
+            *info = bytes;
+        }
         break;
 
     case YGHV_PROC_OP_QUERY:
         st = yghv_proc_query(o, out_len, r.pid);
+        /* 9.608: QUERY writes a 4-qword entry plus a 16-byte name after the
+         * header, but reported only YGHV_PROC_HDR_QWORDS*8. A client that
+         * trusts the info length (the shipped one does) reads the header and
+         * nothing else, which is why op 1 looked like "success, zero data".
+         * The query's own requirement is the same expression, so reuse it. */
+        if (NT_SUCCESS(st)) {
+            *info = (YGHV_PROC_HDR_QWORDS + YGHV_PROC_ENTRY_QWORDS) * 8 + 16;
+        }
         break;
 
     case YGHV_PROC_OP_PROT:
@@ -1031,16 +1254,26 @@ NTSTATUS yghv_proc_dispatch(const void *in, ULONG in_len,
         break;
 
     case YGHV_PROC_OP_OFFSETS: {
-        uint64_t stats[4];
+        /* 9.608: 8 entries, and the stats array must be sized for all 8 --
+         * it was [4] while yghv_offsets_stats now writes 8, which would have
+         * written 32 bytes past a 32-byte stack buffer the moment the new
+         * fields were read. */
+        uint64_t stats[8];
         yghv_offsets_stats(stats);
         o[0] = 1;
         o[1] = stats[0];                    /* derived mask */
         o[2] = stats[1];                    /* validated mask */
         o[3] = stats[2];                    /* failures */
         o[4] = stats[3];                    /* build number */
-        o[5] = g_yghv_off.thread_list_head;
-        o[6] = g_yghv_off.token;
-        o[7] = g_yghv_off.thread_list_entry;
+        /* 9.608: the links-probe diagnostics. off and reason are packed into
+         * one qword because the header is exactly 8 entries by contract:
+         *   o[5] = best good (nodes walked before the attempt ended)
+         *   o[6] = best closed (1 if the circle closed on that attempt)
+         *   o[7] = (reason << 16) | best_off
+         * Both fit: off <= 0x900 and reason <= 10. */
+        o[5] = stats[4];                    /* probe best good   */
+        o[6] = stats[5];                    /* probe best closed */
+        o[7] = ((stats[7] & 0xFFFFULL) << 16) | (stats[6] & 0xFFFFULL);
         st = STATUS_SUCCESS;
         *info = 8 * 8;
         break;

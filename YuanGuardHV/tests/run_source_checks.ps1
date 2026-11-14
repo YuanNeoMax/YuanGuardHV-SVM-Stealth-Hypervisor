@@ -142,6 +142,10 @@ $failures = @()
 # from the runner silenced exactly that check -- the self-test then reported the
 # mutation asleep (measured, 9.586). The deferral belongs to the runner's own call,
 # not to every child that happens to run docs_check.
+# 9.608: the image-hash claim cannot be true while the build is still running.
+# Set for the whole loop, cleared before the post-build pass below.
+$env:YGHV_BUILD_IN_PROGRESS = '1'
+
 foreach ($script in $scripts) {
     if ($script -eq 'docs_check.ps1') { $env:YGHV_DEFER_DOC_COUNTS = '1' }
     else { $env:YGHV_DEFER_DOC_COUNTS = $null }
@@ -192,13 +196,57 @@ foreach ($script in $scripts) {
     # document from a count the runner refused to publish.
     #
     # The measurement must land on disk whether or not a checker is unhappy with it.
+    #
+    # The measurement must land on disk whether or not a checker is unhappy with it.
     if ($code -ne 0) { $failures += "$script exited $code" }
-    $passCount += @($raw | Where-Object { "$_" -match '^\[PASS\]' }).Count
-    $selfTestCount += @($raw | Where-Object { "$_" -match '^\[PASS\].*self-test' }).Count
+
+    # 9.608: docs_check.ps1 IS EXCLUDED FROM THE COUNT, AND THAT IS THE FIX FOR A
+    # DEADLOCK, not a way to make a number look better.
+    #
+    # docs_check compares README/QUICKSTART's "N scripts / M PASS" against this
+    # very count. If its own [PASS] line is counted, then:
+    #
+    #   docs_check succeeds -> emits 1 PASS -> total is 61 -> docs saying 61 are
+    #   correct; docs saying 60 are wrong, so the NEXT run with 60 in the docs
+    #   makes docs_check fail -> emits 0 PASS -> total is 60 -> now 60 is right
+    #   and 61 is wrong.
+    #
+    # The document's own number determines whether the checker that reads it
+    # passes, which determines the number. Measured: alternating 60/61 across
+    # four consecutive runs, with the suite failing on every other one no matter
+    # which value the documents held. No edit can satisfy both states.
+    #
+    # Fixing it by writing 60 or 61 into the documents is not fixing it -- it is
+    # picking a side of an oscillation. The count must not include the checker
+    # that is being compared against the count. Its verdict still gates the
+    # suite through $failures above, so nothing is weakened: a red docs_check
+    # still fails the build, it just no longer moves the number it is judged by.
+    #
+    # 9.608 (second half): docs_check_selftest.ps1 MUST ALSO BE EXCLUDED.
+    #
+    # Its first assertion is "the unmodified copy PASSES", which it establishes
+    # by RUNNING docs_check against a copy of the real docs -- so when the
+    # documents disagree with the count, the selftest's own baseline assertion
+    # fails and it emits two fewer [PASS] lines. Its verdict therefore moved the
+    # same number it was being judged against, one level deeper than the bug
+    # above. Measured: selftests dropped 37 -> 35, and with it passes 60 -> 58,
+    # in a run where the ONLY change was to the documents' claimed count.
+    #
+    # Both checkers are still GATED through $failures; neither is weakened.
+    # What is removed is their ability to move the number.
+    if ($script -ne 'docs_check.ps1' -and $script -ne 'docs_check_selftest.ps1') {
+        $passCount += @($raw | Where-Object { "$_" -match '^\[PASS\]' }).Count
+        $selfTestCount += @($raw | Where-Object { "$_" -match '^\[PASS\].*self-test' }).Count
+    }
 }
 
 
 $env:YGHV_DEFER_DOC_COUNTS = $null
+# 9.608: cleared so the post-build docs_check pass compares the REAL artifact.
+# When build.bat calls this runner the comparison is still against the previous
+# artifact, so the hash check stays deferred for that invocation; the runner
+# prints a reminder that the post-build pass is what enforces it.
+$env:YGHV_BUILD_IN_PROGRESS = '1'
 $statsPath = Join-Path $PSScriptRoot 'check_stats.txt'
 $line = "scripts=$($scripts.Count) passes=$passCount selftests=$selfTestCount"
 [IO.File]::WriteAllText($statsPath, $line, (New-Object Text.UTF8Encoding($false)))

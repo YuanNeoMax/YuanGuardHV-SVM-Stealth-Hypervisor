@@ -125,7 +125,7 @@ CPU 占用：自旋版 100% → **阻塞版 21–29%**（tick 循环用 `KeDelay
 ```
 YuanGuardHV/
 ├── build.bat                 构建（源级检查 → clang-cl → link → 签名）
-├── hv/                       内核源码（48 个文件）
+├── hv/                       内核源码（49 个文件）
 │   ├── svm_simplevm206.cpp   206 主线（vendored SimpleSvm + 4 处缝合）
 │   ├── svm_simplevm206_x64.asm  VMRUN 循环 / 桩 / 退出 thunk
 │   ├── npt_core.c            NPT 映射与权限
@@ -256,7 +256,7 @@ build.bat
 
 流程（`build.bat`）：
 
-1. 先运行 `tests\run_source_checks.ps1`（**18 个脚本 / 61 条 PASS**，含 37 条自检），失败即中止；
+1. 先运行 `tests\run_source_checks.ps1`（**18 个脚本 / 42 条 PASS**，含 19 条自检；两个 docs 检查器只判门、不计入条数），失败即中止；
 2. clang-cl 编译 `hv\*.c` / `hv\*.cpp` + `svm_trampoline.S`；
 3. MSVC link 链接为 `bin\yuanguard_hv.sys`，**同时产出 `bin\yuanguard_hv.map`**；
 4. 运行 `tests\run_map_checks.ps1`（页布局检查，必须链接后跑）；

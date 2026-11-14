@@ -3,7 +3,7 @@
 > **版本**：0.4.3（2026-11-14，tag `bc2b417`）  
 > **镜像（v0.4.3 tag 构建）**：`f3b88948110f2ab9d6f8aba160e3af66ffe2f0a7e66ffd8dbe2615f626a4f3cd`  
 > **当前 HEAD 构建**：`abeaad12e973a71a...`（HEAD 已在 v0.4.16，与 v0.4.3 tag 不是同一份代码）  
-> **测试**：18 检查器 / 61 PASS / 37 自检，ALL PASS  
+> **测试**：18 检查器 / 42 PASS / 19 自检（docs 两门只判不计），ALL PASS  
 > **仓库**：https://github.com/YuanNeoMax/YuanGuardHV-SVM-Stealth-Hypervisor
 
 ---
@@ -127,6 +127,7 @@ PING / HEALTH / READ / STATS / MEM_READ / MEM_WRITE / PHYS_READ / PHYS_WRITE
 | 影子页 | mem_engine.c | A/B 双引擎 |
 | 页表重定向 | mem_pte.c | 无痕映射 |
 | 断点 | mem_bp.c | NPF/INT3/DR |
+| 安全解引用 | yghv_safe.c | **唯一**允许解引用未验证指针的地方（9.608） |
 | 卸载痕迹 | yghv_unload_trace.c | 痕迹清除 |
 
 ### 关键设计约束
@@ -136,6 +137,8 @@ PING / HEALTH / READ / STATS / MEM_READ / MEM_WRITE / PHYS_READ / PHYS_WRITE
 3. **偏移表 fail-closed**：off==0 返回 NULL，所有访问器安全失败。
 4. **字符串不进镜像**：所有导出名走 strtab 解密。
 5. **IRQL 全 PASSIVE**：所有 IOCTL op 在 PASSIVE_LEVEL 执行。
+6. **未验证指针必须走 yghv_safe.c**（9.608）：`>= 0xFFFF800000000000` 只说明"属于内核高半区"，
+   **不说明已映射**。两次 0x50 蓝屏都源于把前者当成了后者。禁止再写裸解引用。
 
 ---
 
@@ -207,6 +210,40 @@ YuanGuardHV/tools/yghv_ctl.ps1 win <pid> set <hwnd> [affinity]
 YuanGuardHV/tools/yghv_client/run.bat state
 YuanGuardHV/tools/yghv_client/run.bat mem-read <pid> <va>
 ```
+
+---
+
+## 五·五、上机实测（2026-11-14，首次）
+
+**v0.4.3 的镜像第一次在真机上跑通。** 本节记录的是实测数据，不是构建结论。
+
+| 项 | 结果 |
+|---|---|
+| 加载 | 成功，服务 `Running` |
+| 虚拟化 | `HypervisorPresent = True`（12 逻辑核） |
+| 持续运行 | 3 小时以上，零蓝屏 |
+| 卸载 | 6.94 s，**`invmrun at unload=0x0`**，卸载后 `HypervisorPresent=False` |
+
+**能力面实测（IOCTL，真实调用）**
+
+| 家族 | 结果 |
+|---|---|
+| `0x838` proc | **15 op 可用**：快照返回 **120 个进程**（pid/ppid/prot/type/signer/base 全部合理）、单进程查询返回正确 pid 与映像名 |
+| `0x839` inject | stats / alloc 成功 |
+| `0x83A` pt | stats / cr3 成功 |
+| `0x83B` win | 派发成功；`win32kfull` 在无交互会话时未解析（返回码 4，符合设计） |
+| `0x825` sys-health | `degraded=0 total=0 fatal=0` |
+
+**实测中修掉的五个真缺陷**（每个都有 dump 或计数证据，见 CHANGELOG 9.608）：
+
+1. 两次 `0x50` 蓝屏 —— "canonical" 被当成 "mapped" → 新增 `hv/yghv_safe.c`
+2. `ActiveProcessLinks` 从未派生成功 —— 闭环判据 `prev == head` **永远为假**
+3. `proc` 快照返回 0 进程 —— 我用宽松验收时**丢了 `good >= 16` 下限**，空链表抢先命中 `0x158`
+4. 快照只回 header —— METHOD_BUFFERED 的 `IoStatus.Information` 报 32 字节，120 条 entry 全被丢弃
+5. `win` 全部返回 error 1 —— `case IOCTL_YGHV_WIN` 被写进了 **CACHE 的内层 switch**
+
+> **这一节的教训**：前四个都不是"代码写错了"，而是**判据观察不到它要观察的事件**。
+> 项目里 9.466 那条纪律在这里第四次生效：先建观测，再改代码。
 
 ---
 
