@@ -245,13 +245,27 @@ YuanGuardHV/tools/yghv_client/run.bat mem-read <pid> <va>
 
 **能力面实测（IOCTL，真实调用）**
 
-| 家族 | 结果 |
-|---|---|
-| `0x838` proc | **15 op 可用**：快照返回 **120 个进程**（pid/ppid/prot/type/signer/base 全部合理）、单进程查询返回正确 pid 与映像名 |
-| `0x839` inject | stats / alloc 成功 |
-| `0x83A` pt | stats / cr3 成功 |
-| `0x83B` win | 派发成功；`win32kfull` 在无交互会话时未解析（返回码 4，符合设计） |
-| `0x825` sys-health | `degraded=0 total=0 fatal=0` |
+| 家族 | op | 实测结果 |
+|---|---|---|
+| **proc 0x838** | 0 快照 | ✅ **120 个进程**，pid/ppid/prot/type/signer/base 全部合理 |
+| | 1 查询 | ✅ pid 与映像名正确（`powershell.exe`）|
+| | 2 保护级别 | ✅ |
+| | 3 挂起/恢复 | ✅ `q0=1`，返回线程 id |
+| | 4 结束进程 | ✅ 对存活目标 |
+| | 5 偏移诊断 | ✅ `derived_mask=0x2FBF`（14/14 派生）|
+| | 6 特征码诊断 | ✅ |
+| | 7 线程枚举 | ⛔ `NOT_IMPLEMENTED`（`TLIST` 未派生，如实返回）|
+| | 8 令牌偷取 | ✅ 返回两个内核指针 |
+| | 9 进程隐藏 | ⛔ **默认拒绝**（见上节）|
+| | 10 句柄降权 | ✅ 派发正确 |
+| | 11 句柄降权诊断 | ✅ |
+| | 12 伪装映像名 | ✅ |
+| | 13 令牌提权 | ✅ 返回启用特权数 `0x39E846` |
+| | 14 线程隐藏 | ⛔ **默认拒绝**（见上节）|
+| **inject 0x839** | 0 分配 / 5 统计 | ✅ |
+| **pt 0x83A** | 0 CR3 / 2 范围映射 / 3 页清单 | ✅ |
+| **win 0x83B** | 0–3 全部 | ✅ 派发正确；`win32kfull` 无交互会话时按设计拒绝 |
+| **sys-health 0x825** | — | ✅ `degraded=0 total=0 fatal=0` |
 
 **实测中修掉的五个真缺陷**（每个都有 dump 或计数证据，见 CHANGELOG 9.608）：
 
