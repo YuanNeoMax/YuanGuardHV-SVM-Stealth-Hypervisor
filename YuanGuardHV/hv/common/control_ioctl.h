@@ -931,4 +931,44 @@ typedef struct {
     ULONG     _pad;
 } yghv_ioctl_inject_req_t;
 
+/*
+ * 9.593: page-table analysis (CR3 decode + per-level tree + range shape).
+ *
+ * A SEPARATE function number from PTE_PROBE because that one answers "what PA
+ * does this VA have" and nothing else, and it was written as a probe inside
+ * the dispatcher rather than as a reusable module. This one answers questions
+ * about a whole address space, and it is where the store-array of mapped
+ * pages lives.
+ *
+ *   op 0 CR3    pid                        -> raw, dtb, pcid, noflush
+ *   op 1 TREE   pid, va                    -> all four entries + their table PAs
+ *   op 2 MAP    pid, va (start), end       -> counts, page sizes, first gap
+ *   op 3 PAGES  pid, va (start), end, max  -> mapped page rows
+ *   op 4 STATS  --                         -> 8 counters
+ *
+ * Reply header is 4 qwords, rows follow at YGHV_PT_HDR_QWORDS.
+ * PAGES rows are 4 qwords each: va | pa | size | flags<<32|pad.
+ */
+#define IOCTL_YGHV_PT \
+    YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x83A, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
+
+#define YGHV_PT_HDR_QWORDS 4
+#define YGHV_PT_OUT_QWORDS 512
+#define YGHV_PT_ROW_QWORDS 4
+
+#define YGHV_PT_OP_CR3   0
+#define YGHV_PT_OP_TREE  1
+#define YGHV_PT_OP_MAP   2
+#define YGHV_PT_OP_PAGES 3
+#define YGHV_PT_OP_STATS 4
+
+typedef struct {
+    ULONG     op;
+    ULONG     pid;
+    ULONG_PTR va;
+    ULONG_PTR end;
+    ULONG     max;
+    ULONG     flags;
+} yghv_ioctl_pt_req_t;
+
 #endif

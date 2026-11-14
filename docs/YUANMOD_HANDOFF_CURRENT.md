@@ -29,7 +29,7 @@
 
 ---
 
-## 记录索引（9.592 重新测量，78 条）
+## 记录索引（9.593 重新测量，79 条）
 
 > 这是本文档自己的目录。**按标题扫一眼，找到要的那条，再跳过去读。**
 > 行数是该记录占的篇幅，用来判断"值不值得读全文"。
@@ -114,6 +114,7 @@
 | 9.590 加密落地 + 导出名从镜像里彻底消掉：最后一条明文来自 import table | 55 |
 | 9.591 进程/线程控制面接进门：偏移表追加、十 op 分发、三客户端同步 | 121 |
 | 9.592 注入原语接进门：五原语一 IOCTL、APC 属主校验、payload 跨回复头 | 148 |
+| 9.593 页表分析成模块：CR3 解码、逐层树、范围形状、页清单 | 111 |
 
 ---
 
@@ -4502,6 +4503,117 @@ A6C ZwAllocateVirtualMemory     ABB ZwFreeVirtualMemory
   只有进程级的 `PsSuspendProcess`（9.591 已用）。要单挂一个线程只能走 APC 冻结。
 - 能力面清单里剩下的：CR3 解密 / 页表分析、PP/PPL 与窗口防截图、无痕通信扩展。
 
+#### 9.593 页表分析成模块：CR3 解码、逐层树、范围形状、页清单
+
+##### 一、为什么不是再写一个 walk
+
+`mem_pte.c` 已经会 `CR3 -> PML4 -> PDPT -> PD -> PT` 并返回物理地址，`IOCTL_YGHV_PTE_PROBE`
+也早就在用。但它只回答一个问题：「这个 VA 的 PA 是多少」。页表分析真正要问的是四个：
+
+- 这个进程的 CR3 是什么，**我看到的是裸值还是 DTB**；
+- 这四层里，**是哪一层缺失**；
+- 这段范围**映射了多少、都是多大的页**；
+- **洞在哪里**。
+
+这四个问题此前只能在一个 IOCTL case 里手写循环，既不能复用也不能单独测。这一轮把它们
+搬成 `hv/common/yghv_pt.h` + `hv/yghv_pt.c`，接 `IOCTL_YGHV_PT`（函数号 **0x83A**）。
+
+**新模块不重新实现遍历。** 每一次表读取都走 `yghv_pte_read_entry` / `yghv_pte_enum_range`。
+理由写在 `mem_pte.c:211-218` 的注释里：那段的四个内层循环曾经从索引 0 起跑而不是从范围
+起点索引起跑，导致一次 16 页的扫描走掉 3.88 亿个表项、把驱动卡进 `STOP_PENDING`。
+**一个遍历器，一个修的地方。**
+
+##### 二、CR3 不是页表基址
+
+这一条是本轮唯一真正会「看起来正确但答案是错的」的点。裸 CR3 在支持 PCID 的机器上：
+
+- 低 12 位是 PCID（`YGHV_CR3_PCID_MASK 0xFFF`）；
+- bit 63 是 no-flush 提示；
+- **DTB 只是 `CR3 & 0x000FFFFFFFFFF000`**。
+
+把裸值当页表基址传给遍历**碰巧能跑**（遍历自己会掩码），但：
+
+- 把它当「页表基址」打印出来，**最多差 4095**；
+- 用它比较两个进程的 CR3 是否相等，只要 PCID 不同就永远是「不等」。
+
+所以 `yghv_pt_cr3_of()` 返回一个结构体而不是一个数：`raw` / `dtb` / `pcid` / `noflush` 分开给。
+**DTB 为 0 时返回失败**，不返回一个「成功但基址是 0」的结果 —— 后者会让下游每一次遍历都说
+「没映射」，读起来像「这个进程没有内存」，而不是「偏移在这个 build 上错了」。
+
+##### 三、树走两层校验
+
+`yghv_pt_tree()` 逐层读并保留**每一级的条目和它所在的表物理地址**，因为「PA 为 0」这一个
+答案分不清「这一层 absent」还是「这张表读不到」。两种失败产生不同的计数器：
+absent 计 `walks`，读不到表计 `fails`。
+
+最后一级命中后，再走一次 `yghv_pte_va_to_pa()` 对比。**两条独立路径对同一个 PA 达成一致**
+值得多读一次表：这里防的失败是「偏移碰巧对了」，它和成功长得一模一样。
+
+##### 四、范围扫描要报「洞」，而洞不在回调里
+
+`yghv_pt_map()` 统计页数、按 4K/2M/1G 分类、可写/可执行/用户页数、最大连续块。
+洞的问题在于：`yghv_pte_enum_range()` **只为已映射的页回调**，所以范围头部未映射、尾部未映射
+这两种洞，回调永远不会看到。两处都单独补：
+
+- 起点先 `yghv_pte_query` 一次，没映射就把 `first_gap_va` 记成起点；
+- 扫完后若最后一个回调的结束位置 `< end_va`，把那里记成洞；
+- 一个回调都没有时，整个范围就是一个洞。
+
+扫描上限 `YGHV_PT_MAX_SCAN_BYTES` 1 GB、`YGHV_PT_MAX_VISITS` 65536 页，超了置
+`truncated` 而不是继续跑 —— 一个 IOCTL 不该跑几分钟。
+
+##### 五、页清单的容量由 out_len 决定，不由常量决定
+
+`op 3 PAGES` 的行是 4 个 qword，回复 = 4 qword 头 + N 行。**上限从 `out_len` 反算**
+（`cap = out_len / 8 - 4`），而不是取 `YGHV_PT_MAX_LIST` 这个常量 —— 常量会和客户端的
+请求大小各自漂移，那正是 `ioctl_buffer_size.ps1` 记着的那三起同类事故的形状。
+
+##### 六、METHOD_BUFFERED 的第三个坑
+
+9.591 记的是「`in` 与 `out` 是同一块缓冲，先 memset 会把请求清零」。9.592 记的是
+「payload 跨过回复头」。这一轮的形状是第一种的变体，仍然要按顺序写：
+
+```
+RtlCopyMemory(&r, in, sizeof(r));   /* 先拷出请求 */
+RtlZeroMemory(out, out_len);        /* 再清回复区 */
+```
+
+##### 七、接线与门
+
+- `control_device.c`：`:3717` 的 `case IOCTL_YGHV_PT:` 只校验 `in_len`，op 分发在
+  `yghv_pt.c`。case 体内出现 `out_len`，过 `ioctl_output_bounds.ps1`。
+- `build.bat` 两处：`:122` 的 for 列表与显式 obj 清单（`yghv_inject.obj` 之后）。
+- 三客户端：`yghv_ctl.ps1` 新增 `'pt'` 命令（无参=计数器 / `<pid>`=CR3 / `<pid> tree <va>` /
+  `<pid> map <start> <end>` / `<pid> pages <start> <end> [max]`，每个分支 `-OutputLength 4096`）；
+  `YghvCtl.java` 只加 `FN_PT = 0x83A` 常量不加 case；`README.md` PowerShell 段加一行。
+
+##### 八、一次 CRLF 事故
+
+`control_ioctl.h` 是 **CRLF** 文件。插入脚本先把内容归一化到 LF、再整体转回 CRLF，但没有
+把已经存在的 `\r\n` 先压成 `\n`，于是插入的那 39 行变成了 `\r\r\n`。编译器报的是
+`control_ioctl.h(972,19): error: expected identifier or '('` —— 看起来像语法错，实际是行尾。
+
+**教训：改 CRLF 文件时，归一化必须是「先压平、再重建」，不是「只把 LF 换成 CRLF」。**
+`eol_check.ps1` 查的是「同一文件不许混 CRLF 与裸 LF」，`\r\r\n` 在它眼里仍是 CRLF，
+抓不到 —— 这个缺陷只有编译器会报。
+
+##### 九、构建验证
+
+```
+EXIT=0，ALL MAP CHECKS PASS
+镜像 SHA256 = 1059462fd02d8401a5de39f228a449520d0e7845dd6fbd444f7e9a93fed4c9d2
+dumpbin /imports：51 行 PsLookupProcessByProcessId、55 行 MmCopyMemory（已在本树 IAT 里）
+map 里 yghv_pt 相关符号 23 个
+```
+
+##### 十、还没做的
+
+- 五个 op 全部**没上机**（记进 ISSUES 的 P1-6）。最需要实测的是 `tree` 的交叉校验：
+  它现在是「两条路径一致就算对」，而两条路径共用同一个 `yghv_pte_read_entry`，
+  所以若把表读取本身写错，两条会一起错、校验一起沉默。
+- 不写页表。**重定向**已经在 `mem_selfmap.c` 与 `npt_remap` 里，有自己关于 flush 和
+  「当前 CPU 用哪个 CR3」的不变量；在这里再加一个写者会把那些不变量劈成两半。
+
 ## 本次会话结束时状态
 
 > 这一段曾被落在 9.564 而正文已经写到 9.582 —— 同一份文件里两个互相矛盾的状态，
@@ -4510,14 +4622,14 @@ A6C ZwAllocateVirtualMemory     ABB ZwFreeVirtualMemory
 
 ```
 驱动          : STOPPED
-镜像          : bin == e31defa5214af6c9
+镜像          : bin == 1059462fd02d8401
                 部署 C:\yghv_pa.sys 仍是 BCC4FECDEA8DCEE5（9.588 的构建还没部署，两者不再相同）
 默认配置      : 真 guest + 全核（9.577 起），12 线程 1.05-1.08×
 卸载          : 0.06-0.23 s，invmrun at unload = 0x0
 台账          : 8 完成 / 9 不做 / 1 需重启（Tier 6.1）
 静态检查      : 17 脚本 / 49 条 PASS（含 33 条自检），另 1 条链接后检查（tests/ 共 19 个脚本）
-文档检查      : docs_check PASS —— 57 md / 32 链接 / 78 记录 / 9 项
-最新编号      : 9.592
+文档检查      : docs_check PASS —— 57 md / 32 链接 / 79 记录 / 9 项
+最新编号      : 9.593
 ```
 
 **P1-1 的结论变了，但没结案。** 9.585 证明三次失败有一个共同原因：

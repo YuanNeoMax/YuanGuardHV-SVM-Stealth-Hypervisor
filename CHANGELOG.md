@@ -12,6 +12,57 @@
 
 ---
 
+## v0.4.5 — 页表分析成模块（第 0.4.x 条能力面的第三块）
+
+**日期**：2026-11-14
+**范围**：v0.4.4..v0.4.5（工程记录 9.593）
+
+> v0.4.3 接进程控制，v0.4.4 接注入，这一轮把「页表」从 IOCTL case 里的手写循环
+> 抬成一个能单独调用的模块。**没有新能力面，是同一个能力的第二种问法。**
+
+### Added
+
+- `hv/common/yghv_pt.h` + `hv/yghv_pt.c`：`yghv_pt_cr3_of()` / `yghv_pt_tree()` /
+  `yghv_pt_map()` / `yghv_pt_pages()` / `yghv_pt_stats()`。
+- `IOCTL_YGHV_PT`（函数号 **0x83A**，设备类型 0x5947，METHOD_BUFFERED）与五个 op：
+  `CR3` / `TREE` / `MAP` / `PAGES` / `STATS`。
+- `tools/yghv_ctl.ps1` 新增 `pt` 命令，五个子形态。**客户端命令 82 → 83 条。**
+
+### Changed
+
+- `CR3` 不再以一个裸数出现。裸 CR3 在 PCID 机器上低 12 位是 PCID、bit 63 是 no-flush，
+  页表基址只是 `CR3 & 0x000FFFFFFFFFF000`：把它当基址打印最多差 4095，
+  用它比较两个进程则只要 PCID 不同就永远「不等」。现在 `raw` / `dtb` / `pcid` / `noflush` 分开回。
+- `TREE` 保留每一级的**条目与其所在表的物理地址**。原来的 `PTE_PROBE` 只回一个 PA，
+  分不清「这一层 absent」与「这张表读不到」。
+- 范围扫描的上限由 `out_len` 反算，不取常量：常量会和客户端的请求大小各自漂移。
+
+### Fixed
+
+- `control_ioctl.h` 插入时行尾被写成 `\r\r\n`（39 行）。编译器报的是
+  `error: expected identifier or '('` —— 语法错的样子，行尾的病因。
+  **改 CRLF 文件必须「先压平到 LF、再整体重建为 CRLF」**；`eol_check.ps1` 查的是
+  「同一文件不许混 CRLF 与裸 LF」，`\r\r\n` 在它眼里仍是 CRLF，抓不到。
+
+### Known limitations
+
+- 五个 op **全部没上机**（见 `docs/ISSUES.md` P1-6）。
+- `TREE` 的交叉校验是「两条路径一致就算对」，而两条路径共用同一个表读取函数：
+  若表读取本身错了，两条会一起错、校验一起沉默。
+- 不写页表。重定向已在 `mem_selfmap.c` 与 `npt_remap` 里，有自己关于 flush 与
+  「当前 CPU 用哪个 CR3」的不变量；再加一个写者会把那些不变量劈成两半。
+
+### Verification
+
+```
+build.bat（YGHV_BAREMETAL_STEP=206 YGHV_206B_COEXIST=1 YGHV_206B_GNPT=1）  EXIT=0
+ALL MAP CHECKS PASS
+bin/yuanguard_hv.sys SHA256 = 1059462fd02d8401a5de39f228a449520d0e7845dd6fbd444f7e9a93fed4c9d2
+dumpbin /imports：PsLookupProcessByProcessId、MmCopyMemory 均已在 IAT
+map：yghv_pt 相关符号 23 个
+tests/run_source_checks.ps1  EXIT=0  scripts=17 passes=49 selftests=33
+```
+
 ## v0.4.4 — 注入原语接入（能力面第二块扩张）
 
 **日期**：2026-11-14

@@ -114,6 +114,7 @@ yghv_ctl.ps1 virt-counts
 yghv_ctl.ps1 guest-start [reset]
 yghv_ctl.ps1 proc [<pid>|offsets|sig|threads <pid> [max]|prot <pid> <hex>|suspend <pid>|resume <pid>|term <pid> [clearp] [code]|token <src> <dst>|hide <pid>|unhide <pid>]
 yghv_ctl.ps1 inject [alloc <pid> <size> [prot]|write <pid> <va> <hex>|free <pid> <va>|thread <pid> <start> [arg] [suspended]|apc <pid> <tid> <routine> [arg]]
+yghv_ctl.ps1 pt [<pid> [cr3|tree <va>|map <start> <end>|pages <start> <end> [max]]]
 ```
 
 `protect` sets the target, enumerates committed pages of the real Java process,

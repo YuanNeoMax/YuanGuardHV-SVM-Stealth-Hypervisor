@@ -5404,6 +5404,135 @@ try {
 
             throw 'inject: usage: inject [alloc <pid> <size> [prot]|write <pid> <va> <hex>|free <pid> <va>|thread <pid> <start> [arg] [suspended]|apc <pid> <tid> <routine> [arg]]'
         }
+        'pt' {
+            # 9.593: page-table analysis. Where 'proc' answers "who is this
+            # process", this answers "how is its address space built".
+            #
+            #   pt                          driver counters
+            #   pt <pid>                    decoded CR3 (raw / dtb / pcid)
+            #   pt <pid> tree <hex_va>      every level's entry + its table PA
+            #   pt <pid> map <hex_start> <hex_end>
+            #   pt <pid> pages <hex_start> <hex_end> [max]
+            #
+            # The CR3 decode is not cosmetic: a raw CR3 on a PCID machine
+            # carries the PCID in its low 12 bits, so comparing two processes'
+            # raw CR3s for equality is wrong whenever their PCIDs differ, and
+            # printing the raw value as "the page table base" is off by up to
+            # 4095. The walk masks it, so nothing breaks — it just answers the
+            # wrong question.
+            function New-PtReq([uint32]$op, [uint32]$pidVal, [uint64]$va, [uint64]$end, [uint32]$max) {
+                $req = New-Object byte[] 32
+                [BitConverter]::GetBytes([uint32]$op).CopyTo($req, 0)
+                [BitConverter]::GetBytes([uint32]$pidVal).CopyTo($req, 4)
+                [BitConverter]::GetBytes([uint64]$va).CopyTo($req, 8)
+                [BitConverter]::GetBytes([uint64]$end).CopyTo($req, 16)
+                [BitConverter]::GetBytes([uint32]$max).CopyTo($req, 24)
+                return ,$req
+            }
+            function ConvertTo-HexVa([string]$s) {
+                return [Convert]::ToUInt64(($s -replace '^0[xX]', ''), 16)
+            }
+
+            if ($null -eq $Arg1) {
+                $req = New-PtReq 4 0 0 0 0
+                $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x83A)) -InBytes $req -OutputLength 4096
+                Write-Host ("pt: dispatches={0} walks={1} scans={2}" -f  [BitConverter]::ToUInt64($out, 0), [BitConverter]::ToUInt64($out, 8),  [BitConverter]::ToUInt64($out, 16))
+                Write-Host ("pt: bytes={0} failures={1} cr3_lookups={2} truncated={3}" -f  [BitConverter]::ToUInt64($out, 24), [BitConverter]::ToUInt64($out, 32),  [BitConverter]::ToUInt64($out, 40), [BitConverter]::ToUInt64($out, 48))
+                return
+            }
+
+            $p = [uint32]::Parse($Arg1)
+            $sub = if ($null -ne $Arg2) { "$Arg2".ToLower() } else { 'cr3' }
+
+            if ($sub -eq 'cr3') {
+                $req = New-PtReq 0 $p 0 0 0
+                $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x83A)) -InBytes $req -OutputLength 4096
+                if ([BitConverter]::ToUInt64($out, 0) -eq 0) {
+                    Write-Host ("pt: pid={0} CR3 lookup FAILED (offset wrong for this build, or no such process)" -f $p)
+                    return
+                }
+                $raw = [BitConverter]::ToUInt64($out, 8)
+                $dtb = [BitConverter]::ToUInt64($out, 16)
+                $pc = [BitConverter]::ToUInt64($out, 24)
+                Write-Host ("pt: pid={0} raw=0x{1:X16} dtb=0x{2:X12} pcid={3} noflush={4}" -f $p, $raw, $dtb, ($pc -band 0xFFFFFFFF), (($pc -shr 32) -band 0xFFFFFFFF))
+                return
+            }
+
+            if ($sub -eq 'tree') {
+                if ($null -eq $Arg3) { throw 'pt: usage: pt <pid> tree <hex_va>' }
+                $va = ConvertTo-HexVa $Arg3
+                $req = New-PtReq 1 $p $va 0 0
+                $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x83A)) -InBytes $req -OutputLength 4096
+                if ([BitConverter]::ToUInt64($out, 0) -eq 0) {
+                    Write-Host ("pt: pid={0} tree FAILED (no CR3)" -f $p)
+                    return
+                }
+                Write-Host ("pt: va=0x{0:X} dtb=0x{1:X12} pa=0x{2:X}" -f $va, [BitConverter]::ToUInt64($out, 8), [BitConverter]::ToUInt64($out, 24))
+                Write-Host ("  PML4E  0x{0:X16} @ pa 0x{1:X}" -f [BitConverter]::ToUInt64($out, 32), [BitConverter]::ToUInt64($out, 40))
+                Write-Host ("  PDPTE  0x{0:X16} @ pa 0x{1:X}" -f [BitConverter]::ToUInt64($out, 48), [BitConverter]::ToUInt64($out, 56))
+                Write-Host ("  PDE    0x{0:X16} @ pa 0x{1:X}" -f [BitConverter]::ToUInt64($out, 64), [BitConverter]::ToUInt64($out, 72))
+                Write-Host ("  PTE    0x{0:X16} @ pa 0x{1:X}" -f [BitConverter]::ToUInt64($out, 80), [BitConverter]::ToUInt64($out, 88))
+                $lv = [BitConverter]::ToUInt64($out, 96)
+                $leaf = [BitConverter]::ToUInt64($out, 104)
+                $leafName = switch ($leaf) { 0 { 'none (absent)' } 1 { '4 KB' } 2 { '2 MB' } 3 { '1 GB' } default { "?$leaf" } }
+                Write-Host ("  levels read={0} leaf={1}" -f $lv, $leafName)
+                return
+            }
+
+            if ($sub -eq 'map' -or $sub -eq 'pages') {
+                if ($null -eq $Arg3 -or $null -eq $Arg4) {
+                    throw ("pt: usage: pt <pid> {0} <hex_start> <hex_end> [max]" -f $sub)
+                }
+                $start = ConvertTo-HexVa $Arg3
+                $end = ConvertTo-HexVa $Arg4
+                if ($end -le $start) { throw 'pt: end must be above start' }
+                $maxv = 0
+                if ($null -ne $Arg5) { $maxv = [uint32]::Parse($Arg5) }
+
+                if ($sub -eq 'map') {
+                    $req = New-PtReq 2 $p $start $end 0
+                    $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x83A)) -InBytes $req -OutputLength 4096
+                    if ([BitConverter]::ToUInt64($out, 0) -eq 0) {
+                        Write-Host 'pt map: FAILED (no CR3, or range above the 1 GB scan ceiling)'
+                        return
+                    }
+                    $pages = [BitConverter]::ToUInt64($out, 8)
+                    $bytes = [BitConverter]::ToUInt64($out, 16)
+                    Write-Host ("pt map: 0x{0:X}-0x{1:X}  mapped {2} page(s) / {3} byte(s)" -f $start, $end, $pages, $bytes)
+                    Write-Host ("  4K={0} 2M={1} 1G={2}" -f  [BitConverter]::ToUInt64($out, 24), [BitConverter]::ToUInt64($out, 32), [BitConverter]::ToUInt64($out, 40))
+                    Write-Host ("  writable={0} executable={1} user={2}" -f  [BitConverter]::ToUInt64($out, 48), [BitConverter]::ToUInt64($out, 56), [BitConverter]::ToUInt64($out, 64))
+                    $gap = [BitConverter]::ToUInt64($out, 72)
+                    if ($gap -ne 0) { Write-Host ("  first gap at 0x{0:X}" -f $gap) }
+                    $runVa = [BitConverter]::ToUInt64($out, 80)
+                    $runSz = [BitConverter]::ToUInt64($out, 88)
+                    if ($runSz -ne 0) { Write-Host ("  largest run 0x{0:X} ({1} byte(s))" -f $runVa, $runSz) }
+                    if ([BitConverter]::ToUInt64($out, 96) -ne 0) { Write-Host '  TRUNCATED at the visit ceiling (65536 pages)' }
+                    return
+                }
+
+                $req = New-PtReq 3 $p $start $end $maxv
+                $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x83A)) -InBytes $req -OutputLength 4096
+                if ([BitConverter]::ToUInt64($out, 0) -eq 0) {
+                    Write-Host 'pt pages: FAILED (no CR3, or range above the 1 GB scan ceiling)'
+                    return
+                }
+                $n = [BitConverter]::ToUInt64($out, 8)
+                $trunc = [BitConverter]::ToUInt64($out, 16)
+                Write-Host ("pt pages: {0} row(s){1}" -f $n, $(if ($trunc -ne 0) { ' (TRUNCATED)' } else { '' }))
+                for ($i = 0; $i -lt $n; $i++) {
+                    $at = (4 + $i * 4) * 8
+                    $va = [BitConverter]::ToUInt64($out, $at)
+                    $pa = [BitConverter]::ToUInt64($out, $at + 8)
+                    $sz = [BitConverter]::ToUInt64($out, $at + 16)
+                    $fl = [BitConverter]::ToUInt64($out, $at + 24)
+                    $szName = switch ($sz) { 0x1000 { '4K' } 0x200000 { '2M' } 0x40000000 { '1G' } default { "0x$($sz.ToString('X'))" } }
+                    Write-Host ("  0x{0:X16} -> 0x{1:X12} {2} {3}{4}{5}" -f  $va, $pa, $szName, $(if (($fl -band 1) -ne 0) { 'W' } else { '-' }), $(if (($fl -band 2) -ne 0) { 'U' } else { '-' }), $(if (($fl -band 4) -ne 0) { 'N' } else { 'X' }))
+                }
+                return
+            }
+
+            throw 'pt: usage: pt [<pid> [cr3|tree <va>|map <start> <end>|pages <start> <end> [max]]]'
+        }
         default {
             throw ("unknown command: {0}" -f $Command)
         }

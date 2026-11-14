@@ -119,7 +119,7 @@ echo   WDK Version: %WDK_VER%
 echo   Compiling...
 
 rem 2026-10-11 Phase 1: mem_pte added (page-table walk, Engine B foundation).
-for %%f in (main svm_core npt_core vmexit vmmcall multi_core protect control_device loader_stealth svm_simplevm_port mem_pte mem_pa mem_engine mem_scan mem_bench mem_share yghv_sections mem_selfmap mem_coop mem_island mem_view mem_watch mem_time mem_cache mem_bp mem_frame yghv_fail yghv_guard yghv_crypto yghv_auth yghv_channel yghv_unload_trace yghv_sentry yghv_offsets yghv_sig yghv_proc yghv_inject) do call :compile %%f || goto :error
+for %%f in (main svm_core npt_core vmexit vmmcall multi_core protect control_device loader_stealth svm_simplevm_port mem_pte mem_pa mem_engine mem_scan mem_bench mem_share yghv_sections mem_selfmap mem_coop mem_island mem_view mem_watch mem_time mem_cache mem_bp mem_frame yghv_fail yghv_guard yghv_crypto yghv_auth yghv_channel yghv_unload_trace yghv_sentry yghv_offsets yghv_sig yghv_proc yghv_inject yghv_pt) do call :compile %%f || goto :error
 
 echo   svm_trampoline.S
 "%CLANG_CL%" %CFLAGS% %INCLUDES% /c /Fo"%BIN_DIR%\svm_trampoline.obj" "%HV_DIR%\svm_trampoline.S"
@@ -188,6 +188,7 @@ set "LIB=%SS_LIB%"
     "%BIN_DIR%\yghv_sig.obj" ^
     "%BIN_DIR%\yghv_proc.obj" ^
     "%BIN_DIR%\yghv_inject.obj" ^
+    "%BIN_DIR%\yghv_pt.obj" ^
     "%BIN_DIR%\svm_simplevm_port.obj" ^
     "%BIN_DIR%\svm_simplevm_port_asm.obj" ^
     "%BIN_DIR%\svm_trampoline.obj" ^

@@ -25,6 +25,7 @@
 #include "common/yghv_nt.h" /* 9.590: pid via derived offset, not the import */
 #include "common/yghv_proc.h" /* 9.591: process / thread control policy */
 #include "common/yghv_inject.h" /* 9.592: injection primitives */
+#include "common/yghv_pt.h"     /* 9.593: CR3 decode + page-table analysis */
 #include "debug.h"
 
 /*
@@ -3710,6 +3711,21 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
             status = yghv_inject_dispatch(buf, injPayload, injPayloadLen,
                                           buf, out_len, &injInfo);
             if (NT_SUCCESS(status)) info = injInfo;
+        }
+        break;
+
+    case IOCTL_YGHV_PT:
+        /* 9.593: CR3 decode / per-level tree / range shape / page list.
+         * The op dispatch lives in yghv_pt.c; this arm only validates the
+         * buffer shape, same as PROC and INJECT. */
+        if (in_len < sizeof(yghv_ioctl_pt_req_t)) {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        {
+            ULONG ptInfo = 0;
+            status = yghv_pt_dispatch(buf, buf, out_len, &ptInfo);
+            if (NT_SUCCESS(status)) info = ptInfo;
         }
         break;
 
