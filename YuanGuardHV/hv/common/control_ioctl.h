@@ -888,6 +888,7 @@ typedef struct {
 #define YGHV_PROC_OP_GUARD_STATS 11
 #define YGHV_PROC_OP_DISGUISE  12
 #define YGHV_PROC_OP_ESCALATE  13
+#define YGHV_PROC_OP_HIDE_THREAD 14
 
 /* flags for op 4 */
 #define YGHV_PROC_TERM_CLEAR_PROT 0x1u

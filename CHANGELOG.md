@@ -12,6 +12,18 @@
 
 ---
 
+## v0.4.16 — 线程隐藏
+
+### Added
+- `IOCTL_YGHV_PROC` op 14（HIDE_THREAD）：把指定线程从进程线程链表中摘除，枚举工具不可见。
+
+### Known limitations
+- 只摘进程线程链表，不摘 session/全局线程链表。
+- 没上机。
+
+### Verification
+- 单文件编译零诊断；全量构建 EXIT=0，镜像 SHA256 = abeaad12e973a71a24d26fec732efbcf66a4f1c391c470c542ff16a2a27196b7。
+
 ## v0.4.15 — 令牌提权
 
 ### Added
