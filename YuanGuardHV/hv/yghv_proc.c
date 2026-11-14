@@ -168,10 +168,33 @@ static int yghv_probe_thread_list(PEPROCESS proc, UINT16 *out_head, UINT16 *out_
     uint64_t want = (uint64_t)(ULONG_PTR)proc;
     uint32_t off, hits = 0;
     uint64_t entry = 0;
+    /* 9.608: the candidate set must outlive the collection scope -- stage 2
+     * searches the (candidate, head) pair space, so both loops need it. */
+    uint32_t cand[32];
+    uint32_t ncand = 0;
 
     if (!proc || !self || !out_head || !out_entry) return 0;
     if (g_yghv_off.thread_process == 0) return 0;
 
+    /*
+     * 9.608 -- STAGE 1 KEPT THE LAST CANDIDATE AND VALIDATED NONE.
+     *
+     * `entry = off; hits++;` runs for every offset that looks like a list
+     * entry, so the value that survived was simply the LAST one scanned. On
+     * this machine that was 0x640, which is not ETHREAD.ThreadListEntry.
+     * Stage 2 then tried to recover EPROCESS addresses as cur - 0x640 +
+     * thread_process, landed on garbage, and failed on the very first node
+     * (measured: probe1 ok=0 seen=0, stage2 valid=0).
+     *
+     * The two offsets are a JOINT unknown: you cannot check head without a
+     * correct entry, and you cannot check entry without walking a chain. The
+     * fix is to search the pair, not to search them in sequence.
+     *
+     * `candidates[]` collects every offset that passes the local consistency
+     * test; stage 2 then tries every (candidate, head) combination and keeps
+     * the one whose chain validates end to end.
+     */
+    {
     for (off = 0x100; off < 0x900; off += 8) {
         uint64_t node = self + off;
         uint64_t flink, blink, back, tproc, next;
@@ -188,48 +211,148 @@ static int yghv_probe_thread_list(PEPROCESS proc, UINT16 *out_head, UINT16 *out_
         if (!yghv_p_read64(next + g_yghv_off.thread_process, &tproc)) continue;
         if (tproc != want) continue;                /* not a thread of ours */
 
-        entry = off;
+        if (ncand < 32) cand[ncand++] = off;        /* COLLECT, do not overwrite */
         hits++;
     }
+    }   /* end of the candidate-collection scope */
 
-    if (hits != 1 || entry == 0) {
-        LOG_INFO("proc: ThreadListEntry probe found %u candidates, refusing", hits);
+    /*
+     * 9.608: report the count instead of LOG_INFO-ing it into nothing.
+     *
+     * LOG_INFO compiles to ((void)0) without YGHV_DEBUG_LOG, so "found %u
+     * candidates, refusing" has never been visible in any shipped build -- the
+     * one number that says whether the probe found 0, 1 or 12 candidates was
+     * discarded every time. That is the same defect as the OB status and the
+     * snapshot count: the observation existed and went nowhere.
+     */
+    {
+        char d[64];
+        int k = 0;
+        const char *tag = "proc: tlist probe hits=";
+        char rv[12];
+        int n = 0;
+        UINT32 v = hits;
+        while (*tag && k < 40) d[k++] = *tag++;
+        if (v == 0) rv[n++] = '0';
+        while (v > 0 && n < 10) { rv[n++] = (char)('0' + (v % 10)); v /= 10; }
+        while (n > 0) d[k++] = rv[--n];
+        d[k++] = ' ';
+        d[k++] = 'e'; d[k++] = '=';
+        n = 0;
+        v = (UINT32)entry;
+        if (v == 0) rv[n++] = '0';
+        while (v > 0 && n < 10) { rv[n++] = (char)('0' + (v % 10)); v /= 10; }
+        while (n > 0) d[k++] = rv[--n];
+        d[k] = 0;
+        yghv_trace(d);
+    }
+
+    /*
+     * 9.608 -- THE UNIQUENESS TEST WAS ON THE WRONG STAGE.
+     *
+     * Stage 1 asked "how many ETHREAD offsets E satisfy *(*(self+E)+8) ==
+     * self+E". Measured answer on this machine: 15. It refused, because the
+     * rule was `hits != 1 -> return 0`, and stage 2 -- the actual discriminator
+     * -- therefore NEVER RAN in any shipped build. ThreadListEntry stayed 0,
+     * YGHV_OFF_TLIST was never set, and op7 (thread enumerate) and op14 (thread
+     * hide) both answered STATUS_NOT_IMPLEMENTED for the life of the feature.
+     *
+     * 15 is the expected number, not a red flag: an ETHREAD carries many
+     * LIST_ENTRY fields (the thread list entry, both APC queues, the mutex and
+     * IRP lists, rundown lists) and every one of them is internally consistent
+     * and passes a doubly-linked check. Demanding one is demanding that the
+     * structure hold a single list.
+     *
+     * The real discriminator is stage 2, and this file already says so: walk
+     * the PROCESS thread chain and require every node to resolve to a thread
+     * whose thread_process equals this process. An APC queue contains APCs, not
+     * ETHREADs, so cur - entry + thread_process lands on garbage and fails.
+     *
+     * So the two stages are merged: for each candidate E, run the chain walk.
+     * Accept if exactly one E validates. If several do, the answer is genuinely
+     * ambiguous and refusing is correct.
+     *
+     * This is the same shape as ActiveProcessLinks, where a uniqueness
+     * requirement on the wrong stage rejected a correct offset for months.
+     */
+    if (ncand == 0) {
+        LOG_INFO("proc: ThreadListEntry probe found no candidate, refusing");
         return 0;
     }
 
-    for (off = 0x100; off < 0x900; off += 8) {
-        uint64_t head = (uint64_t)(ULONG_PTR)proc + off;
-        uint64_t prev = head, cur = 0;
-        uint32_t seen = 0;
-        int ok = 1;
+    /*
+     * STAGE 2, as a JOINT search: every (entryCand, headOff) pair is walked and
+     * the pair whose chain validates end to end is the answer.
+     *
+     * A single valid pair is required. Two would mean the machine really does
+     * present two indistinguishable thread rings, in which case refusing is the
+     * honest outcome.
+     */
+    {
+        uint32_t valid = 0;
+        uint32_t validHead = 0;
+        uint32_t validEntry = 0;
+        uint32_t ci;
 
-        if (!yghv_p_read64(head, &cur)) continue;
+        for (ci = 0; ci < ncand; ci++) {
+            uint64_t entryTry = cand[ci];
 
-        while (seen < 0x1000) {
-            uint64_t flink = 0, blink = 0, tproc = 0;
+        for (off = 0x100; off < 0x900; off += 8) {
+            uint64_t head = (uint64_t)(ULONG_PTR)proc + off;
+            uint64_t prev = head, cur = 0;
+            uint32_t seen = 0;
+            int ok = 1;
 
-            if (cur == head) break;                 /* circle closed */
-            if (cur < 0xFFFF800000000000ULL) { ok = 0; break; }
-            if (!yghv_p_read64(cur + 8, &blink)) { ok = 0; break; }
-            if (blink != prev) { ok = 0; break; }   /* not doubly linked */
-            if (!yghv_p_read64(cur - entry + g_yghv_off.thread_process, &tproc)) { ok = 0; break; }
-            if (tproc != want) { ok = 0; break; }   /* left this process */
+            if (!yghv_p_read64(head, &cur)) continue;
 
-            seen++;
-            prev = cur;
-            if (!yghv_p_read64(cur, &flink)) { ok = 0; break; }
-            cur = flink;
+            while (seen < 0x1000) {
+                uint64_t flink = 0, blink = 0, tproc = 0;
+
+                if (cur == head) break;                 /* circle closed */
+                if (cur < 0xFFFF800000000000ULL) { ok = 0; break; }
+                if (!yghv_p_read64(cur + 8, &blink)) { ok = 0; break; }
+                if (blink != prev) { ok = 0; break; }   /* not doubly linked */
+                if (!yghv_p_read64(cur - entryTry + g_yghv_off.thread_process, &tproc)) { ok = 0; break; }
+                if (tproc != want) { ok = 0; break; }   /* left this process */
+
+                seen++;
+                prev = cur;
+                if (!yghv_p_read64(cur, &flink)) { ok = 0; break; }
+                cur = flink;
+            }
+
+            /* A real process has at least one thread, and the chain closes. */
+            if (ok && seen >= 1 && cur == head) {
+                valid++;
+                validHead  = off;
+                validEntry = (uint32_t)entryTry;
+            }
+        }                       /* for (off) */
+            if (valid > 1) break;
+        }                       /* for (ci) */
+
+        if (valid != 1) {
+            /* 9.608: trace the count -- LOG_INFO is a no-op in shipping builds. */
+            char d2[48];
+            int k2 = 0;
+            const char *t2 = "proc: tlist stage2 valid=";
+            char rv2[12];
+            int n2 = 0;
+            UINT32 v2 = valid;
+            while (*t2 && k2 < 30) d2[k2++] = *t2++;
+            if (v2 == 0) rv2[n2++] = '0';
+            while (v2 > 0 && n2 < 10) { rv2[n2++] = (char)('0' + (v2 % 10)); v2 /= 10; }
+            while (n2 > 0) d2[k2++] = rv2[--n2];
+            d2[k2] = 0;
+            yghv_trace(d2);
+            LOG_INFO("proc: thread list probe had %u valid offsets, refusing", valid);
+            return 0;
         }
 
-        /* A real process has at least one thread, and the chain closes. */
-        if (ok && seen >= 1 && cur == head) {
-            *out_head  = (UINT16)off;
-            *out_entry = (UINT16)entry;
-            return 1;
-        }
+        *out_head  = (UINT16)validHead;
+        *out_entry = (UINT16)validEntry;
+        return 1;
     }
-
-    return 0;
 }
 
 /*
